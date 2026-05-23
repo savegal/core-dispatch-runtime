@@ -86,7 +86,11 @@ Thumbs.db
 /qc
 /python
 /proxies_import.txt
-/accounts*.txt
+/accounts.txt
+/accounts_*.txt
+/accounts-*.txt
+/accounts.import.txt
+!accounts.example.txt
 /flake8_report.txt
 /top5_report.txt
 *.cookies

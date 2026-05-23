@@ -1,0 +1,50 @@
+# Пример файла для импорта аккаунтов TikTok
+# ============================================
+#
+# ВАЛИДНЫЕ КОМБИНАЦИИ COOKIES:
+# 1. sid_tt + sessionid (классический вариант — РЕКОМЕНДУЕТСЯ)
+# 2. sid_guard + msToken (только для просмотра/мониторинга, НЕ подходит для комментирования!
+#    TikTok не показывает поле ввода комментария без sessionid/sid_tt в браузере)
+#
+# ПОДДЕРЖИВАЕМЫЕ ФОРМАТЫ COOKIES:
+# 1. JSON-объект: {"sid_tt": "xxx", "sessionid": "yyy", ...}
+# 2. JSON-массив (browser export): [{"name": "sid_tt", "value": "xxx"}, ...]
+# 3. Inline: sid_tt=xxx;sessionid=yyy
+#
+# ФОРМАТЫ СТРОК:
+# - label;cookies;user_agent;proxy (полный)
+# - cookies;user_agent;proxy
+# - cookies;proxy
+# - cookies (только cookies)
+#
+# Разделители: ; | табуляция
+#
+# ============================================
+
+# Формат 1: Полный (label + cookies JSON-объект + user_agent + proxy)
+Аккаунт1;{"sid_tt":"abc123...","sessionid":"xyz789...","uid_tt":"123456"};Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36;http://user:password@proxy.example.com:8080
+
+# Формат 2: Cookies JSON-объект + Proxy
+{"sid_tt":"def456...","sessionid":"uvw012..."};http://proxy2.example.com:3128
+
+# Формат 3: Только cookies JSON-объект
+{"sid_tt":"ghi789...","sessionid":"rst345...","uid_tt":"789012"}
+
+# Формат 4: Альтернативный набор cookies (sid_guard + msToken)
+{"sid_guard":"1234567890|...|abcdef123456","msToken":"very_long_token_value_here...","uid_tt":"654321"}
+
+# Формат 5: Browser export формат (JSON-массив)
+[{"name":"sid_tt","value":"abc123","domain":".tiktok.com"},{"name":"sessionid","value":"xyz789","domain":".tiktok.com"}]
+
+# Формат 6: Inline формат
+sid_tt=abc123;sessionid=xyz789;uid_tt=123456
+
+# Формат 7: Inline с прокси
+sid_tt=def456;sessionid=uvw012;uid_tt=654321|http://proxy:8080
+
+# Примечания:
+# - Каждая строка = один аккаунт
+# - Пустые строки и строки, начинающиеся с #, игнорируются
+# - Дубликаты (по sid_guard или sid_tt) автоматически пропускаются
+# - Если label не указан, будет использован автоматический (acc_1, acc_2, ...)
+# - Если proxy не указан, система предложит раздать из пула активных прокси
