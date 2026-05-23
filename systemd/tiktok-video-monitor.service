@@ -1,0 +1,25 @@
+[Unit]
+Description=TeletanSoft Video Monitor Worker - Мониторинг TikTok блогеров
+After=network.target redis.service
+Requires=redis.service
+
+[Service]
+Type=simple
+User=teletan
+Group=teletan
+WorkingDirectory=/opt/TeletanSoft
+Environment="PATH=/opt/TeletanSoft/venv/bin:/usr/local/bin:/usr/bin:/bin"
+Environment="PYTHONUNBUFFERED=1"
+ExecStart=/opt/TeletanSoft/venv/bin/python -m services.video_monitor_worker
+Restart=always
+RestartSec=10
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=tiktok-video-monitor
+
+# Ограничения ресурсов (опционально)
+MemoryLimit=1G
+CPUQuota=50%
+
+[Install]
+WantedBy=multi-user.target

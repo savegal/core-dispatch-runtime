@@ -1,0 +1,102 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+env/
+venv/
+ENV/
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+
+# Database
+*.db
+*.sqlite
+*.sqlite3
+*.db-wal
+*.db-shm
+*.db-journal
+*.sqlite-wal
+*.sqlite-shm
+*.sqlite-journal
+dev.db
+test.db
+
+# Environment
+.env
+.env.local
+.env.*.local
+*.env
+
+# IDE
+.vscode/
+.idea/
+.claude/
+*.swp
+*.swo
+*~
+
+# Logs
+*.log
+logs/
+screenshots/
+diagnostics/
+cookies/
+*.png
+*.html
+scratch/
+_archive/
+
+# Coverage
+htmlcov/
+.coverage
+.coverage.*
+.cache
+.pytest_cache/
+
+# Sentry
+.sentryclirc
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Local one-off scripts and sensitive imports
+/fix_*.py
+/verify_*.py
+/check_*.py
+/update_proxy_db.py
+/temp_*.py
+/_win_fix.py
+/.__tmp*
+/qc
+/python
+/proxies_import.txt
+/accounts*.txt
+/flake8_report.txt
+/top5_report.txt
+*.cookies
+*.cookie
+*.bak
+*.bak_*
+*.damaged.bak
+/services/*_block.txt
+/executor/worker_functions.txt
+
+
+
+

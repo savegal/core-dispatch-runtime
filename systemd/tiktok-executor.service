@@ -1,0 +1,32 @@
+[Unit]
+Description=TikTok Comment Service Executor
+After=network.target redis.service
+Wants=redis.service
+Requires=tiktok-backend.service
+
+[Service]
+Type=simple
+User=tiktok
+Group=tiktok
+WorkingDirectory=/opt/tiktok-service
+Environment="PATH=/opt/tiktok-service/venv/bin"
+EnvironmentFile=/opt/tiktok-service/.env
+ExecStart=/opt/tiktok-service/venv/bin/python -m executor.executor
+Restart=always
+RestartSec=10
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=tiktok-executor
+
+# Security settings
+NoNewPrivileges=true
+PrivateTmp=true
+
+# Resource limits
+LimitNOFILE=65536
+
+[Install]
+WantedBy=multi-user.target
+
+
+
