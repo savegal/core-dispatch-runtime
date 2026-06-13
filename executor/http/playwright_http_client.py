@@ -474,6 +474,12 @@ class PlaywrightHttpClient:
         Returns:
             tuple: (success, response_data, error_message, error_type)
         """
+        self.last_request_meta = {
+            "endpoint": profile.endpoint,
+            "method": profile.method,
+            "request_attempted": False,
+            "attempt_count": 0,
+        }
         effective_runtime_profile = runtime_profile_override or self.runtime_profile
         dynamic_params, url, signature_bundle = await resolve_request_signature(
             page=self.page,
@@ -504,6 +510,8 @@ class PlaywrightHttpClient:
             "endpoint": profile.endpoint,
             "method": profile.method,
             "signature": dict(request_signature_meta),
+            "request_attempted": False,
+            "attempt_count": 0,
         }
 
         def _attach_request_meta(payload: Optional[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
@@ -511,6 +519,7 @@ class PlaywrightHttpClient:
                 return payload
             enriched = dict(payload)
             enriched["__request_signature"] = dict(request_signature_meta)
+            enriched["__request_meta"] = dict(self.last_request_meta)
             return enriched
         
         # Маскируем cookies для логирования
@@ -551,6 +560,9 @@ class PlaywrightHttpClient:
         
         for attempt in range(self.retry_policy.max_retries + 1):
             try:
+                self.last_request_meta["attempt_count"] = int(
+                    self.last_request_meta.get("attempt_count") or 0
+                ) + 1
                 # ИСПРАВЛЕНО: Разные timeout для разных попыток
                 # 15 сек для первого запроса (быстрее при ошибках), 30 сек для retry (может быть медленный прокси)
                 base_timeout = 15000  # 15 секунд для обычных запросов
@@ -559,6 +571,8 @@ class PlaywrightHttpClient:
                 
                 # Выполняем запрос через Playwright request context
                 # Playwright автоматически использует cookies из context
+                self.last_request_meta["request_attempted"] = True
+                self.last_request_meta["timeout_ms"] = timeout_to_use
                 response = await self.request_context.fetch(
                     url,
                     method=profile.method,
@@ -571,6 +585,8 @@ class PlaywrightHttpClient:
                 # Если TikTok вернул HTML (капча/WAF/редирект) - сразу классифицируем как FORBIDDEN/CAPTCHA
                 content_type = response.headers.get("content-type", "").lower()
                 status_code = response.status
+                self.last_request_meta["response_status"] = status_code
+                self.last_request_meta["response_content_type"] = content_type
                 
                 # Получаем тело ответа
                 try:
@@ -957,6 +973,7 @@ class PlaywrightHttpClient:
                     "response_root_comment_id": None,
                     "parent_confirmation_level": "unconfirmed",
                     "request_signature": request_signature,
+                    "request_meta": dict(self.last_request_meta),
                 }
 
             expected_parent_id = _normalize_identifier(parent_comment_id)
@@ -978,25 +995,31 @@ class PlaywrightHttpClient:
                 }
 
                 if direct_parent_candidates and expected_parent_id not in direct_parent_candidates:
-                    return (
-                        False,
-                        None,
-                        (
-                            "Reply parent mismatch: "
-                            f"expected={expected_parent_id}, "
-                            f"got_direct={response_parent_id}, "
-                            f"got_reply_to_reply={response_reply_to_reply_id}"
-                        ),
-                        HttpErrorType.API_ERROR,
-                        {
-                            "parent_confirmed": False,
-                            "response_parent_id": response_parent_id,
-                            "response_reply_to_reply_id": response_reply_to_reply_id,
-                            "response_root_comment_id": response_root_comment_id,
-                            "parent_confirmation_level": "unconfirmed",
-                            "request_signature": request_signature,
-                        },
+                    mismatch_reason = (
+                        "Reply parent mismatch: "
+                        f"expected={expected_parent_id}, "
+                        f"got_direct={response_parent_id}, "
+                        f"got_reply_to_reply={response_reply_to_reply_id}"
                     )
+                    logger.warning(
+                        "[HTTP] Reply response returned a comment_id but parent mismatch was detected | "
+                        "correlation_id=%s, comment_id=%s, %s. Treating as submitted-unconfirmed "
+                        "to avoid duplicate DOM retry.",
+                        correlation_id,
+                        comment_id[:40],
+                        mismatch_reason,
+                    )
+                    return True, comment_id, None, None, {
+                        "parent_confirmed": False,
+                        "response_parent_id": response_parent_id,
+                        "response_reply_to_reply_id": response_reply_to_reply_id,
+                        "response_root_comment_id": response_root_comment_id,
+                        "parent_confirmation_level": "network_parent_mismatch",
+                        "parent_mismatch": True,
+                        "parent_mismatch_reason": mismatch_reason,
+                        "request_signature": request_signature,
+                        "request_meta": dict(self.last_request_meta),
+                    }
 
                 if expected_parent_id in direct_parent_candidates:
                     parent_confirmed = True
@@ -1031,6 +1054,7 @@ class PlaywrightHttpClient:
                 "response_root_comment_id": response_root_comment_id,
                 "parent_confirmation_level": parent_confirmation_level,
                 "request_signature": request_signature,
+                "request_meta": dict(self.last_request_meta),
             }
         else:
             return False, None, error_msg, error_type, {
@@ -1040,6 +1064,7 @@ class PlaywrightHttpClient:
                 "response_root_comment_id": None,
                 "parent_confirmation_level": "unconfirmed",
                 "request_signature": self.last_request_meta.get("signature"),
+                "request_meta": dict(self.last_request_meta),
             }
     
     async def publish_main_comment(

@@ -15,13 +15,13 @@ import logging
 import threading
 import time
 import hashlib
-from typing import Optional, Any, Iterable
+from typing import Any, Iterable
 import random # NEW: For jitter
 import json  # ИСПРАВЛЕНО: Для проверки cooldown в last_error
 from pathlib import Path
 from datetime import datetime, timezone, timedelta
 from urllib.parse import urlparse
-from sqlalchemy import and_, or_, not_, func, case
+from sqlalchemy import and_, or_, func, case
 from sqlalchemy.orm import Session
 from db.models import Account, Proxy
 from config.settings import get_settings
@@ -124,6 +124,33 @@ RUNTIME_BUCKET_ORDER = {
     "proxy_issue": 2,
     "cooldown": 3,
     "dead_session": 4,
+}
+
+RUNTIME_HEALTH_HEALTHY = "healthy"
+RUNTIME_HEALTH_RISKY = "risky"
+RUNTIME_HEALTH_CAPTCHA_RECENT = "captcha_recent"
+RUNTIME_HEALTH_PAGE_BLOCKED_RECENT = "page_blocked_recent"
+RUNTIME_HEALTH_LOGIN_UI_RECENT = "login_ui_recent"
+RUNTIME_HEALTH_PROXY_ERROR_RECENT = "proxy_error_recent"
+RUNTIME_HEALTH_COOKIE_ENRICHMENT_RECENT = "cookie_enrichment_recent"
+RUNTIME_HEALTH_COOLDOWN = "cooldown"
+RUNTIME_HEALTH_DEAD_SESSION = "dead_session"
+RUNTIME_HEALTH_PROXY_ISSUE = "proxy_issue"
+
+_RUNTIME_HEALTH_SCORE_PENALTIES = {
+    RUNTIME_HEALTH_RISKY: 8,
+    RUNTIME_HEALTH_CAPTCHA_RECENT: 36,
+    RUNTIME_HEALTH_PAGE_BLOCKED_RECENT: 34,
+    RUNTIME_HEALTH_LOGIN_UI_RECENT: 48,
+    RUNTIME_HEALTH_PROXY_ERROR_RECENT: 30,
+    RUNTIME_HEALTH_COOKIE_ENRICHMENT_RECENT: 18,
+}
+
+_RUNTIME_HEALTH_LAST_RESORT_GRADES = {
+    RUNTIME_HEALTH_CAPTCHA_RECENT,
+    RUNTIME_HEALTH_PAGE_BLOCKED_RECENT,
+    RUNTIME_HEALTH_LOGIN_UI_RECENT,
+    RUNTIME_HEALTH_PROXY_ERROR_RECENT,
 }
 
 ACCOUNT_LIFECYCLE_UNKNOWN = "unknown"
@@ -458,16 +485,29 @@ def _read_account_cookie_source(account: Account) -> str:
     if not raw_cookie_file:
         return ""
 
-    candidate_paths = [Path(raw_cookie_file)]
-    if not candidate_paths[0].is_absolute():
-        candidate_paths.append(Path(settings.COOKIES_DIR) / raw_cookie_file)
-
-    for candidate_path in candidate_paths:
-        try:
-            if candidate_path.exists():
-                return candidate_path.read_text(encoding="utf-8")
-        except Exception as exc:
-            logger.debug(f"[ACCOUNT_SERVICE] Failed to read cookie file {candidate_path}: {exc}")
+    try:
+        cookies_dir = Path(settings.COOKIES_DIR).resolve()
+        candidate_path = Path(raw_cookie_file)
+        if candidate_path.is_absolute():
+            resolved_path = candidate_path.resolve()
+        else:
+            if ".." in candidate_path.parts:
+                logger.warning(
+                    "[ACCOUNT_SERVICE] Rejected unsafe cookie_file for account %s",
+                    getattr(account, "id", "?"),
+                )
+                return ""
+            resolved_path = (cookies_dir / candidate_path).resolve()
+        if not resolved_path.is_relative_to(cookies_dir):
+            logger.warning(
+                "[ACCOUNT_SERVICE] Rejected cookie_file outside COOKIES_DIR for account %s",
+                getattr(account, "id", "?"),
+            )
+            return ""
+        if resolved_path.exists():
+            return resolved_path.read_text(encoding="utf-8")
+    except Exception as exc:
+        logger.debug(f"[ACCOUNT_SERVICE] Failed to read cookie file {raw_cookie_file}: {exc}")
 
     return ""
 
@@ -506,6 +546,25 @@ def _safe_proxy_selection_diag(proxy_value: str | None, proxy_obj: Proxy | None 
     )
 
 
+def _proxy_source_host(proxy_value: str | None) -> str:
+    raw = str(proxy_value or "").strip()
+    if not raw:
+        return ""
+    try:
+        parsed = urlparse(raw if "://" in raw else f"//{raw}")
+        if parsed.hostname:
+            return parsed.hostname.strip("[]").lower()
+    except Exception:
+        pass
+    visible_part = raw.split("@")[-1]
+    host = visible_part.split(":")[0].strip("[]").strip().lower()
+    return host
+
+
+def _parallel_proxy_diversify_by_source_host() -> bool:
+    return bool(getattr(settings, "PARALLEL_PROXY_DIVERSIFY_BY_SOURCE_HOST", True))
+
+
 def _account_cookie_key_diag(account: Account, max_keys: int = 40) -> list[str]:
     raw_cookies = _read_account_cookie_source(account)
     if not raw_cookies:
@@ -535,8 +594,13 @@ def _account_selection_diagnostics(
     *,
     proxy_obj: Proxy | None = None,
 ) -> str:
+    try:
+        runtime_health = _runtime_health_grade(_read_runtime_state(account, now))
+    except Exception:
+        runtime_health = RUNTIME_HEALTH_RISKY
     return (
         f"proxy=({_safe_proxy_selection_diag(getattr(account, 'proxy', None), proxy_obj)}), "
+        f"runtime_health={runtime_health}, "
         f"cookie_keys={_account_cookie_key_diag(account)}, "
         f"age_min={_minutes_since(getattr(account, 'created_at', None), now)}, "
         f"last_used_min={_minutes_since(getattr(account, 'last_used_at', None), now)}, "
@@ -740,6 +804,19 @@ def _read_account_session_quality(
     }
 
 
+def _is_publish_session_last_resort(session_quality: dict[str, Any]) -> bool:
+    """Return true for sessions that can pass passport but are weak in browser UI."""
+    return (
+        session_quality.get("quality_reason") == "no_browser_auth_sid_guard_only"
+        and not bool(session_quality.get("has_browser_auth"))
+    )
+
+
+def _allow_publish_session_last_resort() -> bool:
+    """Allow sid_guard-only sessions only after stronger browser-auth sessions are exhausted."""
+    return bool(getattr(settings, "ALLOW_SID_GUARD_ONLY_PUBLISH_LAST_RESORT", False))
+
+
 def _infer_monitor_category(reason: str | None) -> str:
     text = (reason or "").lower()
     if not text:
@@ -797,6 +874,14 @@ def _infer_runtime_category(reason: str | None) -> str:
         return MONITOR_CATEGORY_CAPTCHA
     if "rate limit" in text or "rate limited" in text or "too many requests" in text:
         return MONITOR_CATEGORY_RATE_LIMIT
+    if "proxy_edge_access_denied" in text or "err_http_response_code_failure" in text:
+        return MONITOR_CATEGORY_PROXY
+    if "page_loading:" in text or "tiktok_shell" in text or "page loading" in text:
+        return MONITOR_CATEGORY_NETWORK
+    if "goto_failed:" in text or "page.goto" in text or "url_stuck_about_blank" in text:
+        if "proxy" in text or "tunnel" in text or "econnrefused" in text or "enotfound" in text or "econnreset" in text:
+            return MONITOR_CATEGORY_PROXY
+        return MONITOR_CATEGORY_NETWORK
     if "login_ambiguous" in text:
         return MONITOR_CATEGORY_BLOCKED
     if "login required" in text or "cookies dead" in text or "dead session" in text or "validation failed" in text:
@@ -830,6 +915,9 @@ def _looks_like_runtime_error(reason: str | None) -> bool:
         "rate limit",
         "rate limited",
         "too many requests",
+        "proxy_edge_access_denied",
+        "err_http_response_code_failure",
+        "http 403",
         "proxy",
         "tunnel",
         "timeout",
@@ -837,6 +925,9 @@ def _looks_like_runtime_error(reason: str | None) -> bool:
         "connection",
         "blocked",
         "login_ambiguous",
+        "goto_failed",
+        "page.goto",
+        "url_stuck_about_blank",
         "forbidden",
         "access denied",
         "on_video_empty_dom_after_settle",
@@ -849,9 +940,22 @@ def _looks_like_runtime_error(reason: str | None) -> bool:
         "dead session",
         "validation failed",
         "page load",
+        "page_loading",
+        "tiktok_shell",
         "critical_cookies_not_generated",
     )
     return any(marker in text for marker in runtime_markers)
+
+
+def _runtime_category_for_stored_reason(category: str, reason: str | None) -> str:
+    normalized_category = category or MONITOR_CATEGORY_UNKNOWN
+    inferred = _infer_runtime_category(reason)
+    if (
+        normalized_category == MONITOR_CATEGORY_BLOCKED
+        and inferred in {MONITOR_CATEGORY_NETWORK, MONITOR_CATEGORY_PROXY}
+    ):
+        return inferred
+    return normalized_category
 
 
 def _build_monitor_error_payload(
@@ -950,7 +1054,10 @@ def _read_runtime_state(
         if payload_scope in {RUNTIME_SCOPE, MAIN_SCOPE, REPLY_SCOPE}:
             scope = payload_scope
             reason = _normalize_reason(payload.get("reason")) or reason
-            category = payload.get("category") or _infer_runtime_category(reason)
+            category = _runtime_category_for_stored_reason(
+                payload.get("category") or _infer_runtime_category(reason),
+                reason,
+            )
             fatal = bool(payload.get("fatal"))
             cooldown_until = _parse_reply_cooldown_until(_serialize_error_payload(payload))
     elif _looks_like_runtime_error(account.last_error):
@@ -989,6 +1096,36 @@ def _read_runtime_state(
         "fatal": fatal,
         "bucket": bucket,
     }
+
+
+def _runtime_health_grade(state: dict[str, Any] | None) -> str:
+    if not state:
+        return RUNTIME_HEALTH_RISKY
+    bucket = str(state.get("bucket") or "").strip()
+    category = str(state.get("category") or "").strip()
+    if bucket == "healthy":
+        return RUNTIME_HEALTH_HEALTHY
+    if bucket == "cooldown" or state.get("active_cooldown"):
+        return RUNTIME_HEALTH_COOLDOWN
+    if bucket == "dead_session":
+        return RUNTIME_HEALTH_DEAD_SESSION
+    if bucket == "proxy_issue":
+        return RUNTIME_HEALTH_PROXY_ISSUE
+    if category == MONITOR_CATEGORY_CAPTCHA:
+        return RUNTIME_HEALTH_CAPTCHA_RECENT
+    if category == MONITOR_CATEGORY_BLOCKED:
+        return RUNTIME_HEALTH_PAGE_BLOCKED_RECENT
+    if category == MONITOR_CATEGORY_LOGIN:
+        return RUNTIME_HEALTH_LOGIN_UI_RECENT
+    if category == MONITOR_CATEGORY_PROXY:
+        return RUNTIME_HEALTH_PROXY_ERROR_RECENT
+    if category == RUNTIME_CATEGORY_COOKIE_ENRICHMENT:
+        return RUNTIME_HEALTH_COOKIE_ENRICHMENT_RECENT
+    return RUNTIME_HEALTH_RISKY
+
+
+def _runtime_health_is_selection_last_resort(state: dict[str, Any] | None) -> bool:
+    return _runtime_health_grade(state) in _RUNTIME_HEALTH_LAST_RESORT_GRADES
 
 
 def get_http_execution_strategy(
@@ -1048,6 +1185,7 @@ def get_http_execution_strategy(
         "strategy": strategy,
         "session_bucket": session_quality["bucket"],
         "state_bucket": state["bucket"],
+        "runtime_health": _runtime_health_grade(state),
         "spend_lane": spend_lane["lane"],
         "lane_reason": spend_lane["reason"],
         "quality_reason": session_quality.get("quality_reason"),
@@ -1144,6 +1282,7 @@ def _calculate_scope_quality_score(
     now = now or datetime.now(timezone.utc)
     score = 100
     bucket = state.get("bucket")
+    runtime_health = _runtime_health_grade(state)
 
     if bucket == "degraded":
         score -= 15
@@ -1153,6 +1292,8 @@ def _calculate_scope_quality_score(
         score -= 40
     elif bucket == "dead_session":
         return 0
+
+    score -= _RUNTIME_HEALTH_SCORE_PENALTIES.get(runtime_health, 0)
 
     if account.status == "error":
         score -= 12
@@ -1463,6 +1604,8 @@ def get_free_account_for_main_comment(
     db: Session,
     *,
     exclude_ids: list[int] | None = None,
+    exclude_proxies: set[str] | list[str] | tuple[str, ...] | None = None,
+    exclude_proxy_source_hosts: bool | None = None,
     pool_owner_user_id: int | None = None,
 ) -> Account | None:
     """
@@ -1538,6 +1681,29 @@ def get_free_account_for_main_comment(
     combined_exclude_ids.update(reserved_ids)
     if combined_exclude_ids:
         query = query.filter(~Account.id.in_(combined_exclude_ids))
+
+    normalized_exclude_proxies = {
+        str(proxy).strip()
+        for proxy in (exclude_proxies or [])
+        if proxy and str(proxy).strip()
+    }
+    exclude_same_proxy_source_host = (
+        _parallel_proxy_diversify_by_source_host()
+        if exclude_proxy_source_hosts is None
+        else bool(exclude_proxy_source_hosts)
+    )
+    normalized_exclude_proxy_hosts = (
+        {host for host in (_proxy_source_host(proxy) for proxy in normalized_exclude_proxies) if host}
+        if exclude_same_proxy_source_host
+        else set()
+    )
+    if normalized_exclude_proxies:
+        query = query.filter(
+            or_(
+                Account.proxy.is_(None),
+                ~Account.proxy.in_(sorted(normalized_exclude_proxies)),
+            )
+        )
 
     if settings.USE_PROXY:
         query = query.filter(
@@ -1631,11 +1797,13 @@ def get_free_account_for_main_comment(
             
             excluded_count = len(combined_exclude_ids) if "combined_exclude_ids" in locals() else (len(exclude_ids) if exclude_ids else 0)
             
-            logger.warning(
+            no_match_log = logger.info if normalized_exclude_proxies else logger.warning
+            no_match_log(
                 f"[ACCOUNT_SERVICE] ⚠️ No accounts available for main comment! "
                 f"Total accounts: {total_accounts}, Active: {active_accounts}, "
                 f"Error (with low error_count): {error_accounts}, "
                 f"Excluded: {excluded_count}, "
+                f"Excluded proxies: {len(normalized_exclude_proxies)}, "
                 f"Not in cooldown: {accounts_not_in_cooldown}, "
                 f"Below limit: {accounts_below_limit}, "
                 f"MAX_ACTIONS_PER_ACCOUNT={settings.MAX_ACTIONS_PER_ACCOUNT}, "
@@ -1662,36 +1830,57 @@ def get_free_account_for_main_comment(
     dialect_name = getattr(getattr(bind, "dialect", None), "name", "") or ""
     supports_skip_locked = dialect_name not in {"", "sqlite"}
     candidate_limit = max(20, min(80, getattr(settings, "MAX_CONCURRENT_BROWSERS", 10) * 4))
-    candidate_query = query.order_by(*order_by_clauses).limit(candidate_limit)
-
-    try:
-        if supports_skip_locked:
-            candidates = candidate_query.with_for_update(skip_locked=True).all()
-        else:
-            candidates = candidate_query.with_for_update().all()
-    except Exception as lock_error:
-        logger.warning(f"SELECT FOR UPDATE not supported, falling back to regular candidate query: {lock_error}")
-        candidates = candidate_query.all()
+    max_candidate_scan = max(candidate_limit, min(2000, candidate_limit * 100))
 
     ranked_candidates: list[tuple[tuple[Any, ...], Account, dict[str, Any], int]] = []
-    for index, candidate in enumerate(candidates):
-        if not _has_auth_material(candidate):
-            continue
-        state = _read_runtime_state(candidate, now)
-        lifecycle = _read_account_lifecycle(candidate, now)
-        session_quality = _read_account_session_quality(candidate, MAIN_SCOPE, now)
-        spend_lane = _read_account_spend_lane(candidate, MAIN_SCOPE, now)
-        if lifecycle["hard_expired"]:
-            continue
-        if state["active_cooldown"] or state["bucket"] in {"dead_session", "proxy_issue"}:
-            continue
-        if session_quality["bucket"] == SESSION_BUCKET_DEAD:
-            continue
-        if spend_lane["lane"] == ACCOUNT_LANE_RETIRE:
-            continue
-        score = _calculate_scope_quality_score(candidate, state, MAIN_SCOPE, now)
-        ranked_candidates.append(
-            (
+    runtime_last_resort_candidates: list[tuple[tuple[Any, ...], Account, dict[str, Any], int]] = []
+    last_resort_candidates: list[tuple[tuple[Any, ...], Account, dict[str, Any], int]] = []
+    candidates: list[Account] = []
+    offset = 0
+    while offset < max_candidate_scan and not ranked_candidates:
+        candidate_query = (
+            query
+            .order_by(*order_by_clauses)
+            .offset(offset)
+            .limit(candidate_limit)
+        )
+
+        try:
+            if supports_skip_locked:
+                candidate_batch = candidate_query.with_for_update(skip_locked=True).all()
+            else:
+                candidate_batch = candidate_query.with_for_update().all()
+        except Exception as lock_error:
+            logger.warning(f"SELECT FOR UPDATE not supported, falling back to regular candidate query: {lock_error}")
+            candidate_batch = candidate_query.all()
+
+        if not candidate_batch:
+            break
+        candidates.extend(candidate_batch)
+        for batch_index, candidate in enumerate(candidate_batch):
+            index = offset + batch_index
+            candidate_proxy = str(candidate.proxy or "").strip()
+            if candidate_proxy:
+                if candidate_proxy in normalized_exclude_proxies:
+                    continue
+                if exclude_same_proxy_source_host and _proxy_source_host(candidate_proxy) in normalized_exclude_proxy_hosts:
+                    continue
+            if not _has_auth_material(candidate):
+                continue
+            state = _read_runtime_state(candidate, now)
+            lifecycle = _read_account_lifecycle(candidate, now)
+            session_quality = _read_account_session_quality(candidate, MAIN_SCOPE, now)
+            spend_lane = _read_account_spend_lane(candidate, MAIN_SCOPE, now)
+            if lifecycle["hard_expired"]:
+                continue
+            if state["active_cooldown"] or state["bucket"] in {"dead_session", "proxy_issue"}:
+                continue
+            if session_quality["bucket"] == SESSION_BUCKET_DEAD:
+                continue
+            if spend_lane["lane"] == ACCOUNT_LANE_RETIRE:
+                continue
+            score = _calculate_scope_quality_score(candidate, state, MAIN_SCOPE, now)
+            ranked_item = (
                 (
                     RUNTIME_BUCKET_ORDER.get(state["bucket"], 5),
                     0 if candidate.status == "active" else 1,
@@ -1705,13 +1894,43 @@ def get_free_account_for_main_comment(
                 state,
                 score,
             )
+            if _is_publish_session_last_resort(session_quality):
+                last_resort_candidates.append(ranked_item)
+                continue
+            if _runtime_health_is_selection_last_resort(state):
+                runtime_last_resort_candidates.append(ranked_item)
+                continue
+            ranked_candidates.append(ranked_item)
+        offset += candidate_limit
+
+    if not ranked_candidates and runtime_last_resort_candidates:
+        logger.warning(
+            "[ACCOUNT_SERVICE] Only recently degraded main runtime sessions available after scanning %s SQL candidates; "
+            "using them as last resort behind browser readiness gates",
+            len(candidates),
+        )
+        ranked_candidates = runtime_last_resort_candidates
+
+    if not ranked_candidates and last_resort_candidates and _allow_publish_session_last_resort():
+        logger.warning(
+            "[ACCOUNT_SERVICE] Only last-resort main sessions available after scanning %s SQL candidates; "
+            "using sid_guard-only sessions behind browser readiness/enrichment gates",
+            len(candidates),
+        )
+        ranked_candidates = last_resort_candidates
+    elif not ranked_candidates and last_resort_candidates:
+        logger.warning(
+            "[ACCOUNT_SERVICE] Skipping %s sid_guard-only main session(s): "
+            "last-resort weak browser sessions are disabled by settings",
+            len(last_resort_candidates),
         )
 
     ranked_candidates.sort(key=lambda item: item[0])
     logger.info(f"[ACCOUNT_SERVICE] Eligible ranked candidates for main comment: {len(ranked_candidates)}")
     if not ranked_candidates:
         try:
-            logger.warning(
+            diag_log = logger.info if normalized_exclude_proxies else logger.warning
+            diag_log(
                 "[ACCOUNT_SERVICE_DIAG] No eligible ranked candidates after runtime filters. "
                 "Inspecting up to 20 SQL candidates."
             )
@@ -1838,6 +2057,9 @@ def get_free_account_for_reply(
     db: Session,
     exclude_ids: list[int] | None = None,
     *,
+    exclude_proxies: set[str] | list[str] | tuple[str, ...] | None = None,
+    exclude_proxy_source_hosts: bool | None = None,
+    exclude_degraded_categories: set[str] | list[str] | tuple[str, ...] | None = None,
     pool_owner_user_id: int | None = None,
 ) -> Account | None:
     """
@@ -1886,6 +2108,34 @@ def get_free_account_for_reply(
     if exclude_ids:
         query = query.filter(~Account.id.in_(exclude_ids))
 
+    normalized_exclude_proxies = {
+        str(proxy).strip()
+        for proxy in (exclude_proxies or [])
+        if proxy and str(proxy).strip()
+    }
+    normalized_exclude_degraded_categories = {
+        str(category).strip()
+        for category in (exclude_degraded_categories or [])
+        if category and str(category).strip()
+    }
+    exclude_same_proxy_source_host = (
+        _parallel_proxy_diversify_by_source_host()
+        if exclude_proxy_source_hosts is None
+        else bool(exclude_proxy_source_hosts)
+    )
+    normalized_exclude_proxy_hosts = (
+        {host for host in (_proxy_source_host(proxy) for proxy in normalized_exclude_proxies) if host}
+        if exclude_same_proxy_source_host
+        else set()
+    )
+    if normalized_exclude_proxies:
+        query = query.filter(
+            or_(
+                Account.proxy.is_(None),
+                ~Account.proxy.in_(sorted(normalized_exclude_proxies)),
+            )
+        )
+
     now = datetime.now(timezone.utc)
     proxy_type_filter = get_proxy_type_filter(db)
     proxy_prefer_mobile = get_proxy_prefer_mobile(db)
@@ -1902,6 +2152,9 @@ def get_free_account_for_reply(
     supports_skip_locked = dialect_name not in {"", "sqlite"}
     batch_size = max(20, min(100, getattr(settings, "MAX_CONCURRENT_BROWSERS", 10) * 4))
     seen_ids: set[int] = set(exclude_ids or [])
+    runtime_last_resort_accounts: list[tuple[Account, dict[str, Any], int]] = []
+    last_resort_accounts: list[tuple[Account, dict[str, Any], int]] = []
+    scanned_count = 0
 
     while True:
         batch_query = query
@@ -1925,40 +2178,136 @@ def get_free_account_for_reply(
             raise
 
         if not accounts:
+            if runtime_last_resort_accounts:
+                logger.warning(
+                    "[ACCOUNT_SERVICE] Only recently degraded reply runtime sessions available after scanning %s SQL candidates; "
+                    "using them as last resort behind browser readiness gates",
+                    scanned_count,
+                )
+                accounts = []
+            elif last_resort_accounts and _allow_publish_session_last_resort():
+                logger.warning(
+                    "[ACCOUNT_SERVICE] Only last-resort reply sessions available after scanning %s SQL candidates; "
+                    "using sid_guard-only sessions behind browser readiness/enrichment gates",
+                    scanned_count,
+                )
+                accounts = []
+            elif last_resort_accounts:
+                logger.warning(
+                    "[ACCOUNT_SERVICE] Skipping %s sid_guard-only reply session(s): "
+                    "last-resort weak browser sessions are disabled by settings",
+                    len(last_resort_accounts),
+                )
+                return None
+            else:
+                return None
+
+        batch_start_index = scanned_count
+        scanned_count += len(accounts)
+
+        using_reserve_accounts = False
+        if not accounts:
+            available_accounts = runtime_last_resort_accounts or last_resort_accounts
+            using_reserve_accounts = bool(available_accounts)
+        else:
+            seen_ids.update(acc.id for acc in accounts)
+
+            available_accounts: list[tuple[Account, dict[str, Any], int]] = []
+            for index, acc in enumerate(accounts):
+                acc_proxy = str(acc.proxy or "").strip()
+                if acc_proxy:
+                    if acc_proxy in normalized_exclude_proxies:
+                        continue
+                    if exclude_same_proxy_source_host and _proxy_source_host(acc_proxy) in normalized_exclude_proxy_hosts:
+                        continue
+                if not _has_auth_material(acc):
+                    continue
+                state = _read_runtime_state(acc, now)
+                lifecycle = _read_account_lifecycle(acc, now)
+                session_quality = _read_account_session_quality(acc, REPLY_SCOPE, now)
+                spend_lane = _read_account_spend_lane(acc, REPLY_SCOPE, now)
+                if lifecycle["hard_expired"]:
+                    continue
+                if session_quality["bucket"] == SESSION_BUCKET_DEAD:
+                    continue
+                if spend_lane["lane"] == ACCOUNT_LANE_RETIRE:
+                    continue
+                if state["active_cooldown"]:
+                    cooldown_until = state.get("cooldown_until")
+                    if cooldown_until:
+                        logger.debug(
+                            f"[COOLDOWN] Account {acc.id} in cooldown until {cooldown_until.isoformat()} "
+                            f"({(cooldown_until - now).total_seconds() / 60:.1f} minutes remaining)"
+                        )
+                    continue
+                if state["bucket"] in {"dead_session", "proxy_issue"}:
+                    continue
+                ranked_index = batch_start_index + index
+                if (
+                    normalized_exclude_degraded_categories
+                    and state["bucket"] == "degraded"
+                    and str(state.get("category") or "").strip() in normalized_exclude_degraded_categories
+                ):
+                    if _is_publish_session_last_resort(session_quality):
+                        last_resort_accounts.append((acc, state, ranked_index))
+                    elif _runtime_health_is_selection_last_resort(state):
+                        runtime_last_resort_accounts.append((acc, state, ranked_index))
+                    continue
+                if _is_publish_session_last_resort(session_quality):
+                    last_resort_accounts.append((acc, state, ranked_index))
+                    continue
+                if _runtime_health_is_selection_last_resort(state):
+                    runtime_last_resort_accounts.append((acc, state, ranked_index))
+                    continue
+                available_accounts.append((acc, state, ranked_index))
+
+        if (
+            not available_accounts
+            and len(accounts) < batch_size
+            and runtime_last_resort_accounts
+        ):
+            logger.warning(
+                "[ACCOUNT_SERVICE] Only recently degraded reply runtime sessions available after scanning %s SQL candidates; "
+            "using them as last resort behind browser readiness gates",
+                scanned_count,
+            )
+            available_accounts = runtime_last_resort_accounts
+            using_reserve_accounts = True
+        elif (
+            not available_accounts
+            and len(accounts) < batch_size
+            and last_resort_accounts
+            and _allow_publish_session_last_resort()
+        ):
+            logger.warning(
+                "[ACCOUNT_SERVICE] Only last-resort reply sessions available after scanning %s SQL candidates; "
+                "using sid_guard-only sessions behind browser readiness/enrichment gates",
+                scanned_count,
+            )
+            available_accounts = last_resort_accounts
+            using_reserve_accounts = True
+        elif not available_accounts and len(accounts) < batch_size and last_resort_accounts:
+            logger.warning(
+                "[ACCOUNT_SERVICE] Skipping %s sid_guard-only reply session(s): "
+                "last-resort weak browser sessions are disabled by settings",
+                len(last_resort_accounts),
+            )
+
+        if not available_accounts and len(accounts) >= batch_size:
+            continue
+
+        if not available_accounts:
             return None
-
-        seen_ids.update(acc.id for acc in accounts)
-
-        available_accounts: list[tuple[Account, dict[str, Any], int]] = []
-        for index, acc in enumerate(accounts):
-            if not _has_auth_material(acc):
-                continue
-            state = _read_runtime_state(acc, now)
-            lifecycle = _read_account_lifecycle(acc, now)
-            session_quality = _read_account_session_quality(acc, REPLY_SCOPE, now)
-            spend_lane = _read_account_spend_lane(acc, REPLY_SCOPE, now)
-            if lifecycle["hard_expired"]:
-                continue
-            if session_quality["bucket"] == SESSION_BUCKET_DEAD:
-                continue
-            if spend_lane["lane"] == ACCOUNT_LANE_RETIRE:
-                continue
-            if state["active_cooldown"]:
-                cooldown_until = state.get("cooldown_until")
-                if cooldown_until:
-                    logger.debug(
-                        f"[COOLDOWN] Account {acc.id} in cooldown until {cooldown_until.isoformat()} "
-                        f"({(cooldown_until - now).total_seconds() / 60:.1f} minutes remaining)"
-                    )
-                continue
-            if state["bucket"] in {"dead_session", "proxy_issue"}:
-                continue
-            available_accounts.append((acc, state, index))
 
         proxy_map = {}
         if available_accounts:
             try:
-                proxy_values = list({acc.proxy for acc, _, _ in available_accounts if acc.proxy})
+                proxy_values = list({
+                    acc.proxy
+                    for pool in (available_accounts, runtime_last_resort_accounts, last_resort_accounts)
+                    for acc, _, _ in pool
+                    if acc.proxy
+                })
                 if proxy_values:
                     proxies = db.query(Proxy).filter(Proxy.proxy.in_(proxy_values)).all()
                     proxy_map = {p.proxy: p for p in proxies}
@@ -1982,10 +2331,29 @@ def get_free_account_for_reply(
             return bool(proxy_obj and proxy_obj.is_mobile == "Y")
 
         if proxy_type_filter:
-            available_accounts = [
+            filtered_accounts = [
                 item for item in available_accounts
                 if _proxy_matches_type(item[0])
             ]
+            if not filtered_accounts and using_reserve_accounts:
+                reserve_pools = [runtime_last_resort_accounts]
+                if _allow_publish_session_last_resort():
+                    reserve_pools.append(last_resort_accounts)
+                for fallback_accounts in reserve_pools:
+                    if not fallback_accounts:
+                        continue
+                    filtered_accounts = [
+                        item for item in fallback_accounts
+                        if _proxy_matches_type(item[0])
+                    ]
+                    if filtered_accounts:
+                        if fallback_accounts is not available_accounts:
+                            logger.warning(
+                                "[ACCOUNT_SERVICE] Reply last-resort proxy-type filter skipped preferred reserve bucket; "
+                                "using alternate last-resort bucket with matching proxy type"
+                            )
+                        break
+            available_accounts = filtered_accounts
         elif proxy_prefer_mobile:
             available_accounts.sort(key=lambda item: 1 if _proxy_is_mobile(item[0]) else 0, reverse=True)
 
@@ -2349,6 +2717,31 @@ def record_main_comment_success(db: Session, account_id: int) -> None:
         raise
 
 
+def record_main_comment_attempt(db: Session, account_id: int) -> None:
+    """Marks a failed main-comment attempt without counting it as a success.
+
+    The main selector uses last_main_comment_at as its short per-account
+    cooldown gate. Updating it here prevents a DOM-broken/browser-broken
+    account from being selected again immediately, while today_main_comments
+    remains unchanged.
+    """
+    account = db.query(Account).filter(Account.id == account_id).with_for_update().first()
+    if not account:
+        return
+
+    now = datetime.now(timezone.utc)
+    account.last_main_comment_at = now
+    account.last_used_at = now
+    account.last_checked_at = now
+
+    try:
+        db.commit()
+    except Exception as e:
+        db.rollback()
+        logger.error(f"Error recording main comment attempt for account {account_id}: {e}", exc_info=True)
+        raise
+
+
 def record_reply_success(db: Session, account_id: int) -> None:
     """Clears transient errors and increments reply counters in one transaction."""
     account = db.query(Account).filter(Account.id == account_id).with_for_update().first()
@@ -2501,6 +2894,12 @@ def _build_scope_runtime_stats(
         "degraded": 0,
         "proxy_issue": 0,
         "dead_session": 0,
+        RUNTIME_HEALTH_CAPTCHA_RECENT: 0,
+        RUNTIME_HEALTH_PAGE_BLOCKED_RECENT: 0,
+        RUNTIME_HEALTH_LOGIN_UI_RECENT: 0,
+        RUNTIME_HEALTH_PROXY_ERROR_RECENT: 0,
+        RUNTIME_HEALTH_COOKIE_ENRICHMENT_RECENT: 0,
+        "runtime_risky": 0,
         "fresh": 0,
         "burn_window": 0,
         "expiring": 0,
@@ -2552,7 +2951,19 @@ def _build_scope_runtime_stats(
         spend_lane = _read_account_spend_lane(account, scope, now)
 
         bucket = state["bucket"]
+        health_grade = _runtime_health_grade(state) if scope != MONITOR_SCOPE else RUNTIME_HEALTH_HEALTHY
         summary[bucket] = int(summary.get(bucket, 0)) + 1
+        if scope != MONITOR_SCOPE:
+            if health_grade == RUNTIME_HEALTH_RISKY:
+                summary["runtime_risky"] = int(summary.get("runtime_risky", 0)) + 1
+            elif health_grade in {
+                RUNTIME_HEALTH_CAPTCHA_RECENT,
+                RUNTIME_HEALTH_PAGE_BLOCKED_RECENT,
+                RUNTIME_HEALTH_LOGIN_UI_RECENT,
+                RUNTIME_HEALTH_PROXY_ERROR_RECENT,
+                RUNTIME_HEALTH_COOKIE_ENRICHMENT_RECENT,
+            }:
+                summary[health_grade] = int(summary.get(health_grade, 0)) + 1
         summary[lifecycle["stage"]] = int(summary.get(lifecycle["stage"], 0)) + 1
         session_key = _SESSION_BUCKET_SCORE_KEYS.get(session_quality["bucket"])
         if session_key:
@@ -2706,7 +3117,12 @@ def get_monitor_account(
         if proxy and str(proxy).strip()
     }
     if normalized_exclude_proxies:
-        query = query.filter(~Account.proxy.in_(sorted(normalized_exclude_proxies)))
+        query = query.filter(
+            or_(
+                Account.proxy.is_(None),
+                ~Account.proxy.in_(sorted(normalized_exclude_proxies)),
+            )
+        )
 
     try:
         candidate_limit = max(50, int(getattr(settings, "MONITOR_ACCOUNT_CANDIDATE_LIMIT", 250)))

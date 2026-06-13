@@ -22,7 +22,6 @@ CAPTCHA_TEXT_MARKERS = (
     "email verification",
     "verification code",
     "enter the code",
-    "sent to",
     "two-factor",
     "two factor",
     "2fa",
@@ -61,7 +60,6 @@ async def detect_captcha(page: Page, wait_ms: int = 1000) -> tuple[bool, Optiona
                     'email verification',
                     'verification code',
                     'enter the code',
-                    'sent to',
                     'two-factor',
                     'two factor',
                     '2fa',
@@ -76,7 +74,14 @@ async def detect_captcha(page: Page, wait_ms: int = 1000) -> tuple[bool, Optiona
                     if (!el || !el.getBoundingClientRect) return false;
                     const r = el.getBoundingClientRect();
                     const st = getComputedStyle(el);
-                    return r.width > 0 && r.height > 0 && st.display !== 'none' && st.visibility !== 'hidden';
+                    const ariaHidden = String(el.getAttribute('aria-hidden') || '').toLowerCase() === 'true';
+                    return r.width > 0
+                        && r.height > 0
+                        && st.display !== 'none'
+                        && st.visibility !== 'hidden'
+                        && st.opacity !== '0'
+                        && st.pointerEvents !== 'none'
+                        && !ariaHidden;
                 };
 
                 const classifyText = (text) => {
@@ -90,7 +95,6 @@ async def detect_captcha(page: Page, wait_ms: int = 1000) -> tuple[bool, Optiona
                         normalized.includes('email verification') ||
                         normalized.includes('verification code') ||
                         normalized.includes('enter the code') ||
-                        normalized.includes('sent to') ||
                         normalized.includes('two-factor') ||
                         normalized.includes('two factor') ||
                         normalized.includes('2fa') ||
@@ -115,7 +119,16 @@ async def detect_captcha(page: Page, wait_ms: int = 1000) -> tuple[bool, Optiona
                     'iframe[src*="captcha"]',
                     'iframe[src*="verify"]',
                     'iframe[src*="challenge"]',
+                    'iframe[src*="secsdk"]',
                 ];
+
+                const selectorHintType = (selector) => {
+                    const selectorLower = String(selector || '').toLowerCase();
+                    if (selectorLower.includes('one-time-code')) return 'account_verification';
+                    if (selectorLower.includes('captcha')) return 'verify';
+                    if (selectorLower.includes('challenge') || selectorLower.includes('secsdk')) return 'challenge';
+                    return null;
+                };
 
                 for (const selector of captchaSelectors) {
                     try {
@@ -126,17 +139,9 @@ async def detect_captcha(page: Page, wait_ms: int = 1000) -> tuple[bool, Optiona
                             if (textType) {
                                 return { found: true, type: textType, selector };
                             }
-                            const selectorLower = selector.toLowerCase();
-                            if (
-                                selectorLower.includes('one-time-code')
-                            ) {
-                                return { found: true, type: 'account_verification', selector };
-                            }
-                            if (selectorLower.includes('captcha')) {
-                                return { found: true, type: 'verify', selector };
-                            }
-                            if (selectorLower.includes('challenge')) {
-                                return { found: true, type: 'challenge', selector };
+                            const hintType = selectorHintType(selector);
+                            if (hintType) {
+                                return { found: true, type: hintType, selector };
                             }
                         }
                     } catch (e) {
@@ -147,14 +152,92 @@ async def detect_captcha(page: Page, wait_ms: int = 1000) -> tuple[bool, Optiona
                 const iframes = document.querySelectorAll('iframe');
                 for (const iframe of iframes) {
                     try {
+                        if (!visible(iframe)) continue;
                         const src = (iframe.getAttribute('src') || '').toLowerCase();
-                        if (src.includes('captcha') || src.includes('verify') || src.includes('challenge')) {
+                        if (
+                            src.includes('captcha') ||
+                            src.includes('verify') ||
+                            src.includes('challenge') ||
+                            src.includes('secsdk')
+                        ) {
                             return { found: true, type: 'challenge', selector: 'iframe' };
                         }
                     } catch (e) {
                         continue;
                     }
                 }
+
+                const normalizedText = (el) => String(el && (el.innerText || el.textContent) || '')
+                    .toLowerCase()
+                    .replace(/\\s+/g, ' ')
+                    .trim();
+                const visibleDescendants = (root, selector) => {
+                    try {
+                        return [...root.querySelectorAll(selector)].filter(visible);
+                    } catch (_) {
+                        return [];
+                    }
+                };
+                const looksLikeTikTokPuzzleChallenge = (el) => {
+                    if (!visible(el)) return false;
+                    const r = el.getBoundingClientRect();
+                    const vw = window.innerWidth || 0;
+                    const vh = window.innerHeight || 0;
+                    if (r.width < 260 || r.height < 220 || r.width > Math.max(760, vw * 0.75)) return false;
+                    const cx = r.left + r.width / 2;
+                    const cy = r.top + r.height / 2;
+                    if (vw > 0 && (cx < vw * 0.25 || cx > vw * 0.82)) return false;
+                    if (vh > 0 && (cy < vh * 0.22 || cy > vh * 0.90)) return false;
+
+                    const text = normalizedText(el);
+                    if (classifyText(text) === 'slider') return true;
+
+                    const hasAudioControl =
+                        /(^|\\s)audio($|\\s)/.test(text) ||
+                        visibleDescendants(el, '[aria-label*="audio" i], button, [role="button"]').some((node) => {
+                            const label = `${node.getAttribute('aria-label') || ''} ${node.innerText || node.textContent || ''}`.toLowerCase();
+                            return /(^|\\s)audio($|\\s)/.test(label);
+                        });
+                    if (!hasAudioControl) return false;
+
+                    const mediaLike = visibleDescendants(
+                        el,
+                        'img, canvas, svg, [style*="background-image"], [class*="Image"], [class*="image"]'
+                    ).filter((node) => {
+                        try {
+                            const br = node.getBoundingClientRect();
+                            return br.width >= 48 && br.height >= 48;
+                        } catch (_) {
+                            return false;
+                        }
+                    });
+
+                    const controls = visibleDescendants(el, 'button, [role="button"], [tabindex], input[type="range"], [role="slider"]');
+                    const hasSliderLikeControl = controls.some((node) => {
+                        try {
+                            const br = node.getBoundingClientRect();
+                            const label = `${node.getAttribute('aria-label') || ''} ${node.innerText || node.textContent || ''}`.toLowerCase();
+                            return node.matches('[role="slider"], input[type="range"]') ||
+                                label.includes('slide') ||
+                                label.includes('drag') ||
+                                label.includes('verify') ||
+                                (br.width >= 44 && br.height >= 28 && br.left >= r.left && br.right <= r.right && br.top > r.top + r.height * 0.45);
+                        } catch (_) {
+                            return false;
+                        }
+                    });
+
+                    const iconLikeButtons = controls.filter((node) => {
+                        try {
+                            const br = node.getBoundingClientRect();
+                            return br.width >= 18 && br.height >= 18 && br.width <= 90 && br.height <= 90;
+                        } catch (_) {
+                            return false;
+                        }
+                    }).length;
+
+                    return mediaLike.length > 0 && (hasSliderLikeControl || iconLikeButtons >= 2);
+                };
 
                 const modalCandidates = [
                     ...document.querySelectorAll('.TUXModal-overlay, [class*="Modal"], [class*="modal"], [role="dialog"]')
@@ -164,6 +247,28 @@ async def detect_captcha(page: Page, wait_ms: int = 1000) -> tuple[bool, Optiona
                     const textType = classifyText(el.innerText || el.textContent || '');
                     if (textType) {
                         return { found: true, type: textType, selector: 'modal_text' };
+                    }
+                    if (looksLikeTikTokPuzzleChallenge(el)) {
+                        return { found: true, type: 'slider', selector: 'visual_puzzle_modal' };
+                    }
+                }
+
+                const structuralCandidates = [...document.body.querySelectorAll('body > div, body > section, body > aside')]
+                    .filter(visible)
+                    .filter((el) => {
+                        try {
+                            const st = getComputedStyle(el);
+                            const r = el.getBoundingClientRect();
+                            return /fixed|absolute|sticky/i.test(st.position || '') &&
+                                r.width >= 260 &&
+                                r.height >= 220;
+                        } catch (_) {
+                            return false;
+                        }
+                    });
+                for (const el of structuralCandidates) {
+                    if (looksLikeTikTokPuzzleChallenge(el)) {
+                        return { found: true, type: 'slider', selector: 'visual_puzzle_overlay' };
                     }
                 }
 

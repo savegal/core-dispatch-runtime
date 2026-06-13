@@ -110,6 +110,8 @@ class TaskCard:
     replies_unconfirmed: int = 0
     needs_review: bool = False
     publications: dict[str, Any] = field(default_factory=dict)
+    coverage: dict[str, Any] = field(default_factory=dict)
+    health: dict[str, Any] = field(default_factory=dict)
     cost: float = 0.0
     refunded: float = 0.0
     net_cost: float = 0.0

@@ -15,8 +15,11 @@ from services.likes_config import (
     BOOST_LIKES_MAX,
     BOOST_LIKES_MIN,
     BOOST_LIKES_QUANTITY_KEY,
+    BOOST_LIKES_TARGET_MODE_KEY,
+    BOOST_LIKES_TARGET_SINGLE_TOP,
     coerce_bool,
     coerce_likes_quantity,
+    coerce_likes_target_mode,
 )
 
 logger = logging.getLogger("services.app_settings")
@@ -35,6 +38,17 @@ COMMENTING_MODE_KEY = "commenting_mode"
 COMMENTING_MODE_OLD = "old"
 COMMENTING_MODE_PARALLEL = "parallel"
 COMMENTING_MODES = {COMMENTING_MODE_OLD, COMMENTING_MODE_PARALLEL}
+ORDER_EXECUTION_STRATEGY_KEY = "order_execution_strategy"
+ORDER_EXECUTION_STRATEGY_BALANCED = "balanced"
+ORDER_EXECUTION_STRATEGY_FAST = "fast"
+ORDER_EXECUTION_STRATEGY_CAREFUL = "careful"
+ORDER_EXECUTION_STRATEGY_VERIFY = "verify"
+ORDER_EXECUTION_STRATEGIES = {
+    ORDER_EXECUTION_STRATEGY_BALANCED,
+    ORDER_EXECUTION_STRATEGY_FAST,
+    ORDER_EXECUTION_STRATEGY_CAREFUL,
+    ORDER_EXECUTION_STRATEGY_VERIFY,
+}
 
 AUTOPILOT_CONTROL_MODE_KEY = "autopilot_control_mode"
 AUTOPILOT_CONTROL_ACTIVE = "active"
@@ -292,6 +306,45 @@ def set_commenting_mode(db: Session, mode: str, updated_by: int | None = None) -
     )
 
 
+def normalize_order_execution_strategy(
+    value: Any,
+    default: str = ORDER_EXECUTION_STRATEGY_BALANCED,
+) -> str:
+    normalized = str(value or "").strip().lower()
+    if normalized in ORDER_EXECUTION_STRATEGIES:
+        return normalized
+    return default if default in ORDER_EXECUTION_STRATEGIES else ORDER_EXECUTION_STRATEGY_BALANCED
+
+
+def get_order_execution_strategy(
+    db: Session,
+    default: str = ORDER_EXECUTION_STRATEGY_BALANCED,
+) -> str:
+    raw = get_setting(db, ORDER_EXECUTION_STRATEGY_KEY, default)
+    return normalize_order_execution_strategy(raw, default=default)
+
+
+def set_order_execution_strategy(
+    db: Session,
+    strategy: str,
+    updated_by: int | None = None,
+) -> bool:
+    normalized = normalize_order_execution_strategy(strategy, default="")
+    if normalized not in ORDER_EXECUTION_STRATEGIES:
+        logger.warning(f"Invalid order_execution_strategy value: {strategy}")
+        return False
+    return set_setting(
+        db,
+        ORDER_EXECUTION_STRATEGY_KEY,
+        normalized,
+        description=(
+            "Order execution strategy: balanced keeps current behavior; fast/careful/verify "
+            "are explicit operator modes for future retry and verification policy tuning."
+        ),
+        updated_by=updated_by,
+    )
+
+
 def normalize_autopilot_control_mode(value: Any, default: str = AUTOPILOT_CONTROL_ACTIVE) -> str:
     normalized = str(value or "").strip().lower()
     if normalized in AUTOPILOT_CONTROL_MODES:
@@ -487,6 +540,27 @@ def set_boost_likes_quantity(db: Session, value: int, updated_by: int | None = N
         description=(
             "Количество лайков на комментарий. "
             f"Диапазон: {BOOST_LIKES_MIN}-{BOOST_LIKES_MAX}"
+        ),
+        updated_by=updated_by,
+    )
+
+
+def get_boost_likes_target_mode(db: Session, default: str = BOOST_LIKES_TARGET_SINGLE_TOP) -> str:
+    """Returns how parallel comment likes choose Boost targets."""
+    raw = get_setting(db, BOOST_LIKES_TARGET_MODE_KEY, default)
+    return coerce_likes_target_mode(raw, default)
+
+
+def set_boost_likes_target_mode(db: Session, value: str, updated_by: int | None = None) -> bool:
+    """Stores how parallel comment likes choose Boost targets."""
+    normalized = coerce_likes_target_mode(value, BOOST_LIKES_TARGET_SINGLE_TOP)
+    return set_setting(
+        db,
+        BOOST_LIKES_TARGET_MODE_KEY,
+        normalized,
+        description=(
+            "How Boost comment likes choose targets in parallel commenting: "
+            "single_top or each_found."
         ),
         updated_by=updated_by,
     )

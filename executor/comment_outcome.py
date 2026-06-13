@@ -13,11 +13,27 @@ import asyncio
 import json
 import logging
 import re
-import unicodedata
+import uuid
 from typing import Optional, Dict, Any, Callable, Tuple
-from patchright.async_api import Page, TimeoutError as PWTimeout
+from patchright.async_api import Page
+from executor.captcha_detector import detect_captcha
 
 logger = logging.getLogger("executor.comment_outcome")
+
+
+def _new_parent_anchor_token() -> str:
+    return f"pa-{uuid.uuid4().hex}"
+
+
+async def _visible_captcha_error(page: Page) -> Optional[str]:
+    try:
+        has_captcha, captcha_type = await detect_captcha(page, wait_ms=0)
+    except Exception as exc:
+        logger.debug("[FIND_COMMENT] captcha probe failed: %s", exc)
+        return None
+    if not has_captcha:
+        return None
+    return f"captcha_challenge:{captcha_type or 'unknown'}"
 
 
 def normalize_text(text: str) -> str:
@@ -659,6 +675,18 @@ async def find_comment_in_list(
         logger.log(level, "[PARENT_SEARCH_TRACE] %s", json.dumps(payload, ensure_ascii=False)[:2200])
 
     _log_parent_search_trace("start")
+    captcha_error = await _visible_captcha_error(page)
+    if captcha_error:
+        _log_parent_search_trace(
+            "captcha_detected",
+            level=logging.WARNING,
+            error=captcha_error,
+        )
+        return False, {
+            "error": captcha_error,
+            "scrolls": 0,
+            "text_normalized": expected,
+        }
     
     # Селекторы для контейнера списка комментариев
     list_selectors = [
@@ -682,7 +710,7 @@ async def find_comment_in_list(
         selectors.COMMENT_ITEM,
         '[data-e2e="comment-item"]',
         '[data-e2e*="comment-level"]',
-        '[data-cid]',
+        '[data-cid]:not([data-cid^="one-column-item"])',
         '[data-comment-id]',
         '[class*="CommentItem"]',
         '[class*="DivComment"]',
@@ -776,7 +804,7 @@ async def find_comment_in_list(
     try:
         selected_list = await page.evaluate(
             """
-            ({selectors}) => {
+            ({selectors, strictScope}) => {
                 const visible = (el) => {
                     if (!el || !el.getBoundingClientRect) return false;
                     const r = el.getBoundingClientRect();
@@ -796,7 +824,7 @@ async def find_comment_in_list(
                     '[data-e2e*="comment-text"]',
                     '[data-e2e*="comment-username"]',
                     '[class*="DivCommentObject"]',
-                    '[data-cid]',
+                    '[data-cid]:not([data-cid^="one-column-item"])',
                     '[data-comment-id]',
                 ].join(', ');
                 const itemSelectors = [strongItemSelectors, 'p', 'li', '[role="listitem"]'].join(', ');
@@ -808,6 +836,7 @@ async def find_comment_in_list(
                         if (!visible(el)) continue;
                         const strongItems = visibleCount(el, strongItemSelectors);
                         const items = visibleCount(el, itemSelectors);
+                        if (strictScope && strongItems <= 0) continue;
                         let strongList = false;
                         try {
                             strongList = el.matches(
@@ -829,23 +858,42 @@ async def find_comment_in_list(
                 entries.sort((a, b) => b.score - a.score);
                 const chosen = entries[0] || null;
                 if (!chosen) return null;
-                const isScrollable = (el) => !!el && el.scrollHeight > el.clientHeight + 20;
+                const badScrollTags = new Set([
+                    'IMG', 'SVG', 'PATH', 'USE', 'PICTURE', 'SOURCE', 'CANVAS',
+                    'SPAN', 'STRONG', 'P', 'A', 'BUTTON', 'I'
+                ]);
+                const isRealScrollContainer = (el) => {
+                    if (!el || !visible(el) || badScrollTags.has(el.tagName)) return false;
+                    const r = el.getBoundingClientRect();
+                    if (r.width < 180 || r.height < 120) return false;
+                    return el.scrollHeight > el.clientHeight + 20;
+                };
+                const scrollScore = (el) => {
+                    if (!isRealScrollContainer(el)) return -1;
+                    const r = el.getBoundingClientRect();
+                    const strongItems = visibleCount(el, strongItemSelectors);
+                    return strongItems * 1000 + Math.min(el.clientHeight || 0, 1200) + Math.min(r.width || 0, 800);
+                };
                 const scrollableDescendant = (el) => {
                     try {
                         const nodes = [...el.querySelectorAll('*')].filter(visible);
-                        return nodes.find((node) => isScrollable(node) && visibleCount(node, strongItemSelectors) > 0) || null;
+                        const candidates = nodes
+                            .map((node) => ({ node, score: scrollScore(node) }))
+                            .filter((item) => item.score >= 0 && visibleCount(item.node, strongItemSelectors) > 0)
+                            .sort((a, b) => b.score - a.score);
+                        return candidates.length ? candidates[0].node : null;
                     } catch (_) {
                         return null;
                     }
                 };
                 const scrollableAncestor = (el) => {
                     for (let cur = el; cur && cur !== document.body && cur !== document.documentElement; cur = cur.parentElement) {
-                        if (!visible(cur)) continue;
+                        if (!isRealScrollContainer(cur)) continue;
                         let style = null;
                         try { style = getComputedStyle(cur); } catch (_) { style = null; }
                         const overflow = style ? `${style.overflowY || ''} ${style.overflow || ''}` : '';
                         const overflowLooksScrollable = /(auto|scroll|overlay)/i.test(overflow);
-                        if (cur.scrollHeight > cur.clientHeight + 20 && (overflowLooksScrollable || cur !== el)) {
+                        if (overflowLooksScrollable || cur !== el) {
                             return cur;
                         }
                     }
@@ -855,15 +903,17 @@ async def find_comment_in_list(
                 const openedScrollEl = (() => {
                     try {
                         const node = document.querySelector('[data-smart-comment-scroll-opened="1"]');
-                        return node && (node === scopeEl || scopeEl.contains(node)) ? node : null;
+                        return node && (node === scopeEl || scopeEl.contains(node)) && isRealScrollContainer(node)
+                            ? node
+                            : null;
                     } catch (_) {
                         return null;
                     }
                 })();
-                let scrollEl = openedScrollEl || (isScrollable(chosen.el)
+                let scrollEl = openedScrollEl || (isRealScrollContainer(chosen.el)
                     ? chosen.el
                     : (scrollableDescendant(chosen.el) || scrollableAncestor(chosen.el)));
-                if (!isScrollable(scrollEl)) {
+                if (!isRealScrollContainer(scrollEl)) {
                     scrollEl = scopeEl;
                 }
                 try {
@@ -889,14 +939,14 @@ async def find_comment_in_list(
                     selector: chosen.selector,
                     scroll_container_tag: scrollEl.tagName,
                     scroll_container_class: String(scrollEl.className || '').slice(0, 160),
-                    scroll_container_scrollable: isScrollable(scrollEl),
+                    scroll_container_scrollable: isRealScrollContainer(scrollEl),
                     items: chosen.items,
                     strong_items: chosen.strongItems,
                     score: chosen.score,
                 };
             }
             """,
-            {"selectors": list_selectors},
+            {"selectors": list_selectors, "strictScope": bool(strict_scope)},
         )
         if selected_list:
             candidate = await page.query_selector('[data-smart-comment-list-active-scope="1"]')
@@ -986,6 +1036,20 @@ async def find_comment_in_list(
     last_scroll_state: Dict[str, Any] | None = None
     wheel_nudge_attempts = 0
     for scroll_i in range(max_scrolls):
+        captcha_error = await _visible_captcha_error(page)
+        if captcha_error:
+            _log_parent_search_trace(
+                "captcha_detected",
+                level=logging.WARNING,
+                scroll=scroll_i,
+                error=captcha_error,
+            )
+            return False, {
+                "error": captcha_error,
+                "scrolls": scroll_i + 1,
+                "text_normalized": expected,
+                "matched_list_selector": matched_list_selector,
+            }
         # ОБНОВЛЕНО: Ищем корневые контейнеры комментариев в нужном scope.
         try:
             comment_roots = await _query_comment_roots()
@@ -1009,17 +1073,33 @@ async def find_comment_in_list(
                             break
 
                     if txt:
+                        anchor_token = _new_parent_anchor_token()
+                        try:
+                            await comment_root.evaluate(
+                                """
+                                (el, token) => {
+                                    try {
+                                        el.setAttribute('data-smart-parent-anchor', token);
+                                        return true;
+                                    } catch (_) {
+                                        return false;
+                                    }
+                                }
+                                """,
+                                anchor_token,
+                            )
+                        except Exception:
+                            anchor_token = None
                         comment_id = await comment_root.evaluate(
                             """
                             el => {
-                                const selector = '[data-cid], [data-comment-id], [data-id], [id^="comment-"]';
+                                const selector = '[data-cid], [data-comment-id], [id^="comment-"]';
                                 const read = (node) => {
                                     if (!node) return null;
                                     const raw =
                                         node.getAttribute('data-cid') ||
                                         node.getAttribute('data-comment-id') ||
-                                        node.getAttribute('data-id') ||
-                                        node.id ||
+                                        (node.id && node.id.startsWith('comment-') ? node.id : null) ||
                                         null;
                                     return raw ? String(raw).replace(/^comment-/, '') : null;
                                 };
@@ -1085,6 +1165,7 @@ async def find_comment_in_list(
                             "comment_id": str(comment_id) if comment_id else None,
                             "text_selector": matched_selector,
                             "author": author,
+                            "anchor_token": anchor_token,
                         }
                 except Exception as e:
                     logger.debug(f"[FIND_COMMENT] Error processing comment root {idx}: {e}")
@@ -1133,7 +1214,7 @@ async def find_comment_in_list(
                         nudge_limit = 3 if not can_scroll else 2
                         if strict_scope and wheel_nudge_attempts < nudge_limit:
                             wheel_nudge_attempts += 1
-                            nudge_target = comment_list if comment_list is not None else scroll_target
+                            nudge_target = scroll_target if scroll_target is not None else comment_list
                             nudge = await _nudge_comment_list_scroll(
                                 nudge_target,
                                 delta=max(800, int((after_scroll_state.get("client") or 0) * 1.2)),
@@ -1225,7 +1306,8 @@ async def find_comment_in_list(
                         text: text.slice(0, 180),
                         selector,
                         author: m ? m[1] : (authorEl ? (authorEl.innerText || authorEl.textContent || '').trim().replace(/^@/, '') : null),
-                        cid: root.getAttribute('data-cid') || root.getAttribute('data-comment-id') || root.getAttribute('data-id') || root.id || null,
+                        cid: root.getAttribute('data-cid') || root.getAttribute('data-comment-id') || (root.id && root.id.startsWith('comment-') ? root.id : null) || null,
+                        dom_id: root.getAttribute('data-id') || root.id || null,
                     });
                     if (samples.length >= 12) break;
                 }
@@ -1288,6 +1370,8 @@ async def find_comments_in_list_batch(
     ensure_open: bool = True,
     strict_scope: bool = False,
     min_match_ratio: float = 0.7,
+    return_partial_on_found: bool = False,
+    partial_found_sink: Optional[Dict[int, Dict[str, Any]]] = None,
     _stabilize_retry: bool = False,
 ) -> Tuple[Dict[int, Dict[str, Any]], Dict[str, Any]]:
     """Find multiple target comments in one scoped pass through the comment list.
@@ -1315,14 +1399,47 @@ async def find_comments_in_list_batch(
             "max_scrolls": max_scrolls,
             "min_match_ratio": min_match_ratio,
             "require_author_match": require_author_match,
+            "return_partial_on_found": return_partial_on_found,
+            "partial_sink": partial_found_sink is not None,
             "url": getattr(page, "url", None),
         }
         payload.update({k: v for k, v in fields.items() if v is not None})
         logger.log(level, "[PARENT_BATCH_SEARCH_TRACE] %s", json.dumps(payload, ensure_ascii=False)[:2400])
 
+    def _empty_result_info(**extra: Any) -> Dict[str, Any]:
+        payload: Dict[str, Any] = {
+            "found_count": 0,
+            "missing_count": len(targets),
+            "target_count": len(targets),
+            "matched_indexes": [],
+            "missing_indexes": [int(target["index"]) for target in targets],
+            "missing_previews": [
+                {
+                    "index": int(target["index"]),
+                    "text_preview": str(target.get("text") or "")[:120],
+                    "author": target.get("author"),
+                    "comment_id": target.get("cid"),
+                }
+                for target in targets[:12]
+            ],
+        }
+        payload.update(extra)
+        return payload
+
     _log_batch_trace("start")
     if not targets:
         return {}, {"target_count": 0, "scrolls": 0}
+    captcha_error = await _visible_captcha_error(page)
+    if captcha_error:
+        _log_batch_trace(
+            "captcha_detected",
+            level=logging.WARNING,
+            error=captcha_error,
+        )
+        return {}, _empty_result_info(
+            error=captcha_error,
+            scrolls=0,
+        )
 
     list_selectors = [
         '[data-smart-comment-surface-opened="1"]',
@@ -1343,7 +1460,7 @@ async def find_comments_in_list_batch(
         selectors.COMMENT_ITEM,
         '[data-e2e="comment-item"]',
         '[data-e2e*="comment-level"]',
-        '[data-cid]',
+        '[data-cid]:not([data-cid^="one-column-item"])',
         '[data-comment-id]',
         '[class*="CommentItem"]',
         '[class*="DivComment"]',
@@ -1383,7 +1500,7 @@ async def find_comments_in_list_batch(
     try:
         selected_list = await page.evaluate(
             """
-            ({selectors}) => {
+            ({selectors, strictScope}) => {
                 const visible = (el) => {
                     if (!el || !el.getBoundingClientRect) return false;
                     const r = el.getBoundingClientRect();
@@ -1403,7 +1520,7 @@ async def find_comments_in_list_batch(
                     '[data-e2e*="comment-text"]',
                     '[data-e2e*="comment-username"]',
                     '[class*="DivCommentObject"]',
-                    '[data-cid]',
+                    '[data-cid]:not([data-cid^="one-column-item"])',
                     '[data-comment-id]',
                 ].join(', ');
                 const itemSelectors = [strongItemSelectors, 'p', 'li', '[role="listitem"]'].join(', ');
@@ -1415,6 +1532,7 @@ async def find_comments_in_list_batch(
                         if (!visible(el)) continue;
                         const strongItems = visibleCount(el, strongItemSelectors);
                         const items = visibleCount(el, itemSelectors);
+                        if (strictScope && strongItems <= 0) continue;
                         let strongList = false;
                         try {
                             strongList = el.matches(
@@ -1436,23 +1554,42 @@ async def find_comments_in_list_batch(
                 entries.sort((a, b) => b.score - a.score);
                 const chosen = entries[0] || null;
                 if (!chosen) return null;
-                const isScrollable = (el) => !!el && el.scrollHeight > el.clientHeight + 20;
+                const badScrollTags = new Set([
+                    'IMG', 'SVG', 'PATH', 'USE', 'PICTURE', 'SOURCE', 'CANVAS',
+                    'SPAN', 'STRONG', 'P', 'A', 'BUTTON', 'I'
+                ]);
+                const isRealScrollContainer = (el) => {
+                    if (!el || !visible(el) || badScrollTags.has(el.tagName)) return false;
+                    const r = el.getBoundingClientRect();
+                    if (r.width < 180 || r.height < 120) return false;
+                    return el.scrollHeight > el.clientHeight + 20;
+                };
+                const scrollScore = (el) => {
+                    if (!isRealScrollContainer(el)) return -1;
+                    const r = el.getBoundingClientRect();
+                    const strongItems = visibleCount(el, strongItemSelectors);
+                    return strongItems * 1000 + Math.min(el.clientHeight || 0, 1200) + Math.min(r.width || 0, 800);
+                };
                 const scrollableDescendant = (el) => {
                     try {
                         const nodes = [...el.querySelectorAll('*')].filter(visible);
-                        return nodes.find((node) => isScrollable(node) && visibleCount(node, strongItemSelectors) > 0) || null;
+                        const candidates = nodes
+                            .map((node) => ({ node, score: scrollScore(node) }))
+                            .filter((item) => item.score >= 0 && visibleCount(item.node, strongItemSelectors) > 0)
+                            .sort((a, b) => b.score - a.score);
+                        return candidates.length ? candidates[0].node : null;
                     } catch (_) {
                         return null;
                     }
                 };
                 const scrollableAncestor = (el) => {
                     for (let cur = el; cur && cur !== document.body && cur !== document.documentElement; cur = cur.parentElement) {
-                        if (!visible(cur)) continue;
+                        if (!isRealScrollContainer(cur)) continue;
                         let style = null;
                         try { style = getComputedStyle(cur); } catch (_) { style = null; }
                         const overflow = style ? `${style.overflowY || ''} ${style.overflow || ''}` : '';
                         const overflowLooksScrollable = /(auto|scroll|overlay)/i.test(overflow);
-                        if (cur.scrollHeight > cur.clientHeight + 20 && (overflowLooksScrollable || cur !== el)) {
+                        if (overflowLooksScrollable || cur !== el) {
                             return cur;
                         }
                     }
@@ -1462,15 +1599,17 @@ async def find_comments_in_list_batch(
                 const openedScrollEl = (() => {
                     try {
                         const node = document.querySelector('[data-smart-comment-scroll-opened="1"]');
-                        return node && (node === scopeEl || scopeEl.contains(node)) ? node : null;
+                        return node && (node === scopeEl || scopeEl.contains(node)) && isRealScrollContainer(node)
+                            ? node
+                            : null;
                     } catch (_) {
                         return null;
                     }
                 })();
-                let scrollEl = openedScrollEl || (isScrollable(chosen.el)
+                let scrollEl = openedScrollEl || (isRealScrollContainer(chosen.el)
                     ? chosen.el
                     : (scrollableDescendant(chosen.el) || scrollableAncestor(chosen.el)));
-                if (!isScrollable(scrollEl)) {
+                if (!isRealScrollContainer(scrollEl)) {
                     scrollEl = scopeEl;
                 }
                 try {
@@ -1496,14 +1635,14 @@ async def find_comments_in_list_batch(
                     selector: chosen.selector,
                     scroll_container_tag: scrollEl.tagName,
                     scroll_container_class: String(scrollEl.className || '').slice(0, 160),
-                    scroll_container_scrollable: isScrollable(scrollEl),
+                    scroll_container_scrollable: isRealScrollContainer(scrollEl),
                     items: chosen.items,
                     strong_items: chosen.strongItems,
                     score: chosen.score,
                 };
             }
             """,
-            {"selectors": list_selectors},
+            {"selectors": list_selectors, "strictScope": bool(strict_scope)},
         )
         if selected_list:
             candidate = await page.query_selector('[data-smart-comment-list-batch-scope="1"]')
@@ -1513,6 +1652,14 @@ async def find_comments_in_list_batch(
                     await page.query_selector('[data-smart-comment-list-batch-scroll="1"]')
                 ) or candidate
                 matched_list_selector = str(selected_list.get("selector") or "")
+                try:
+                    selected_scope_strong_items = int(selected_list.get("strong_items") or 0)
+                except (TypeError, ValueError):
+                    selected_scope_strong_items = 0
+                try:
+                    selected_scope_items = int(selected_list.get("items") or 0)
+                except (TypeError, ValueError):
+                    selected_scope_items = 0
                 _log_batch_trace(
                     "scope_selected",
                     selector=matched_list_selector,
@@ -1574,6 +1721,8 @@ async def find_comments_in_list_batch(
                         ensure_open=False,
                         strict_scope=strict_scope,
                         min_match_ratio=min_match_ratio,
+                        return_partial_on_found=return_partial_on_found,
+                        partial_found_sink=partial_found_sink,
                         _stabilize_retry=True,
                     )
                 except Exception as exc:
@@ -1583,12 +1732,11 @@ async def find_comments_in_list_batch(
                         error=str(exc)[:120],
                     )
             _log_batch_trace("comment_list_not_open", level=logging.WARNING)
-            return {}, {
-                "error": "comment_list_not_open",
-                "scrolls": 0,
-                "target_count": len(targets),
-                "list_selector_tried": list_selectors,
-            }
+            return {}, _empty_result_info(
+                error="comment_list_not_open",
+                scrolls=0,
+                list_selector_tried=list_selectors,
+            )
         logger.debug("[FIND_COMMENT_BATCH] Comment list container not found, using document scope")
 
     scope_selector = None
@@ -1617,15 +1765,78 @@ async def find_comments_in_list_batch(
     seen_row_signatures: set[str] = set()
     last_new_row_count = 0
     stagnant_row_steps = 0
+    partial_returned = False
     author_fallback_candidates: Dict[int, list[Dict[str, Any]]] = {}
     author_fallback_keys: Dict[int, set[str]] = {}
 
+    def _missing_target_indexes() -> list[int]:
+        return [
+            int(target["index"])
+            for target in targets
+            if int(target["index"]) not in found
+        ]
+
+    def _missing_target_previews(limit: int = 12) -> list[Dict[str, Any]]:
+        previews: list[Dict[str, Any]] = []
+        for target in targets:
+            target_index = int(target["index"])
+            if target_index in found:
+                continue
+            previews.append(
+                {
+                    "index": target_index,
+                    "text_preview": str(target.get("text") or "")[:120],
+                    "author": target.get("author"),
+                    "comment_id": target.get("cid"),
+                }
+            )
+            if len(previews) >= limit:
+                break
+        return previews
+
+    def _result_info(**extra: Any) -> Dict[str, Any]:
+        payload: Dict[str, Any] = {
+            "found_count": len(found),
+            "missing_count": max(0, len(targets) - len(found)),
+            "target_count": len(targets),
+            "matched_indexes": sorted(int(index) for index in found.keys()),
+            "missing_indexes": _missing_target_indexes(),
+            "missing_previews": _missing_target_previews(),
+        }
+        if partial_returned:
+            payload["partial_returned"] = True
+        payload.update(extra)
+        return payload
+
     for scroll_i in range(max_scrolls):
         completed_scrolls = scroll_i + 1
+        captcha_error = await _visible_captcha_error(page)
+        if captcha_error:
+            _log_batch_trace(
+                "captcha_detected",
+                level=logging.WARNING,
+                scroll=scroll_i,
+                error=captcha_error,
+                found_count=len(found),
+                target_count=len(targets),
+                selector=matched_list_selector,
+                max_seen_rows=max_seen_rows,
+                unique_rows_seen=len(seen_row_signatures),
+            )
+            return found, _result_info(
+                error=captcha_error,
+                scrolls=completed_scrolls,
+                matched_list_selector=matched_list_selector,
+                max_seen_rows=max_seen_rows,
+                last_row_count=last_row_count,
+                unique_rows_seen=len(seen_row_signatures),
+                author_fallback_candidates=author_fallback_candidates,
+            )
         try:
+            scan_token = _new_parent_anchor_token()
             scan = await page.evaluate(
                 """
-                ({rootSelector, textSelectors, scopeSelector, scrollSelector}) => {
+                ({rootSelector, textSelectors, scopeSelector, scrollSelector, scanToken}) => {
                     const visible = (el) => {
                         if (!el || !el.getBoundingClientRect) return false;
                         const r = el.getBoundingClientRect();
@@ -1652,7 +1863,7 @@ async def find_comments_in_list_batch(
                             (value.includes('comment-level') || value.includes('comment-text'));
                     };
                     const containerSelector = [
-                        '[data-cid]',
+                        '[data-cid]:not([data-cid^="one-column-item"])',
                         '[data-comment-id]',
                         '[data-id]',
                         '[data-e2e="comment-item"]',
@@ -1661,15 +1872,16 @@ async def find_comments_in_list_batch(
                         'article',
                         'li'
                     ].join(', ');
-                    const cidSelector = '[data-cid], [data-comment-id], [data-id], [id^="comment-"]';
+                    const cidSelector = '[data-cid], [data-comment-id], [id^="comment-"], [data-id]';
                     const readCid = (el) => {
                         if (!el) return null;
-                        const raw =
+                        const reliableRaw =
                             el.getAttribute('data-cid') ||
                             el.getAttribute('data-comment-id') ||
-                            el.getAttribute('data-id') ||
-                            el.id ||
+                            (el.id && el.id.startsWith('comment-') ? el.id : null) ||
                             null;
+                        const dataId = el.getAttribute('data-id');
+                        const raw = reliableRaw || (/^\\d{10,30}$/.test(String(dataId || '')) ? dataId : null);
                         if (!raw) return null;
                         return String(raw).replace(/^comment-/, '') || null;
                     };
@@ -1686,7 +1898,7 @@ async def find_comments_in_list_batch(
                         const structurallyCommentLike = (() => {
                             try {
                                 return container.matches(containerSelector) ||
-                                    !!container.querySelector('[data-e2e*="comment-level"], [data-e2e*="comment-text"], [data-cid], [data-comment-id]');
+                                    !!container.querySelector('[data-e2e*="comment-level"], [data-e2e*="comment-text"], [data-cid]:not([data-cid^="one-column-item"]), [data-comment-id]');
                             } catch (_) {
                                 return false;
                             }
@@ -1723,6 +1935,14 @@ async def find_comments_in_list_batch(
                             } catch (_) {}
                             try { return container.querySelector(cidSelector); } catch (_) { return null; }
                         })();
+                        let anchorToken = null;
+                        try { anchorToken = container.getAttribute('data-smart-parent-anchor') || null; } catch (_) { anchorToken = null; }
+                        if (!anchorToken && scanToken) {
+                            anchorToken = `${scanToken}-${rows.length}`;
+                        }
+                        if (anchorToken) {
+                            try { container.setAttribute('data-smart-parent-anchor', anchorToken); } catch (_) {}
+                        }
                         rows.push({
                             position: i,
                             text,
@@ -1730,6 +1950,7 @@ async def find_comments_in_list_batch(
                             cid: readCid(idHost),
                             author: m ? m[1] : (authorEl ? (authorEl.innerText || authorEl.textContent || '').trim().replace(/^@/, '') : null),
                             scrollTop: scrollNode && typeof scrollNode.scrollTop === 'number' ? scrollNode.scrollTop : null,
+                            anchorToken,
                         });
                     }
                     return {
@@ -1741,13 +1962,14 @@ async def find_comments_in_list_batch(
                 """,
                 {
                     "rootSelector": comment_root_selector,
-                        "textSelectors": comment_text_selectors,
-                        "scopeSelector": scope_selector,
+                    "textSelectors": comment_text_selectors,
+                    "scopeSelector": scope_selector,
                     "scrollSelector": (
                         '[data-smart-comment-list-batch-scroll="1"]'
                         if scroll_target is not None
                         else None
                     ),
+                    "scanToken": scan_token,
                 },
             )
         except Exception as exc:
@@ -1757,12 +1979,10 @@ async def find_comments_in_list_batch(
 
         if (scan or {}).get("scopeMissing") and strict_scope:
             _log_batch_trace("comment_list_not_open_during_scan", level=logging.WARNING, scroll=scroll_i)
-            return found, {
-                "error": "comment_list_not_open",
-                "scrolls": completed_scrolls,
-                "found_count": len(found),
-                "target_count": len(targets),
-            }
+            return found, _result_info(
+                error="comment_list_not_open",
+                scrolls=completed_scrolls,
+            )
 
         rows = (scan or {}).get("rows") or []
         last_row_count = len(rows)
@@ -1844,6 +2064,7 @@ async def find_comments_in_list_batch(
                                     "comment_id": row_cid,
                                     "text_selector": row.get("selector"),
                                     "author": row.get("author"),
+                                    "anchor_token": row.get("anchorToken"),
                                     "matched_by": "text_author_fallback",
                                     "fallback_reason": "author_missing" if not row_author else "author_mismatch",
                                 })
@@ -1865,8 +2086,11 @@ async def find_comments_in_list_batch(
                 "comment_id": row_cid,
                 "text_selector": row.get("selector"),
                 "author": row.get("author"),
+                "anchor_token": row.get("anchorToken"),
                 "matched_by": matched_by,
             }
+            if partial_found_sink is not None:
+                partial_found_sink[target_index] = dict(found[target_index])
             _log_batch_trace(
                 "found",
                 scroll=scroll_i,
@@ -1879,6 +2103,9 @@ async def find_comments_in_list_batch(
             if len(found) >= len(targets):
                 break
 
+        # Ранний выход только когда найдены ВСЕ цели. Прежний «partial return»
+        # (выход через ~2 лишних скролла после первого совпадения) бросал
+        # main-комментарии ниже по списку, и реплаеры их пропускали.
         if len(found) >= len(targets):
             break
 
@@ -1907,7 +2134,7 @@ async def find_comments_in_list_batch(
                     nudge_limit = 3 if not can_scroll else 2
                     if strict_scope and wheel_nudge_attempts < nudge_limit:
                         wheel_nudge_attempts += 1
-                        nudge_target = comment_list if comment_list is not None else scroll_target
+                        nudge_target = scroll_target if scroll_target is not None else comment_list
                         nudge = await _nudge_comment_list_scroll(
                             nudge_target,
                             delta=max(800, int((after_state.get("client") or 0) * 1.2)),
@@ -1943,6 +2170,37 @@ async def find_comments_in_list_batch(
         await asyncio.sleep(scroll_delay_ms / 1000)
 
     level = logging.INFO if found else logging.WARNING
+    if (
+        strict_scope
+        and not found
+        and max_seen_rows == 0
+        and selected_scope_strong_items > 0
+        and scan_failures == 0
+    ):
+        _log_batch_trace(
+            "surface_parse_empty",
+            level=logging.WARNING,
+            found_count=0,
+            target_count=len(targets),
+            scrolls=completed_scrolls,
+            selector=matched_list_selector,
+            selected_items=selected_scope_items,
+            selected_strong_items=selected_scope_strong_items,
+            last_row_count=last_row_count,
+            unique_rows_seen=len(seen_row_signatures),
+            stagnant_row_steps=stagnant_row_steps,
+        )
+        return found, _result_info(
+            error="comment_surface_parse_empty",
+            scrolls=completed_scrolls,
+            matched_list_selector=matched_list_selector,
+            selected_items=selected_scope_items,
+            selected_strong_items=selected_scope_strong_items,
+            max_seen_rows=max_seen_rows,
+            last_row_count=last_row_count,
+            unique_rows_seen=len(seen_row_signatures),
+            author_fallback_candidates=author_fallback_candidates,
+        )
     if not found and max_seen_rows == 0 and scan_failures > 0:
         _log_batch_trace(
             "scan_failed",
@@ -1951,15 +2209,13 @@ async def find_comments_in_list_batch(
             scrolls=completed_scrolls,
             selector=matched_list_selector,
         )
-        return found, {
-            "error": "scan_failed",
-            "found_count": 0,
-            "target_count": len(targets),
-            "scrolls": completed_scrolls,
-            "matched_list_selector": matched_list_selector,
-            "scan_failures": scan_failures,
-            "author_fallback_candidates": author_fallback_candidates,
-        }
+        return found, _result_info(
+            error="scan_failed",
+            scrolls=completed_scrolls,
+            matched_list_selector=matched_list_selector,
+            scan_failures=scan_failures,
+            author_fallback_candidates=author_fallback_candidates,
+        )
     _log_batch_trace(
         "complete",
         level=level,
@@ -1976,19 +2232,17 @@ async def find_comments_in_list_batch(
         scan_failures=scan_failures if scan_failures else None,
         author_fallback_count=sum(len(items) for items in author_fallback_candidates.values()) or None,
     )
-    return found, {
-        "found_count": len(found),
-        "target_count": len(targets),
-        "scrolls": completed_scrolls,
-        "matched_list_selector": matched_list_selector,
-        "max_seen_rows": max_seen_rows,
-        "last_row_count": last_row_count,
-        "unique_rows_seen": len(seen_row_signatures),
-        "new_rows_last_scan": last_new_row_count,
-        "stagnant_row_steps": stagnant_row_steps,
-        "last_row_samples": last_row_samples,
-        "author_fallback_candidates": author_fallback_candidates,
-    }
+    return found, _result_info(
+        scrolls=completed_scrolls,
+        matched_list_selector=matched_list_selector,
+        max_seen_rows=max_seen_rows,
+        last_row_count=last_row_count,
+        unique_rows_seen=len(seen_row_signatures),
+        new_rows_last_scan=last_new_row_count,
+        stagnant_row_steps=stagnant_row_steps,
+        last_row_samples=last_row_samples,
+        author_fallback_candidates=author_fallback_candidates,
+    )
 
 
 def classify_outcome(

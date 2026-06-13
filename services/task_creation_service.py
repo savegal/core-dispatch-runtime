@@ -23,9 +23,17 @@ from services.likes_config import (
     BOOST_LIKES_DEFAULT,
     BOOST_LIKES_ENABLED_KEY,
     BOOST_LIKES_QUANTITY_KEY,
+    BOOST_LIKES_TARGET_MODE_KEY,
+    BOOST_LIKES_TARGET_SINGLE_TOP,
     coerce_bool,
     coerce_likes_quantity,
+    coerce_likes_target_mode,
     provider_available as likes_provider_available,
+)
+from services.app_settings_service import (
+    ORDER_EXECUTION_STRATEGY_BALANCED,
+    ORDER_EXECUTION_STRATEGY_KEY,
+    normalize_order_execution_strategy,
 )
 
 logger = logging.getLogger("services.task_creation")
@@ -66,6 +74,10 @@ def _coerce_bool(value: Any, default: bool) -> bool:
 
 def _coerce_likes_quantity(value: Any, default: int) -> int:
     return coerce_likes_quantity(value, default)
+
+
+def _coerce_likes_target_mode(value: Any, default: str = BOOST_LIKES_TARGET_SINGLE_TOP) -> str:
+    return coerce_likes_target_mode(value, default)
 
 
 def _is_admin_user(user: User) -> bool:
@@ -110,6 +122,8 @@ def _build_monitor_task_settings(
     created_from: str,
     boost_likes_enabled: bool,
     boost_likes_quantity: int,
+    boost_likes_target_mode: str = BOOST_LIKES_TARGET_SINGLE_TOP,
+    order_execution_strategy: str = ORDER_EXECUTION_STRATEGY_BALANCED,
     text_variant_offset: int = 0,
 ) -> dict[str, Any]:
     task_settings = dict(template.settings or {})
@@ -123,6 +137,8 @@ def _build_monitor_task_settings(
     task_settings["created_from"] = created_from
     task_settings["boost_likes_enabled"] = boost_likes_enabled
     task_settings["likes_count"] = boost_likes_quantity if boost_likes_enabled else 0
+    task_settings["boost_likes_target_mode"] = _coerce_likes_target_mode(boost_likes_target_mode)
+    task_settings["order_execution_strategy"] = normalize_order_execution_strategy(order_execution_strategy)
     # Связь с шаблоном: используется UI orders для отображения "Шаблон: X",
     # для повторов "Сделать копию" и для аналитики monitoring.
     task_settings["template_id"] = template.id
@@ -193,6 +209,52 @@ async def get_boost_likes_config_async(db: AsyncSession) -> tuple[bool, int]:
         return default_enabled, default_quantity
 
 
+def get_boost_likes_target_mode_sync(db: Session) -> str:
+    try:
+        row = db.query(AppSettings).filter(AppSettings.key == BOOST_LIKES_TARGET_MODE_KEY).first()
+        raw = _parse_setting_value(row.value) if row else None
+        return _coerce_likes_target_mode(raw)
+    except Exception as e:
+        logger.warning(f"Failed to read boost likes target mode, using default: {e}")
+        return BOOST_LIKES_TARGET_SINGLE_TOP
+
+
+async def get_boost_likes_target_mode_async(db: AsyncSession) -> str:
+    try:
+        result = await db.execute(
+            select(AppSettings).filter(AppSettings.key == BOOST_LIKES_TARGET_MODE_KEY)
+        )
+        row = result.scalar_one_or_none()
+        raw = _parse_setting_value(row.value) if row else None
+        return _coerce_likes_target_mode(raw)
+    except Exception as e:
+        logger.warning(f"Failed to read boost likes target mode, using default: {e}")
+        return BOOST_LIKES_TARGET_SINGLE_TOP
+
+
+def get_order_execution_strategy_sync(db: Session) -> str:
+    try:
+        row = db.query(AppSettings).filter(AppSettings.key == ORDER_EXECUTION_STRATEGY_KEY).first()
+        raw = _parse_setting_value(row.value) if row else None
+        return normalize_order_execution_strategy(raw, ORDER_EXECUTION_STRATEGY_BALANCED)
+    except Exception as e:
+        logger.warning(f"Failed to read order execution strategy, using default: {e}")
+        return ORDER_EXECUTION_STRATEGY_BALANCED
+
+
+async def get_order_execution_strategy_async(db: AsyncSession) -> str:
+    try:
+        result = await db.execute(
+            select(AppSettings).filter(AppSettings.key == ORDER_EXECUTION_STRATEGY_KEY)
+        )
+        row = result.scalar_one_or_none()
+        raw = _parse_setting_value(row.value) if row else None
+        return normalize_order_execution_strategy(raw, ORDER_EXECUTION_STRATEGY_BALANCED)
+    except Exception as e:
+        logger.warning(f"Failed to read order execution strategy, using default: {e}")
+        return ORDER_EXECUTION_STRATEGY_BALANCED
+
+
 def create_monitored_task_sync(
     db: Session,
     creator: CreatorSource,
@@ -225,6 +287,8 @@ def create_monitored_task_sync(
             return MonitoredTaskCreationResult(status="insufficient_funds", cost=cost)
 
     boost_likes_enabled, boost_likes_quantity = get_boost_likes_config_sync(db)
+    boost_likes_target_mode = get_boost_likes_target_mode_sync(db)
+    order_execution_strategy = get_order_execution_strategy_sync(db)
     task_boost_likes_enabled = boost_likes_enabled and bool(_template_reply_texts(template))
     likes_for_task = boost_likes_quantity if task_boost_likes_enabled else 0
     task_settings = _build_monitor_task_settings(
@@ -235,6 +299,8 @@ def create_monitored_task_sync(
         created_from,
         task_boost_likes_enabled,
         boost_likes_quantity,
+        boost_likes_target_mode,
+        order_execution_strategy,
     )
     invalid_text_reason = _validate_monitor_text_variants(task_settings)
     if invalid_text_reason:
@@ -322,6 +388,8 @@ async def create_monitored_task_async(
             return MonitoredTaskCreationResult(status="insufficient_funds", cost=cost)
 
     boost_likes_enabled, boost_likes_quantity = await get_boost_likes_config_async(db)
+    boost_likes_target_mode = await get_boost_likes_target_mode_async(db)
+    order_execution_strategy = await get_order_execution_strategy_async(db)
     task_boost_likes_enabled = boost_likes_enabled and bool(_template_reply_texts(template))
     likes_for_task = boost_likes_quantity if task_boost_likes_enabled else 0
     task_settings = _build_monitor_task_settings(
@@ -332,6 +400,8 @@ async def create_monitored_task_async(
         created_from,
         task_boost_likes_enabled,
         boost_likes_quantity,
+        boost_likes_target_mode,
+        order_execution_strategy,
     )
     invalid_text_reason = _validate_monitor_text_variants(task_settings)
     if invalid_text_reason:
@@ -451,6 +521,8 @@ def create_monitored_tasks_batch_sync(
         candidate_videos = candidate_videos[:affordable_count]
 
     boost_likes_enabled, boost_likes_quantity = get_boost_likes_config_sync(db)
+    boost_likes_target_mode = get_boost_likes_target_mode_sync(db)
+    order_execution_strategy = get_order_execution_strategy_sync(db)
     task_boost_likes_enabled = boost_likes_enabled and bool(_template_reply_texts(template))
     likes_for_task = boost_likes_quantity if task_boost_likes_enabled else 0
 
@@ -466,6 +538,8 @@ def create_monitored_tasks_batch_sync(
             created_from,
             task_boost_likes_enabled,
             boost_likes_quantity,
+            boost_likes_target_mode,
+            order_execution_strategy,
             text_variant_offset=video_index,
         )
         invalid_text_reason = _validate_monitor_text_variants(task_settings)

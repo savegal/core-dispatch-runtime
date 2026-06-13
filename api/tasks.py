@@ -1,13 +1,15 @@
 from fastapi import APIRouter, Depends, HTTPException, Query, Request, Header
 from pydantic import BaseModel, field_validator, model_validator
 from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy import select
+from sqlalchemy import delete, select
 from db.database import get_db
-from db.models import Task, User, AppSettings
+from db.models import CreatorSource, CreatorVideo, PendingEnqueue, Task, Transaction, User, AppSettings
 from db.constants import TaskStatus
 from services.task_service import (
     claim_dedup_key,
     finalize_reserved_enqueue_async,
+    promote_task_to_high_priority,
+    remove_tasks_from_queue,
     reserve_task_for_enqueue_async,
 )
 from services.task_stop_signal import request_task_stop
@@ -28,13 +30,19 @@ import logging
 import asyncio
 from config.limiter import limiter
 from api.auth import verify_user_header, verify_admin_header, ensure_user_scope
-from services.task_creation_service import get_boost_likes_config_async
+from services.task_creation_service import (
+    get_boost_likes_config_async,
+    get_boost_likes_target_mode_async,
+    get_order_execution_strategy_async,
+)
 from services.user_facing_errors import build_task_display_reason, build_task_execution_summary, collect_task_warnings
 from services.likes_config import (
     BOOST_LIKES_DEFAULT,
     BOOST_LIKES_ENABLED_KEY,
     BOOST_LIKES_MAX,
     BOOST_LIKES_QUANTITY_KEY,
+    BOOST_LIKES_TARGET_SINGLE_TOP,
+    coerce_likes_target_mode,
     coerce_bool,
     coerce_likes_quantity,
     provider_available as likes_provider_available,
@@ -46,6 +54,30 @@ router = APIRouter(prefix="/api/tasks", tags=["tasks"])
 settings = get_settings()
 ACCOUNT_POOL_MODE_SHARED = "shared"
 ACCOUNT_POOL_MODE_PERSONAL = "personal"
+
+
+def _settings_dict(task: Task) -> dict:
+    return dict(task.settings or {}) if isinstance(task.settings, dict) else {}
+
+
+def _money(value) -> Decimal:
+    try:
+        return Decimal(str(value or "0.00"))
+    except Exception:
+        return Decimal("0.00")
+
+
+def _remaining_task_refund(task: Task) -> Decimal:
+    return max(_money(task.total_cost) - _money(task.refunded_cost), Decimal("0.00"))
+
+
+def _mark_creator_video_released(video: CreatorVideo, *, task_id: int, now: datetime) -> None:
+    meta = dict(video.meta or {}) if isinstance(video.meta, dict) else {}
+    meta["queue_cancelled_at"] = now.isoformat()
+    meta["queue_cancelled_task_id"] = int(task_id)
+    video.meta = meta
+    video.status = "new"
+    video.task_id = None
 
 
 def _normalize_account_pool_mode_from_settings(task_settings: dict | None) -> str:
@@ -710,6 +742,8 @@ async def create_task(
         cost = Decimal("0.00")  # Ð”Ð»Ñ Ð°Ð´Ð¼Ð¸Ð½Ð¾Ð² Ð¸ DEMO_MODE
 
     boost_likes_enabled, boost_likes_quantity = await get_boost_likes_config_async(db)
+    boost_likes_target_mode = await get_boost_likes_target_mode_async(db)
+    order_execution_strategy = await get_order_execution_strategy_async(db)
 
     # REFACTOR: Ð¡Ð¾Ñ…Ñ€Ð°Ð½ÑÐµÐ¼ origin Ð² settings (Ð´Ð»Ñ Ñ„Ð¸Ð»ÑŒÑ‚Ñ€Ð°Ñ†Ð¸Ð¸ Ð¸ Ð¾Ñ‚Ð¾Ð±Ñ€Ð°Ð¶ÐµÐ½Ð¸Ñ)
     # WHY: Ð¥Ñ€Ð°Ð½Ð¸Ð¼ Ð² settings, Ð½Ð¾ Ð¼Ð¾Ð¶Ð½Ð¾ Ð»ÐµÐ³ÐºÐ¾ Ñ„Ð¸Ð»ÑŒÑ‚Ñ€Ð¾Ð²Ð°Ñ‚ÑŒ Ñ‡ÐµÑ€ÐµÐ· JSONB queries Ð² Ð±ÑƒÐ´ÑƒÑ‰ÐµÐ¼
@@ -736,6 +770,11 @@ async def create_task(
     likes_for_task = boost_likes_quantity if task_boost_likes_enabled else 0
     task_settings["boost_likes_enabled"] = task_boost_likes_enabled
     task_settings["likes_count"] = likes_for_task
+    task_settings["boost_likes_target_mode"] = coerce_likes_target_mode(
+        boost_likes_target_mode,
+        BOOST_LIKES_TARGET_SINGLE_TOP,
+    )
+    task_settings["order_execution_strategy"] = order_execution_strategy
     
     # HYBRID: Ð”Ð»Ñ engagement_only ÑÐ¾Ñ…Ñ€Ð°Ð½ÑÐµÐ¼ Ð¿Ð°Ñ€Ð°Ð¼ÐµÑ‚Ñ€Ñ‹ Ð¿Ð¾Ð¸ÑÐºÐ° ÐºÐ¾Ð¼Ð¼ÐµÐ½Ñ‚Ð°Ñ€Ð¸Ñ
     if task_data.kind == "engagement_only":
@@ -846,6 +885,122 @@ async def list_tasks(
         raise HTTPException(status_code=500, detail=f"Database error: {str(e)[:200]}")
 
 
+@router.post("/cancel_pending")
+@limiter.limit("20/minute")
+async def cancel_pending_tasks(
+    request: Request,
+    user_id: int = Query(..., description="ID пользователя, владельца задач"),
+    db: AsyncSession = Depends(get_db),
+    auth_user_id: int = Depends(verify_user_header),
+):
+    """Отменяет все pending-заказы пользователя и снимает их из Redis-очереди."""
+    try:
+        ensure_user_scope(user_id, auth_user_id)
+        now = datetime.now(timezone.utc)
+
+        user_result = await db.execute(select(User).filter(User.id == user_id).with_for_update())
+        owner = user_result.scalar_one_or_none()
+        if not owner:
+            raise HTTPException(status_code=404, detail="User not found")
+
+        try:
+            result = await db.execute(
+                select(Task)
+                .filter(Task.user_id == user_id, Task.status == TaskStatus.PENDING.value)
+                .with_for_update()
+            )
+        except Exception as lock_error:
+            logger.warning(
+                "SELECT FOR UPDATE not supported in cancel_pending_tasks, falling back to regular query: %s",
+                lock_error,
+            )
+            result = await db.execute(
+                select(Task).filter(Task.user_id == user_id, Task.status == TaskStatus.PENDING.value)
+            )
+
+        pending_tasks = list(result.scalars().all())
+        pending_ids = [int(task.id) for task in pending_tasks]
+        if not pending_ids:
+            return {
+                "success": True,
+                "cancelled": 0,
+                "removed_from_queue": 0,
+                "released_videos": 0,
+                "refunded_amount": 0.0,
+            }
+
+        videos_by_task: dict[int, list[CreatorVideo]] = {}
+        videos_result = await db.execute(
+            select(CreatorVideo)
+            .join(CreatorSource, CreatorVideo.creator_id == CreatorSource.id)
+            .filter(
+                CreatorVideo.task_id.in_(pending_ids),
+                CreatorSource.user_id == user_id,
+                CreatorVideo.status == "queued",
+            )
+        )
+        for video in videos_result.scalars().all():
+            if video.task_id:
+                videos_by_task.setdefault(int(video.task_id), []).append(video)
+
+        refunded_amount = Decimal("0.00")
+        released_videos = 0
+        for task in pending_tasks:
+            task_settings = _settings_dict(task)
+            task_settings["cancelled_by_user"] = True
+            task_settings["cancelled_at"] = now.isoformat()
+            task_settings["cancel_reason"] = "orders_queue_cancel"
+            task.status = TaskStatus.STOPPED.value
+            task.error_reason = "cancelled_by_user"
+            task.settings = task_settings
+            task.updated_at = now
+
+            refund = _remaining_task_refund(task)
+            if refund > 0:
+                owner.balance = (owner.balance or Decimal("0.00")) + refund
+                task.refunded_cost = _money(task.refunded_cost) + refund
+                db.add(
+                    Transaction(
+                        user_id=user_id,
+                        task_id=task.id,
+                        amount=refund,
+                        type="refund",
+                        description=f"Возврат за отмену заказа #{task.id} из очереди",
+                    )
+                )
+                refunded_amount += refund
+
+            for video in videos_by_task.get(int(task.id), []):
+                _mark_creator_video_released(video, task_id=int(task.id), now=now)
+                released_videos += 1
+
+        await db.execute(delete(PendingEnqueue).where(PendingEnqueue.task_id.in_(pending_ids)))
+        await db.commit()
+
+        removed_from_queue = await asyncio.to_thread(remove_tasks_from_queue, pending_ids)
+        logger.info(
+            "Cancelled pending queue for user_id=%s: tasks=%s redis_removed=%s released_videos=%s refunded=%s",
+            user_id,
+            len(pending_ids),
+            removed_from_queue,
+            released_videos,
+            refunded_amount,
+        )
+        return {
+            "success": True,
+            "cancelled": len(pending_ids),
+            "removed_from_queue": removed_from_queue,
+            "released_videos": released_videos,
+            "refunded_amount": float(refunded_amount),
+        }
+    except HTTPException:
+        raise
+    except Exception as e:
+        await db.rollback()
+        logger.error(f"Error cancelling pending tasks for user {user_id}: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=f"Database error: {str(e)[:200]}")
+
+
 @router.get("/{task_id}", response_model=TaskResponse)
 @limiter.limit("60/minute")  # Ð˜Ð¡ÐŸÐ ÐÐ’Ð›Ð•ÐÐž: Rate limiting
 async def get_task(
@@ -873,6 +1028,87 @@ async def get_task(
         raise
     except Exception as e:
         logger.error(f"Error getting task {task_id}: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=f"Database error: {str(e)[:200]}")
+
+
+@router.post("/{task_id}/priority")
+@limiter.limit("30/minute")
+async def prioritize_task(
+    request: Request,
+    task_id: int,
+    user_id: int = Query(..., description="ID пользователя, владельца задачи"),
+    db: AsyncSession = Depends(get_db),
+    auth_user_id: int = Depends(verify_user_header),
+):
+    """Повышает pending-заказ до верхнего приоритета очереди."""
+    try:
+        ensure_user_scope(user_id, auth_user_id)
+
+        try:
+            result = await db.execute(
+                select(Task)
+                .filter(Task.id == task_id, Task.user_id == user_id)
+                .with_for_update()
+            )
+        except Exception as lock_error:
+            logger.warning(
+                "SELECT FOR UPDATE not supported in prioritize_task, falling back to regular query: %s",
+                lock_error,
+            )
+            result = await db.execute(select(Task).filter(Task.id == task_id, Task.user_id == user_id))
+
+        task = result.scalar_one_or_none()
+        if not task:
+            raise HTTPException(status_code=404, detail="Task not found")
+        if str(task.status or "").lower() != TaskStatus.PENDING.value:
+            raise HTTPException(status_code=409, detail="Task can be prioritized only while pending")
+
+        now = datetime.now(timezone.utc)
+        task_settings = _settings_dict(task)
+        already_high = str(task_settings.get("queue_priority") or "").strip().lower() == "high"
+        task_settings["queue_priority"] = "high"
+        task_settings["priority_set_by_user"] = True
+        task_settings["priority_set_at"] = now.isoformat()
+        task.settings = task_settings
+        task.updated_at = now
+        await db.commit()
+        await db.refresh(task)
+
+        try:
+            queue_state = await asyncio.to_thread(promote_task_to_high_priority, task.id)
+        except Exception as queue_error:
+            logger.warning(
+                "Task %s priority was saved but Redis requeue failed; reserving enqueue: %s",
+                task.id,
+                queue_error,
+            )
+            await reserve_task_for_enqueue_async(db, task.id)
+            await db.commit()
+            queue_state = {
+                "removed": 0,
+                "enqueue_state": "pending_reserve",
+                "error": str(queue_error)[:160],
+            }
+        logger.info(
+            "Task %s prioritized by user %s (already_high=%s, queue_state=%s)",
+            task.id,
+            user_id,
+            already_high,
+            queue_state,
+        )
+        return {
+            "success": True,
+            "task_id": task.id,
+            "status": task.status,
+            "queue_priority": "high",
+            "already_high": already_high,
+            "queue": queue_state,
+        }
+    except HTTPException:
+        raise
+    except Exception as e:
+        await db.rollback()
+        logger.error(f"Error prioritizing task {task_id}: {e}", exc_info=True)
         raise HTTPException(status_code=500, detail=f"Database error: {str(e)[:200]}")
 
 

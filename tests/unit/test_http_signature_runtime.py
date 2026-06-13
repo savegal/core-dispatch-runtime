@@ -130,7 +130,11 @@ async def test_execute_request_prefers_runtime_signature_over_cookie_signature()
     assert "stale_cookie_bogus" not in request_context.last_url
     assert request_context.last_form == {"text": "hello", "text_extra": "[]"}
     assert response_data["__request_signature"]["mode"] == "runtime_signed"
+    assert response_data["__request_meta"]["request_attempted"] is True
     assert client.last_request_meta["signature"]["mode"] == "runtime_signed"
+    assert client.last_request_meta["request_attempted"] is True
+    assert client.last_request_meta["attempt_count"] == 1
+    assert client.last_request_meta["response_status"] == 200
 
 
 @pytest.mark.unit
@@ -167,6 +171,7 @@ async def test_execute_request_accepts_runtime_a_bogus_signature():
     assert request_context.last_form == {"text": "hello", "text_extra": "[]"}
     assert response_data["__request_signature"]["mode"] == "runtime_signed"
     assert response_data["__request_signature"]["has_a_bogus"] is True
+    assert response_data["__request_meta"]["request_attempted"] is True
 
 
 @pytest.mark.unit
@@ -206,6 +211,8 @@ async def test_execute_request_blocks_sensitive_publish_when_page_signer_has_no_
     assert request_context.calls == 0
     assert client.last_request_meta["signature"]["mode"] == "unsigned"
     assert client.last_request_meta["signature"]["signer_available"] is True
+    assert client.last_request_meta["request_attempted"] is False
+    assert client.last_request_meta["attempt_count"] == 0
 
 
 @pytest.mark.unit
@@ -242,6 +249,8 @@ async def test_execute_request_blocks_unsigned_publish_on_page_path():
     assert "blocked" in error_msg.lower()
     assert request_context.calls == 0
     assert client.last_request_meta["signature"]["mode"] == "unsigned"
+    assert client.last_request_meta["request_attempted"] is False
+    assert client.last_request_meta["attempt_count"] == 0
 
 
 @pytest.mark.unit
@@ -277,6 +286,8 @@ async def test_execute_request_allows_unsigned_like_on_page_path():
     assert error_type is None
     assert request_context.calls == 1
     assert response_data["__request_signature"]["mode"] == "unsigned"
+    assert response_data["__request_meta"]["request_attempted"] is True
+    assert client.last_request_meta["request_attempted"] is True
 
 
 @pytest.mark.unit

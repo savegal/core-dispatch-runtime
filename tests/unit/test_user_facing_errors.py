@@ -6,6 +6,7 @@ from services.user_facing_errors import (
     build_video_status_summary,
     humanize_warning,
 )
+from services.task_execution_ledger import LEDGER_VERSION
 
 
 @pytest.mark.unit
@@ -25,10 +26,17 @@ def test_build_task_execution_summary_aggregates_execution_details():
                             "method": "http",
                             "comment_id": "1234567890",
                             "verify_mode": "fast_precheck",
+                            "expected": 3,
+                            "variants_published": [
+                                {"network_confirmed": True},
+                                {"local_confirmed": True},
+                            ],
                         },
                         "replies": {
                             "ok": 1,
                             "total": 2,
+                            "requested_variants": 3,
+                            "submitted": 2,
                             "items": [
                                 {
                                     "method": "http",
@@ -48,6 +56,11 @@ def test_build_task_execution_summary_aggregates_execution_details():
                             "requested": True,
                             "quantity": 50,
                             "ok": True,
+                            "target_mode": "each_found",
+                            "orders": [
+                                {"username": "main_a", "quantity": 50, "ok": True, "reply_count": 2},
+                                {"username": "main_b", "quantity": 50, "ok": False, "reply_count": 1, "error": "network_error"},
+                            ],
                         },
                     },
                 },
@@ -66,7 +79,7 @@ def test_build_task_execution_summary_aggregates_execution_details():
                             "items": [{
                                 "method": "dom_fallback",
                                 "parent_confirmed": True,
-                                "visibility_status": "confirmed_local",
+                                "visibility_status": "network_confirmed",
                             }],
                         },
                         "likes": {
@@ -96,8 +109,13 @@ def test_build_task_execution_summary_aggregates_execution_details():
     assert summary["main"]["verified"] is True
     assert summary["main"]["method"] == "mixed"
     assert summary["main"]["comment_id"] == "1234567890"
+    assert summary["main"]["expected"] == 4
+    assert summary["main"]["submitted"] == 3
+    assert summary["main"]["verified_count"] == 2
     assert summary["replies"]["ok"] == 2
     assert summary["replies"]["total"] == 3
+    assert summary["replies"]["requested"] == 4
+    assert summary["replies"]["submitted"] == 3
     assert summary["replies"]["parent_confirmed"] == 2
     assert summary["replies"]["parent_ui_confirmed"] == 1
     assert summary["replies"]["visibility_confirmed"] == 2
@@ -109,6 +127,42 @@ def test_build_task_execution_summary_aggregates_execution_details():
     assert summary["likes"]["successful_urls"] == 1
     assert summary["likes"]["failed_urls"] == 1
     assert summary["likes"]["error"]
+    assert summary["likes"]["target_mode"] == "each_found"
+    assert summary["likes"]["orders_total"] == 2
+    assert summary["likes"]["orders_ok"] == 1
+    assert summary["likes"]["orders_failed"] == 1
+    assert [item["username"] for item in summary["likes"]["targets"]] == ["main_a", "main_b"]
+    assert summary["ledger"]["version"] == LEDGER_VERSION
+    assert summary["coverage"]["parent_targets_total"] >= 1
+    assert "error_categories" in summary["health"]
+
+
+@pytest.mark.unit
+def test_build_task_execution_summary_counts_legacy_verified_main_without_variants():
+    task = {
+        "status": "done",
+        "video_urls": ["https://tiktok.test/1"],
+        "settings": {
+            "url_results": {
+                "https://tiktok.test/1": {
+                    "status": "success",
+                    "engagement": {
+                        "main": {"posted": True, "verified": True},
+                        "replies": {},
+                        "likes": {},
+                    },
+                }
+            }
+        },
+    }
+
+    summary = build_task_execution_summary(task)
+
+    assert summary["main"]["posted"] is True
+    assert summary["main"]["verified"] is True
+    assert summary["main"]["expected"] == 1
+    assert summary["main"]["submitted"] == 1
+    assert summary["main"]["verified_count"] == 1
 
 
 @pytest.mark.unit
@@ -160,6 +214,61 @@ def test_build_task_execution_summary_humanizes_reply_submitted_unconfirmed():
     assert "Reply comment" not in (summary["display_reason"] or "")
     assert summary["warnings"]
     assert "Reply comment" not in summary["warnings"][0]
+
+
+@pytest.mark.unit
+def test_humanize_warning_reports_parallel_main_partial_without_raw_message():
+    warning = {
+        "code": "parallel_main_partial",
+        "submitted": 6,
+        "expected": 9,
+        "message": "6/9 main comments were submitted; replies will target the submitted parents",
+    }
+
+    short = humanize_warning(warning, short=True)
+    long = humanize_warning(warning, short=False)
+
+    assert short
+    assert "6" in short and "9" in short
+    assert "main comments" not in short
+    assert "main comments" not in long
+    assert "ответ" not in long.lower()
+
+
+@pytest.mark.unit
+def test_humanize_warning_reports_parallel_main_incomplete_replies_skipped():
+    warning = {
+        "code": "parallel_main_incomplete_replies_skipped",
+        "submitted": 6,
+        "expected": 9,
+        "message": "Reply phase skipped because not all expected main comments were submitted",
+    }
+
+    short = humanize_warning(warning, short=True)
+    long = humanize_warning(warning, short=False)
+
+    assert short
+    assert "6" in short and "9" in short
+    assert "Reply phase" not in short
+    assert "Reply phase" not in long
+
+
+@pytest.mark.unit
+def test_humanize_warning_reports_parallel_main_partial_replies_continued():
+    warning = {
+        "code": "parallel_main_partial_replies_continued",
+        "submitted": 6,
+        "expected": 9,
+        "message": "Reply phase continued with the main comments that were submitted",
+    }
+
+    short = humanize_warning(warning, short=True)
+    long = humanize_warning(warning, short=False)
+
+    assert short
+    assert "6" in short and "9" in short
+    assert "Reply phase" not in short
+    assert "Reply phase" not in long
 
 
 @pytest.mark.unit
@@ -222,6 +331,42 @@ def test_build_task_execution_summary_treats_submitted_unconfirmed_as_done_warni
     assert summary["videos"]["failed"] == 0
     assert summary["has_warnings"] is True
     assert "main_public_confirmation_unconfirmed" not in (summary["display_reason"] or "")
+
+
+@pytest.mark.unit
+def test_build_task_execution_summary_counts_legacy_unconfirmed_replies_as_submitted():
+    task = {
+        "status": "done",
+        "video_urls": ["https://tiktok.test/1"],
+        "settings": {
+            "url_results": {
+                "https://tiktok.test/1": {
+                    "status": "submitted_unconfirmed",
+                    "warnings": [{"code": "reply_submitted_unconfirmed"}],
+                    "engagement": {
+                        "main": {"posted": True, "verified": True},
+                        "replies": {
+                            "ok": 1,
+                            "total": 3,
+                            "submitted_unconfirmed": 2,
+                            "items": [
+                                {"success": True, "visibility_status": "confirmed_local"},
+                                {"submitted_unconfirmed": True, "visibility_status": "submitted_unconfirmed"},
+                                {"submitted_unconfirmed": True, "visibility_status": "submitted_unconfirmed"},
+                            ],
+                        },
+                        "likes": {},
+                    },
+                }
+            }
+        },
+    }
+
+    summary = build_task_execution_summary(task)
+
+    assert summary["replies"]["submitted"] == 3
+    assert summary["replies"]["submitted_unconfirmed"] == 2
+    assert summary["replies"]["visibility_confirmed"] == 1
 
 
 @pytest.mark.unit

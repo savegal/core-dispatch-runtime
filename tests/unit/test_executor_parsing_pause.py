@@ -110,13 +110,13 @@ def test_worker_requeues_non_admin_task_while_parsing(monkeypatch):
     monkeypatch.setattr(
         executor,
         "requeue_deferred_task",
-        lambda task_id, **kwargs: calls["requeue"].append((task_id, kwargs.get("priority"))),
+        lambda task_id, **kwargs: calls["requeue"].append((task_id, kwargs.get("priority_level"))),
     )
 
     executor.worker(2)
 
     assert calls["dequeue"] == 1
-    assert calls["requeue"] == [(123, True)]
+    assert calls["requeue"] == [(123, "normal")]
     assert calls["lock_released"] == 1
 
 

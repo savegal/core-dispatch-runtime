@@ -48,7 +48,11 @@ def test_publish_action_detaches_listener_on_post_click_failed():
     src = inspect.getsource(publish_action._publish_via_current_input)
     err_pos = src.find("post_click_failed:")
     assert err_pos > 0
-    window = src[max(0, err_pos - 200) : err_pos]
+    # Both post_click_failed returns share a single _detach_listener() that sits a
+    # few lines above (just inside the `except ... as js_exc:` block). Use a 400-char
+    # window — matching the captcha test — so the legitimate driver_closed_error
+    # branch between the detach and the return string doesn't trip a false failure.
+    window = src[max(0, err_pos - 400) : err_pos]
     assert "_detach_listener()" in window, (
         "post_click_failed return забыли _detach_listener()"
     )

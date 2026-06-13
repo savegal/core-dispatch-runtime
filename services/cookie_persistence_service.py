@@ -92,14 +92,26 @@ def save_cookies_to_file(cookie_file_path: Optional[str], cookies: List[Dict[str
         return False
     
     try:
-        # ИСПРАВЛЕНО: Безопасность - проверяем путь
+        # Only relative paths inside COOKIES_DIR are accepted.  Use resolved
+        # paths instead of string-prefix checks so Windows drive paths and
+        # sibling directories cannot escape the cookie directory.
         cookie_file_str = cookie_file_path.strip()
-        if '..' in cookie_file_str or cookie_file_str.startswith('/'):
+        candidate = Path(cookie_file_str)
+        if (
+            not cookie_file_str
+            or candidate.is_absolute()
+            or ".." in candidate.parts
+        ):
             logger.warning(f"Unsafe cookie file path: {cookie_file_str}")
             return False
-        
+
+        cookies_dir = Path(settings.COOKIES_DIR).resolve()
+        cookie_file = (cookies_dir / candidate).resolve()
+        if not cookie_file.is_relative_to(cookies_dir):
+            logger.warning(f"Cookie file path outside cookies directory: {cookie_file_str}")
+            return False
+
         # Сохраняем в файл
-        cookie_file = Path(settings.COOKIES_DIR) / cookie_file_str
         cookie_file.parent.mkdir(parents=True, exist_ok=True)
         
         cookies_str = cookies_to_string(cookies)

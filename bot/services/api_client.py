@@ -124,6 +124,8 @@ class APIClient:
             return 5.0
         if endpoint.startswith("/api/settings/commenting_mode"):
             return 5.0
+        if endpoint.startswith("/api/settings/order_execution_strategy"):
+            return 5.0
         if endpoint.startswith("/api/settings/monitor_parallel_browsers"):
             return 3.0
         if endpoint.startswith("/api/settings/proxy"):
@@ -238,6 +240,8 @@ class APIClient:
             return ("/api/settings/software_mode",)
         if endpoint.startswith("/api/settings/commenting_mode"):
             return ("/api/settings/commenting_mode",)
+        if endpoint.startswith("/api/settings/order_execution_strategy"):
+            return ("/api/settings/order_execution_strategy",)
         if endpoint.startswith("/api/pricing"):
             return ("/api/pricing",)
         if endpoint.startswith("/api/users/") or endpoint.startswith("/api/users?"):
@@ -784,6 +788,20 @@ class APIClient:
         from urllib.parse import urlencode
         params = {"user_id": user_id}
         url = f"/api/tasks/{task_id}/stop?{urlencode(params)}"
+        return await self._request("POST", url, json={})
+
+    async def cancel_pending_tasks(self, user_id: int) -> dict:
+        """Отменяет все pending-заказы пользователя в очереди."""
+        from urllib.parse import urlencode
+        params = {"user_id": user_id}
+        url = f"/api/tasks/cancel_pending?{urlencode(params)}"
+        return await self._request("POST", url, json={})
+
+    async def prioritize_task(self, task_id: int, user_id: int) -> dict:
+        """Повышает pending-заказ до верхнего приоритета очереди."""
+        from urllib.parse import urlencode
+        params = {"user_id": user_id}
+        url = f"/api/tasks/{task_id}/priority?{urlencode(params)}"
         return await self._request("POST", url, json={})
 
     async def list_tasks(
@@ -1473,6 +1491,7 @@ class APIClient:
         self,
         boost_likes_enabled: bool | None = None,
         boost_likes_quantity: int | None = None,
+        boost_likes_target_mode: str | None = None,
     ) -> dict:
         """Update likes settings."""
         payload = {}
@@ -1480,6 +1499,8 @@ class APIClient:
             payload["boost_likes_enabled"] = boost_likes_enabled
         if boost_likes_quantity is not None:
             payload["boost_likes_quantity"] = boost_likes_quantity
+        if boost_likes_target_mode is not None:
+            payload["boost_likes_target_mode"] = boost_likes_target_mode
         return await self._request("POST", "/api/settings/boost_likes", json=payload)
 
     async def get_software_mode_settings(self) -> dict:
@@ -1504,6 +1525,18 @@ class APIClient:
             "POST",
             "/api/settings/commenting_mode",
             json={"commenting_mode": commenting_mode},
+        )
+
+    async def get_order_execution_strategy_settings(self) -> dict:
+        """Returns the current order execution strategy."""
+        return await self._request("GET", "/api/settings/order_execution_strategy")
+
+    async def update_order_execution_strategy(self, order_execution_strategy: str) -> dict:
+        """Updates the current order execution strategy."""
+        return await self._request(
+            "POST",
+            "/api/settings/order_execution_strategy",
+            json={"order_execution_strategy": order_execution_strategy},
         )
 
     async def get_monitor_parallel_browsers_settings(self) -> dict:

@@ -1,4 +1,5 @@
 import logging
+import logging.handlers
 from types import SimpleNamespace
 
 import pytest
@@ -24,6 +25,27 @@ def test_setup_logging_keeps_httpx_request_logs_below_info():
 
     assert logging.getLogger("httpx").getEffectiveLevel() >= logging.WARNING
     assert logging.getLogger("httpcore").getEffectiveLevel() >= logging.WARNING
+
+
+def test_setup_logging_accepts_diagnostic_rotation_settings(tmp_path):
+    log_path = tmp_path / "executor.log"
+
+    setup_logging(
+        level="INFO",
+        log_file=str(log_path),
+        log_max_bytes=2048,
+        log_backup_count=9,
+    )
+
+    file_handlers = [
+        handler
+        for handler in logging.getLogger().handlers
+        if isinstance(handler, logging.handlers.RotatingFileHandler)
+    ]
+
+    assert file_handlers
+    assert file_handlers[-1].maxBytes == 2048
+    assert file_handlers[-1].backupCount == 9
 
 
 @pytest.mark.asyncio

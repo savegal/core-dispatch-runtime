@@ -158,6 +158,13 @@ async def main():
         logger.warning(f"Redis не доступен, используется MemoryStorage (fallback): {e}")
         dp = Dispatcher(storage=MemoryStorage())
 
+    # RateLimitMiddleware: глобальная защита от спама/перегруза. Навешиваем на уровне
+    # диспетчера, поэтому он срабатывает раньше любых роутер-мидлварей и покрывает все
+    # сообщения и callback'и (включая /start).
+    from bot.middleware.rate_limit_middleware import RateLimitMiddleware
+    rate_limit_middleware = RateLimitMiddleware()
+    dp.message.middleware(rate_limit_middleware)
+    dp.callback_query.middleware(rate_limit_middleware)
 
     # Регистрируем роутеры (важен порядок)
     from bot.handlers import order_wizard
@@ -197,6 +204,29 @@ async def main():
     dp.include_router(autopilot.router)  # Автокомментинг
     dp.include_router(video_parsing.router)  # Парсинг видео
     dp.include_router(video_inbox.router)  # УЛУЧШЕНО: Inbox для новых видео
+
+    # WorkerAccessMiddleware: реальный контроль доступа на функциональных разделах
+    # (мои аккаунты, заказы, автопилот, парсинг и т.д.). Навешиваем ДО comment_mode_guard,
+    # чтобы заблокированный/неодобренный пользователь отсекался раньше. НЕ навешиваем на
+    # menu.router — он обслуживает /start и сценарий регистрации/ожидания одобрения,
+    # иначе новый/ожидающий пользователь не сможет даже подать заявку. Админ-роутеры уже
+    # защищены AdminMiddleware и здесь не дублируются.
+    from bot.middleware.worker_access_middleware import WorkerAccessMiddleware
+    worker_access_middleware = WorkerAccessMiddleware()
+    for worker_router in (
+        autopilot.router,
+        video_parsing.router,
+        video_inbox.router,
+        orders.router,
+        templates.router,
+        order_wizard.router,
+        engagement_wizard.router,
+        personal_accounts.router,
+        settings.router,
+        quick_order.router,
+    ):
+        worker_router.message.middleware(worker_access_middleware)
+        worker_router.callback_query.middleware(worker_access_middleware)
 
     for commenting_router in (
         orders.router,

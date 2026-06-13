@@ -2,7 +2,7 @@ from aiogram import Router, F
 from aiogram.types import Message, CallbackQuery, InlineKeyboardMarkup, InlineKeyboardButton
 from aiogram.filters import Command
 from aiogram.fsm.context import FSMContext
-from aiogram.exceptions import TelegramForbiddenError
+from aiogram.exceptions import TelegramBadRequest, TelegramForbiddenError
 from bot.services.api_client import api_client
 from bot.services.subscription_service import check_user_access
 from bot.keyboards.common import get_main_menu_keyboard, get_access_denied_keyboard
@@ -103,7 +103,7 @@ async def ensure_access(callback: CallbackQuery) -> tuple[bool, dict | None]:
         logger.error(f"Error checking access: {e}", exc_info=True)
         try:
             await safe_callback_answer(callback, "Ошибка проверки доступа", show_alert=True)
-        except:
+        except Exception:
             pass
         return False, None
 
@@ -544,11 +544,23 @@ async def check_access_handler(callback: CallbackQuery):
                     reply_markup=get_access_denied_keyboard(),
                     parse_mode="Markdown"
                 )
+    except TelegramBadRequest as e:
+        if "message is not modified" in str(e).lower():
+            try:
+                await safe_callback_answer(callback)
+            except Exception:
+                pass
+            return
+        logger.error(f"Error checking access: {e}", exc_info=True)
+        try:
+            await safe_callback_answer(callback, "Ошибка проверки доступа", show_alert=True)
+        except Exception:
+            pass
     except Exception as e:
         logger.error(f"Error checking access: {e}", exc_info=True)
         try:
             await safe_callback_answer(callback, "Ошибка проверки доступа", show_alert=True)
-        except:
+        except Exception:
             pass
 
 

@@ -6,6 +6,8 @@ import re
 from collections.abc import Mapping
 from typing import Any
 
+from services.task_execution_ledger import build_task_execution_ledger, LEDGER_VERSION
+
 
 _SUMMARY_RE = re.compile(r"успешно:\s*(\d+)\s*/\s*(\d+)", re.IGNORECASE)
 
@@ -265,6 +267,61 @@ def humanize_warning(warning: Any, short: bool = False) -> str | None:
             if short:
                 return "Часть вариантов комментария не отправилась"
             return "Часть вариантов главного комментария не удалось отправить. Остальные варианты продолжили выполнение."
+        if code == "parallel_main_partial":
+            submitted = _safe_int(warning.get("submitted"))
+            expected = _safe_int(warning.get("expected"))
+            if submitted and expected:
+                if short:
+                    return f"Главные комментарии: отправлено {submitted} из {expected}"
+                return (
+                    f"Главные комментарии: отправлено {submitted} из {expected}. "
+                    "Система сохранила то, что удалось отправить."
+                )
+            if short:
+                return "Часть главных комментариев не отправилась"
+            return (
+                "Часть главных комментариев не удалось отправить. "
+                "Система сохранила то, что удалось отправить."
+            )
+        if code == "parallel_main_partial_replies_continued":
+            submitted = _safe_int(warning.get("submitted"))
+            expected = _safe_int(warning.get("expected"))
+            if submitted and expected:
+                if short:
+                    return f"\u041e\u0442\u0432\u0435\u0442\u044b \u0437\u0430\u043f\u0443\u0449\u0435\u043d\u044b \u043f\u043e \u0433\u043b\u0430\u0432\u043d\u044b\u043c {submitted}/{expected}"
+                return (
+                    f"\u0413\u043b\u0430\u0432\u043d\u044b\u0435 \u043a\u043e\u043c\u043c\u0435\u043d\u0442\u0430\u0440\u0438\u0438 \u043e\u0442\u043f\u0440\u0430\u0432\u043b\u0435\u043d\u044b \u0447\u0430\u0441\u0442\u0438\u0447\u043d\u043e: {submitted} \u0438\u0437 {expected}. "
+                    "\u041e\u0442\u0432\u0435\u0442\u044b \u043f\u0440\u043e\u0434\u043e\u043b\u0436\u0438\u043b\u0438 \u0440\u0430\u0431\u043e\u0442\u0443 \u043f\u043e \u043e\u0442\u043f\u0440\u0430\u0432\u043b\u0435\u043d\u043d\u044b\u043c \u0433\u043b\u0430\u0432\u043d\u044b\u043c."
+                )
+            if short:
+                return "\u041e\u0442\u0432\u0435\u0442\u044b \u0437\u0430\u043f\u0443\u0449\u0435\u043d\u044b \u043f\u043e \u043e\u0442\u043f\u0440\u0430\u0432\u043b\u0435\u043d\u043d\u044b\u043c \u0433\u043b\u0430\u0432\u043d\u044b\u043c"
+            return "\u041e\u0442\u0432\u0435\u0442\u044b \u043f\u0440\u043e\u0434\u043e\u043b\u0436\u0438\u043b\u0438 \u0440\u0430\u0431\u043e\u0442\u0443 \u043f\u043e \u0442\u0435\u043c \u0433\u043b\u0430\u0432\u043d\u044b\u043c \u043a\u043e\u043c\u043c\u0435\u043d\u0442\u0430\u0440\u0438\u044f\u043c, \u043a\u043e\u0442\u043e\u0440\u044b\u0435 \u0443\u0434\u0430\u043b\u043e\u0441\u044c \u043e\u0442\u043f\u0440\u0430\u0432\u0438\u0442\u044c."
+        if code == "parallel_main_partial_legacy_unused":
+            submitted = _safe_int(warning.get("submitted"))
+            expected = _safe_int(warning.get("expected"))
+            if submitted and expected:
+                if short:
+                    return f"Главные комментарии: отправлено {submitted} из {expected}"
+                return (
+                    f"Главные комментарии: отправлено {submitted} из {expected}. "
+                    "Ответы продолжили работу по тем комментариям, которые удалось отправить."
+                )
+            if short:
+                return "Часть главных комментариев не отправилась"
+            return "Часть главных комментариев не удалось отправить. Ответы продолжили работу по опубликованным комментариям."
+        if code == "parallel_main_incomplete_replies_skipped":
+            submitted = _safe_int(warning.get("submitted"))
+            expected = _safe_int(warning.get("expected"))
+            if submitted and expected:
+                if short:
+                    return f"Ответы не запускались: главных {submitted}/{expected}"
+                return (
+                    f"Ответы не запускались: главных комментариев отправлено {submitted} из {expected}. "
+                    "Это защищает reply-аккаунты от бессмысленного поиска неполного набора parent-комментариев."
+                )
+            if short:
+                return "Ответы не запускались: главные отправлены не полностью"
+            return "Ответы не запускались, потому что главные комментарии отправлены не полностью."
         if code == "engagement_parent_author_fallback":
             requested = _clean_text(warning.get("requested_author"))
             matched = _clean_text(warning.get("matched_author"))
@@ -406,6 +463,9 @@ def build_task_execution_summary(task: Mapping[str, Any] | None) -> dict[str, An
             "main": {},
             "replies": {},
             "likes": {},
+            "ledger": {},
+            "coverage": {},
+            "health": {},
         }
 
     status = (_clean_text(task.get("status")) or "unknown").lower()
@@ -415,6 +475,11 @@ def build_task_execution_summary(task: Mapping[str, Any] | None) -> dict[str, An
     url_results = settings.get("url_results", {})
     if not isinstance(url_results, Mapping):
         url_results = {}
+    stored_ledger = settings.get("execution_ledger")
+    if isinstance(stored_ledger, Mapping) and _safe_int(stored_ledger.get("version")) == LEDGER_VERSION:
+        task_ledger = dict(stored_ledger)
+    else:
+        task_ledger = build_task_execution_ledger(url_results)
 
     warnings = collect_task_warnings(task, short=False)
     display_reason = build_task_display_reason(task, short=False)
@@ -428,9 +493,18 @@ def build_task_execution_summary(task: Mapping[str, Any] | None) -> dict[str, An
     main_verified = False
     main_posted = False
     main_verify_mode = None
+    main_expected = 0
+    main_submitted = 0
+    main_verified_count = 0
 
     replies_ok = 0
     replies_total = 0
+    replies_requested = 0
+    replies_submitted = 0
+    reply_attempted = 0
+    reply_failed = 0
+    reply_variant_outcomes = 0
+    reply_variants_not_started = 0
     reply_parent_confirmed = 0
     reply_parent_ui_confirmed = 0
     reply_visibility_confirmed = 0
@@ -443,6 +517,11 @@ def build_task_execution_summary(task: Mapping[str, Any] | None) -> dict[str, An
     likes_success_urls = 0
     likes_failed_urls = 0
     likes_errors: list[str] = []
+    likes_target_mode = None
+    likes_orders_total = 0
+    likes_orders_ok = 0
+    likes_orders_failed = 0
+    likes_targets: list[dict[str, Any]] = []
 
     for result in url_results.values():
         if not isinstance(result, Mapping):
@@ -472,11 +551,35 @@ def build_task_execution_summary(task: Mapping[str, Any] | None) -> dict[str, An
             main_verified = main_verified or bool(main.get("verified"))
             main_posted = main_posted or bool(main.get("posted"))
             main_verify_mode = main_verify_mode or _clean_text(main.get("verify_mode"))
+            expected = _safe_int(main.get("expected"))
+            variants = main.get("variants_published") or []
+            variant_count = len(variants) if isinstance(variants, list) else 0
+            submitted_count = variant_count or (1 if main.get("posted") else 0)
+            verified_count = 0
+            if variant_count > 0:
+                for variant in variants:
+                    if not isinstance(variant, Mapping):
+                        continue
+                    if variant.get("network_confirmed") or variant.get("local_confirmed"):
+                        verified_count += 1
+            elif main.get("verified"):
+                verified_count = submitted_count
+            main_expected += expected if expected > 0 else submitted_count
+            main_submitted += submitted_count
+            main_verified_count += verified_count
 
         replies = engagement.get("replies", {})
         if isinstance(replies, Mapping):
             replies_ok += _safe_int(replies.get("ok"))
             replies_total += _safe_int(replies.get("total"))
+            replies_requested += _safe_int(replies.get("requested_variants")) or _safe_int(replies.get("total"))
+            reply_attempted += _safe_int(replies.get("attempted"))
+            reply_failed += _safe_int(replies.get("failed"))
+            reply_variant_outcomes += _safe_int(replies.get("variant_outcomes"))
+            reply_variants_not_started += _safe_int(replies.get("variants_not_started"))
+            explicit_submitted = _safe_int(replies.get("submitted"))
+            aggregate_unconfirmed = _safe_int(replies.get("submitted_unconfirmed"))
+            item_unconfirmed = 0
             for item in replies.get("items") or []:
                 if not isinstance(item, Mapping):
                     continue
@@ -488,16 +591,20 @@ def build_task_execution_summary(task: Mapping[str, Any] | None) -> dict[str, An
                 elif _clean_text(item.get("parent_confirmation_level")) == "ui_author_only":
                     reply_parent_ui_confirmed += 1
                 visibility_status = _clean_text(item.get("visibility_status"))
-                if visibility_status == "confirmed_local":
+                if visibility_status in {"confirmed_local", "network_confirmed"}:
                     reply_visibility_confirmed += 1
-                elif visibility_status == "submitted_unconfirmed":
-                    reply_submitted_unconfirmed += 1
+                elif visibility_status == "submitted_unconfirmed" or item.get("submitted_unconfirmed"):
+                    item_unconfirmed += 1
+            unconfirmed_count = aggregate_unconfirmed or item_unconfirmed
+            reply_submitted_unconfirmed += unconfirmed_count
+            replies_submitted += explicit_submitted or (_safe_int(replies.get("ok")) + unconfirmed_count)
 
         likes = engagement.get("likes", {})
         if isinstance(likes, Mapping):
             likes_enabled = likes_enabled or bool(likes.get("enabled"))
             likes_requested = likes_requested or bool(likes.get("requested"))
             likes_quantity = max(likes_quantity, _safe_int(likes.get("quantity")))
+            likes_target_mode = likes_target_mode or _clean_text(likes.get("target_mode"))
             if likes.get("requested"):
                 if likes.get("ok"):
                     likes_success_urls += 1
@@ -506,6 +613,30 @@ def build_task_execution_summary(task: Mapping[str, Any] | None) -> dict[str, An
                     error_text = humanize_error_text(likes.get("error"), short=False) or _clean_text(likes.get("error"))
                     if error_text:
                         likes_errors.append(error_text)
+            like_orders = likes.get("orders") if isinstance(likes.get("orders"), list) else []
+            for order in like_orders:
+                if not isinstance(order, Mapping):
+                    continue
+                username = _clean_text(order.get("username")).lstrip("@")
+                if not username:
+                    continue
+                ok = bool(order.get("ok"))
+                likes_orders_total += 1
+                if ok:
+                    likes_orders_ok += 1
+                else:
+                    likes_orders_failed += 1
+                likes_targets.append(
+                    {
+                        "username": username,
+                        "quantity": _safe_int(order.get("quantity")),
+                        "ok": ok,
+                        "reply_count": _safe_int(order.get("reply_count")),
+                        "parent_text": _clean_text(order.get("parent_text")),
+                        "selection_reason": _clean_text(order.get("selection_reason")) or None,
+                        "error": humanize_error_text(order.get("error"), short=True) or _clean_text(order.get("error")),
+                    }
+                )
 
     known_video_count = video_success + video_failed
     video_pending = max(0, total_urls - known_video_count)
@@ -567,10 +698,19 @@ def build_task_execution_summary(task: Mapping[str, Any] | None) -> dict[str, An
             "method": _compress_method(main_methods),
             "comment_id": main_comment_id,
             "verify_mode": main_verify_mode,
+            "expected": main_expected,
+            "submitted": main_submitted,
+            "verified_count": main_verified_count,
         },
         "replies": {
             "ok": replies_ok,
             "total": replies_total,
+            "requested": replies_requested,
+            "submitted": replies_submitted,
+            "attempted": reply_attempted,
+            "failed": reply_failed,
+            "variant_outcomes": reply_variant_outcomes,
+            "variants_not_started": reply_variants_not_started,
             "parent_confirmed": reply_parent_confirmed,
             "parent_ui_confirmed": reply_parent_ui_confirmed,
             "visibility_confirmed": reply_visibility_confirmed,
@@ -584,7 +724,15 @@ def build_task_execution_summary(task: Mapping[str, Any] | None) -> dict[str, An
             "successful_urls": likes_success_urls,
             "failed_urls": likes_failed_urls,
             "error": likes_errors[0] if likes_errors else None,
+            "target_mode": likes_target_mode,
+            "orders_total": likes_orders_total,
+            "orders_ok": likes_orders_ok,
+            "orders_failed": likes_orders_failed,
+            "targets": likes_targets,
         },
+        "ledger": task_ledger,
+        "coverage": task_ledger.get("coverage", {}) if isinstance(task_ledger, Mapping) else {},
+        "health": task_ledger.get("health_signals", {}) if isinstance(task_ledger, Mapping) else {},
     }
 
 

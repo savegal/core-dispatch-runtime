@@ -402,6 +402,7 @@ async def _do_post_reply(
                     parent_comment_id=parent_comment_id,
                     max_total_seconds=35.0,
                     correlation_id=correlation_id,
+                    expected_video_url=video_url,
                 )
 
                 elapsed = time.monotonic() - started

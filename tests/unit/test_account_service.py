@@ -85,6 +85,7 @@ def test_account_selection_diagnostics_exposes_cookie_keys_not_values():
     assert "today_main=2" in diag
     assert "today_replies=3" in diag
     assert "errors=1" in diag
+    assert "runtime_health=risky" in diag
 
 
 @pytest.mark.unit
@@ -413,6 +414,257 @@ class TestAccountService:
         assert account is not None
         assert account.id == healthy.id
 
+    def test_get_free_account_for_reply_can_skip_degraded_captcha_category(self, db_session: Session):
+        degraded = Account(
+            label="reply_degraded_captcha",
+            status="active",
+            cookies="sessionid=reply-degraded-captcha",
+            last_error=json.dumps(
+                {
+                    "scope": "runtime",
+                    "category": "captcha",
+                    "reason": "captcha_challenge:slider",
+                }
+            ),
+        )
+        healthy = Account(
+            label="reply_degraded_captcha_healthy",
+            status="active",
+            cookies="sessionid=reply-healthy-after-degraded",
+            last_validation_ok=datetime.now(timezone.utc),
+        )
+        db_session.add_all([degraded, healthy])
+        db_session.commit()
+
+        account = get_free_account_for_reply(
+            db_session,
+            exclude_degraded_categories={"captcha", "page_blocked"},
+        )
+
+        assert account is not None
+        assert account.id == healthy.id
+
+    def test_get_free_account_for_reply_uses_excluded_degraded_as_last_resort(self, db_session: Session):
+        degraded = Account(
+            label="reply_degraded_captcha_last_resort",
+            status="active",
+            cookies="sessionid=reply-degraded-captcha-last-resort",
+            last_error=json.dumps(
+                {
+                    "scope": "runtime",
+                    "category": "captcha",
+                    "reason": "captcha_challenge:slider",
+                }
+            ),
+        )
+        db_session.add(degraded)
+        db_session.commit()
+
+        account = get_free_account_for_reply(
+            db_session,
+            exclude_degraded_categories={"captcha", "page_blocked"},
+        )
+
+        assert account is not None
+        assert account.id == degraded.id
+
+    def test_main_selector_keeps_no_proxy_account_when_excluding_other_proxy(self, db_session: Session):
+        account = Account(
+            label="main_no_proxy_with_exclude_proxy",
+            status="active",
+            cookies=json.dumps(
+                {
+                    "sessionid": "main-no-proxy-session",
+                    "sid_tt": "main-no-proxy-sid",
+                    "s_v_web_id": "main-no-proxy-verify",
+                    "ttwid": "main-no-proxy-wid",
+                    "msToken": "main-no-proxy-ms",
+                }
+            ),
+            proxy=None,
+            last_validation_ok=datetime.now(timezone.utc),
+        )
+        db_session.add(account)
+        db_session.commit()
+
+        selected = get_free_account_for_main_comment(
+            db_session,
+            exclude_proxies={"http://already-used-proxy"},
+        )
+
+        assert selected is not None
+        assert selected.id == account.id
+
+    def test_reply_selector_keeps_no_proxy_account_when_excluding_other_proxy(self, db_session: Session):
+        account = Account(
+            label="reply_no_proxy_with_exclude_proxy",
+            status="active",
+            cookies="sessionid=reply-no-proxy-session; sid_tt=reply-sid",
+            proxy=None,
+            last_validation_ok=datetime.now(timezone.utc),
+        )
+        db_session.add(account)
+        db_session.commit()
+
+        selected = get_free_account_for_reply(
+            db_session,
+            exclude_proxies={"http://already-used-proxy"},
+        )
+
+        assert selected is not None
+        assert selected.id == account.id
+
+    def test_reply_last_resort_proxy_type_filter_tries_alternate_bucket(
+        self,
+        db_session: Session,
+        monkeypatch: pytest.MonkeyPatch,
+    ):
+        monkeypatch.setattr(account_service_module, "get_proxy_type_filter", lambda _db: "mobile")
+        residential_proxy = "http://reply-residential-last-resort"
+        mobile_proxy = "http://reply-mobile-sid-last-resort"
+        db_session.add_all(
+            [
+                Proxy(proxy=residential_proxy, is_mobile="N"),
+                Proxy(proxy=mobile_proxy, is_mobile="Y"),
+            ]
+        )
+        runtime_wrong_proxy = Account(
+            label="reply_runtime_last_resort_wrong_proxy_type",
+            status="active",
+            cookies="sessionid=runtime-wrong-proxy; sid_tt=runtime-sid",
+            proxy=residential_proxy,
+            last_error=json.dumps(
+                {
+                    "scope": "runtime",
+                    "category": "captcha",
+                    "reason": "captcha_challenge:slider",
+                }
+            ),
+        )
+        sid_guard_mobile = Account(
+            label="reply_sid_guard_last_resort_mobile",
+            status="active",
+            cookies="sid_guard=reply-sid-guard; msToken=reply-ms",
+            proxy=mobile_proxy,
+            last_validation_ok=datetime.now(timezone.utc),
+        )
+        db_session.add_all([runtime_wrong_proxy, sid_guard_mobile])
+        db_session.commit()
+
+        selected = get_free_account_for_reply(db_session)
+
+        assert selected is not None
+        assert selected.id == sid_guard_mobile.id
+
+    def test_runtime_health_grade_classifies_recent_runtime_categories(self, db_session: Session):
+        account = Account(
+            label="runtime_health_grade_login",
+            status="active",
+            cookies="sessionid=health-grade",
+            last_error=json.dumps(
+                {
+                    "scope": "runtime",
+                    "category": account_service_module.MONITOR_CATEGORY_LOGIN,
+                    "reason": "login required during comment publish",
+                }
+            ),
+        )
+
+        state = account_service_module._read_runtime_state(account, datetime.now(timezone.utc))
+
+        assert account_service_module._runtime_health_grade(state) == "login_ui_recent"
+
+    def test_page_loading_ambiguous_is_not_classified_as_page_blocked(self):
+        reason = "login_ambiguous:page_loading:tiktok_shell_incomplete:on_video_no_login_btn:video"
+
+        assert account_service_module._infer_runtime_category(reason) == account_service_module.MONITOR_CATEGORY_NETWORK
+        assert account_service_module._looks_like_runtime_error(reason) is True
+
+    def test_edge_access_denied_is_classified_as_proxy_not_login_blocked(self):
+        reason = "proxy_edge_access_denied:err_http_response_code_failure"
+
+        assert account_service_module._infer_runtime_category(reason) == account_service_module.MONITOR_CATEGORY_PROXY
+        assert account_service_module._looks_like_runtime_error(reason) is True
+        assert (
+            account_service_module._infer_runtime_category("ERR_HTTP_RESPONSE_CODE_FAILURE")
+            == account_service_module.MONITOR_CATEGORY_PROXY
+        )
+        assert account_service_module._looks_like_runtime_error("ERR_HTTP_RESPONSE_CODE_FAILURE") is True
+
+    def test_stored_goto_failed_page_blocked_is_reclassified_as_network(self):
+        account = Account(
+            label="runtime_old_goto_failed_blocked",
+            status="active",
+            cookies="sessionid=old-goto",
+            last_error=json.dumps(
+                {
+                    "scope": "runtime",
+                    "category": account_service_module.MONITOR_CATEGORY_BLOCKED,
+                    "reason": 'login_ambiguous:goto_failed:Page.goto: Timeout 120000ms exceeded.',
+                }
+            ),
+        )
+
+        state = account_service_module._read_runtime_state(account, datetime.now(timezone.utc))
+
+        assert state["category"] == account_service_module.MONITOR_CATEGORY_NETWORK
+        assert account_service_module._runtime_health_grade(state) == "risky"
+
+    def test_get_free_account_for_main_comment_prefers_healthy_over_recent_captcha(
+        self,
+        db_session: Session,
+    ):
+        degraded = Account(
+            label="main_recent_captcha_degraded",
+            status="active",
+            cookies='{"sessionid":"main-captcha","sid_tt":"sid-captcha","s_v_web_id":"verify-captcha","ttwid":"wid-captcha","msToken":"ms-captcha"}',
+            last_error=json.dumps(
+                {
+                    "scope": "runtime",
+                    "category": account_service_module.MONITOR_CATEGORY_CAPTCHA,
+                    "reason": "captcha_challenge:slider",
+                }
+            ),
+            created_at=datetime.now(timezone.utc) - timedelta(hours=4),
+            last_validation_ok=datetime.now(timezone.utc),
+        )
+        healthy = Account(
+            label="main_recent_captcha_healthy",
+            status="active",
+            cookies='{"sessionid":"main-healthy","sid_tt":"sid-healthy","s_v_web_id":"verify-healthy","ttwid":"wid-healthy","msToken":"ms-healthy"}',
+            created_at=datetime.now(timezone.utc) - timedelta(hours=4),
+            last_validation_ok=datetime.now(timezone.utc),
+        )
+        db_session.add_all([degraded, healthy])
+        db_session.commit()
+
+        account = get_free_account_for_main_comment(db_session)
+
+        assert account is not None
+        assert account.id == healthy.id
+
+    def test_get_free_account_for_reply_uses_recent_login_as_last_resort(self, db_session: Session):
+        degraded = Account(
+            label="reply_recent_login_last_resort",
+            status="active",
+            cookies='{"sessionid":"reply-login","sid_tt":"sid-login","s_v_web_id":"verify-login","ttwid":"wid-login","msToken":"ms-login"}',
+            last_error=json.dumps(
+                {
+                    "scope": "runtime",
+                    "category": account_service_module.MONITOR_CATEGORY_LOGIN,
+                    "reason": "login required during reply",
+                }
+            ),
+            last_validation_ok=datetime.now(timezone.utc),
+        )
+        db_session.add(degraded)
+        db_session.commit()
+
+        account = get_free_account_for_reply(db_session)
+
+        assert account is not None
+        assert account.id == degraded.id
+
     def test_get_free_account_for_main_comment_skips_runtime_cooldown(self, db_session: Session):
         """Main-comment selector should skip accounts that are still in runtime cooldown."""
         cooldown_until = (datetime.now(timezone.utc) + timedelta(minutes=20)).isoformat()
@@ -512,15 +764,31 @@ class TestAccountService:
                     }
                 ),
             ),
+            Account(
+                label="runtime_health_recent_captcha",
+                status="active",
+                cookies="sessionid=health4",
+                proxy="http://health-proxy-d",
+                last_error=json.dumps(
+                    {
+                        "scope": "runtime",
+                        "category": "captcha",
+                        "reason": "captcha_challenge:slider",
+                    }
+                ),
+            ),
         ]
         db_session.add_all(accounts)
         db_session.commit()
 
         health = get_account_runtime_health(db_session)
         assert set(health.keys()) >= {"generated_at", "main_comment", "reply", "monitor"}
-        assert health["main_comment"]["total_candidates"] == 3
+        assert health["main_comment"]["total_candidates"] == 4
         assert health["reply"]["cooldown"] >= 1
         assert health["monitor"]["cooldown"] >= 1
+        assert health["main_comment"]["captcha_recent"] >= 1
+        assert "runtime_risky" in health["main_comment"]
+        assert health["monitor"]["captcha_recent"] == 0
 
     def test_get_free_account_for_main_comment_skips_bad_proxy(self, db_session: Session, monkeypatch: pytest.MonkeyPatch):
         """Main selector should skip accounts whose proxy is currently marked bad."""
@@ -549,6 +817,306 @@ class TestAccountService:
         account = get_free_account_for_main_comment(db_session)
         assert account is not None
         assert account.id == healthy_account.id
+
+    def test_get_free_account_for_main_comment_excludes_proxy_for_current_batch(
+        self,
+        db_session: Session,
+        monkeypatch: pytest.MonkeyPatch,
+    ):
+        """Parallel main selection avoids the exact proxy endpoint already picked in the batch."""
+        monkeypatch.setattr(account_service_module.settings, "USE_PROXY", True, raising=False)
+        monkeypatch.setattr(account_service_module.settings, "PARALLEL_PROXY_DIVERSIFY_BY_SOURCE_HOST", False, raising=False)
+        first_proxy = "http://user:pass@10.20.30.40:1000"
+        same_source_proxy = "http://other:pass@10.20.30.40:2000"
+        second_proxy = "http://main-batch-proxy-b"
+        first_account = Account(
+            label="main_batch_proxy_a",
+            status="active",
+            cookies='{"sessionid":"main-a","sid_tt":"main-a-sid","s_v_web_id":"main-a-verify","ttwid":"main-a-wid","msToken":"main-a-ms"}',
+            proxy=first_proxy,
+            created_at=datetime.now(timezone.utc) - timedelta(hours=4),
+            last_validation_ok=datetime.now(timezone.utc),
+        )
+        same_source_account = Account(
+            label="main_batch_proxy_same_source",
+            status="active",
+            cookies='{"sessionid":"main-same","sid_tt":"main-same-sid","s_v_web_id":"main-same-verify","ttwid":"main-same-wid","msToken":"main-same-ms"}',
+            proxy=same_source_proxy,
+            created_at=datetime.now(timezone.utc) - timedelta(hours=4),
+            last_validation_ok=datetime.now(timezone.utc),
+        )
+        second_account = Account(
+            label="main_batch_proxy_b",
+            status="active",
+            cookies='{"sessionid":"main-b","sid_tt":"main-b-sid","s_v_web_id":"main-b-verify","ttwid":"main-b-wid","msToken":"main-b-ms"}',
+            proxy=second_proxy,
+            created_at=datetime.now(timezone.utc) - timedelta(hours=4),
+            last_validation_ok=datetime.now(timezone.utc),
+        )
+        db_session.add_all([first_account, same_source_account, second_account])
+        db_session.commit()
+
+        selected = get_free_account_for_main_comment(
+            db_session,
+            exclude_proxies={first_proxy},
+        )
+
+        assert selected is not None
+        assert selected.id == same_source_account.id
+
+    def test_get_free_account_for_main_comment_can_exclude_same_source_host(
+        self,
+        db_session: Session,
+        monkeypatch: pytest.MonkeyPatch,
+    ):
+        """A stricter opt-in mode can avoid all endpoints on the same proxy host."""
+        monkeypatch.setattr(account_service_module.settings, "USE_PROXY", True, raising=False)
+        monkeypatch.setattr(account_service_module.settings, "PARALLEL_PROXY_DIVERSIFY_BY_SOURCE_HOST", True, raising=False)
+        first_proxy = "http://user:pass@10.20.30.41:1000"
+        same_source_proxy = "http://other:pass@10.20.30.41:2000"
+        second_proxy = "http://main-batch-proxy-c"
+        first_account = Account(
+            label="main_batch_proxy_host_a",
+            status="active",
+            cookies='{"sessionid":"host-main-a","sid_tt":"host-main-a-sid","s_v_web_id":"host-main-a-verify","ttwid":"host-main-a-wid","msToken":"host-main-a-ms"}',
+            proxy=first_proxy,
+            created_at=datetime.now(timezone.utc) - timedelta(hours=4),
+            last_validation_ok=datetime.now(timezone.utc),
+        )
+        same_source_account = Account(
+            label="main_batch_proxy_host_same_source",
+            status="active",
+            cookies='{"sessionid":"host-main-same","sid_tt":"host-main-same-sid","s_v_web_id":"host-main-same-verify","ttwid":"host-main-same-wid","msToken":"host-main-same-ms"}',
+            proxy=same_source_proxy,
+            created_at=datetime.now(timezone.utc) - timedelta(hours=4),
+            last_validation_ok=datetime.now(timezone.utc),
+        )
+        second_account = Account(
+            label="main_batch_proxy_host_c",
+            status="active",
+            cookies='{"sessionid":"host-main-c","sid_tt":"host-main-c-sid","s_v_web_id":"host-main-c-verify","ttwid":"host-main-c-wid","msToken":"host-main-c-ms"}',
+            proxy=second_proxy,
+            created_at=datetime.now(timezone.utc) - timedelta(hours=4),
+            last_validation_ok=datetime.now(timezone.utc),
+        )
+        db_session.add_all([first_account, same_source_account, second_account])
+        db_session.commit()
+
+        selected = get_free_account_for_main_comment(
+            db_session,
+            exclude_proxies={first_proxy},
+        )
+
+        assert selected is not None
+        assert selected.id == second_account.id
+
+    def test_get_free_account_for_main_comment_can_exclude_only_exact_proxy_when_balancing(
+        self,
+        db_session: Session,
+        monkeypatch: pytest.MonkeyPatch,
+    ):
+        """Least-used fallback may balance ports on the same source host."""
+        monkeypatch.setattr(account_service_module.settings, "USE_PROXY", True, raising=False)
+        monkeypatch.setattr(account_service_module.settings, "PARALLEL_PROXY_DIVERSIFY_BY_SOURCE_HOST", True, raising=False)
+        first_proxy = "http://user:pass@10.20.30.43:1000"
+        same_source_proxy = "http://other:pass@10.20.30.43:2000"
+        first_account = Account(
+            label="main_balance_exact_a",
+            status="active",
+            cookies='{"sessionid":"balance-main-a","sid_tt":"balance-main-a-sid","s_v_web_id":"balance-main-a-verify","ttwid":"balance-main-a-wid","msToken":"balance-main-a-ms"}',
+            proxy=first_proxy,
+            created_at=datetime.now(timezone.utc) - timedelta(hours=4),
+            last_validation_ok=datetime.now(timezone.utc),
+        )
+        same_source_account = Account(
+            label="main_balance_exact_same_source",
+            status="active",
+            cookies='{"sessionid":"balance-main-same","sid_tt":"balance-main-same-sid","s_v_web_id":"balance-main-same-verify","ttwid":"balance-main-same-wid","msToken":"balance-main-same-ms"}',
+            proxy=same_source_proxy,
+            created_at=datetime.now(timezone.utc) - timedelta(hours=4),
+            last_validation_ok=datetime.now(timezone.utc),
+        )
+        db_session.add_all([first_account, same_source_account])
+        db_session.commit()
+
+        selected = get_free_account_for_main_comment(
+            db_session,
+            exclude_proxies={first_proxy},
+            exclude_proxy_source_hosts=False,
+        )
+
+        assert selected is not None
+        assert selected.id == same_source_account.id
+
+    def test_get_free_account_for_main_comment_scans_past_first_host_filtered_batch(
+        self,
+        db_session: Session,
+        monkeypatch: pytest.MonkeyPatch,
+    ):
+        """Host diversification should not return None just because the first SQL page shares one host."""
+        monkeypatch.setattr(account_service_module.settings, "USE_PROXY", True, raising=False)
+        monkeypatch.setattr(account_service_module.settings, "PARALLEL_PROXY_DIVERSIFY_BY_SOURCE_HOST", True, raising=False)
+        monkeypatch.setattr(account_service_module.settings, "MAX_CONCURRENT_BROWSERS", 5, raising=False)
+        excluded_proxy = "http://user:pass@10.20.30.42:1000"
+        same_host_accounts = [
+            Account(
+                label=f"main_same_host_page_{idx:02d}",
+                status="active",
+                cookies=f'{{"sessionid":"same-{idx}","sid_tt":"same-sid-{idx}","s_v_web_id":"same-verify-{idx}","ttwid":"same-wid-{idx}","msToken":"same-ms-{idx}"}}',
+                proxy=f"http://other:pass@10.20.30.42:{2000 + idx}",
+                created_at=datetime.now(timezone.utc) - timedelta(hours=4),
+                last_validation_ok=datetime.now(timezone.utc),
+            )
+            for idx in range(20)
+        ]
+        target_account = Account(
+            label="main_different_host_after_first_page",
+            status="active",
+            cookies='{"sessionid":"target-main","sid_tt":"target-main-sid","s_v_web_id":"target-main-verify","ttwid":"target-main-wid","msToken":"target-main-ms"}',
+            proxy="http://other:pass@10.20.30.99:3000",
+            created_at=datetime.now(timezone.utc) - timedelta(hours=4),
+            last_validation_ok=datetime.now(timezone.utc),
+        )
+        db_session.add_all([*same_host_accounts, target_account])
+        db_session.commit()
+
+        selected = get_free_account_for_main_comment(
+            db_session,
+            exclude_proxies={excluded_proxy},
+        )
+
+        assert selected is not None
+        assert selected.id == target_account.id
+
+    def test_get_free_account_for_reply_excludes_proxy_for_current_batch(
+        self,
+        db_session: Session,
+        monkeypatch: pytest.MonkeyPatch,
+    ):
+        """Parallel reply selection avoids the exact proxy endpoint already picked in the batch."""
+        monkeypatch.setattr(account_service_module.settings, "USE_PROXY", True, raising=False)
+        monkeypatch.setattr(account_service_module.settings, "PARALLEL_PROXY_DIVERSIFY_BY_SOURCE_HOST", False, raising=False)
+        first_proxy = "http://user:pass@10.20.30.50:1000"
+        same_source_proxy = "http://other:pass@10.20.30.50:2000"
+        second_proxy = "http://reply-batch-proxy-b"
+        first_account = Account(
+            label="reply_batch_proxy_a",
+            status="active",
+            cookies='{"sessionid":"reply-a","sid_tt":"reply-a-sid","s_v_web_id":"reply-a-verify","ttwid":"reply-a-wid","msToken":"reply-a-ms"}',
+            proxy=first_proxy,
+            created_at=datetime.now(timezone.utc) - timedelta(hours=66),
+            last_validation_ok=datetime.now(timezone.utc),
+        )
+        same_source_account = Account(
+            label="reply_batch_proxy_same_source",
+            status="active",
+            cookies='{"sessionid":"reply-same","sid_tt":"reply-same-sid","s_v_web_id":"reply-same-verify","ttwid":"reply-same-wid","msToken":"reply-same-ms"}',
+            proxy=same_source_proxy,
+            created_at=datetime.now(timezone.utc) - timedelta(hours=66),
+            last_validation_ok=datetime.now(timezone.utc),
+        )
+        second_account = Account(
+            label="reply_batch_proxy_b",
+            status="active",
+            cookies='{"sessionid":"reply-b","sid_tt":"reply-b-sid","s_v_web_id":"reply-b-verify","ttwid":"reply-b-wid","msToken":"reply-b-ms"}',
+            proxy=second_proxy,
+            created_at=datetime.now(timezone.utc) - timedelta(hours=66),
+            last_validation_ok=datetime.now(timezone.utc),
+        )
+        db_session.add_all([first_account, same_source_account, second_account])
+        db_session.commit()
+
+        selected = get_free_account_for_reply(
+            db_session,
+            exclude_proxies={first_proxy},
+        )
+
+        assert selected is not None
+        assert selected.id == same_source_account.id
+
+    def test_get_free_account_for_reply_can_exclude_same_source_host(
+        self,
+        db_session: Session,
+        monkeypatch: pytest.MonkeyPatch,
+    ):
+        """A stricter opt-in mode can avoid all reply endpoints on the same proxy host."""
+        monkeypatch.setattr(account_service_module.settings, "USE_PROXY", True, raising=False)
+        monkeypatch.setattr(account_service_module.settings, "PARALLEL_PROXY_DIVERSIFY_BY_SOURCE_HOST", True, raising=False)
+        first_proxy = "http://user:pass@10.20.30.51:1000"
+        same_source_proxy = "http://other:pass@10.20.30.51:2000"
+        second_proxy = "http://reply-batch-proxy-c"
+        first_account = Account(
+            label="reply_batch_proxy_host_a",
+            status="active",
+            cookies='{"sessionid":"host-reply-a","sid_tt":"host-reply-a-sid","s_v_web_id":"host-reply-a-verify","ttwid":"host-reply-a-wid","msToken":"host-reply-a-ms"}',
+            proxy=first_proxy,
+            created_at=datetime.now(timezone.utc) - timedelta(hours=66),
+            last_validation_ok=datetime.now(timezone.utc),
+        )
+        same_source_account = Account(
+            label="reply_batch_proxy_host_same_source",
+            status="active",
+            cookies='{"sessionid":"host-reply-same","sid_tt":"host-reply-same-sid","s_v_web_id":"host-reply-same-verify","ttwid":"host-reply-same-wid","msToken":"host-reply-same-ms"}',
+            proxy=same_source_proxy,
+            created_at=datetime.now(timezone.utc) - timedelta(hours=66),
+            last_validation_ok=datetime.now(timezone.utc),
+        )
+        second_account = Account(
+            label="reply_batch_proxy_host_c",
+            status="active",
+            cookies='{"sessionid":"host-reply-c","sid_tt":"host-reply-c-sid","s_v_web_id":"host-reply-c-verify","ttwid":"host-reply-c-wid","msToken":"host-reply-c-ms"}',
+            proxy=second_proxy,
+            created_at=datetime.now(timezone.utc) - timedelta(hours=66),
+            last_validation_ok=datetime.now(timezone.utc),
+        )
+        db_session.add_all([first_account, same_source_account, second_account])
+        db_session.commit()
+
+        selected = get_free_account_for_reply(
+            db_session,
+            exclude_proxies={first_proxy},
+        )
+
+        assert selected is not None
+        assert selected.id == second_account.id
+
+    def test_get_free_account_for_reply_can_exclude_only_exact_proxy_when_balancing(
+        self,
+        db_session: Session,
+        monkeypatch: pytest.MonkeyPatch,
+    ):
+        """Reply least-used fallback may balance ports on the same source host."""
+        monkeypatch.setattr(account_service_module.settings, "USE_PROXY", True, raising=False)
+        monkeypatch.setattr(account_service_module.settings, "PARALLEL_PROXY_DIVERSIFY_BY_SOURCE_HOST", True, raising=False)
+        first_proxy = "http://user:pass@10.20.30.52:1000"
+        same_source_proxy = "http://other:pass@10.20.30.52:2000"
+        first_account = Account(
+            label="reply_balance_exact_a",
+            status="active",
+            cookies='{"sessionid":"balance-reply-a","sid_tt":"balance-reply-a-sid","s_v_web_id":"balance-reply-a-verify","ttwid":"balance-reply-a-wid","msToken":"balance-reply-a-ms"}',
+            proxy=first_proxy,
+            created_at=datetime.now(timezone.utc) - timedelta(hours=66),
+            last_validation_ok=datetime.now(timezone.utc),
+        )
+        same_source_account = Account(
+            label="reply_balance_exact_same_source",
+            status="active",
+            cookies='{"sessionid":"balance-reply-same","sid_tt":"balance-reply-same-sid","s_v_web_id":"balance-reply-same-verify","ttwid":"balance-reply-same-wid","msToken":"balance-reply-same-ms"}',
+            proxy=same_source_proxy,
+            created_at=datetime.now(timezone.utc) - timedelta(hours=66),
+            last_validation_ok=datetime.now(timezone.utc),
+        )
+        db_session.add_all([first_account, same_source_account])
+        db_session.commit()
+
+        selected = get_free_account_for_reply(
+            db_session,
+            exclude_proxies={first_proxy},
+            exclude_proxy_source_hosts=False,
+        )
+
+        assert selected is not None
+        assert selected.id == same_source_account.id
 
     def test_get_monitor_account_skips_bad_proxy(self, db_session: Session, monkeypatch: pytest.MonkeyPatch):
         """Monitor selector should avoid accounts backed by proxies already marked bad."""
@@ -877,6 +1445,236 @@ class TestAccountService:
         strong_quality = account_service_module._read_account_session_quality(strong, account_service_module.MAIN_SCOPE)
         assert weak_quality["bucket"] == "dom_only"
         assert strong_quality["bucket"] == "http_strong"
+
+    def test_main_selector_scans_past_sid_guard_only_accounts(
+        self,
+        db_session: Session,
+        monkeypatch: pytest.MonkeyPatch,
+    ):
+        """Passport-valid but browser-auth-missing accounts should not block deeper good candidates."""
+        monkeypatch.setattr(account_service_module.settings, "MAX_CONCURRENT_BROWSERS", 1, raising=False)
+        now = datetime.now(timezone.utc)
+        weak_accounts = [
+            Account(
+                label=f"main_sid_guard_only_{idx}",
+                status="active",
+                cookies=json.dumps({"sid_guard": f"sg-{idx}", "msToken": f"ms-{idx}"}),
+                proxy=f"http://main-sid-guard-proxy-{idx}",
+                created_at=now - timedelta(hours=5),
+                last_validation_ok=now - timedelta(minutes=20),
+            )
+            for idx in range(25)
+        ]
+        strong = Account(
+            label="main_browser_auth_after_weak_batch",
+            status="active",
+            cookies=json.dumps(
+                {
+                    "sessionid": "main-strong-session",
+                    "sid_tt": "main-strong-sid",
+                    "sid_guard": "main-strong-guard",
+                    "s_v_web_id": "main-strong-verify",
+                    "ttwid": "main-strong-wid",
+                    "msToken": "main-strong-ms",
+                    "tt_chain_token": "main-strong-chain",
+                }
+            ),
+            proxy="http://main-strong-after-weak-proxy",
+            created_at=now - timedelta(hours=5),
+            last_validation_ok=now - timedelta(minutes=20),
+        )
+        db_session.add_all([*weak_accounts, strong])
+        db_session.commit()
+
+        selected = get_free_account_for_main_comment(db_session)
+
+        assert selected is not None
+        assert selected.id == strong.id
+        weak_quality = account_service_module._read_account_session_quality(
+            weak_accounts[0],
+            account_service_module.MAIN_SCOPE,
+        )
+        assert weak_quality["quality_reason"] == "no_browser_auth_sid_guard_only"
+
+    def test_main_selector_scans_past_large_sid_guard_only_prefix(
+        self,
+        db_session: Session,
+        monkeypatch: pytest.MonkeyPatch,
+    ):
+        """Large imported weak pools should not make main selection stop before a stronger account."""
+        monkeypatch.setattr(account_service_module.settings, "MAX_CONCURRENT_BROWSERS", 1, raising=False)
+        now = datetime.now(timezone.utc)
+        weak_accounts = [
+            Account(
+                label=f"main_sid_guard_large_prefix_{idx}",
+                status="active",
+                cookies=json.dumps({"sid_guard": f"sg-large-{idx}", "msToken": f"ms-large-{idx}"}),
+                proxy=f"http://main-large-weak-proxy-{idx}",
+                created_at=now - timedelta(hours=5),
+                last_validation_ok=now - timedelta(minutes=20),
+            )
+            for idx in range(825)
+        ]
+        strong = Account(
+            label="main_browser_auth_after_large_weak_prefix",
+            status="active",
+            cookies=json.dumps(
+                {
+                    "sessionid": "main-large-strong-session",
+                    "sid_tt": "main-large-strong-sid",
+                    "sid_guard": "main-large-strong-guard",
+                    "s_v_web_id": "main-large-strong-verify",
+                    "ttwid": "main-large-strong-wid",
+                    "msToken": "main-large-strong-ms",
+                    "tt_chain_token": "main-large-strong-chain",
+                }
+            ),
+            proxy="http://main-large-strong-proxy",
+            created_at=now - timedelta(hours=5),
+            last_validation_ok=now - timedelta(minutes=20),
+        )
+        db_session.add_all([*weak_accounts, strong])
+        db_session.commit()
+
+        selected = get_free_account_for_main_comment(db_session)
+
+        assert selected is not None
+        assert selected.id == strong.id
+
+    def test_main_selector_uses_sid_guard_only_as_last_resort_by_default(self, db_session: Session):
+        """Main selection may use sid_guard-only accounts only when no stronger browser-auth accounts exist."""
+        account = Account(
+            label="main_sid_guard_only_last_resort",
+            status="active",
+            cookies=json.dumps({"sid_guard": "last-resort-guard", "msToken": "last-resort-ms"}),
+            proxy="http://main-last-resort-proxy",
+            created_at=datetime.now(timezone.utc) - timedelta(hours=5),
+            last_validation_ok=datetime.now(timezone.utc) - timedelta(minutes=20),
+        )
+        db_session.add(account)
+        db_session.commit()
+
+        selected = get_free_account_for_main_comment(db_session)
+
+        assert selected is not None
+        assert selected.id == account.id
+
+    def test_main_selector_can_disable_sid_guard_only_last_resort(
+        self,
+        db_session: Session,
+        monkeypatch: pytest.MonkeyPatch,
+    ):
+        """The sid_guard-only fallback remains easy to disable if it proves noisy in production."""
+        monkeypatch.setattr(
+            account_service_module.settings,
+            "ALLOW_SID_GUARD_ONLY_PUBLISH_LAST_RESORT",
+            False,
+            raising=False,
+        )
+        account = Account(
+            label="main_sid_guard_only_last_resort_disabled",
+            status="active",
+            cookies=json.dumps({"sid_guard": "last-resort-guard", "msToken": "last-resort-ms"}),
+            proxy="http://main-last-resort-proxy-disabled",
+            created_at=datetime.now(timezone.utc) - timedelta(hours=5),
+            last_validation_ok=datetime.now(timezone.utc) - timedelta(minutes=20),
+        )
+        db_session.add(account)
+        db_session.commit()
+
+        selected = get_free_account_for_main_comment(db_session)
+
+        assert selected is None
+
+    def test_reply_selector_scans_past_sid_guard_only_accounts(
+        self,
+        db_session: Session,
+        monkeypatch: pytest.MonkeyPatch,
+    ):
+        """Reply selection should also prefer real browser-auth accounts beyond a weak first batch."""
+        monkeypatch.setattr(account_service_module.settings, "MAX_CONCURRENT_BROWSERS", 1, raising=False)
+        now = datetime.now(timezone.utc)
+        weak_accounts = [
+            Account(
+                label=f"reply_sid_guard_only_{idx}",
+                status="active",
+                cookies=json.dumps({"sid_guard": f"reply-sg-{idx}", "msToken": f"reply-ms-{idx}"}),
+                proxy=f"http://reply-sid-guard-proxy-{idx}",
+                created_at=now - timedelta(hours=5),
+                last_validation_ok=now - timedelta(minutes=20),
+            )
+            for idx in range(25)
+        ]
+        strong = Account(
+            label="reply_browser_auth_after_weak_batch",
+            status="active",
+            cookies=json.dumps(
+                {
+                    "sessionid": "reply-strong-session",
+                    "sid_tt": "reply-strong-sid",
+                    "sid_guard": "reply-strong-guard",
+                    "s_v_web_id": "reply-strong-verify",
+                    "ttwid": "reply-strong-wid",
+                    "msToken": "reply-strong-ms",
+                    "tt_chain_token": "reply-strong-chain",
+                }
+            ),
+            proxy="http://reply-strong-after-weak-proxy",
+            created_at=now - timedelta(hours=5),
+            last_validation_ok=now - timedelta(minutes=20),
+        )
+        db_session.add_all([*weak_accounts, strong])
+        db_session.commit()
+
+        selected = get_free_account_for_reply(db_session)
+
+        assert selected is not None
+        assert selected.id == strong.id
+
+    def test_reply_selector_uses_sid_guard_only_as_last_resort_by_default(self, db_session: Session):
+        """Reply selection may use sid_guard-only accounts only when no stronger browser-auth accounts exist."""
+        account = Account(
+            label="reply_sid_guard_only_last_resort",
+            status="active",
+            cookies=json.dumps({"sid_guard": "reply-last-resort-guard", "msToken": "reply-last-resort-ms"}),
+            proxy="http://reply-last-resort-proxy",
+            created_at=datetime.now(timezone.utc) - timedelta(hours=5),
+            last_validation_ok=datetime.now(timezone.utc) - timedelta(minutes=20),
+        )
+        db_session.add(account)
+        db_session.commit()
+
+        selected = get_free_account_for_reply(db_session)
+
+        assert selected is not None
+        assert selected.id == account.id
+
+    def test_reply_selector_can_disable_sid_guard_only_last_resort(
+        self,
+        db_session: Session,
+        monkeypatch: pytest.MonkeyPatch,
+    ):
+        """The sid_guard-only fallback remains easy to disable if it proves noisy in production."""
+        monkeypatch.setattr(
+            account_service_module.settings,
+            "ALLOW_SID_GUARD_ONLY_PUBLISH_LAST_RESORT",
+            False,
+            raising=False,
+        )
+        account = Account(
+            label="reply_sid_guard_only_last_resort_disabled",
+            status="active",
+            cookies=json.dumps({"sid_guard": "reply-last-resort-guard", "msToken": "reply-last-resort-ms"}),
+            proxy="http://reply-last-resort-proxy-disabled",
+            created_at=datetime.now(timezone.utc) - timedelta(hours=5),
+            last_validation_ok=datetime.now(timezone.utc) - timedelta(minutes=20),
+        )
+        db_session.add(account)
+        db_session.commit()
+
+        selected = get_free_account_for_reply(db_session)
+
+        assert selected is None
 
     def test_runtime_health_exposes_session_quality_buckets(self, db_session: Session):
         """Runtime health should surface session-quality mix, not just generic active/error buckets."""

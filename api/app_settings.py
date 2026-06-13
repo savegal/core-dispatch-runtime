@@ -13,10 +13,14 @@ from services.app_settings_service import (
     set_boost_likes_enabled,
     get_boost_likes_quantity,
     set_boost_likes_quantity,
+    get_boost_likes_target_mode,
+    set_boost_likes_target_mode,
     get_software_mode,
     set_software_mode,
     get_commenting_mode,
     set_commenting_mode,
+    get_order_execution_strategy,
+    set_order_execution_strategy,
     get_monitor_max_parallel_browsers,
     set_monitor_max_parallel_browsers,
     get_user_schema_enabled,
@@ -27,6 +31,8 @@ from services.app_settings_service import (
     COMMENTING_MODE_OLD,
     COMMENTING_MODE_PARALLEL,
     COMMENTING_MODES,
+    ORDER_EXECUTION_STRATEGY_BALANCED,
+    ORDER_EXECUTION_STRATEGIES,
     MONITOR_MAX_PARALLEL_MIN,
     MONITOR_MAX_PARALLEL_MAX,
 )
@@ -34,6 +40,9 @@ from services.likes_config import (
     BOOST_LIKES_DEFAULT,
     BOOST_LIKES_MAX,
     BOOST_LIKES_MIN,
+    BOOST_LIKES_TARGET_MODES,
+    BOOST_LIKES_TARGET_SINGLE_TOP,
+    coerce_likes_target_mode,
     coerce_likes_quantity,
     provider_available as likes_provider_available,
 )
@@ -59,6 +68,7 @@ class ProxySettingsUpdate(BaseModel):
 class BoostLikesSettingsResponse(BaseModel):
     boost_likes_enabled: bool
     boost_likes_quantity: int
+    boost_likes_target_mode: str
     boost_provider_available: bool
 
 
@@ -69,6 +79,7 @@ class BoostLikesSettingsUpdate(BaseModel):
         ge=BOOST_LIKES_MIN,
         le=BOOST_LIKES_MAX,
     )
+    boost_likes_target_mode: str | None = None
 
 
 class SoftwareModeSettingsResponse(BaseModel):
@@ -87,6 +98,15 @@ class CommentingModeSettingsResponse(BaseModel):
 
 class CommentingModeSettingsUpdate(BaseModel):
     commenting_mode: str
+
+
+class OrderExecutionStrategyResponse(BaseModel):
+    order_execution_strategy: str
+    available_strategies: list[str]
+
+
+class OrderExecutionStrategyUpdate(BaseModel):
+    order_execution_strategy: str
 
 
 class MonitorParallelBrowsersResponse(BaseModel):
@@ -190,6 +210,10 @@ async def get_boost_likes_settings(
             return BoostLikesSettingsResponse(
                 boost_likes_enabled=provider_available and stored_enabled,
                 boost_likes_quantity=get_boost_likes_quantity(sync_db, default=default_quantity),
+                boost_likes_target_mode=get_boost_likes_target_mode(
+                    sync_db,
+                    default=BOOST_LIKES_TARGET_SINGLE_TOP,
+                ),
                 boost_provider_available=provider_available,
             )
     except Exception as e:
@@ -218,10 +242,26 @@ async def update_boost_likes_settings(
             if settings.boost_likes_quantity is not None:
                 set_boost_likes_quantity(sync_db, settings.boost_likes_quantity)
 
+            if settings.boost_likes_target_mode is not None:
+                raw_mode = str(settings.boost_likes_target_mode or "").strip().lower()
+                if raw_mode not in BOOST_LIKES_TARGET_MODES:
+                    raise HTTPException(
+                        status_code=400,
+                        detail=f"Invalid boost_likes_target_mode. Must be one of: {sorted(BOOST_LIKES_TARGET_MODES)}",
+                    )
+                set_boost_likes_target_mode(
+                    sync_db,
+                    coerce_likes_target_mode(raw_mode, BOOST_LIKES_TARGET_SINGLE_TOP),
+                )
+
             stored_enabled = get_boost_likes_enabled(sync_db, default=default_enabled)
             return BoostLikesSettingsResponse(
                 boost_likes_enabled=provider_available and stored_enabled,
                 boost_likes_quantity=get_boost_likes_quantity(sync_db, default=default_quantity),
+                boost_likes_target_mode=get_boost_likes_target_mode(
+                    sync_db,
+                    default=BOOST_LIKES_TARGET_SINGLE_TOP,
+                ),
                 boost_provider_available=provider_available,
             )
     except HTTPException:
@@ -319,6 +359,51 @@ async def update_commenting_mode_settings(
     except Exception as e:
         logger.error(f"Error updating commenting mode settings: {e}", exc_info=True)
         raise HTTPException(status_code=500, detail=f"Error updating commenting mode settings: {str(e)[:200]}")
+
+
+@router.get("/order_execution_strategy", response_model=OrderExecutionStrategyResponse)
+async def get_order_execution_strategy_settings(
+    _: None = Depends(verify_admin_header)
+):
+    """Returns the current order execution strategy."""
+    try:
+        with get_sync_db_context() as sync_db:
+            strategy = get_order_execution_strategy(sync_db, default=ORDER_EXECUTION_STRATEGY_BALANCED)
+            return OrderExecutionStrategyResponse(
+                order_execution_strategy=strategy,
+                available_strategies=sorted(ORDER_EXECUTION_STRATEGIES),
+            )
+    except Exception as e:
+        logger.error(f"Error getting order execution strategy: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=f"Error getting order execution strategy: {str(e)[:200]}")
+
+
+@router.post("/order_execution_strategy", response_model=OrderExecutionStrategyResponse)
+async def update_order_execution_strategy_settings(
+    settings: OrderExecutionStrategyUpdate,
+    _: None = Depends(verify_admin_header)
+):
+    """Updates the current order execution strategy."""
+    try:
+        strategy = (settings.order_execution_strategy or "").strip().lower()
+        if strategy not in ORDER_EXECUTION_STRATEGIES:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Invalid order_execution_strategy. Must be one of: {sorted(ORDER_EXECUTION_STRATEGIES)}",
+            )
+
+        with get_sync_db_context() as sync_db:
+            set_order_execution_strategy(sync_db, strategy)
+            updated_strategy = get_order_execution_strategy(sync_db, default=ORDER_EXECUTION_STRATEGY_BALANCED)
+            return OrderExecutionStrategyResponse(
+                order_execution_strategy=updated_strategy,
+                available_strategies=sorted(ORDER_EXECUTION_STRATEGIES),
+            )
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error updating order execution strategy: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=f"Error updating order execution strategy: {str(e)[:200]}")
 
 
 @router.get("/monitor_parallel_browsers", response_model=MonitorParallelBrowsersResponse)

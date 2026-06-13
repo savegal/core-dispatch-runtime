@@ -29,6 +29,13 @@ def _back_to_card_keyboard(task_id: int) -> InlineKeyboardMarkup:
     )
 
 
+def _as_int(value: object) -> int:
+    try:
+        return int(value or 0)
+    except (TypeError, ValueError):
+        return 0
+
+
 def _publication_line(index: int, item: dict) -> str:
     icon = "🟠" if item.get("unconfirmed") else "✅"
     account = handle(item.get("account_username")) if item.get("account_username") else "аккаунт"
@@ -70,6 +77,22 @@ def build_card_text(card: dict) -> str:
             f"Ответов: {publication_progress(card, replies=True)}",
         ]
     )
+    coverage = card.get("coverage") if isinstance(card.get("coverage"), dict) else {}
+    parent_total = _as_int(coverage.get("parent_targets_total"))
+    if parent_total:
+        parent_submitted = _as_int(coverage.get("parent_targets_submitted"))
+        parent_fallback = _as_int(coverage.get("parent_targets_fallback"))
+        line = f"Цели ответов: `{parent_submitted}/{parent_total}`"
+        if parent_fallback:
+            line += f" · fallback `{parent_fallback}`"
+        lines.append(line)
+    health = card.get("health") if isinstance(card.get("health"), dict) else {}
+    categories = health.get("error_categories") if isinstance(health.get("error_categories"), dict) else {}
+    if categories:
+        top_errors = sorted(categories.items(), key=lambda item: -_as_int(item[1]))[:2]
+        rendered = ", ".join(f"{md(key)} `{_as_int(value)}`" for key, value in top_errors if _as_int(value) > 0)
+        if rendered:
+            lines.append(f"Диагностика: {rendered}")
     publications = card.get("publications") or {}
     mains = publications.get("mains") or []
     replies = publications.get("replies") or []

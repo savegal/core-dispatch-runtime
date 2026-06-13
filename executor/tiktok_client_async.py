@@ -615,25 +615,27 @@ def _get_cookies_for_account(account: Account) -> str:
         return account.cookies
     
     if account.cookie_file:
-        # ИСПРАВЛЕНО: Безопасность - запрещаем .. и абсолютные пути
+        # Accept either a relative cookie filename or an absolute path, but in
+        # both cases the resolved file must stay inside COOKIES_DIR.  This keeps
+        # the old path traversal protection while matching account_service and
+        # services.cookie_validator, which already allow absolute in-dir paths.
         cookie_file_str = account.cookie_file.strip()
-        
-        # Проверяем на путь-траверс (..)
-        if '..' in cookie_file_str or cookie_file_str.startswith('/'):
+        cookie_path = Path(cookie_file_str)
+
+        if not cookie_file_str or (not cookie_path.is_absolute() and ".." in cookie_path.parts):
             raise TikTokClientError(f"Unsafe cookie file path: {cookie_file_str}")
-        
-        # Разрешаем только относительные пути внутри cookies директории
-        cookie_file_path = Path(settings.COOKIES_DIR) / cookie_file_str
-        
-        # Проверяем, что файл действительно внутри cookies директории (защита от symlinks)
+
         try:
-            cookie_file_path = cookie_file_path.resolve()
             cookies_dir = Path(settings.COOKIES_DIR).resolve()
-            if not str(cookie_file_path).startswith(str(cookies_dir)):
+            if cookie_path.is_absolute():
+                cookie_file_path = cookie_path.resolve()
+            else:
+                cookie_file_path = (cookies_dir / cookie_path).resolve()
+            if not cookie_file_path.is_relative_to(cookies_dir):
                 raise TikTokClientError(f"Cookie file path outside cookies directory: {cookie_file_str}")
         except Exception as e:
             raise TikTokClientError(f"Invalid cookie file path: {cookie_file_str}, error: {e}")
-        
+
         if cookie_file_path.exists():
             try:
                 with open(cookie_file_path, 'r', encoding='utf-8') as f:

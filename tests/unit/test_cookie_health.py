@@ -14,6 +14,15 @@ import pytest
 
 
 @pytest.mark.unit
+def test_manual_captcha_wait_disabled_by_default(monkeypatch):
+    from executor import cookie_health
+
+    monkeypatch.delenv("ALLOW_MANUAL_CAPTCHA_SOLVE", raising=False)
+
+    assert cookie_health._manual_captcha_wait_enabled() is False
+
+
+@pytest.mark.unit
 @pytest.mark.asyncio
 async def test_probe_cookie_health_ready(monkeypatch):
     from executor import cookie_health
@@ -232,6 +241,45 @@ async def test_probe_cookie_health_visible_login_ui_is_dead(monkeypatch):
 
     assert result.verdict == cookie_health.CookieVerdict.DEAD
     assert result.reason.startswith("visible_login_ui:")
+
+
+@pytest.mark.unit
+@pytest.mark.asyncio
+async def test_probe_cookie_health_logged_in_marker_overrides_sidebar_login_button(monkeypatch):
+    from executor import cookie_health
+    from executor.session_bootstrap import QuickLoginCheck
+
+    async def fake_login_state(_page):
+        return {
+            "state": "logged_in",
+            "loginCount": 1,
+            "loginModalCount": 0,
+            "commentLoginCtaCount": 0,
+            "stateIsLoginFalse": False,
+            "loggedInCount": 1,
+            "stateIsLoginTrue": True,
+        }
+
+    async def fake_quick(_page):
+        return QuickLoginCheck(
+            state="ready",
+            on_video=True,
+            has_login_button=True,
+            has_logged_in_marker=True,
+            current_url="https://www.tiktok.com/@u/video/1",
+            reason="strong_marker:state:isLogin:true",
+        )
+
+    class _Page:
+        url = "https://www.tiktok.com/@u/video/1"
+
+    monkeypatch.setattr(cookie_health, "get_browser_login_state", fake_login_state)
+    monkeypatch.setattr(cookie_health, "quick_video_login_check", fake_quick)
+
+    result = await cookie_health.probe_cookie_health(_Page())
+
+    assert result.verdict == cookie_health.CookieVerdict.READY
+    assert result.reason == "strong_marker:state:isLogin:true"
 
 
 @pytest.mark.unit

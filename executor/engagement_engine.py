@@ -40,7 +40,6 @@ from executor.http.signature_runtime import wait_for_runtime_signer_ready
 from services.account_service import (
     MAIN_SCOPE,
     REPLY_SCOPE,
-    count_viable_accounts_for_http,
     get_free_account_for_main_comment,
     get_free_account_for_reply,
     get_http_execution_strategy,
@@ -58,6 +57,7 @@ from services.likes_config import (
     BOOST_LIKES_DEFAULT,
     BOOST_LIKES_ENABLED_KEY,
     BOOST_LIKES_QUANTITY_KEY,
+    BOOST_LIKES_TARGET_SINGLE_TOP,
     coerce_bool,
     coerce_likes_quantity,
     provider_available as likes_provider_available,
@@ -66,12 +66,48 @@ from services.metrics import increment_counter, record_timing
 
 logger = logging.getLogger("executor.engagement_engine")
 settings = get_settings()
+_TASK_LOG_COMPAT = log  # Keep module-level log attribute for tests/extensions that monkeypatch it.
 FAST_VERIFY_TIMEOUT_SECONDS = 18
 FAST_VERIFY_INTERVAL_SECONDS = 4
 FAST_VERIFY_MAX_SCROLLS = 4
 FAST_VERIFY_SCROLL_DELAY_MS = 350
 _SHORTLINK_HOST_MARKERS = ("vt.tiktok.com", "vm.tiktok.com")
 ENGAGEMENT_ONLY_REPLY_MAX_ATTEMPTS = 6
+
+
+def _bounded_float_setting(
+    name: str,
+    default: float,
+    *,
+    minimum: float = 0.0,
+    maximum: Optional[float] = None,
+) -> float:
+    try:
+        value = float(getattr(settings, name, default))
+    except Exception:
+        value = float(default)
+    value = max(float(minimum), value)
+    if maximum is not None:
+        value = min(float(maximum), value)
+    return value
+
+
+def _main_publish_max_seconds() -> float:
+    return _bounded_float_setting(
+        "PARALLEL_MAIN_PUBLISH_MAX_SECONDS",
+        40.0,
+        minimum=15.0,
+        maximum=90.0,
+    )
+
+
+def _reply_publish_max_seconds() -> float:
+    return _bounded_float_setting(
+        "PARALLEL_REPLY_PUBLISH_MAX_SECONDS",
+        55.0,
+        minimum=20.0,
+        maximum=120.0,
+    )
 
 
 def _reply_variants_from_task(task: Task) -> List[str]:
@@ -103,6 +139,8 @@ def _reply_variants_from_task(task: Task) -> List[str]:
 HTTP_SKIP_AFTER_FATAL_FAILS = 3
 HTTP_SKIP_AFTER_WARMUP_FAILS = 5
 HTTP_SKIP_AFTER_HTTP_FAILS = 5
+HTTP_SIGNER_COOLDOWN_AFTER_WARMUP_FAILS = 3
+HTTP_SIGNER_COOLDOWN_SECONDS = 180.0
 UI_NO_PROGRESS_COOLDOWN_AFTER = 3
 UI_NO_PROGRESS_UNKNOWN_COOLDOWN_AFTER = 1
 AMBIGUOUS_POST_SUBMIT_ERRORS = {
@@ -128,6 +166,10 @@ def _new_http_health_stats() -> Dict[str, int]:
     }
 
 _HTTP_ACCOUNT_HEALTH: Dict[int, Dict[str, int]] = _defaultdict(_new_http_health_stats)
+_HTTP_RUNTIME_SIGNER_HEALTH: Dict[str, float] = {
+    "warmup_fail": 0.0,
+    "cooldown_until": 0.0,
+}
 
 
 def _is_ambiguous_post_submit_result(result: Any) -> bool:
@@ -613,6 +655,16 @@ def _log_pipeline_event(
 
 
 def _record_http_account_result(account_id: Optional[int], outcome: str) -> None:
+    if outcome == "success":
+        _HTTP_RUNTIME_SIGNER_HEALTH["warmup_fail"] = 0.0
+        _HTTP_RUNTIME_SIGNER_HEALTH["cooldown_until"] = 0.0
+    elif outcome == "warmup_fail":
+        failures = float(_HTTP_RUNTIME_SIGNER_HEALTH.get("warmup_fail") or 0.0) + 1.0
+        _HTTP_RUNTIME_SIGNER_HEALTH["warmup_fail"] = failures
+        if failures >= HTTP_SIGNER_COOLDOWN_AFTER_WARMUP_FAILS:
+            _HTTP_RUNTIME_SIGNER_HEALTH["cooldown_until"] = (
+                time.monotonic() + HTTP_SIGNER_COOLDOWN_SECONDS
+            )
     if account_id is None:
         return
     stats = _HTTP_ACCOUNT_HEALTH[account_id]
@@ -662,16 +714,19 @@ def _record_http_account_failure_result(
 
 def _should_skip_http_for_account(account_id: Optional[int]) -> Optional[str]:
     if account_id is None:
-        return None
+        cooldown_until = float(_HTTP_RUNTIME_SIGNER_HEALTH.get("cooldown_until") or 0.0)
+        return "runtime_signer_cooldown" if cooldown_until > time.monotonic() else None
     stats = _HTTP_ACCOUNT_HEALTH.get(account_id)
-    if not stats:
-        return None
-    if stats["fatal"] >= HTTP_SKIP_AFTER_FATAL_FAILS:
-        return "recent_fatal_http_errors"
-    if stats["warmup_fail"] >= HTTP_SKIP_AFTER_WARMUP_FAILS:
-        return "recent_warmup_failures"
-    if stats["http_fail"] >= HTTP_SKIP_AFTER_HTTP_FAILS and stats["success"] == 0:
-        return "repeated_http_failures_without_success"
+    if stats:
+        if stats["fatal"] >= HTTP_SKIP_AFTER_FATAL_FAILS:
+            return "recent_fatal_http_errors"
+        if stats["warmup_fail"] >= HTTP_SKIP_AFTER_WARMUP_FAILS:
+            return "recent_warmup_failures"
+        if stats["http_fail"] >= HTTP_SKIP_AFTER_HTTP_FAILS and stats["success"] == 0:
+            return "repeated_http_failures_without_success"
+    cooldown_until = float(_HTTP_RUNTIME_SIGNER_HEALTH.get("cooldown_until") or 0.0)
+    if cooldown_until > time.monotonic():
+        return "runtime_signer_cooldown"
     return None
 
 
@@ -1047,12 +1102,14 @@ class EngagementResult:
         self.comment_author: Optional[str] = None
         # API лайков: вкл/выкл и количество настраиваются в app settings.
         self.boost_order_id: Optional[int] = None
+        self.boost_orders: List[Dict[str, Any]] = []
         self.boost_error: Optional[str] = None
         self.boost_enabled: bool = True
         self.boost_quantity: int = _coerce_likes_quantity(
             settings.BOOST_PROJECT_LIKES_QUANTITY,
             BOOST_LIKES_DEFAULT,
         )
+        self.boost_target_mode: str = BOOST_LIKES_TARGET_SINGLE_TOP
         self.warnings: List[Dict[str, str]] = []
     
     def to_dict(
@@ -1194,13 +1251,16 @@ class EngagementResult:
                 "replies": {
                     "ok": successful_replies,
                     "total": len(self.replies),
+                    "submitted": successful_replies + submitted_unconfirmed_replies,
                     "submitted_unconfirmed": submitted_unconfirmed_replies,
                     "items": self.replies
                 },
                 "likes": {
                     "provider": "boost_project",
                     "order_id": self.boost_order_id,
+                    "orders": list(self.boost_orders),
                     "quantity": self.boost_quantity,
+                    "target_mode": self.boost_target_mode,
                     "error": self.boost_error,
                     "enabled": self.boost_enabled,
                     "provider_available": provider_enabled,
@@ -1214,6 +1274,12 @@ class EngagementResult:
                 "duration_ms": duration_ms
             }
         }
+        try:
+            from services.task_execution_ledger import attach_url_execution_ledger
+
+            attach_url_execution_ledger(result)
+        except Exception:
+            logger.debug("Failed to attach engagement execution ledger", exc_info=True)
         return result
 
 
@@ -1257,6 +1323,7 @@ async def find_comment_for_engagement(
             verify_account = get_free_account_for_reply(
                 db,
                 exclude_ids=tried_account_ids,
+                exclude_degraded_categories={"captcha", "page_blocked"},
                 pool_owner_user_id=pool_owner_user_id,
             )
             if not verify_account:
@@ -1405,6 +1472,7 @@ async def verify_comment_dom(
         verify_account = get_free_account_for_reply(
             db,
             exclude_ids=tried_account_ids,
+            exclude_degraded_categories={"captcha", "page_blocked"},
             pool_owner_user_id=pool_owner_user_id,
         )
         if not verify_account:
@@ -1742,9 +1810,24 @@ async def _attempt_publish_on_account(
                             return comment_id, None, "http"
 
                     reason = error_msg or ("http_reply_failed" if is_reply else "http_failed")
-                    _record_http_account_failure_result(account.id, error_type)
-                    _register_runtime_failure(db, account, reason, error_type=error_type)
-                    return None, reason, "http"
+                    request_meta = getattr(http_client, "last_request_meta", None)
+                    request_attempted = True
+                    if isinstance(request_meta, dict) and "request_attempted" in request_meta:
+                        request_attempted = bool(request_meta.get("request_attempted"))
+
+                    if not request_attempted:
+                        logger.info(
+                            "Task %s: %s HTTP stopped before TikTok request on account %s "
+                            "(%s); trying DOM fallback on the same account",
+                            task_id,
+                            publish_kind_label,
+                            account.id,
+                            str(reason)[:120],
+                        )
+                    else:
+                        _record_http_account_failure_result(account.id, error_type)
+                        _register_runtime_failure(db, account, reason, error_type=error_type)
+                        return None, reason, "http"
 
         # Cookie enrichment runs only for main publishes. We deliberately skip
         # it for replies so we do not slow down the answer (the main pass on a
@@ -1956,14 +2039,15 @@ async def _attempt_publish_on_account(
                 text,
                 parent_comment_text=parent_comment_text,
                 parent_comment_id=parent_comment_id,
-                max_total_seconds=25.0,
+                max_total_seconds=_reply_publish_max_seconds(),
                 correlation_id=correlation_id,
+                expected_video_url=video_url,
             )
         else:
             result = await publish_comment_hybrid(
                 page,
                 text,
-                max_total_seconds=25.0,
+                max_total_seconds=_main_publish_max_seconds(),
                 correlation_id=correlation_id,
             )
 
@@ -2405,6 +2489,7 @@ async def execute_replies_http(
             reply_account = get_free_account_for_reply(
                 db,
                 exclude_ids=used_account_ids if used_account_ids else None,
+                exclude_degraded_categories={"captcha", "page_blocked"},
                 pool_owner_user_id=pool_owner_user_id,
             )
             if not reply_account:
@@ -2686,13 +2771,34 @@ async def execute_engagement_only_replies_via_full_flow(
 
     results: List[Dict[str, Any]] = []
     used_reply_accounts: List[int] = []
+    used_reply_proxy_values: set[str] = set()
+    used_reply_proxy_counts: Dict[str, int] = {}
     resolved_parent_id = anchor_id
     resolved_author = (comment_author or "").strip() or None
     max_attempts = max(1, min(int(settings.MAX_RETRY_ACCOUNTS), ENGAGEMENT_ONLY_REPLY_MAX_ATTEMPTS))
+    dynamic_worker_pool_enabled = bool(getattr(settings, "PARALLEL_DYNAMIC_WORKER_POOL_ENABLED", True))
+    def _positive_int_setting(name: str, default: int) -> int:
+        try:
+            return max(1, int(getattr(settings, name, default) or default))
+        except Exception:
+            return max(1, int(default))
+
+    requested_parallel_worker_target = _positive_int_setting("PARALLEL_COMMENTING_TARGET_BROWSERS", 3)
+    parallel_browser_capacity = _positive_int_setting(
+        "PARALLEL_COMMENTING_MAX_BROWSERS",
+        max(3, requested_parallel_worker_target),
+    )
+    parallel_worker_target = min(requested_parallel_worker_target, parallel_browser_capacity)
+    parallel_capacity_request = (
+        parallel_browser_capacity
+        if dynamic_worker_pool_enabled
+        else 3
+    )
     reply_selection_lock = asyncio.Lock()
     submitted_parent_keys_by_variant: Dict[int, set[str]] = {}
     last_outcomes_by_variant: Dict[int, List[Any]] = {}
     last_reply_account_by_variant: Dict[int, Optional[int]] = {}
+    active_reply_proxy_counts: Dict[str, int] = {}
 
     def _current_main_candidate() -> PublishedMain:
         return PublishedMain(
@@ -2705,22 +2811,98 @@ async def execute_engagement_only_replies_via_full_flow(
             tiktok_username=(resolved_author or None),
         )
 
+    def _account_proxy_value(account: Optional[Account]) -> Optional[str]:
+        proxy = str(getattr(account, "proxy", "") or "").strip()
+        return proxy or None
+
+    def _inc_proxy_count(counts: Dict[str, int], proxy: Optional[str]) -> None:
+        if proxy:
+            counts[proxy] = counts.get(proxy, 0) + 1
+
+    def _dec_proxy_count(counts: Dict[str, int], proxy: Optional[str]) -> None:
+        if not proxy:
+            return
+        current = counts.get(proxy, 0)
+        if current <= 1:
+            counts.pop(proxy, None)
+        else:
+            counts[proxy] = current - 1
+
+    def _overloaded_active_proxies(counts: Dict[str, int]) -> set[str]:
+        if not counts:
+            return set()
+        min_uses = min(counts.values())
+        return {proxy for proxy, count in counts.items() if count > min_uses}
+
     async def _select_reply_account(attempt_db: Session) -> Optional[Account]:
         async with reply_selection_lock:
+            strict_degraded_categories = {"captcha", "page_blocked"}
+            exclude_proxies = (
+                set(active_reply_proxy_counts) | set(used_reply_proxy_values)
+                if dynamic_worker_pool_enabled
+                else set(used_reply_proxy_values)
+            )
             candidate = get_free_account_for_reply(
                 attempt_db,
                 exclude_ids=list(used_reply_accounts),
+                exclude_proxies=exclude_proxies,
+                exclude_degraded_categories=strict_degraded_categories,
                 pool_owner_user_id=pool_owner_user_id,
             )
+            if candidate is None and exclude_proxies:
+                balanced_exclude_proxies = (
+                    _overloaded_active_proxies(active_reply_proxy_counts)
+                    if dynamic_worker_pool_enabled
+                    else set()
+                )
+                if not balanced_exclude_proxies and used_reply_proxy_counts:
+                    min_uses = min(used_reply_proxy_counts.values())
+                    balanced_exclude_proxies = {
+                        proxy
+                        for proxy, count in used_reply_proxy_counts.items()
+                        if count > min_uses
+                    }
+                if balanced_exclude_proxies:
+                    logger.info(
+                        "Task %s: engagement_only no completely unused reply proxy; "
+                        "trying least-used proxy selection",
+                        task_id,
+                    )
+                    candidate = get_free_account_for_reply(
+                        attempt_db,
+                        exclude_ids=list(used_reply_accounts),
+                        exclude_proxies=balanced_exclude_proxies,
+                        exclude_proxy_source_hosts=False,
+                        exclude_degraded_categories=strict_degraded_categories,
+                        pool_owner_user_id=pool_owner_user_id,
+                    )
+                if candidate is None:
+                    logger.info(
+                        "Task %s: engagement_only no reply account on less-used proxy; "
+                        "falling back to account-only selection",
+                        task_id,
+                    )
+                    candidate = get_free_account_for_reply(
+                        attempt_db,
+                        exclude_ids=list(used_reply_accounts),
+                        exclude_degraded_categories=strict_degraded_categories,
+                        pool_owner_user_id=pool_owner_user_id,
+                    )
             if candidate:
                 used_reply_accounts.append(candidate.id)
+                proxy_value = _account_proxy_value(candidate)
+                if proxy_value:
+                    used_reply_proxy_values.add(proxy_value)
+                    used_reply_proxy_counts[proxy_value] = used_reply_proxy_counts.get(proxy_value, 0) + 1
+                    if dynamic_worker_pool_enabled:
+                        _inc_proxy_count(active_reply_proxy_counts, proxy_value)
             return candidate
 
     def _ensure_parallel_browser_capacity() -> bool:
         try:
             from executor.browser_pool import ensure_thread_browser_pool_capacity
 
-            ensure_thread_browser_pool_capacity(3)
+            ensure_thread_browser_pool_capacity(parallel_capacity_request)
             return True
         except Exception as exc:
             logger.warning(
@@ -2837,6 +3019,7 @@ async def execute_engagement_only_replies_via_full_flow(
             "resolved_parent_id": None,
             "resolved_author": None,
             "matched_text": None,
+            "proxy_value": None,
         }
 
         if _is_stop_requested():
@@ -2869,6 +3052,7 @@ async def execute_engagement_only_replies_via_full_flow(
                 return attempt_info
 
             attempt_info["account_id"] = reply_account.id
+            attempt_info["proxy_value"] = _account_proxy_value(reply_account)
             last_reply_account_by_variant[variant_idx] = reply_account.id
             correlation_id = (
                 f"task_{task_id}_engagement_reply_v{variant_idx}"
@@ -2909,6 +3093,10 @@ async def execute_engagement_only_replies_via_full_flow(
                 )
                 attempt_info["error"] = f"reply_attempt_exception:{str(exc)[:80]}"
                 return attempt_info
+            finally:
+                if dynamic_worker_pool_enabled:
+                    async with reply_selection_lock:
+                        _dec_proxy_count(active_reply_proxy_counts, attempt_info.get("proxy_value"))
 
         outcomes = list(attempt_result.replies or [])
         attempt_info["outcomes"] = outcomes
@@ -2958,6 +3146,268 @@ async def execute_engagement_only_replies_via_full_flow(
         if str(reply_text or "").strip()
     ]
     reply_rounds: Dict[int, int] = {}
+    consecutive_surface_unavailable_batches = 0
+    max_surface_unavailable_batches = 2
+
+    if dynamic_worker_pool_enabled and pending_reply_variants:
+        if not _ensure_parallel_browser_capacity():
+            for variant_idx, reply_text in pending_reply_variants:
+                results.append(
+                    _failure_reply_row(
+                        reply_text,
+                        variant_idx,
+                        attempts=reply_rounds.get(variant_idx, 0),
+                        account_id=last_reply_account_by_variant.get(variant_idx),
+                        error="parallel_browser_capacity_unavailable",
+                    )
+                )
+            pending_reply_variants = []
+        else:
+            active_reply_tasks: Dict[asyncio.Task, Tuple[int, str]] = {}
+            inflight_reply_variants: set[int] = set()
+            stop_after_dynamic = False
+            consecutive_surface_unavailable_attempts = 0
+            max_surface_unavailable_attempts = (
+                max_surface_unavailable_batches * max(1, parallel_worker_target)
+            )
+            recent_surface_failures: List[Tuple[int, str, Dict[str, Any]]] = []
+
+            async def _cancel_active_dynamic_reply_tasks() -> None:
+                if not active_reply_tasks:
+                    return
+                for pending_task in list(active_reply_tasks):
+                    pending_task.cancel()
+                await asyncio.gather(*active_reply_tasks.keys(), return_exceptions=True)
+                active_reply_tasks.clear()
+                inflight_reply_variants.clear()
+
+            def _append_unresolved_dynamic_reply_rows(error: str) -> None:
+                reported_variants = {
+                    int(row.get("variant_index") or 0)
+                    for row in results
+                    if isinstance(row, dict)
+                }
+                unresolved_items = [*active_reply_tasks.values(), *pending_reply_variants]
+                for variant_idx, reply_text in unresolved_items:
+                    if variant_idx in reported_variants:
+                        continue
+                    results.append(
+                        _failure_reply_row(
+                            reply_text,
+                            variant_idx,
+                            attempts=reply_rounds.get(variant_idx, 0),
+                            account_id=last_reply_account_by_variant.get(variant_idx),
+                            error=error,
+                        )
+                    )
+                    reported_variants.add(variant_idx)
+
+            try:
+                while (
+                    ((pending_reply_variants and not stop_after_dynamic) or active_reply_tasks)
+                    and not _is_stop_requested()
+                ):
+                    while (
+                        pending_reply_variants
+                        and not stop_after_dynamic
+                        and len(active_reply_tasks) < parallel_worker_target
+                        and not _is_stop_requested()
+                    ):
+                        variant_idx, reply_text = pending_reply_variants.pop(0)
+                        if variant_idx in inflight_reply_variants:
+                            pending_reply_variants.append((variant_idx, reply_text))
+                            break
+                        reply_rounds[variant_idx] = reply_rounds.get(variant_idx, 0) + 1
+                        task_obj = asyncio.create_task(
+                            _run_reply_variant_attempt(
+                                variant_idx,
+                                reply_text,
+                                reply_rounds[variant_idx],
+                            )
+                        )
+                        active_reply_tasks[task_obj] = (variant_idx, reply_text)
+                        inflight_reply_variants.add(variant_idx)
+                        logger.debug(
+                            "Task %s: engagement_only dynamic reply worker started variant=%s attempt=%s active=%s pending=%s",
+                            task_id,
+                            variant_idx,
+                            reply_rounds[variant_idx],
+                            len(active_reply_tasks),
+                            len(pending_reply_variants),
+                        )
+
+                    if not active_reply_tasks:
+                        break
+
+                    done, _pending = await asyncio.wait(
+                        list(active_reply_tasks.keys()),
+                        timeout=0.5,
+                        return_when=asyncio.FIRST_COMPLETED,
+                    )
+                    if not done:
+                        continue
+
+                    completed_reply_results: List[Tuple[int, str, Dict[str, Any]]] = []
+                    for task_obj in done:
+                        task_meta = active_reply_tasks.pop(task_obj, None)
+                        if task_meta is None:
+                            continue
+                        variant_idx, reply_text = task_meta
+                        inflight_reply_variants.discard(variant_idx)
+                        try:
+                            raw_result = task_obj.result()
+                        except BaseException as exc:
+                            if isinstance(exc, (asyncio.CancelledError, KeyboardInterrupt, SystemExit)):
+                                if _is_stop_requested():
+                                    continue
+                                raise
+                            logger.warning(
+                                "Task %s: engagement_only dynamic reply variant %s task raised: %s",
+                                task_id,
+                                variant_idx,
+                                str(exc)[:120],
+                            )
+                            raw_result = {
+                                "variant_index": variant_idx,
+                                "text": reply_text,
+                                "completed": False,
+                                "stopped": False,
+                                "error": f"parallel_reply_exception:{str(exc)[:80]}",
+                                "account_id": last_reply_account_by_variant.get(variant_idx),
+                                "outcomes": [],
+                                "replies": [],
+                                "resolved_parent_id": None,
+                                "resolved_author": None,
+                                "matched_text": None,
+                            }
+                        completed_reply_results.append((variant_idx, reply_text, raw_result))
+
+                    completed_reply_results.sort(
+                        key=lambda row: 0 if row[2].get("completed") else 1
+                    )
+                    for variant_idx, reply_text, raw_result in completed_reply_results:
+                        surface_unavailable = (
+                            raw_result.get("error") == "comment_list_not_open"
+                            and not raw_result.get("completed")
+                            and not raw_result.get("stopped")
+                        )
+                        if surface_unavailable:
+                            consecutive_surface_unavailable_attempts += 1
+                            recent_surface_failures.append((variant_idx, reply_text, raw_result))
+                        else:
+                            consecutive_surface_unavailable_attempts = 0
+                            recent_surface_failures = []
+
+                        if raw_result.get("resolved_parent_id"):
+                            resolved_parent_id = str(raw_result["resolved_parent_id"])
+                        if raw_result.get("resolved_author"):
+                            resolved_author = str(raw_result["resolved_author"])
+                        if raw_result.get("matched_text"):
+                            anchor_text = str(raw_result["matched_text"])
+
+                        if raw_result.get("completed"):
+                            results.extend(raw_result.get("replies") or [])
+                            continue
+
+                        if raw_result.get("stopped"):
+                            results.append(
+                                _stopped_reply_row(
+                                    reply_text,
+                                    variant_idx,
+                                    attempts=max(1, reply_rounds.get(variant_idx, 0)),
+                                    account_id=raw_result.get("account_id")
+                                    or last_reply_account_by_variant.get(variant_idx),
+                                )
+                            )
+                            stop_after_dynamic = True
+                            pending_reply_variants = []
+                            await _cancel_active_dynamic_reply_tasks()
+                            continue
+
+                        if consecutive_surface_unavailable_attempts >= max_surface_unavailable_attempts:
+                            logger.warning(
+                                "Task %s: stopping engagement_only reply phase after %s consecutive "
+                                "dynamic attempts where no account could open the comment list",
+                                task_id,
+                                consecutive_surface_unavailable_attempts,
+                            )
+                            for failed_variant_idx, failed_reply_text, failed_result in recent_surface_failures:
+                                last_outcomes = last_outcomes_by_variant.get(failed_variant_idx) or []
+                                if last_outcomes:
+                                    results.extend(
+                                        _engagement_reply_outcome_to_dict(
+                                            outcome,
+                                            attempts=reply_rounds.get(failed_variant_idx, max_attempts),
+                                        )
+                                        for outcome in last_outcomes
+                                    )
+                                else:
+                                    results.append(
+                                        _failure_reply_row(
+                                            failed_reply_text,
+                                            failed_variant_idx,
+                                            attempts=reply_rounds.get(failed_variant_idx, max_attempts),
+                                            account_id=failed_result.get("account_id")
+                                            or last_reply_account_by_variant.get(failed_variant_idx),
+                                            error="comment_list_not_open",
+                                        )
+                                    )
+                            _append_unresolved_dynamic_reply_rows("comment_list_not_open")
+                            pending_reply_variants = []
+                            stop_after_dynamic = True
+                            await _cancel_active_dynamic_reply_tasks()
+                            continue
+
+                        can_retry = (
+                            raw_result.get("error") not in {"no_free_reply_accounts", "stopped_by_user"}
+                            and reply_rounds.get(variant_idx, 0) < max_attempts
+                        )
+                        if can_retry:
+                            pending_reply_variants.append((variant_idx, reply_text))
+                            continue
+
+                        last_outcomes = last_outcomes_by_variant.get(variant_idx) or []
+                        if last_outcomes:
+                            results.extend(
+                                _engagement_reply_outcome_to_dict(
+                                    outcome,
+                                    attempts=reply_rounds.get(variant_idx, max_attempts),
+                                )
+                                for outcome in last_outcomes
+                            )
+                        else:
+                            results.append(
+                                _failure_reply_row(
+                                    reply_text,
+                                    variant_idx,
+                                    attempts=reply_rounds.get(variant_idx, max_attempts),
+                                    account_id=raw_result.get("account_id")
+                                    or last_reply_account_by_variant.get(variant_idx),
+                                    error=raw_result.get("error")
+                                    or "engagement_reply_parent_not_found_or_comment_list_not_open",
+                                )
+                            )
+            finally:
+                stopped_now = _is_stop_requested()
+                active_when_stopped = list(active_reply_tasks.values())
+                if active_reply_tasks:
+                    for task_obj in active_reply_tasks:
+                        task_obj.cancel()
+                    await asyncio.gather(*active_reply_tasks.keys(), return_exceptions=True)
+                if stopped_now:
+                    for variant_idx, reply_text in [*active_when_stopped, *pending_reply_variants]:
+                        results.append(
+                            _stopped_reply_row(
+                                reply_text,
+                                variant_idx,
+                                attempts=reply_rounds.get(variant_idx, 0),
+                                account_id=last_reply_account_by_variant.get(variant_idx),
+                            )
+                        )
+                await _close_parallel_phase_browsers("reply_dynamic_phase")
+            pending_reply_variants = []
+            if _is_stop_requested():
+                return results, resolved_parent_id, resolved_author
 
     while pending_reply_variants:
         if _is_stop_requested():
@@ -3012,6 +3462,7 @@ async def execute_engagement_only_replies_via_full_flow(
 
         retry_variants: List[Tuple[int, str]] = []
         stop_after_batch = False
+        batch_surface_unavailable_flags: List[bool] = []
         for (variant_idx, reply_text), raw_result in zip(batch, raw_batch_results):
             if isinstance(raw_result, BaseException):
                 if isinstance(raw_result, (asyncio.CancelledError, KeyboardInterrupt, SystemExit)):
@@ -3035,6 +3486,12 @@ async def execute_engagement_only_replies_via_full_flow(
                     "resolved_author": None,
                     "matched_text": None,
                 }
+
+            batch_surface_unavailable_flags.append(
+                raw_result.get("error") == "comment_list_not_open"
+                and not raw_result.get("completed")
+                and not raw_result.get("stopped")
+            )
 
             if raw_result.get("resolved_parent_id"):
                 resolved_parent_id = str(raw_result["resolved_parent_id"])
@@ -3089,6 +3546,42 @@ async def execute_engagement_only_replies_via_full_flow(
                         or "engagement_reply_parent_not_found_or_comment_list_not_open",
                     )
                 )
+
+        if batch_surface_unavailable_flags and all(batch_surface_unavailable_flags):
+            consecutive_surface_unavailable_batches += 1
+        else:
+            consecutive_surface_unavailable_batches = 0
+
+        if consecutive_surface_unavailable_batches >= max_surface_unavailable_batches:
+            logger.warning(
+                "Task %s: stopping engagement_only reply phase after %s consecutive "
+                "parallel batches where no account could open the comment list",
+                task_id,
+                consecutive_surface_unavailable_batches,
+            )
+            for variant_idx, reply_text in retry_variants:
+                last_outcomes = last_outcomes_by_variant.get(variant_idx) or []
+                if last_outcomes:
+                    results.extend(
+                        _engagement_reply_outcome_to_dict(
+                            outcome,
+                            attempts=reply_rounds.get(variant_idx, max_attempts),
+                        )
+                        for outcome in last_outcomes
+                    )
+                else:
+                    results.append(
+                        _failure_reply_row(
+                            reply_text,
+                            variant_idx,
+                            attempts=reply_rounds.get(variant_idx, max_attempts),
+                            account_id=last_reply_account_by_variant.get(variant_idx),
+                            error="comment_list_not_open",
+                        )
+                    )
+            retry_variants = []
+            pending_reply_variants = []
+            break
 
         if stop_after_batch:
             break
@@ -3179,6 +3672,35 @@ async def _order_boost_likes(
         return order_id, None
     logger.warning(f"Task {task_id}: Likes order failed: {err}")
     return None, err or "Unknown error"
+
+
+def _record_single_boost_order(
+    result: EngagementResult,
+    *,
+    username: Optional[str],
+    order_id: Optional[Any],
+    error: Optional[str],
+    quantity: int,
+    parent_text: Optional[str] = None,
+    parent_key: Optional[str] = None,
+    selection_reason: str = "single_comment",
+) -> None:
+    clean_username = str(username or "").strip().lstrip("@")
+    if not clean_username:
+        return
+    result.boost_orders = [
+        {
+            "order_id": order_id,
+            "username": clean_username,
+            "quantity": quantity,
+            "ok": order_id is not None,
+            "error": error,
+            "reply_count": sum(1 for reply in result.replies if reply.get("success") or reply.get("submitted_unconfirmed")),
+            "parent_key": str(parent_key or "").strip() or None,
+            "parent_text": str(parent_text or "").strip() or None,
+            "selection_reason": selection_reason,
+        }
+    ]
 
 
 def _engagement_only_replies_confirm_parent(replies: List[Dict[str, Any]]) -> bool:
@@ -3283,7 +3805,6 @@ async def execute_hybrid_full(
 
         if comment_id:
             if not replies_to_post:
-                main_account = candidate
                 main_comment_id = comment_id
                 result.main_comment["comment_id"] = main_comment_id
                 result.main_comment["verify_mode"] = "skipped_no_replies"
@@ -3321,7 +3842,6 @@ async def execute_hybrid_full(
             )
             final_verify_mode = verify_mode or "unknown"
 
-            main_account = candidate
             main_comment_id = verified_id or comment_id
             result.main_comment["comment_id"] = main_comment_id
             result.main_comment["verify_mode"] = final_verify_mode
@@ -3583,6 +4103,16 @@ async def execute_hybrid_full(
             likes_enabled=boost_enabled,
             likes_quantity=boost_quantity,
         )
+        _record_single_boost_order(
+            result,
+            username=result.comment_author,
+            order_id=result.boost_order_id,
+            error=result.boost_error,
+            quantity=boost_quantity,
+            parent_text=result.main_comment.get("text_choice"),
+            parent_key=result.main_comment.get("comment_id"),
+            selection_reason="single_comment",
+        )
 
     _release_reserved_main_accounts()
     return result
@@ -3636,6 +4166,7 @@ async def execute_engagement_only(
 
     # ========== REPLIES (HTTP) ==========
     replies_to_post = _reply_variants_from_task(task)
+    likes_ordered_upfront = False
 
     initial_comment_id = str(comment_id or "").strip()
     initial_author = (username or "").strip() or None
@@ -3688,8 +4219,31 @@ async def execute_engagement_only(
             result.boost_enabled = False
             return result
 
+        if boost_enabled and initial_author:
+            # Likes-first: автор целевого комментария известен заранее, поэтому
+            # заказываем лайки ДО фазы ответов — комментарий поднимается выше в
+            # списке и reply-аккаунты находят его быстрее.
+            result.boost_order_id, result.boost_error = await _order_boost_likes(
+                video_url=video_url,
+                comment_author_username=initial_author,
+                task_id=task_id,
+                likes_enabled=boost_enabled,
+                likes_quantity=boost_quantity,
+            )
+            _record_single_boost_order(
+                result,
+                username=initial_author,
+                order_id=result.boost_order_id,
+                error=result.boost_error,
+                quantity=boost_quantity,
+                parent_text=comment_text,
+                parent_key=initial_comment_id or None,
+                selection_reason="engagement_parent",
+            )
+            likes_ordered_upfront = True
+
         logger.info(
-            "Task %s: Executing %s engagement_only replies via full-order DOM flow",
+            "Task %s: Executing %s engagement_only replies via full-order hybrid flow",
             task_id,
             len(replies_to_post),
         )
@@ -3712,7 +4266,10 @@ async def execute_engagement_only(
         logger.info(f"Task {task_id}: No replies to post")
     
     # ========== LIKES через API лайков ==========
-    if boost_enabled and not replies_to_post:
+    if likes_ordered_upfront:
+        # Лайки уже заказаны до фазы ответов (автор был известен заранее).
+        pass
+    elif boost_enabled and not replies_to_post:
         result.boost_enabled = False
         result.boost_error = None
         logger.info(
@@ -3743,6 +4300,16 @@ async def execute_engagement_only(
             task_id=task_id,
             likes_enabled=boost_enabled,
             likes_quantity=boost_quantity,
+        )
+        _record_single_boost_order(
+            result,
+            username=result.comment_author,
+            order_id=result.boost_order_id,
+            error=result.boost_error,
+            quantity=boost_quantity,
+            parent_text=comment_text,
+            parent_key=result.comment_id,
+            selection_reason="engagement_parent",
         )
 
     return result

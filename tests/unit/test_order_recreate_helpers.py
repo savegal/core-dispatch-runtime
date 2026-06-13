@@ -161,6 +161,47 @@ def test_order_overview_recomputes_stale_failed_execution_summary():
 
 
 @pytest.mark.unit
+def test_order_overview_counts_unconfirmed_reply_submissions_as_sent():
+    task = {
+        "id": 795,
+        "status": "done",
+        "progress": 1,
+        "video_urls": ["https://vt.tiktok.com/demo/"],
+        "reply1": "reply",
+        "settings": {
+            "origin": "engagement_only",
+            "engagement_comment_text": "target comment",
+            "url_results": {
+                "https://vt.tiktok.com/demo/": {
+                    "status": "submitted_unconfirmed",
+                    "warnings": [{"code": "reply_submitted_unconfirmed"}],
+                    "engagement": {
+                        "main": {"posted": True, "verified": True},
+                        "replies": {
+                            "ok": 1,
+                            "total": 3,
+                            "submitted_unconfirmed": 2,
+                            "items": [
+                                {"success": True, "visibility_status": "confirmed_local"},
+                                {"submitted_unconfirmed": True, "visibility_status": "submitted_unconfirmed"},
+                                {"submitted_unconfirmed": True, "visibility_status": "submitted_unconfirmed"},
+                            ],
+                        },
+                        "likes": {},
+                    },
+                }
+            },
+        },
+    }
+
+    overview = _render_order_detail(task, "overview")
+
+    assert "Ответы: отправлено 3, вариантов заказано 3" in overview
+    assert "подтверждено 1" in overview
+    assert "без публичной проверки 2" in overview
+
+
+@pytest.mark.unit
 def test_text_variants_for_recreated_order_does_not_clone_missing_variants():
     task = {"main_comment": "main", "settings": {"text_variants": ["one"]}}
 
@@ -222,7 +263,7 @@ def test_orders_list_uses_compact_filter_header_and_grid_buttons():
     }
     task_failed = {
         "id": 2,
-        "status": "error",
+        "status": "pending",
         "progress": 0,
         "video_urls": ["bad"],
         "main_comment": "failed text",
@@ -247,7 +288,40 @@ def test_orders_list_uses_compact_filter_header_and_grid_buttons():
         for button in row
     )
     assert any(
+        button.callback_data == "orders:cancel_pending:ask:all:0"
+        for row in keyboard.inline_keyboard
+        for button in row
+    )
+    assert any(
         button.callback_data == "orders:page:running:0" and "В работе" in button.text
+        for row in keyboard.inline_keyboard
+        for button in row
+    )
+
+
+@pytest.mark.unit
+def test_orders_keyboard_can_show_cancel_queue_from_pending_probe():
+    done_task = {
+        "id": 1,
+        "status": "done",
+        "progress": 1,
+        "video_urls": ["https://www.tiktok.com/@demo/video/1"],
+        "main_comment": "Done text",
+        "settings": {},
+    }
+
+    keyboard = _build_orders_keyboard(
+        [done_task],
+        page=0,
+        total_pages=1,
+        filter_name="all",
+        all_tasks=[done_task],
+        has_pending_tasks=True,
+    )
+
+    assert any(
+        button.text == "🧹 Отменить очередь"
+        and button.callback_data == "orders:cancel_pending:ask:all:0"
         for row in keyboard.inline_keyboard
         for button in row
     )
@@ -311,6 +385,38 @@ def test_order_detail_tabs_show_full_links_texts_and_actions():
 
 
 @pytest.mark.unit
+def test_pending_order_detail_exposes_priority_button_once():
+    task = {
+        "id": 42,
+        "status": "pending",
+        "progress": 0,
+        "video_urls": ["https://www.tiktok.com/@demo/video/1"],
+        "main_comment": "Main comment",
+        "settings": {"origin": "monitor_auto_comment"},
+    }
+
+    keyboard = _build_order_detail_keyboard(task, "overview", page=0, filter_name="all")
+    callbacks = [
+        button.callback_data
+        for row in keyboard.inline_keyboard
+        for button in row
+    ]
+
+    assert "order:priority:42:overview:0:all:0" in callbacks
+
+    task["settings"]["queue_priority"] = "high"
+    high_keyboard = _build_order_detail_keyboard(task, "overview", page=0, filter_name="all")
+    high_callbacks = [
+        button.callback_data
+        for row in high_keyboard.inline_keyboard
+        for button in row
+    ]
+
+    assert "order:priority:42:overview:0:all:0" not in high_callbacks
+    assert "Приоритет: высокий" in _render_order_detail(task, "overview")
+
+
+@pytest.mark.unit
 def test_engagement_only_order_display_does_not_show_fake_main_comments():
     task = {
         "id": 11,
@@ -344,6 +450,470 @@ def test_engagement_only_order_display_does_not_show_fake_main_comments():
     assert "<code>anchor text</code>" in texts
     assert "<code>Reply A</code>" in texts
     assert "<code>Reply B</code>" in texts
+
+
+@pytest.mark.unit
+def test_order_overview_shows_publication_and_boost_like_targets():
+    task = {
+        "id": 12,
+        "kind": "full",
+        "status": "done",
+        "progress": 1,
+        "video_urls": ["https://www.tiktok.com/@demo/video/1"],
+        "main_comment": "main",
+        "settings": {
+            "text_variants": ["main"],
+            "replies": ["reply"],
+            "reply_count": 1,
+            "url_results": {
+                "https://www.tiktok.com/@demo/video/1": {
+                    "status": "submitted_unconfirmed",
+                    "engagement": {
+                        "main": {
+                            "posted": True,
+                            "expected": 3,
+                            "variants_published": [
+                                {"network_confirmed": True},
+                                {"local_confirmed": False},
+                            ],
+                        },
+                        "replies": {
+                            "ok": 1,
+                            "submitted": 2,
+                            "requested_variants": 3,
+                            "submitted_unconfirmed": 1,
+                            "items": [],
+                        },
+                        "likes": {
+                            "enabled": True,
+                            "requested": True,
+                            "quantity": 50,
+                            "target_mode": "each_found",
+                            "orders": [
+                                {"username": "main_a", "quantity": 50, "ok": True, "reply_count": 2},
+                                {"username": "main_b", "quantity": 50, "ok": False, "reply_count": 1, "error": "network_error"},
+                            ],
+                        },
+                    },
+                }
+            },
+        },
+    }
+
+    overview = _render_order_detail(task, "overview")
+    videos = _render_order_detail(task, "videos")
+
+    assert "main_a" in overview
+    assert "main_b" in overview
+    assert "Boost" in overview
+    assert "Лайки: 50 частично" in overview
+    assert "2, вариантов заказано 3" in overview
+    assert "1/2" in overview
+    assert "Ответы: отправлено 2, вариантов заказано 3, подтверждено 1, без публичной проверки 1" in overview
+    assert "main_a" in videos
+
+
+@pytest.mark.unit
+def test_order_overview_uses_readable_card_sections_without_private_fields():
+    task = {
+        "id": 812,
+        "kind": "full",
+        "status": "done",
+        "progress": 1,
+        "video_urls": ["https://www.tiktok.com/@demo/video/readable"],
+        "main_comment": "main",
+        "settings": {
+            "text_variants": ["main"],
+            "replies": ["reply"],
+            "reply_count": 1,
+            "url_results": {
+                "https://www.tiktok.com/@demo/video/readable": {
+                    "status": "submitted_unconfirmed",
+                    "engagement": {
+                        "main": {
+                            "expected": 3,
+                            "variants_published": [
+                                {"network_confirmed": True, "account_id": 1001, "proxy": "secret-proxy"},
+                                {"local_confirmed": False, "account_id": 1002},
+                            ],
+                        },
+                        "replies": {
+                            "submitted": 1,
+                            "requested_variants": 2,
+                            "submitted_unconfirmed": 1,
+                            "items": [],
+                        },
+                        "likes": {
+                            "enabled": True,
+                            "requested": True,
+                            "quantity": 50,
+                            "target_mode": "single_top",
+                            "orders": [
+                                {
+                                    "username": "main_author",
+                                    "quantity": 50,
+                                    "reply_count": 1,
+                                    "ok": True,
+                                    "order_id": "provider-secret-id",
+                                }
+                            ],
+                        },
+                    },
+                }
+            },
+        },
+    }
+
+    overview = _render_order_detail(task, "overview")
+
+    assert "<b>Статус</b>" in overview
+    assert "<b>Состав заказа</b>" in overview
+    assert "<b>Итоги публикации</b>" in overview
+    assert "<b>Видео</b>" in overview
+    assert "Тексты главных: 1" in overview
+    assert "Главные: отправлено 2/3" in overview
+    assert "Лайки: 50" in overview
+    assert "provider-secret-id" not in overview
+    assert "secret-proxy" not in overview
+    assert "account_id" not in overview
+
+
+@pytest.mark.unit
+def test_order_overview_shows_parallel_totals_parent_targets_and_no_private_fields():
+    task = {
+        "id": 13,
+        "kind": "full",
+        "status": "done",
+        "progress": 1,
+        "video_urls": ["https://www.tiktok.com/@demo/video/2"],
+        "settings": {
+            "text_variants": ["main one", "main two", "main three"],
+            "replies": ["reply one", "reply two", "reply three"],
+            "reply_count": 3,
+            "boost_likes_enabled": True,
+            "likes_count": 100,
+            "url_results": {
+                "https://www.tiktok.com/@demo/video/2": {
+                    "status": "success",
+                    "engagement": {
+                        "main": {
+                            "posted": True,
+                            "expected": 9,
+                            "variants_published": [
+                                {"text": "main one", "account_id": 101, "network_confirmed": True},
+                                {"text": "main two", "account_id": 102},
+                                {"text": "main three", "account_id": 103},
+                            ],
+                        },
+                        "replies": {
+                            "requested_variants": 3,
+                            "submitted": 2,
+                            "submitted_unconfirmed": 1,
+                            "items": [
+                                {
+                                    "attempted": True,
+                                    "success": True,
+                                    "matched_main_text": "main one",
+                                    "requested_parent_author": "wanted",
+                                    "matched_parent_author": "wanted",
+                                    "parent_author_match_mode": "text_author",
+                                },
+                                {
+                                    "attempted": True,
+                                    "submitted_unconfirmed": True,
+                                    "matched_main_text": "main two",
+                                    "requested_parent_author": "wanted",
+                                    "matched_parent_author": "other_author",
+                                    "author_fallback_used": True,
+                                },
+                            ],
+                        },
+                        "likes": {
+                            "enabled": True,
+                            "requested": True,
+                            "quantity": 100,
+                            "target_mode": "single_top",
+                            "orders": [
+                                {
+                                    "username": "wanted",
+                                    "quantity": 100,
+                                    "reply_count": 2,
+                                    "parent_text": "main one",
+                                    "selection_reason": "most_replies",
+                                    "ok": True,
+                                    "order_id": "private-provider-order",
+                                }
+                            ],
+                        },
+                    },
+                }
+            },
+        },
+    }
+
+    overview = _render_order_detail(task, "overview")
+    videos = _render_order_detail(task, "videos")
+
+    assert "опубликовано 3/9" in overview
+    assert "Главные: отправлено 3/9" in overview
+    assert "Главные для ответов" in overview
+    assert "искали @wanted, ответили @other_author" in overview
+    assert "по тексту и username 1" in overview
+    assert "по тексту без username 1" in overview
+    assert "@wanted: 100 лайков, ответов у выбранного комментария 2" in overview
+    assert "выбран комментарий с максимумом ответов" in overview
+    assert "Комментарий: <code>main one</code>" in overview
+    assert "@wanted 100 (2 отв.)" in videos
+    assert "private-provider-order" not in overview
+    assert "account_id" not in overview
+    assert "proxy" not in overview.lower()
+
+
+@pytest.mark.unit
+def test_order_publication_map_groups_replies_by_main_without_private_fields():
+    task = {
+        "id": 14,
+        "kind": "full",
+        "status": "done",
+        "progress": 1,
+        "video_urls": ["https://www.tiktok.com/@demo/video/map"],
+        "settings": {
+            "text_variants": ["main one", "main two"],
+            "replies": ["reply one", "reply two", "reply three"],
+            "url_results": {
+                "https://www.tiktok.com/@demo/video/map": {
+                    "status": "submitted_unconfirmed",
+                    "engagement": {
+                        "main": {
+                            "expected": 2,
+                            "variants_published": [
+                                {
+                                    "text": "main one",
+                                    "comment_id": "main-a-id",
+                                    "account_id": 101,
+                                    "tiktok_username": "main_author_a",
+                                    "network_confirmed": True,
+                                    "proxy": "private-proxy",
+                                },
+                                {
+                                    "text": "main two",
+                                    "comment_id": "main-b-id",
+                                    "account_id": 102,
+                                    "tiktok_username": "main_author_b",
+                                },
+                            ],
+                        },
+                        "replies": {
+                            "requested_variants": 3,
+                            "submitted": 3,
+                            "submitted_unconfirmed": 2,
+                            "items": [
+                                {
+                                    "text": "reply one",
+                                    "success": True,
+                                    "matched_main_text": "main one",
+                                    "parent_key": "account:101:text:main one",
+                                    "matched_parent_author": "main_author_a",
+                                    "account_id": 201,
+                                },
+                                {
+                                    "text": "reply two",
+                                    "submitted_unconfirmed": True,
+                                    "comment_id": "main-a-id",
+                                    "matched_main_text": "main two",
+                                    "parent_key": "account:102:text:main two",
+                                    "requested_parent_author": "wanted_author",
+                                    "matched_parent_author": "main_author_b",
+                                    "author_fallback_used": True,
+                                    "account_id": 202,
+                                },
+                                {
+                                    "text": "reply three",
+                                    "submitted_unconfirmed": True,
+                                    "matched_main_text": "unknown main",
+                                    "parent_key": "unknown main",
+                                    "matched_parent_author": "unknown_author",
+                                    "account_id": 203,
+                                },
+                                {
+                                    "text": "failed reply",
+                                    "attempted": True,
+                                    "error": "stealth_reject_empty_body",
+                                    "matched_main_text": "main one",
+                                },
+                            ],
+                        },
+                        "likes": {
+                            "enabled": True,
+                            "requested": True,
+                            "quantity": 50,
+                            "orders": [
+                                {
+                                    "username": "main_author_a",
+                                    "quantity": 50,
+                                    "reply_count": 1,
+                                    "ok": True,
+                                    "order_id": "private-provider-order",
+                                }
+                            ],
+                        },
+                    },
+                }
+            },
+        },
+    }
+
+    text = _render_order_detail(task, "map")
+    keyboard = _build_order_detail_keyboard(task, "map", page=0, filter_name="all")
+
+    assert "Заказ #14 · Публикации" in text
+    assert "<b>1. @main_author_a · ✅ подтверждено</b>" in text
+    assert "<code>main one</code>" in text
+    assert "<code>reply one</code>" in text
+    assert "Лайки: 50 лайков заказано" in text
+    assert "<b>2. @main_author_b · ☑️ отправлено без публичной проверки</b>" in text
+    assert "ответили по совпадению текста" in text
+    assert "искали @wanted_author" in text
+    assert "<code>reply two</code>" in text
+    second_card = text.split("<b>2. @main_author_b", 1)[1].split("<b>Ответы без точной привязки", 1)[0]
+    assert "<code>reply two</code>" in second_card
+    assert "Ответы без точной привязки" in text
+    assert "<code>reply three</code>" in text
+    assert "failed reply" not in text
+    assert "private-provider-order" not in text
+    assert "private-proxy" not in text
+    assert "account_id" not in text
+    assert any(
+        button.callback_data == "order:detail:14:map:0:all"
+        for row in keyboard.inline_keyboard
+        for button in row
+    )
+
+
+@pytest.mark.unit
+def test_engagement_only_publication_map_shows_target_comment_not_published_main():
+    task = {
+        "id": 16,
+        "kind": "engagement_only",
+        "status": "done",
+        "progress": 1,
+        "video_urls": ["https://www.tiktok.com/@demo/video/reply-only"],
+        "main_comment": "target parent text",
+        "settings": {
+            "engagement_username": "wanted_author",
+            "engagement_comment_text": "target parent text",
+            "replies": ["reply one", "reply two"],
+            "reply_count": 2,
+            "url_results": {
+                "https://www.tiktok.com/@demo/video/reply-only": {
+                    "status": "submitted_unconfirmed",
+                    "mode": "engagement_only",
+                    "comment_id": "parent-cid",
+                    "engagement": {
+                        "main": {
+                            "success": False,
+                            "posted": False,
+                            "text_choice": None,
+                            "comment_id": None,
+                        },
+                        "replies": {
+                            "submitted": 2,
+                            "submitted_unconfirmed": 1,
+                            "items": [
+                                {
+                                    "text": "reply one",
+                                    "success": True,
+                                    "parent_comment_id": "parent-cid",
+                                    "matched_main_text": "target parent text",
+                                    "requested_parent_author": "wanted_author",
+                                    "matched_parent_author": "wanted_author",
+                                },
+                                {
+                                    "text": "reply two",
+                                    "submitted_unconfirmed": True,
+                                    "matched_main_text": "target parent text",
+                                    "requested_parent_author": "wanted_author",
+                                    "matched_parent_author": "other_author",
+                                    "author_fallback_used": True,
+                                },
+                            ],
+                        },
+                    },
+                }
+            },
+        },
+    }
+
+    overview = _render_order_detail(task, "overview")
+    text = _render_order_detail(task, "map")
+
+    assert "Тип: только ответы" in overview
+    assert "Автор поиска: <code>@wanted_author</code>" in overview
+    assert "Заказ #16 · Публикации" in text
+    assert "Комментарий для ответа" in text
+    assert "<code>target parent text</code>" in text
+    assert "<code>reply one</code>" in text
+    assert "<code>reply two</code>" in text
+    assert "username не нашли, ответили по совпадению текста" in text
+    assert "Ответы без точной привязки" not in text
+    assert "Главные:" not in text
+
+
+@pytest.mark.unit
+def test_order_publication_map_paginates_many_replies_under_soft_limit():
+    reply_items = [
+        {
+            "text": f"reply {idx} " + ("x" * 260),
+            "submitted_unconfirmed": True,
+            "matched_main_text": "main one",
+            "parent_key": "account:101:text:main one",
+        }
+        for idx in range(1, 21)
+    ]
+    task = {
+        "id": 15,
+        "kind": "full",
+        "status": "done",
+        "progress": 1,
+        "video_urls": ["https://www.tiktok.com/@demo/video/map-long"],
+        "settings": {
+            "text_variants": ["main one"],
+            "replies": [item["text"] for item in reply_items],
+            "url_results": {
+                "https://www.tiktok.com/@demo/video/map-long": {
+                    "status": "submitted_unconfirmed",
+                    "engagement": {
+                        "main": {
+                            "expected": 1,
+                            "variants_published": [
+                                {"text": "main one", "account_id": 101, "tiktok_username": "main_author"}
+                            ],
+                        },
+                        "replies": {
+                            "requested_variants": 20,
+                            "submitted": 20,
+                            "submitted_unconfirmed": 20,
+                            "items": reply_items,
+                        },
+                    },
+                }
+            },
+        },
+    }
+
+    page_count = _order_detail_page_count(task, "map")
+    pages = [_render_order_detail(task, "map", page) for page in range(page_count)]
+    keyboard = _build_order_detail_keyboard(task, "map", page=0, filter_name="all", content_page=0)
+
+    assert page_count > 1
+    assert "reply 1" in "\n".join(pages)
+    assert "reply 20" in "\n".join(pages)
+    assert max(len(page) for page in pages) < 3600
+    assert any(
+        button.callback_data == "order:detail:15:map:0:all:1"
+        for row in keyboard.inline_keyboard
+        for button in row
+    )
 
 
 @pytest.mark.unit

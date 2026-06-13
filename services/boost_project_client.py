@@ -152,18 +152,21 @@ async def order_tiktok_comment_likes(
 
     try:
         async with httpx.AsyncClient(timeout=30.0) as client:
+            # Boost Project documents API v1 examples as GET query requests,
+            # and the previous working bot used that form. Keep POST as a
+            # compatibility fallback for panels that accept form submissions.
             status, data, raw = await _request_json_with_retries(
                 client,
-                "POST",
+                "GET",
                 _base_url(),
-                data=payload,
+                params=payload,
             )
             if status in {404, 405}:
                 status, data, raw = await _request_json_with_retries(
                     client,
-                    "GET",
+                    "POST",
                     _base_url(),
-                    params=payload,
+                    data=payload,
                 )
 
         if status == 401:

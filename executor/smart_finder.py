@@ -663,13 +663,24 @@ async def find_submit_button_fast(
                 # Ищем кнопку в родительском элементе или рядом
                 button = await comment_input.evaluate_handle("""
                     el => {
+                        // NB: ':has-text()' is a Playwright-only pseudo-class and is
+                        // INVALID inside the browser's native querySelectorAll (it throws,
+                        // and the surrounding try/except silently swallowed it, so this
+                        // strategy never worked). Use valid CSS to gather candidates, then
+                        // filter by type/data-e2e/text in JS.
                         const parent = el.closest('form, div, section');
-                        if (parent) {
-                            const buttons = parent.querySelectorAll('button[type="submit"], button:has-text("Post"), button:has-text("Опубликовать")');
-                            for (const btn of buttons) {
-                                if (btn.offsetParent !== null) {
-                                    return btn;
-                                }
+                        if (!parent) return null;
+                        const wanted = ['post', 'опубликовать', 'отправить'];
+                        const candidates = parent.querySelectorAll(
+                            'button[type="submit"], button[data-e2e*="post"], div[data-e2e*="post"][role="button"], button, [role="button"]'
+                        );
+                        for (const btn of candidates) {
+                            if (btn.offsetParent === null) continue;
+                            const type = (btn.getAttribute('type') || '').toLowerCase();
+                            const e2e = (btn.getAttribute('data-e2e') || '').toLowerCase();
+                            const txt = (btn.textContent || '').trim().toLowerCase();
+                            if (type === 'submit' || e2e.includes('post') || wanted.some(w => txt.includes(w))) {
+                                return btn;
                             }
                         }
                         return null;

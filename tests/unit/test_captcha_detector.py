@@ -28,6 +28,7 @@ def test_captcha_detector_avoids_broad_user_text_and_verified_badge_markers():
     assert "selectorLower.includes('captcha') || selectorLower.includes('verify')" not in source
     assert "selectorLower.includes('verification')" not in source
     assert "'[role=\"dialog\"]'" not in source[source.find("const captchaSelectors"):source.find("const iframes")]
+    assert '[class*="verify"]' not in source
 
 
 @pytest.mark.unit
@@ -48,3 +49,28 @@ async def test_captcha_detector_returns_account_verification_type():
 
     assert found is True
     assert captcha_type == "account_verification"
+
+
+@pytest.mark.unit
+def test_captcha_detector_has_visual_puzzle_modal_heuristic_without_broad_verify_class():
+    source = inspect.getsource(detect_captcha)
+
+    assert "looksLikeTikTokPuzzleChallenge" in source
+    assert "visual_puzzle_modal" in source
+    assert "visual_puzzle_overlay" in source
+    assert "audio" in source
+    assert '[class*="verify"]' not in source
+
+
+@pytest.mark.unit
+def test_captcha_detector_requires_visible_iframe_and_avoids_broad_sent_to_marker():
+    source = inspect.getsource(detect_captcha)
+
+    assert "if (!visible(iframe)) continue;" in source
+    assert "st.opacity !== '0'" in source
+    assert "st.pointerEvents !== 'none'" in source
+    assert "sent to" not in CAPTCHA_TEXT_MARKERS
+    assert "'sent to'" not in source
+    assert "'[id*=\"secsdk\"]'" not in source
+    assert "'[class*=\"secsdk\"]'" not in source
+    assert "'iframe[src*=\"secsdk\"]'" in source

@@ -47,7 +47,10 @@ def get_redis():
 # Живой executor останавливает задачу сам; это страховка для recovery после падения.
 TASK_TIMEOUT_SECONDS = int(getattr(settings, "TASK_PROCESSING_TIMEOUT", 1800) or 1800)
 TASK_QUEUE_MARKER_TTL = 24 * 3600
-AUTOPILOT_QUEUE_ORIGINS = {"autopilot"}
+TASK_QUEUE_PRIORITY_HIGH = "high"
+TASK_QUEUE_PRIORITY_NORMAL = "normal"
+TASK_QUEUE_PRIORITY_LOW = "low"
+AUTOPILOT_QUEUE_ORIGINS = {"autopilot", "monitor_auto_comment"}
 
 
 def _task_queue_marker_key(task_id: int) -> str:
@@ -58,8 +61,12 @@ def _priority_task_queue_name() -> str:
     return f"{settings.REDIS_TASK_QUEUE}:priority"
 
 
-def _task_queue_names() -> tuple[str, str]:
-    return (settings.REDIS_TASK_QUEUE, _priority_task_queue_name())
+def _high_priority_task_queue_name() -> str:
+    return f"{settings.REDIS_TASK_QUEUE}:high"
+
+
+def _task_queue_names() -> tuple[str, str, str]:
+    return (_high_priority_task_queue_name(), _priority_task_queue_name(), settings.REDIS_TASK_QUEUE)
 
 
 def _task_origin(task: Task | None) -> str:
@@ -69,12 +76,58 @@ def _task_origin(task: Task | None) -> str:
     return "manual"
 
 
+def _normalize_queue_priority(value: object, default: str | None = None) -> str | None:
+    raw = str(value or "").strip().lower()
+    if raw in {"high", "urgent", "vip", "top", "highest"}:
+        return TASK_QUEUE_PRIORITY_HIGH
+    if raw in {"normal", "manual", "medium", "priority"}:
+        return TASK_QUEUE_PRIORITY_NORMAL
+    if raw in {"low", "autopilot", "background"}:
+        return TASK_QUEUE_PRIORITY_LOW
+    return default
+
+
+def _task_queue_priority_level(task: Task | None) -> str:
+    task_settings = getattr(task, "settings", None)
+    if isinstance(task_settings, dict):
+        explicit = _normalize_queue_priority(
+            task_settings.get("queue_priority")
+            or task_settings.get("task_queue_priority")
+            or task_settings.get("priority")
+        )
+        if explicit:
+            return explicit
+
+    if _task_origin(task) in AUTOPILOT_QUEUE_ORIGINS:
+        return TASK_QUEUE_PRIORITY_LOW
+    return TASK_QUEUE_PRIORITY_NORMAL
+
+
 def _task_uses_priority_queue(task: Task | None) -> bool:
-    return _task_origin(task) not in AUTOPILOT_QUEUE_ORIGINS
+    return _task_queue_priority_level(task) != TASK_QUEUE_PRIORITY_LOW
 
 
 def task_uses_priority_queue(task: Task | None) -> bool:
     return _task_uses_priority_queue(task)
+
+
+def task_queue_priority_level(task: Task | None) -> str:
+    return _task_queue_priority_level(task)
+
+
+def _queue_name_for_priority_level(priority_level: str | None) -> str:
+    normalized = _normalize_queue_priority(priority_level, TASK_QUEUE_PRIORITY_NORMAL)
+    if normalized == TASK_QUEUE_PRIORITY_HIGH:
+        return _high_priority_task_queue_name()
+    if normalized == TASK_QUEUE_PRIORITY_LOW:
+        return settings.REDIS_TASK_QUEUE
+    return _priority_task_queue_name()
+
+
+def _queue_name_for_enqueue(*, priority: bool = False, priority_level: str | None = None) -> str:
+    if priority_level is not None:
+        return _queue_name_for_priority_level(priority_level)
+    return _priority_task_queue_name() if priority else settings.REDIS_TASK_QUEUE
 
 
 def _queued_length(redis_client) -> int:
@@ -256,13 +309,13 @@ def _enqueue_autopilot_retry_for_reset_videos(
     return created
 
 
-def requeue_deferred_task(task_id: int, *, priority: bool = False) -> None:
+def requeue_deferred_task(task_id: int, *, priority: bool = False, priority_level: str | None = None) -> None:
     """Puts a popped task back as newest so older eligible tasks can proceed."""
     marker_claimed = False
     try:
         marker_claimed = _claim_queue_marker(task_id)
         redis_client = get_redis()
-        queue_name = _priority_task_queue_name() if priority else settings.REDIS_TASK_QUEUE
+        queue_name = _queue_name_for_enqueue(priority=priority, priority_level=priority_level)
         redis_client.lpush(queue_name, str(task_id))
     except Exception:
         if marker_claimed:
@@ -270,7 +323,13 @@ def requeue_deferred_task(task_id: int, *, priority: bool = False) -> None:
         raise
 
 
-def enqueue_task(task_id: int, retries: int = 3, *, priority: bool = False) -> None:
+def enqueue_task(
+    task_id: int,
+    retries: int = 3,
+    *,
+    priority: bool = False,
+    priority_level: str | None = None,
+) -> None:
     """
     Добавляет задачу в очередь Redis с retry при ошибках подключения.
     
@@ -279,11 +338,16 @@ def enqueue_task(task_id: int, retries: int = 3, *, priority: bool = False) -> N
     from redis.exceptions import ConnectionError, TimeoutError
     
     redis_client = get_redis()
-    queue_name = _priority_task_queue_name() if priority else settings.REDIS_TASK_QUEUE
+    queue_name = _queue_name_for_enqueue(priority=priority, priority_level=priority_level)
     for attempt in range(retries):
         try:
             redis_client.lpush(queue_name, str(task_id))
-            logger.debug(f"Task {task_id} enqueued successfully (priority={priority})")
+            logger.debug(
+                "Task %s enqueued successfully (priority=%s, priority_level=%s)",
+                task_id,
+                priority,
+                priority_level,
+            )
             try:
                 queue_len = _queued_length(redis_client)
                 set_gauge("queue.length", queue_len)
@@ -311,7 +375,13 @@ def enqueue_task(task_id: int, retries: int = 3, *, priority: bool = False) -> N
             raise
 
 
-def enqueue_task_once(task_id: int, retries: int = 3, *, priority: bool = False) -> str:
+def enqueue_task_once(
+    task_id: int,
+    retries: int = 3,
+    *,
+    priority: bool = False,
+    priority_level: str | None = None,
+) -> str:
     """
     Enqueues a task only once across the normal flow and recovery flow.
 
@@ -325,12 +395,44 @@ def enqueue_task_once(task_id: int, retries: int = 3, *, priority: bool = False)
         if not marker_claimed:
             logger.info(f"Task {task_id} is already queued, skipping duplicate enqueue")
             return "already_queued"
-        enqueue_task(task_id, retries=retries, priority=priority)
+        enqueue_task(task_id, retries=retries, priority=priority, priority_level=priority_level)
         return "enqueued"
     except Exception:
         if marker_claimed:
             _release_queue_marker(task_id)
         raise
+
+
+def promote_task_to_high_priority(task_id: int) -> dict[str, object]:
+    """Moves a pending queued task into the highest-priority Redis queue."""
+    task_id_int = int(task_id)
+    redis_client = get_redis()
+    removed = 0
+    try:
+        removed += int(redis_client.lrem(_high_priority_task_queue_name(), 0, str(task_id_int)) or 0)
+    except Exception as exc:
+        logger.warning(
+            "Task %s is being promoted, but old high-priority queue copy could not be removed: %s",
+            task_id_int,
+            exc,
+        )
+    redis_client.lpush(_high_priority_task_queue_name(), str(task_id_int))
+    try:
+        redis_client.set(_task_queue_marker_key(task_id_int), "1", ex=TASK_QUEUE_MARKER_TTL)
+    except Exception as exc:
+        logger.warning("Failed to refresh queue marker while promoting task %s: %s", task_id_int, exc)
+
+    for queue_name in (_priority_task_queue_name(), settings.REDIS_TASK_QUEUE):
+        try:
+            removed += int(redis_client.lrem(queue_name, 0, str(task_id_int)) or 0)
+        except Exception as exc:
+            logger.warning(
+                "Task %s promoted to high priority, but old queue copy in %s could not be removed: %s",
+                task_id_int,
+                queue_name,
+                exc,
+            )
+    return {"removed": removed, "enqueue_state": "enqueued"}
 
 
 def reserve_task_for_enqueue(db: Session, task_id: int) -> None:
@@ -368,7 +470,11 @@ def finalize_reserved_enqueue(db: Session, task_id: int) -> bool:
             return False
 
     try:
-        enqueue_state = enqueue_task_once(task_id, retries=1, priority=_task_uses_priority_queue(task))
+        enqueue_state = enqueue_task_once(
+            task_id,
+            retries=1,
+            priority_level=_task_queue_priority_level(task),
+        )
     except Exception as e:
         logger.warning(f"Failed to finalize reserved enqueue for task {task_id}: {e}")
         return False
@@ -440,7 +546,7 @@ async def finalize_reserved_enqueue_async(db, task_id: int) -> bool:
             enqueue_task_once,
             task_id,
             1,
-            priority=_task_uses_priority_queue(task),
+            priority_level=_task_queue_priority_level(task),
         )
     except Exception as e:
         logger.warning(f"Failed to finalize reserved enqueue for task {task_id} (async): {e}")
@@ -496,7 +602,7 @@ def dequeue_task(timeout: int = 5) -> int | None:
     redis_client = get_redis()
     try:
         result = redis_client.brpop(
-            [_priority_task_queue_name(), settings.REDIS_TASK_QUEUE],
+            [_high_priority_task_queue_name(), _priority_task_queue_name(), settings.REDIS_TASK_QUEUE],
             timeout=timeout,
         )
         if result:
@@ -654,7 +760,7 @@ def recover_tasks_lost_in_redis(db: Session) -> int:
     for task in lost_tasks:
         try:
             # Пытаемся добавить в очередь
-            enqueue_task_once(task.id, retries=1, priority=_task_uses_priority_queue(task))
+            enqueue_task_once(task.id, retries=1, priority_level=_task_queue_priority_level(task))
             recovered += 1
             logger.info(f"Recovered task {task.id} that was lost in Redis")
         except Exception as e:

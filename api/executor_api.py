@@ -6,7 +6,7 @@ from db.database import get_db
 from db.models import AppSettings, Task, Log, User
 from services.app_settings_service import SOFTWARE_MODE_KEY, SOFTWARE_MODE_PARSING
 from services.balance_service import has_full_functionality_access
-from services.task_service import dequeue_task, requeue_deferred_task
+from services.task_service import dequeue_task, requeue_deferred_task, task_queue_priority_level
 from api.auth import verify_executor_header
 from datetime import datetime, timezone
 import logging
@@ -100,7 +100,11 @@ async def next_task(
             user = user_result.scalar_one_or_none()
             if not (user and has_full_functionality_access(user)):
                 await db.rollback()
-                await asyncio.to_thread(requeue_deferred_task, task_id)
+                await asyncio.to_thread(
+                    requeue_deferred_task,
+                    task_id,
+                    priority_level=task_queue_priority_level(task),
+                )
                 logger.info(
                     "Deferred restricted task %s in /api/executor/next_task: software_mode=parsing",
                     task_id,

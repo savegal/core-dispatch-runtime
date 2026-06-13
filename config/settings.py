@@ -36,6 +36,10 @@ class Settings(BaseSettings):
     # - 32GB RAM: MAX_CONCURRENT_BROWSERS = 30-40
     RANDOM_DELAY: bool = True
     ACCOUNT_COOLDOWN_SECONDS: int = 60  # Для ноутбука: 60. Для сервера (стабильные аккаунты): 30-20
+    # Prefer real browser auth (sessionid/sid_tt), but allow sid_guard-only
+    # accounts as a last resort. They still must pass browser action-ready and
+    # enrichment gates before any DOM publish/search is attempted.
+    ALLOW_SID_GUARD_ONLY_PUBLISH_LAST_RESORT: bool = True
     # Жизненный цикл по дате создания записи в БД (created_at):
     # True — режим «сжигаемых» аккаунтов: старше ~72ч без свежей валидации → hard_expired, аккаунт
     #   исключается из main/reply/monitor (как на ферме одноразовых логинов).
@@ -213,6 +217,12 @@ class Settings(BaseSettings):
     EXECUTOR_API_TOKEN: str  # Обязательное поле, должно быть задано в .env
     JWT_SECRET: str  # Обязательное поле, должно быть задано в .env
     JWT_ALG: str = "HS256"
+    PLAYWRIGHT_DESKTOP_VIEWPORT_WIDTH: int = 1920
+    PLAYWRIGHT_DESKTOP_VIEWPORT_HEIGHT: int = 960
+    PLAYWRIGHT_PROXYLESS_VIEWPORT_WIDTH: int = 1280
+    PLAYWRIGHT_PROXYLESS_VIEWPORT_HEIGHT: int = 720
+    PLAYWRIGHT_SYNC_WINDOW_WITH_VIEWPORT: bool = True
+    PLAYWRIGHT_WINDOW_EXTRA_HEIGHT: int = 90
     
     # ИСПРАВЛЕНО: Валидация обязательных секретов
     @field_validator('EXECUTOR_API_TOKEN', 'JWT_SECRET')
@@ -437,6 +447,27 @@ class Settings(BaseSettings):
     MAX_RETRY_ACCOUNTS: int = 3  # Максимум попыток с разными аккаунтами для одной задачи
     PARALLEL_COMMENTING_MAX_MAIN_ATTEMPTS: int = 6
     PARALLEL_COMMENTING_MAX_REPLY_ATTEMPTS: int = 6
+    PARALLEL_DYNAMIC_WORKER_POOL_ENABLED: bool = True
+    PARALLEL_COMMENTING_TARGET_BROWSERS: int = 4
+    PARALLEL_COMMENTING_MAX_BROWSERS: int = 4
+    PARALLEL_MAIN_PUBLISH_MAX_SECONDS: float = 32.0
+    PARALLEL_MAIN_INPUT_RETRY_MAX_SECONDS: float = 18.0
+    PARALLEL_MAIN_OPEN_COMMENTS_MAX_SECONDS: float = 10.0
+    PARALLEL_MAIN_INPUT_SEARCH_MAX_SECONDS: float = 6.0
+    PARALLEL_REPLY_PUBLISH_MAX_SECONDS: float = 30.0
+    PARALLEL_REPLY_START_DELAY_MIN_SECONDS: float = 2.0
+    PARALLEL_REPLY_START_DELAY_MAX_SECONDS: float = 5.0
+    PARALLEL_MAIN_READY_IDLE_MIN_SECONDS: float = 0.2
+    PARALLEL_MAIN_READY_IDLE_MAX_SECONDS: float = 0.6
+    PARALLEL_REPLY_READY_IDLE_MIN_SECONDS: float = 0.2
+    PARALLEL_REPLY_READY_IDLE_MAX_SECONDS: float = 0.6
+    PARALLEL_INITIAL_SHELL_READY_SECONDS: float = 12.0
+    PARALLEL_PAGE_LOADING_EXTRA_WAIT_SECONDS: float = 18.0
+    PARALLEL_MAIN_WARMUP_PROBABILITY: float = 0.0
+    PARALLEL_MAIN_WARMUP_TIMEOUT_SECONDS: float = 3.0
+    PARALLEL_PROXY_DIVERSIFY_BY_SOURCE_HOST: bool = True
+    PARALLEL_COMMENTING_DOM_FIRST: bool = True
+    PARALLEL_COMMENTING_FAST_AUTH_GATE: bool = True
     ACCOUNT_VALIDATION_CACHE_TTL_MINUTES: int = 2  # TTL кэша валидации аккаунтов (минуты)
     ACCOUNT_VALIDATION_MAX_AGE_MINUTES: int = 10  # Максимальный возраст валидации аккаунта (минуты)
 
@@ -463,6 +494,22 @@ class Settings(BaseSettings):
     USE_JSON_LOGGING: bool = Field(
         default=False,
         description="Использовать structured logging (JSON) вместо обычного текстового формата"
+    )
+    EXECUTOR_LOG_FILE: str = Field(
+        default="logs/executor.log",
+        description="Executor log file path. Use a separate file for long diagnostic runs if needed.",
+    )
+    LOG_FILE_MAX_MB: int = Field(
+        default=50,
+        ge=1,
+        le=2048,
+        description="Maximum size of one rotating log file in megabytes.",
+    )
+    LOG_FILE_BACKUP_COUNT: int = Field(
+        default=20,
+        ge=1,
+        le=200,
+        description="Number of rotated executor log files to keep.",
     )
 
 

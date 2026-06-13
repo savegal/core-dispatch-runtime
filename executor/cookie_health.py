@@ -45,7 +45,7 @@ from services.account_service import mark_needs_reauth, mark_soft_error
 
 logger = logging.getLogger("executor.cookie_health")
 _settings = get_settings()
-_MANUAL_CAPTCHA_WAIT_SECONDS = float(os.getenv("MANUAL_CAPTCHA_WAIT_SECONDS", "30"))
+_MANUAL_CAPTCHA_WAIT_SECONDS = float(os.getenv("MANUAL_CAPTCHA_WAIT_SECONDS", "15"))
 _MANUAL_CAPTCHA_POLL_SECONDS = 2.0
 _TRUE_ENV_VALUES = {"1", "true", "yes", "on"}
 
@@ -113,14 +113,32 @@ def _needs_action_probe_reason(reason: Optional[str]) -> bool:
 
 
 def _visible_logged_out_reason(state: dict) -> Optional[str]:
-    if str(state.get("state") or "").lower() != "logged_out":
+    login_count = int(state.get("loginCount") or 0)
+    login_modal_count = int(state.get("loginModalCount") or 0)
+    comment_login_cta_count = int(state.get("commentLoginCtaCount") or 0)
+    state_is_login_false = bool(state.get("stateIsLoginFalse"))
+    state_name = str(state.get("state") or "").lower()
+    logged_in_count = int(state.get("loggedInCount") or 0)
+    state_is_login_true = bool(state.get("stateIsLoginTrue"))
+    has_logged_in_marker = (
+        state_name == "logged_in"
+        or logged_in_count > 0
+        or state_is_login_true
+    )
+    has_visible_login_ui = (
+        (login_count > 0 and not has_logged_in_marker)
+        or login_modal_count > 0
+        or comment_login_cta_count > 0
+        or state_is_login_false
+    )
+    if state_name != "logged_out" and not has_visible_login_ui:
         return None
     return (
         "visible_login_ui:"
-        f"login={int(state.get('loginCount') or 0)}:"
-        f"modal={int(state.get('loginModalCount') or 0)}:"
-        f"comment_cta={int(state.get('commentLoginCtaCount') or 0)}:"
-        f"state_false={bool(state.get('stateIsLoginFalse'))}"
+        f"login={login_count}:"
+        f"modal={login_modal_count}:"
+        f"comment_cta={comment_login_cta_count}:"
+        f"state_false={state_is_login_false}"
     )
 
 
@@ -143,7 +161,7 @@ async def _visible_logged_out_health_if_present(page: Page) -> Optional[CookieHe
 
 def _manual_captcha_wait_enabled() -> bool:
     raw = os.getenv("ALLOW_MANUAL_CAPTCHA_SOLVE")
-    if raw is not None and not _env_flag("ALLOW_MANUAL_CAPTCHA_SOLVE", False):
+    if raw is None or not _env_flag("ALLOW_MANUAL_CAPTCHA_SOLVE", False):
         return False
     try:
         return not bool(_settings.PLAYWRIGHT_HEADLESS)

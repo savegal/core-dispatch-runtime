@@ -6,9 +6,33 @@
 """
 import logging
 from typing import Optional
+from urllib.parse import urlsplit
 from patchright.async_api import Page
 
 logger = logging.getLogger("executor.navigation_utils")
+
+
+def _normalize_url_for_compare(raw: str) -> str:
+    """Normalize a URL to scheme://host/path for an *exact* identity check.
+
+    Query string and fragment are dropped and the trailing slash is stripped so
+    that e.g. ``.../video/123`` and ``.../video/123/?lang=en`` compare equal,
+    while a short URL (the homepage ``https://www.tiktok.com/``) is NOT treated
+    as "the same page" as a longer video URL. A bare substring check used to do
+    exactly that and caused reload() on the wrong page instead of navigating to
+    the target video.
+    """
+    try:
+        parts = urlsplit((raw or "").strip())
+    except Exception:
+        return (raw or "").strip().lower()
+    scheme = (parts.scheme or "").lower()
+    netloc = (parts.netloc or "").lower()
+    path = (parts.path or "").rstrip("/").lower()
+    if not netloc and not scheme:
+        # Relative or malformed input: fall back to a normalized raw string.
+        return (raw or "").strip().rstrip("/").lower()
+    return f"{scheme}://{netloc}{path}"
 
 
 async def smart_navigate(
@@ -39,12 +63,14 @@ async def smart_navigate(
         return
     
     try:
-        # Проверяем текущий URL
-        current_url = page.url.lower()
-        target_url_lower = url.lower()
-        
-        # Если уже на нужной странице - используем reload (быстрее)
-        if target_url_lower in current_url or current_url in target_url_lower:
+        # Точное сравнение адресов (scheme://host/path, без query/fragment).
+        # Подстрочное сравнение было опасным: короткий адрес (главная
+        # https://www.tiktok.com/) является подстрокой любого видео-URL, из-за
+        # чего софт ошибочно делал reload() не на той странице вместо перехода
+        # на нужное видео.
+        same_page = _normalize_url_for_compare(page.url) == _normalize_url_for_compare(url)
+
+        if same_page:
             logger.debug(f"[NAVIGATION] Already on page {url[:50]}, using reload() instead of goto()")
             await page.reload(wait_until=wait_until, timeout=timeout)
         else:

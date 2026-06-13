@@ -44,12 +44,25 @@ def test_parallel_commenting_mode_never_passes_reply_fallback_mains():
 
 
 @pytest.mark.unit
-def test_parallel_commenting_mode_batches_replies_by_three():
+def test_parallel_commenting_mode_uses_dynamic_reply_worker_pool():
     from executor import user_schema
     src = inspect.getsource(user_schema.execute_user_schema_parallel)
 
-    assert "batch = pending_reply_variants[:3]" in src
-    assert "pending_reply_variants = pending_reply_variants[3:]" in src
+    assert "asyncio.FIRST_COMPLETED" in src
+    assert "inflight_reply_variants" in src
+    assert "pending_reply_variants.append((item.variant_index, item.text))" in src
+    assert "retry_variants + pending_reply_variants" not in src
+
+
+@pytest.mark.unit
+def test_parallel_commenting_mode_does_not_abort_on_one_exhausted_reply_variant():
+    from executor import user_schema
+    src = inspect.getsource(user_schema.execute_user_schema_parallel)
+
+    assert "continuing remaining variants" in src
+    assert "fatal_reply_error" in src
+    assert "result.error = fatal_reply_error.error" in src
+    assert "result.error = terminal_reply_error.error" not in src
 
 
 @pytest.mark.unit

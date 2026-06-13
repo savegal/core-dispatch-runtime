@@ -387,6 +387,42 @@ async def test_reply_comment_accepts_network_root_match_for_top_level_parent(mon
 
 @pytest.mark.unit
 @pytest.mark.asyncio
+async def test_reply_comment_treats_parent_mismatch_with_comment_id_as_submitted_unconfirmed(monkeypatch):
+    response = _DummyResponse(status=200, body='{"status_code":0}')
+    request_context = _DummyRequestContext(response)
+    client = PlaywrightHttpClient(request_context, retry_policy=RetryPolicy(max_retries=0))
+
+    async def _fake_execute_request(*args, **kwargs):
+        return True, {
+            "status_code": 0,
+            "comment": {
+                "cid": "cid_mismatch_1",
+                "reply_id": "other_parent_999",
+            },
+        }, None, None
+
+    monkeypatch.setattr(client, "_execute_request", _fake_execute_request)
+
+    success, comment_id, error_msg, error_type, meta = await client.reply_comment(
+        aweme_id="123",
+        parent_comment_id="parent_456",
+        text="reply text",
+        cookies={},
+        correlation_id="test_reply_parent_mismatch",
+    )
+
+    assert success is True
+    assert comment_id == "cid_mismatch_1"
+    assert error_msg is None
+    assert error_type is None
+    assert meta["parent_confirmed"] is False
+    assert meta["parent_mismatch"] is True
+    assert meta["response_parent_id"] == "other_parent_999"
+    assert meta["parent_confirmation_level"] == "network_parent_mismatch"
+
+
+@pytest.mark.unit
+@pytest.mark.asyncio
 async def test_post_reply_allows_parent_id_without_main_comment_text(monkeypatch):
     async def _raise_create_page(*args, **kwargs):
         raise RuntimeError("sentinel_create_page")

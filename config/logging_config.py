@@ -110,7 +110,9 @@ def setup_logging(
     level: str = "INFO",
     format_string: str | None = None,
     log_file: str | None = None,
-    use_json: bool = False
+    use_json: bool = False,
+    log_max_bytes: int | None = None,
+    log_backup_count: int | None = None,
 ) -> None:
     """
     Настраивает логирование для всего приложения.
@@ -169,12 +171,14 @@ def setup_logging(
         # ИСПРАВЛЕНО: Используем RotatingFileHandler для ротации логов
         log_path = Path(log_file)
         log_path.parent.mkdir(parents=True, exist_ok=True)
+        rotation_max_bytes = max(1, int(log_max_bytes or (10 * 1024 * 1024)))
+        rotation_backup_count = max(1, int(log_backup_count or 5))
         
         # RotatingFileHandler: maxBytes=10MB, backupCount=5 (сохраняем последние 5 файлов)
         file_handler = logging.handlers.RotatingFileHandler(
             log_file,
-            maxBytes=10 * 1024 * 1024,  # 10MB
-            backupCount=5,
+            maxBytes=rotation_max_bytes,
+            backupCount=rotation_backup_count,
             encoding='utf-8'
         )
         file_handler.setFormatter(formatter)

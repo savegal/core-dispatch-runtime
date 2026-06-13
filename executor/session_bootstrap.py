@@ -592,6 +592,21 @@ async def get_browser_login_state(page: Page) -> dict:
                         'login',
                         'sign in',
                         'sign-in',
+                        'iniciar sesión',
+                        'iniciar sesion',
+                        'se connecter',
+                        'anmelden',
+                        'einloggen',
+                        'entrar',
+                        'iniciar sessão',
+                        'iniciar sessao',
+                        'accedi',
+                        'oturum aç',
+                        'oturum ac',
+                        'masuk',
+                        'dang nhap',
+                        'zaloguj się',
+                        'zaloguj',
                         '\u0432\u043e\u0439\u0442\u0438',
                         '\u0443\u0432\u0456\u0439\u0442\u0438',
                         '\u767b\u5f55',
@@ -687,9 +702,13 @@ async def get_browser_login_state(page: Page) -> dict:
                 const loginCount = loginNodes.length;
                 const loginModalCount = dialogNodes.length;
                 const commentLoginCtaCount = commentLoginNodes.length;
+                const hasVisibleLoginUi = loginCount > 0
+                    || loginModalCount > 0
+                    || commentLoginCtaCount > 0
+                    || stateIsLoginFalse;
                 let state = 'unknown';
-                if ((stateIsLoginTrue || loggedInCount > 0) && !stateIsLoginFalse) state = 'logged_in';
-                else if (loginCount > 0 || loginModalCount > 0 || commentLoginCtaCount > 0 || stateIsLoginFalse) state = 'logged_out';
+                if (hasVisibleLoginUi) state = 'logged_out';
+                else if ((stateIsLoginTrue || loggedInCount > 0) && !stateIsLoginFalse) state = 'logged_in';
 
                 return {
                     state,

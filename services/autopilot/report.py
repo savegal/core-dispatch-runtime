@@ -19,6 +19,7 @@ from services.autopilot.models import (
     TaskListResult,
     TaskPreview,
 )
+from services.task_execution_ledger import LEDGER_VERSION, build_task_execution_ledger
 
 VISIBLE_ORIGINS = {"autopilot", "manual_retry"}
 REPORT_ORIGINS = {"autopilot", "autopilot_archived", "manual_retry"}
@@ -421,6 +422,16 @@ def task_card_payload(
     counts = task_publication_counts(task)
     publications = task_publications(task, account_labels=account_labels)
     publication_summary = publications["summary"]
+    stored_ledger = settings.get("execution_ledger")
+    try:
+        stored_ledger_version = int((stored_ledger or {}).get("version") or 0) if isinstance(stored_ledger, dict) else 0
+    except (TypeError, ValueError):
+        stored_ledger_version = 0
+    if isinstance(stored_ledger, dict) and stored_ledger_version == LEDGER_VERSION:
+        execution_ledger = stored_ledger
+    else:
+        url_results = settings.get("url_results") if isinstance(settings.get("url_results"), dict) else {}
+        execution_ledger = build_task_execution_ledger(url_results)
     created_at = task.created_at
     updated_at = task.updated_at
     duration_seconds = None
@@ -453,6 +464,8 @@ def task_card_payload(
             replies_unconfirmed=int(publication_summary["replies_unconfirmed"]),
             needs_review=bool(publication_summary["needs_review"]),
             publications={"mains": publications["mains"], "replies": publications["replies"]},
+            coverage=execution_ledger.get("coverage", {}) if isinstance(execution_ledger, dict) else {},
+            health=execution_ledger.get("health_signals", {}) if isinstance(execution_ledger, dict) else {},
             cost=decimal_to_float(cost),
             refunded=decimal_to_float(refunded),
             net_cost=decimal_to_float(max(cost - refunded, Decimal("0.00"))),

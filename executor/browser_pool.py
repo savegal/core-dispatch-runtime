@@ -44,6 +44,11 @@ _TIKTOK_SHORTCUTS_SUPPRESS_INIT_SCRIPT = r"""
     const hasMarker = (txt) => {
         txt = String(txt || '');
         if (txt.includes('Introducing keyboard shortcuts')) return true;
+        const lower = txt.toLowerCase();
+        if (
+            lower.includes('browse your feed') &&
+            (lower.includes('scroll') || lower.includes('arrows on the right') || lower.includes('got it'))
+        ) return true;
         return txt.includes('Go to previous video')
             && txt.includes('Go to next video')
             && txt.includes('Mute / unmute video')
@@ -74,6 +79,12 @@ _TIKTOK_SHORTCUTS_SUPPRESS_INIT_SCRIPT = r"""
         const z = parseInt(st.zIndex || '0', 10);
         return st.position === 'fixed' || st.position === 'absolute' || z > 10;
     };
+    const safeMarkerNode = (el) => {
+        if (!el || !el.getBoundingClientRect) return false;
+        const r = el.getBoundingClientRect();
+        if (r.width > window.innerWidth * 0.75 || r.height > window.innerHeight * 0.75) return false;
+        return r.width >= 20 && r.height >= 12;
+    };
 
     const setSeen = () => {
         try {
@@ -87,6 +98,10 @@ _TIKTOK_SHORTCUTS_SUPPRESS_INIT_SCRIPT = r"""
                 'shortcutGuideSeen',
                 'tiktok_shortcuts_guide_seen',
                 'webapp_keyboard_shortcuts_seen',
+                'tiktok_feed_navigation_guide_seen',
+                'feed_navigation_guide_seen',
+                'webapp_feed_navigation_guide_seen',
+                'tiktok_video_navigation_guide_seen',
             ];
             for (const k of keys) {
                 localStorage.setItem(k, '1');
@@ -107,7 +122,7 @@ _TIKTOK_SHORTCUTS_SUPPRESS_INIT_SCRIPT = r"""
                     const curTxt = cur.innerText || cur.textContent || '';
                     if (!hasMarker(curTxt)) continue;
                     if (boundedOverlay(cur)) count += kill(cur);
-                    else {
+                    else if (i <= 1 && safeMarkerNode(cur)) {
                         try {
                             cur.style.setProperty('pointer-events', 'none', 'important');
                             cur.style.setProperty('visibility', 'hidden', 'important');
@@ -148,6 +163,87 @@ _TIKTOK_SHORTCUTS_SUPPRESS_INIT_SCRIPT = r"""
 """
 
 settings = get_settings()
+
+
+def _positive_int_setting(name: str, default: int, *, minimum: int = 1, maximum: int = 10000) -> int:
+    try:
+        value = int(getattr(settings, name, default) or default)
+    except (TypeError, ValueError):
+        value = default
+    return max(minimum, min(maximum, value))
+
+
+def _is_mobile_user_agent(user_agent: str | None) -> bool:
+    user_agent_lower = (user_agent or "").lower()
+    return any(marker in user_agent_lower for marker in ["iphone", "android", "mobile", "ipad", "tablet"])
+
+
+def _desktop_viewport_size_for_account(account) -> tuple[int, int]:
+    has_proxy = bool(getattr(account, "proxy", None) and str(account.proxy).strip())
+    if has_proxy:
+        return (
+            _positive_int_setting("PLAYWRIGHT_DESKTOP_VIEWPORT_WIDTH", 1920, minimum=800, maximum=3840),
+            _positive_int_setting("PLAYWRIGHT_DESKTOP_VIEWPORT_HEIGHT", 1080, minimum=600, maximum=2160),
+        )
+    return (
+        _positive_int_setting("PLAYWRIGHT_PROXYLESS_VIEWPORT_WIDTH", 1280, minimum=800, maximum=3840),
+        _positive_int_setting("PLAYWRIGHT_PROXYLESS_VIEWPORT_HEIGHT", 720, minimum=600, maximum=2160),
+    )
+
+
+def _desktop_window_args_for_account(account) -> list[str]:
+    if _is_mobile_user_agent(getattr(account, "user_agent", None)):
+        return []
+    if not bool(getattr(settings, "PLAYWRIGHT_SYNC_WINDOW_WITH_VIEWPORT", True)):
+        return []
+    width, height = _desktop_viewport_size_for_account(account)
+    extra_height = _positive_int_setting("PLAYWRIGHT_WINDOW_EXTRA_HEIGHT", 90, minimum=0, maximum=240)
+    return [
+        f"--window-size={width},{height + extra_height}",
+        "--force-device-scale-factor=1",
+        "--high-dpi-support=1",
+    ]
+
+
+async def _log_page_window_metrics(page: Page, account_id: int | None) -> None:
+    try:
+        metrics = await page.evaluate(
+            """() => ({
+                innerWidth,
+                innerHeight,
+                outerWidth,
+                outerHeight,
+                devicePixelRatio,
+                screenWidth: screen.width,
+                screenHeight: screen.height,
+                docClientWidth: document.documentElement.clientWidth,
+                docScrollWidth: document.documentElement.scrollWidth,
+            })"""
+        )
+    except Exception as exc:
+        logger.debug("Browser viewport metric probe failed for account=%s: %s", account_id, exc)
+        return
+
+    try:
+        width_gap = abs(int(metrics.get("innerWidth") or 0) - int(metrics.get("outerWidth") or 0))
+        height_gap = abs(int(metrics.get("innerHeight") or 0) - int(metrics.get("outerHeight") or 0))
+    except Exception:
+        width_gap = 0
+        height_gap = 0
+    logger.info(
+        "[BROWSER_VIEWPORT] account=%s inner=%sx%s outer=%sx%s dpr=%s screen=%sx%s doc=%sx%s mismatch=%s",
+        account_id,
+        metrics.get("innerWidth"),
+        metrics.get("innerHeight"),
+        metrics.get("outerWidth"),
+        metrics.get("outerHeight"),
+        metrics.get("devicePixelRatio"),
+        metrics.get("screenWidth"),
+        metrics.get("screenHeight"),
+        metrics.get("docClientWidth"),
+        metrics.get("docScrollWidth"),
+        bool(width_gap > 180 or height_gap > 220),
+    )
 
 
 class _RetryPageAcquire(Exception):
@@ -829,6 +925,7 @@ class BrowserPool:
                     # Headless через --headless=new (полный Chromium, а не headless-shell)
                     if settings.PLAYWRIGHT_HEADLESS:
                         launch_options["args"].append("--headless=new")
+                    launch_options["args"].extend(_desktop_window_args_for_account(account))
                     launch_options["args"].extend([
                         # ── Audio ────────────────────────────────────────────────────────────
                         "--mute-audio",
@@ -1147,10 +1244,8 @@ class BrowserPool:
                         f"(KHTML, like Gecko) Chrome/{_chrome_ver} Safari/537.36"
                     )
                     # Desktop не имеет touch-событий
-                    if account.proxy and account.proxy.strip():
-                        context_options["viewport"] = {"width": 1920, "height": 1080}
-                    else:
-                        context_options["viewport"] = {"width": 1280, "height": 720}
+                    viewport_width, viewport_height = _desktop_viewport_size_for_account(account)
+                    context_options["viewport"] = {"width": viewport_width, "height": viewport_height}
                 
                 # КРИТИЧНО: Отключаем WebRTC для предотвращения утечки реального IP
                 # permissions=[] запрещает камеру/микрофон, что предотвращает WebRTC запросы
@@ -1506,6 +1601,7 @@ class BrowserPool:
                         pass
                     raise
                 self._mark_page_in_use(page, account_id)
+                await _log_page_window_metrics(page, account_id)
                 return context, page
                 
             except _RetryPageAcquire:

@@ -44,7 +44,7 @@ from services.balance_service import (
 )
 from decimal import Decimal
 from services.task_service import dequeue_task
-from services.task_service import get_text_stats, record_text_result, requeue_deferred_task, task_uses_priority_queue
+from services.task_service import get_text_stats, record_text_result, requeue_deferred_task, task_queue_priority_level
 from services.app_settings_service import is_parsing_mode
 from services.metrics import increment_counter, record_timing
 from services.likes_config import BOOST_LIKES_DEFAULT, coerce_likes_quantity
@@ -100,12 +100,29 @@ from services.metrics import set_gauge
 # ИСПРАВЛЕНО: Используем JSON logging если включено в настройках
 from config.settings import get_settings
 settings_for_logging = get_settings()
+_executor_log_file = str(
+    getattr(settings_for_logging, "EXECUTOR_LOG_FILE", os.path.join("logs", "executor.log"))
+    or os.path.join("logs", "executor.log")
+)
+_executor_log_max_mb = max(1, int(getattr(settings_for_logging, "LOG_FILE_MAX_MB", 50) or 50))
+_executor_log_backup_count = max(
+    1,
+    int(getattr(settings_for_logging, "LOG_FILE_BACKUP_COUNT", 20) or 20),
+)
 setup_logging(
     level="INFO",
-    log_file=os.path.join("logs", "executor.log"),
+    log_file=_executor_log_file,
     use_json=settings_for_logging.USE_JSON_LOGGING,
+    log_max_bytes=_executor_log_max_mb * 1024 * 1024,
+    log_backup_count=_executor_log_backup_count,
 )
 logger = logging.getLogger("executor")
+logger.info(
+    "Executor file logging enabled: path=%s max_mb=%s backups=%s",
+    _executor_log_file,
+    _executor_log_max_mb,
+    _executor_log_backup_count,
+)
 
 # Инициализируем Sentry для мониторинга ошибок
 init_sentry()
@@ -141,6 +158,25 @@ def _mark_task_settings_dirty(task: Task) -> None:
         flag_modified(task, "settings")
     except Exception as exc:
         logger.debug("Task %s: failed to flag settings as modified: %s", getattr(task, "id", None), exc)
+
+
+def _refresh_execution_ledger(task_settings: dict[str, Any] | None) -> dict[str, Any]:
+    """Attach per-URL ledgers and a task-level aggregate to task settings."""
+    settings_dict = task_settings if isinstance(task_settings, dict) else {}
+    url_results = settings_dict.get("url_results")
+    if not isinstance(url_results, dict):
+        return settings_dict
+    try:
+        from services.task_execution_ledger import (
+            attach_url_execution_ledgers,
+            build_task_execution_ledger,
+        )
+
+        attach_url_execution_ledgers(url_results)
+        settings_dict["execution_ledger"] = build_task_execution_ledger(url_results)
+    except Exception:
+        logger.debug("Failed to refresh task execution ledger", exc_info=True)
+    return settings_dict
 
 
 def _set_executor_activity(status: str = "ok", **extra: Any) -> None:
@@ -435,6 +471,10 @@ def _format_likes_status(likes_info: dict | None) -> str:
     info = likes_info or {}
     if info.get("enabled") is False or info.get("requested") is False:
         return "Likes: disabled"
+    if info.get("attempted") is False:
+        return "Likes: skipped"
+    if info.get("error") in {"likes_not_started", "likes_target_missing", "tiktok_username_unknown"}:
+        return "Likes: skipped"
     if info.get("ok"):
         return f"Likes: {info.get('quantity', BOOST_LIKES_DEFAULT)}"
     if info.get("provider_available") is False:
@@ -1231,6 +1271,21 @@ def process_task(task_id: int) -> None:
             merged.setdefault("stopped_at", datetime.now(timezone.utc).isoformat())
             return merged
 
+        def normalize_url_result_for_timeout(result_row: dict) -> dict:
+            if not task_timed_out or not isinstance(result_row, dict):
+                return result_row
+            normalized = dict(result_row)
+            if str(normalized.get("error") or "") in {"", "stopped_by_user"}:
+                normalized["error"] = "task_timeout"
+            normalized["timeout_stopped"] = True
+            timing = normalized.get("timing")
+            if isinstance(timing, dict):
+                timing = dict(timing)
+                timing["timeout_stopped"] = True
+                timing["timeout_seconds"] = task_timeout_seconds
+                normalized["timing"] = timing
+            return normalized
+
         def task_stop_requested_now() -> bool:
             nonlocal task_stopped_by_user
             if task_timeout_requested_now():
@@ -1431,12 +1486,14 @@ def process_task(task_id: int) -> None:
                         started_at=started_at,
                         ended_at=ended_at
                     )
+                    result_dict = normalize_url_result_for_timeout(result_dict)
                     url_results[video_url] = result_dict
                     
                     # Сохраняем результат в task_settings
                     if not task_settings.get("url_results"):
                         task_settings["url_results"] = {}
                     task_settings["url_results"][video_url] = result_dict
+                    task_settings = _refresh_execution_ledger(task_settings)
                     task.settings = task_settings
                     _mark_task_settings_dirty(task)
                     
@@ -1451,10 +1508,11 @@ def process_task(task_id: int) -> None:
                         replies_info = engagement.get("replies", {})
                         likes_info = engagement.get("likes", {})
                         likes_str = _format_likes_status(likes_info)
+                        replies_expected = replies_info.get("requested_variants") or replies_info.get("total", 0)
                         log_level = logger.warning if result_status in _URL_UNCONFIRMED_STATUSES else logger.info
                         log_level(
                             f"Task {task_id}, URL {idx+1}: ENGAGEMENT_ONLY processed. "
-                            f"Status: {result_status}, Replies: {replies_info.get('ok', 0)}/{replies_info.get('total', 0)}, "
+                            f"Status: {result_status}, Replies: {replies_info.get('ok', 0)}/{replies_expected}, "
                             f"{likes_str}"
                         )
                     else:
@@ -1464,10 +1522,11 @@ def process_task(task_id: int) -> None:
                         replies_info = engagement.get("replies", {})
                         likes_info = engagement.get("likes", {})
                         likes_str = _format_likes_status(likes_info)
+                        replies_expected = replies_info.get("requested_variants") or replies_info.get("total", 0)
                         logger.warning(
                             f"Task {task_id}, URL {idx+1}: ENGAGEMENT_ONLY failed. "
                             f"Status: {result_dict.get('status')}, Error: {result_dict.get('error')}, "
-                            f"Replies: {replies_info.get('ok', 0)}/{replies_info.get('total', 0)}, "
+                            f"Replies: {replies_info.get('ok', 0)}/{replies_expected}, "
                             f"{likes_str}"
                         )
                     
@@ -1779,12 +1838,14 @@ def process_task(task_id: int) -> None:
                 result_dict["timing"] = result_dict.get("timing") or {}
                 result_dict["timing"]["started_at"] = started_at
                 result_dict["timing"]["ended_at"] = ended_at
+                result_dict = normalize_url_result_for_timeout(result_dict)
                 url_results[video_url] = result_dict
                 
                 # Сохраняем результат в task_settings
                 if not task_settings.get("url_results"):
                     task_settings["url_results"] = {}
                 task_settings["url_results"][video_url] = result_dict
+                task_settings = _refresh_execution_ledger(task_settings)
                 task.settings = task_settings
                 _mark_task_settings_dirty(task)
                 
@@ -1806,11 +1867,12 @@ def process_task(task_id: int) -> None:
                             int(replies_info.get("ok") or 0)
                             + int(replies_info.get("submitted_unconfirmed") or 0)
                         )
+                    replies_expected = replies_info.get("requested_variants") or replies_info.get("total", 0)
                     if result_status in _URL_UNCONFIRMED_STATUSES:
                         logger.warning(
                             f"Task {task_id}, URL {idx+1}: HYBRID FULL submitted but awaiting public confirmation. "
                             f"Status: {result_status}, Error: {result_dict.get('error')}, "
-                            f"Replies submitted: {submitted_replies}/{replies_info.get('total', 0)} "
+                            f"Replies submitted: {submitted_replies}/{replies_expected} "
                             f"(public={replies_info.get('ok', 0)}, "
                             f"unconfirmed={replies_info.get('submitted_unconfirmed', 0)}), "
                             f"{likes_str}"
@@ -1818,7 +1880,7 @@ def process_task(task_id: int) -> None:
                     else:
                         logger.info(
                             f"Task {task_id}, URL {idx+1}: HYBRID FULL completed successfully. "
-                            f"Replies: {replies_info.get('ok', 0)}/{replies_info.get('total', 0)}, "
+                            f"Replies: {replies_info.get('ok', 0)}/{replies_expected}, "
                             f"{likes_str}"
                         )
                 else:
@@ -1832,10 +1894,11 @@ def process_task(task_id: int) -> None:
                     replies_info = engagement.get("replies", {})
                     likes_info = engagement.get("likes", {})
                     likes_str = _format_likes_status(likes_info)
+                    replies_expected = replies_info.get("requested_variants") or replies_info.get("total", 0)
                     logger.warning(
                         f"Task {task_id}, URL {idx+1}: HYBRID FULL failed. "
                         f"Status: {result_dict.get('status')}, Error: {result_dict.get('error')}, "
-                        f"Replies: {replies_info.get('ok', 0)}/{replies_info.get('total', 0)}, "
+                        f"Replies: {replies_info.get('ok', 0)}/{replies_expected}, "
                         f"{likes_str}"
                     )
                 
@@ -1890,6 +1953,7 @@ def process_task(task_id: int) -> None:
             task_settings["timeout_cooldown_seconds"] = task_timeout_cooldown_seconds
             task_settings["stopped_at"] = datetime.now(timezone.utc).isoformat()
             task_settings.pop("stopped_by_user", None)
+            task_settings = _refresh_execution_ledger(task_settings)
             task.settings = task_settings
             _mark_task_settings_dirty(task)
             task.status = "stopped"
@@ -1928,6 +1992,7 @@ def process_task(task_id: int) -> None:
             task_settings["failed_urls"] = failed_urls
             task_settings["unconfirmed_urls"] = unconfirmed_urls
             task_settings["successful_urls"] = successful_urls_list
+            task_settings = _refresh_execution_ledger(task_settings)
             task.settings = task_settings
             _mark_task_settings_dirty(task)
             task.status = "stopped"
@@ -1972,6 +2037,7 @@ def process_task(task_id: int) -> None:
             task_settings["failed_urls"] = failed_urls
             task_settings["unconfirmed_urls"] = unconfirmed_urls
             task_settings["successful_urls"] = successful_urls_list
+            task_settings = _refresh_execution_ledger(task_settings)
             task.settings = task_settings
             _mark_task_settings_dirty(task)
             
@@ -2035,10 +2101,18 @@ def process_task(task_id: int) -> None:
             task_settings["failed_urls"] = failed_urls
             task_settings["unconfirmed_urls"] = unconfirmed_urls
             task_settings["successful_urls"] = successful_urls_list
+            task_settings = _refresh_execution_ledger(task_settings)
             task.settings = task_settings
             _mark_task_settings_dirty(task)
             
-            logger.info(f"Task {task_id} completed successfully: {successful_urls} URLs processed")
+            if unconfirmed_urls:
+                logger.warning(
+                    f"Task {task_id} completed with unconfirmed submissions: "
+                    f"{successful_urls}/{len(video_urls)} URLs processed, "
+                    f"{len(unconfirmed_urls)} awaiting confirmation"
+                )
+            else:
+                logger.info(f"Task {task_id} completed successfully: {successful_urls} URLs processed")
             
             # ИСПРАВЛЕНО: Записываем метрику успешного завершения задачи
             try:
@@ -2193,7 +2267,7 @@ def worker(worker_id: int) -> None:
                             global _last_parsing_pause_log_at
                             requeue_deferred_task(
                                 task_id,
-                                priority=task_uses_priority_queue(task_snapshot),
+                                priority_level=task_queue_priority_level(task_snapshot),
                             )
                             now_ts = time.time()
                             if now_ts - _last_parsing_pause_log_at >= 60:

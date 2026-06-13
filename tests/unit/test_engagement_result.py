@@ -163,5 +163,8 @@ def test_engagement_only_text_parent_with_unconfirmed_reply_is_not_failed():
     assert payload["core_status"] == "submitted_unconfirmed"
     assert payload["error"] is None
     assert payload["comment_id"] is None
+    assert payload["engagement"]["replies"]["submitted"] == 1
     assert payload["engagement"]["replies"]["submitted_unconfirmed"] == 1
     assert payload["warnings"][0]["code"] == "reply_submitted_unconfirmed"
+    assert payload["execution_ledger"]["summary"]["replies"]["submitted"] == 1
+    assert payload["execution_ledger"]["health_signals"]["error_categories"].get("stealth_reject") == 1

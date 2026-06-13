@@ -238,6 +238,12 @@ def test_login_state_ignores_deep_cookie_banner_login_context():
     assert "depth < 20" in source
     assert "\\u9690\\u79c1" in source
     assert "'sign in'" in source
+    assert "'iniciar sesion'" in source
+    assert "'se connecter'" in source
+    assert "'anmelden'" in source
+    assert "'entrar'" in source
+    assert "'accedi'" in source
+    assert "'zaloguj'" in source
     assert "\\u0432\\u043e\\u0439\\u0442\\u0438" in source
     assert "\\u767b\\u5f55" in source
     assert "\\u30ed\\u30b0\\u30a4\\u30f3" in source
@@ -248,6 +254,10 @@ def test_login_state_ignores_deep_cookie_banner_login_context():
     assert "startsWith(needle + ' ')" in source
     assert '[aria-label*="Profile" i][role="button"]' not in source
     assert "&& !stateIsLoginFalse" in source
+    assert "const hasVisibleLoginUi" in source
+    assert source.find("if (hasVisibleLoginUi) state = 'logged_out'") < source.find(
+        "else if ((stateIsLoginTrue || loggedInCount > 0) && !stateIsLoginFalse)"
+    )
 
 
 @pytest.mark.unit

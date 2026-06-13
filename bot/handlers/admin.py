@@ -16,8 +16,11 @@ from bot.utils.markdown_escape import escape_markdown_simple
 from services.smart_account_parser import parse_accounts_file_smart
 from services.likes_config import (
     BOOST_LIKES_DEFAULT,
+    BOOST_LIKES_TARGET_EACH_FOUND,
+    BOOST_LIKES_TARGET_SINGLE_TOP,
     BOOST_LIKES_MAX,
     BOOST_LIKES_MIN,
+    coerce_likes_target_mode,
     coerce_likes_quantity,
 )
 from dataclasses import asdict
@@ -56,6 +59,13 @@ ADMIN_USER_FILTER_LABELS = dict(ADMIN_USER_FILTERS)
 
 def _format_likes_range() -> str:
     return f"{BOOST_LIKES_MIN} до {BOOST_LIKES_MAX:,}".replace(",", " ")
+
+
+def _format_likes_target_mode(mode: str | None) -> str:
+    normalized = coerce_likes_target_mode(mode, BOOST_LIKES_TARGET_SINGLE_TOP)
+    if normalized == BOOST_LIKES_TARGET_EACH_FOUND:
+        return "каждый найденный автор"
+    return "один лучший комментарий"
 
 
 async def _safe_edit_callback_text(
@@ -568,6 +578,7 @@ async def admin_menu(callback: CallbackQuery):
             boost_likes_result,
             software_mode_result,
             commenting_mode_result,
+            order_strategy_result,
         ) = await asyncio.gather(
             api_client.get_account_stats(),
             api_client.get_proxy_stats(),
@@ -580,6 +591,7 @@ async def admin_menu(callback: CallbackQuery):
             api_client.get_boost_likes_settings(),
             api_client.get_software_mode_settings(),
             api_client.get_commenting_mode_settings(),
+            api_client.get_order_execution_strategy_settings(),
             return_exceptions=True,
         )
 
@@ -603,6 +615,7 @@ async def admin_menu(callback: CallbackQuery):
         boost_likes = _normalize(boost_likes_result, "likes settings")
         software_mode_data = _normalize(software_mode_result, "software mode")
         commenting_mode_data = _normalize(commenting_mode_result, "commenting mode")
+        order_strategy_data = _normalize(order_strategy_result, "order strategy")
 
         resources_accounts = resources_stats.get("accounts", {}) or {}
         resources_proxies = resources_stats.get("proxies", {}) or {}
@@ -641,6 +654,7 @@ async def admin_menu(callback: CallbackQuery):
         current_software_mode = software_mode_data.get("software_mode", "full")
         software_mode_label = "🟢 Полный" if current_software_mode == "full" else "🟡 Парсинг"
         current_commenting_mode = commenting_mode_data.get("commenting_mode", "old")
+        order_strategy_label = str(order_strategy_data.get("order_execution_strategy") or "balanced")
         commenting_mode_label = "🟢 Новая параллельная" if current_commenting_mode == "parallel" else "⚪ Старая"
 
         attention_lines = _build_attention_lines(
@@ -678,6 +692,7 @@ async def admin_menu(callback: CallbackQuery):
             "⚙️ *Текущий конфиг*\n"
             f"Режим: `{software_mode_label}`\n"
             f"Комментинг: `{commenting_mode_label}`\n"
+            f"Стратегия заказов: `{order_strategy_label}`\n"
             f"Прокси-режим: `{proxy_mode}`\n"
             f"Лайки: `{'вкл' if likes_enabled else 'выкл'}` | qty `{likes_quantity}` | API лайков `{'настроен' if provider_available else 'не настроен'}`\n"
             f"Цены: success `{price_success:.2f}` | failure `{price_failure:.2f}` | refund `{refund_delta:.2f}`\n"
@@ -4902,6 +4917,91 @@ async def set_commenting_mode_handler(callback: CallbackQuery):
             pass
 
 
+def _build_order_strategy_text(strategy: str, available: list[str] | None = None) -> tuple[str, InlineKeyboardMarkup]:
+    available_set = set(available or ["balanced", "fast", "careful", "verify"])
+    ordered = [item for item in ("balanced", "fast", "careful", "verify") if item in available_set]
+    labels = {
+        "balanced": "Balanced",
+        "fast": "Fast",
+        "careful": "Careful",
+        "verify": "Verify",
+    }
+    descriptions = {
+        "balanced": "Current production behavior. Safest default.",
+        "fast": "For future lower-latency policies.",
+        "careful": "For future deeper retries and slower confirmation.",
+        "verify": "For future stronger public-confirmation policies.",
+    }
+    active = strategy if strategy in available_set else "balanced"
+    lines = [
+        "*Order execution strategy*",
+        "",
+        f"Active: `{active}`",
+        "",
+    ]
+    for item in ordered:
+        marker = "✓" if item == active else "•"
+        lines.append(f"{marker} *{labels.get(item, item)}* — {descriptions.get(item, '')}")
+    lines.append("")
+    lines.append("_Balanced keeps current commenting behavior. Other modes are stored on new orders for controlled rollout._")
+    keyboard_rows = [
+        [InlineKeyboardButton(text=f"{'✓ ' if item == active else ''}{labels.get(item, item)}", callback_data=f"admin:order_strategy:set:{item}")]
+        for item in ordered
+    ]
+    keyboard_rows.append([InlineKeyboardButton(text="Back", callback_data="admin:main")])
+    return "\n".join(lines), InlineKeyboardMarkup(inline_keyboard=keyboard_rows)
+
+
+@router.callback_query(F.data == "admin:order_strategy")
+async def order_strategy_menu(callback: CallbackQuery):
+    try:
+        await callback.answer()
+        settings_data = await api_client.get_order_execution_strategy_settings()
+        strategy = str(settings_data.get("order_execution_strategy") or "balanced")
+        available = settings_data.get("available_strategies")
+        text, keyboard = _build_order_strategy_text(strategy, available if isinstance(available, list) else None)
+        await _safe_edit_callback_text(callback, text, reply_markup=keyboard, parse_mode="Markdown")
+    except Exception as e:
+        logger.error(f"Error showing order strategy menu: {e}", exc_info=True)
+        try:
+            await callback.answer("Order strategy load error", show_alert=True)
+        except Exception:
+            pass
+
+
+@router.callback_query(F.data.startswith("admin:order_strategy:set:"))
+async def set_order_strategy_handler(callback: CallbackQuery):
+    strategy = callback.data.split(":")[-1]
+    if strategy not in {"balanced", "fast", "careful", "verify"}:
+        await callback.answer("Invalid strategy", show_alert=True)
+        return
+
+    try:
+        await callback.answer(f"Strategy: {strategy}", show_alert=False)
+    except Exception:
+        pass
+
+    try:
+        old_data = await api_client.get_order_execution_strategy_settings()
+        old_strategy = str(old_data.get("order_execution_strategy") or "balanced")
+        if old_strategy != strategy:
+            await api_client.update_order_execution_strategy(strategy)
+            await log_admin_action(
+                admin_telegram_id=callback.from_user.id,
+                action_type="order_execution_strategy_update",
+                target_user_id=None,
+                details={"old_strategy": old_strategy, "new_strategy": strategy},
+            )
+        text, keyboard = _build_order_strategy_text(strategy, old_data.get("available_strategies"))
+        await _safe_edit_callback_text(callback, text, reply_markup=keyboard, parse_mode="Markdown")
+    except Exception as e:
+        logger.error(f"Error updating order strategy: {e}", exc_info=True)
+        try:
+            await callback.answer("Order strategy update error", show_alert=True)
+        except Exception:
+            pass
+
+
 @router.callback_query(F.data == "admin:boost_likes")
 async def boost_likes_menu(callback: CallbackQuery, state: FSMContext):
     """Показывает меню управления лайками на комментарии."""
@@ -4917,6 +5017,10 @@ async def boost_likes_menu(callback: CallbackQuery, state: FSMContext):
             settings_data.get("boost_likes_quantity"),
             BOOST_LIKES_DEFAULT,
         )
+        target_mode = coerce_likes_target_mode(
+            settings_data.get("boost_likes_target_mode"),
+            BOOST_LIKES_TARGET_SINGLE_TOP,
+        )
 
         provider_text = "✅ Подключен" if provider_available else "⚠️ API ключ не настроен"
         enabled_text = "Включено" if likes_enabled else "Выключено"
@@ -4924,11 +5028,14 @@ async def boost_likes_menu(callback: CallbackQuery, state: FSMContext):
         text = "❤️ *Лайки на комментарии*\n"
         text += "━━━━━━━━━━━━━━━━━━━━\n\n"
         text += f"• *Статус:* `{enabled_text}`\n"
-        text += f"• *Лайков на заказ:* `{likes_quantity}`\n"
+        text += f"• *Лайков на Boost-заказ:* `{likes_quantity}`\n"
+        text += f"• *Parallel-цель:* `{_format_likes_target_mode(target_mode)}`\n"
         text += f"• *API лайков:* `{provider_text}`\n\n"
         text += "💡 *Как это работает:*\n"
         text += "• При включении после комментария/ответов запускается заказ лайков.\n"
         text += "• Количество применяется к новым заказам.\n"
+        text += "• Режим цели применяется только к новому parallel-комментингу.\n"
+        text += "• `Один лучший` выбирает автора с максимумом ответов; `каждый найденный` создаёт до 3 Boost-заказов.\n"
         text += "• При выключении лайки полностью пропускаются.\n"
 
         keyboard = InlineKeyboardMarkup(inline_keyboard=[
@@ -4942,6 +5049,12 @@ async def boost_likes_menu(callback: CallbackQuery, state: FSMContext):
                 InlineKeyboardButton(
                     text=f"🔢 Количество: {likes_quantity}",
                     callback_data="admin:boost_likes:edit_quantity",
+                )
+            ],
+            [
+                InlineKeyboardButton(
+                    text=f"🎯 Цель: {_format_likes_target_mode(target_mode)}",
+                    callback_data="admin:boost_likes:toggle_target_mode",
                 )
             ],
             [
@@ -4976,6 +5089,37 @@ async def toggle_boost_likes(callback: CallbackQuery, state: FSMContext):
     except Exception as e:
         logger.error(f"Error toggling boost likes: {e}", exc_info=True)
         await callback.answer("Ошибка обновления настройки", show_alert=True)
+
+
+@router.callback_query(F.data == "admin:boost_likes:toggle_target_mode")
+async def toggle_boost_likes_target_mode(callback: CallbackQuery, state: FSMContext):
+    """Переключает режим выбора комментариев для Boost-лайков в parallel-комментинге."""
+    try:
+        await callback.answer()
+
+        settings_data = await api_client.get_boost_likes_settings()
+        current_mode = coerce_likes_target_mode(
+            settings_data.get("boost_likes_target_mode"),
+            BOOST_LIKES_TARGET_SINGLE_TOP,
+        )
+        new_mode = (
+            BOOST_LIKES_TARGET_EACH_FOUND
+            if current_mode == BOOST_LIKES_TARGET_SINGLE_TOP
+            else BOOST_LIKES_TARGET_SINGLE_TOP
+        )
+
+        await api_client.update_boost_likes_settings(boost_likes_target_mode=new_mode)
+        await log_admin_action(
+            admin_telegram_id=callback.from_user.id,
+            action_type="boost_likes_target_mode_update",
+            target_user_id=None,
+            details={"old_mode": current_mode, "new_mode": new_mode},
+        )
+        await boost_likes_menu(callback, state)
+        await callback.answer("✅ Режим цели обновлён", show_alert=False)
+    except Exception as e:
+        logger.error(f"Error toggling boost likes target mode: {e}", exc_info=True)
+        await callback.answer("Ошибка обновления режима цели", show_alert=True)
 
 
 @router.callback_query(F.data == "admin:boost_likes:edit_quantity")
