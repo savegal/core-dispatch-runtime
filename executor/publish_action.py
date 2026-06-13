@@ -1605,6 +1605,174 @@ async def _reply_scoped_input_contains_expected_text(page: Page, text: str) -> t
     return False, ""
 
 
+async def _main_comment_input_committed_text_state(
+    page: Page,
+    expected_text: Optional[str] = None,
+) -> Dict[str, Any]:
+    """Return visible top-level composer text without requiring a byte-exact match."""
+    try:
+        result = await page.evaluate(
+            r"""
+            ([expected]) => {
+                const normalizeText = (value) => String(value || '').replace(/\s+/g, ' ').trim();
+                const expectedText = normalizeText(expected);
+                const placeholderMarkers = [
+                    'add comment',
+                    'add a comment',
+                    'say something',
+                    'leave a comment',
+                    '\u0434\u043e\u0431\u0430\u0432\u044c\u0442\u0435 \u043a\u043e\u043c\u043c\u0435\u043d\u0442\u0430\u0440',
+                    '\u043d\u0430\u043f\u0438\u0448\u0438\u0442\u0435 \u043a\u043e\u043c\u043c\u0435\u043d\u0442\u0430\u0440',
+                    '\u0434\u043e\u0434\u0430\u0442\u0438 \u043a\u043e\u043c\u0435\u043d\u0442\u0430\u0440',
+                    '\u0434\u043e\u0434\u0430\u0442\u0438 \u0432\u0456\u0434\u043f\u043e\u0432\u0456\u0434\u044c'
+                ];
+                const visible = (el) => {
+                    if (!el || !el.getBoundingClientRect) return false;
+                    const r = el.getBoundingClientRect();
+                    const st = getComputedStyle(el);
+                    return r.width > 0 && r.height > 0 &&
+                        st.display !== 'none' && st.visibility !== 'hidden';
+                };
+                const disabled = (el) => {
+                    if (!el) return true;
+                    const st = getComputedStyle(el);
+                    return el.hasAttribute('disabled') ||
+                        el.getAttribute('aria-disabled') === 'true' ||
+                        el.classList.contains('disabled') ||
+                        getComputedStyle(el).pointerEvents === 'none' ||
+                        parseFloat(st.opacity || '1') < 0.45;
+                };
+                const isRealEditor = (el) => el && (
+                    el.isContentEditable ||
+                    (el.getAttribute && el.getAttribute('contenteditable') === 'true') ||
+                    el.tagName === 'TEXTAREA' ||
+                    el.tagName === 'INPUT' ||
+                    (el.getAttribute && el.getAttribute('role') === 'textbox')
+                );
+                const labelOf = (el) => [
+                    el && el.getAttribute && (el.getAttribute('data-e2e') || ''),
+                    el && el.getAttribute && (el.getAttribute('aria-label') || ''),
+                    el && el.getAttribute && (el.getAttribute('placeholder') || ''),
+                    el && el.getAttribute && (el.getAttribute('data-placeholder') || ''),
+                    el && String(el.className || ''),
+                    el && (el.id || ''),
+                    el && (el.tagName || ''),
+                ].join(' ').toLowerCase();
+                const isCommentScoped = (el) => {
+                    let cur = el;
+                    for (let depth = 0; depth < 8 && cur && cur !== document.body; depth++, cur = cur.parentElement) {
+                        const label = labelOf(cur);
+                        if (
+                            label.includes('search') ||
+                            label.includes('captcha') ||
+                            label.includes('challenge') ||
+                            label.includes('login') ||
+                            label.includes('sign in') ||
+                            label.includes('signup')
+                        ) return false;
+                        if (label.includes('comment')) return true;
+                    }
+                    return false;
+                };
+                const readEditorText = (editor) => {
+                    if (!editor) return '';
+                    const raw = (editor.value !== undefined && editor.value !== null && editor.value !== '')
+                        ? editor.value
+                        : (editor.textContent || editor.innerText || '');
+                    return normalizeText(raw);
+                };
+                const tokensOf = (value) => normalizeText(value)
+                    .toLowerCase()
+                    .split(/[^0-9a-zA-Z\u00c0-\uffff]+/)
+                    .map(token => token.trim())
+                    .filter(token => token.length >= 2);
+                const textMatchesExpected = (actual, expectedValue) => {
+                    if (!expectedValue) return true;
+                    const actualLower = normalizeText(actual).toLowerCase();
+                    const expectedLower = normalizeText(expectedValue).toLowerCase();
+                    if (!actualLower || !expectedLower) return false;
+                    if (actualLower === expectedLower) return true;
+                    if (actualLower.includes(expectedLower) || expectedLower.includes(actualLower)) return true;
+                    const expectedTokens = tokensOf(expectedLower);
+                    if (!expectedTokens.length) return false;
+                    const hits = expectedTokens.filter(token => actualLower.includes(token)).length;
+                    return hits >= Math.min(2, expectedTokens.length) &&
+                        (hits / expectedTokens.length) >= 0.5;
+                };
+                const innerEditor = (raw) => {
+                    if (!raw) return null;
+                    if (isRealEditor(raw)) return raw;
+                    if (!raw.querySelector) return null;
+                    return raw.querySelector(
+                        'div[contenteditable="true"], [contenteditable="true"], textarea, input, [role="textbox"]'
+                    );
+                };
+                const editors = [];
+                const wrappers = [
+                    ...document.querySelectorAll('[data-smart-id="comment-input"]'),
+                    ...document.querySelectorAll('[data-e2e="comment-input"]'),
+                    ...document.querySelectorAll('[data-e2e*="comment-input"]'),
+                    ...document.querySelectorAll('[data-e2e*="CommentInput"]'),
+                ];
+                for (const wrapper of wrappers) {
+                    const editor = innerEditor(wrapper);
+                    if (editor && (visible(editor) || visible(wrapper) || visible(editor.parentElement))) {
+                        editors.push(editor);
+                    }
+                }
+                for (const editor of document.querySelectorAll(
+                    'div[contenteditable="true"], [contenteditable="true"], [role="textbox"], textarea, input'
+                )) {
+                    if (!isRealEditor(editor) || !visible(editor) || !isCommentScoped(editor)) continue;
+                    editors.push(editor);
+                }
+
+                const seen = new Set();
+                for (const editor of editors) {
+                    if (!editor || seen.has(editor)) continue;
+                    seen.add(editor);
+                    const text = readEditorText(editor);
+                    const lower = text.toLowerCase();
+                    const placeholderLeak = placeholderMarkers.some(
+                        marker => lower.startsWith(marker) || lower.includes('add comment...')
+                    );
+                    if (!text || placeholderLeak) continue;
+                    if (!textMatchesExpected(text, expectedText)) {
+                        return {
+                            ok: false,
+                            reason: 'text_mismatch',
+                            text: text.slice(0, 180),
+                            textLen: text.length,
+                            expected: expectedText.slice(0, 180),
+                        };
+                    }
+                    const post = document.querySelector(
+                        '[data-smart-id="comment-post-ready"], [data-smart-id="comment-post"], ' +
+                        '[data-e2e="comment-post"], [data-e2e*="comment-post"], [data-e2e="post-comment-button"]'
+                    );
+                    return {
+                        ok: true,
+                        text: text.slice(0, 180),
+                        textLen: text.length,
+                        postVisible: visible(post),
+                        postDisabled: post ? disabled(post) : null,
+                        editorTag: editor.tagName,
+                        editorE2e: editor.getAttribute && editor.getAttribute('data-e2e'),
+                        editorSmart: editor.getAttribute && editor.getAttribute('data-smart-id'),
+                    };
+                }
+                return { ok: false, reason: editors.length ? 'empty_or_placeholder' : 'editor_not_found' };
+            }
+            """,
+            [expected_text or ""],
+        )
+        if isinstance(result, dict):
+            return result
+    except Exception as exc:
+        logger.debug("[PUBLISH] main composer text-state probe failed: %s", str(exc)[:120])
+    return {"ok": False, "reason": "probe_exception"}
+
+
 async def _type_main_comment_by_mouse_keyboard(page: Page, text: str, *, fast: bool = True) -> dict[str, Any]:
     """Type a top-level comment through a real focused editor path.
 
@@ -2159,9 +2327,26 @@ async def _publish_main_comment_direct_dom(
                 dom_strategy=combined_strategy,
                 post_was_enabled_at_click=post_was_enabled,
             )
+        error_reason = (
+            "no_network_response_after_main_direct_post_click"
+            if request_attempted
+            else "no_network_request_after_main_direct_post_click"
+        )
+        _log_publish_trace(
+            "publish_result",
+            page=page,
+            expected_video_url=expected_video_url,
+            correlation_id=correlation_id,
+            status="timeout",
+            reason=error_reason,
+            request_attempted=request_attempted,
+            post_was_enabled=post_was_enabled,
+            elapsed=round(elapsed, 2),
+            level=logging.WARNING,
+        )
         return PublishResult(
             status="timeout",
-            error_reason="no_network_request_after_main_direct_post_click",
+            error_reason=error_reason,
             network_captured=False,
             network_request_attempted=request_attempted,
             elapsed_seconds=elapsed,
@@ -2551,9 +2736,41 @@ async def _publish_via_current_input(
                 timeout=probe_timeout,
             )
         except asyncio.TimeoutError:
-            return False
+            ok, visible_text = False, ""
         except Exception:
-            return False
+            ok, visible_text = False, ""
+        if not ok and main_comment_aggressive:
+            try:
+                state = await _asyncio_wait_for(
+                    _main_comment_input_committed_text_state(page, text),
+                    timeout=probe_timeout,
+                )
+            except asyncio.TimeoutError:
+                state = {"ok": False, "reason": "timeout"}
+            except Exception:
+                state = {"ok": False, "reason": "exception"}
+            if isinstance(state, dict) and state.get("ok"):
+                visible_text = str(state.get("text") or "")
+                logger.warning(
+                    "[PUBLISH] Main typing phase %s timed out/unverified but composer has text; "
+                    "continuing aggressively to Post: '%s'",
+                    phase,
+                    visible_text[:60],
+                )
+                _log_publish_trace(
+                    "main_typing_timeout_text_present",
+                    page=page,
+                    expected_video_url=expected_video_url,
+                    correlation_id=correlation_id,
+                    phase=phase,
+                    dom_strategy=dom_strategy,
+                    input_text_len=int(state.get("textLen") or len(visible_text or "")),
+                    input_preview=visible_text[:60],
+                    post_visible=state.get("postVisible"),
+                    post_disabled=state.get("postDisabled"),
+                    level=logging.WARNING,
+                )
+                return True
         if not ok:
             return False
         logger.info(
@@ -2992,25 +3209,66 @@ async def _publish_via_current_input(
             return captcha_result
         disabled_reason = str(getattr(enabled_info, "reason", "") or "")
         if disabled_reason.startswith("post_button_input_not_ready:"):
-            _log_publish_trace(
-                "publish_result",
-                page=page,
-                expected_video_url=expected_video_url,
-                correlation_id=correlation_id,
-                status="dom_error",
-                reason=disabled_reason,
-                post_was_enabled=False,
-                elapsed=round(time.monotonic() - started, 2),
-                level=logging.WARNING,
-            )
-            return PublishResult(
-                status="dom_error",
-                error_reason=disabled_reason,
-                dom_strategy=input_info.strategy or post_info.strategy,
-                elapsed_seconds=time.monotonic() - started,
-                post_was_enabled_at_click=False,
-                network_request_attempted=False,
-            )
+            if main_comment_aggressive:
+                state = await _main_comment_input_committed_text_state(page, text)
+                if isinstance(state, dict) and state.get("ok"):
+                    logger.warning(
+                        "[PUBLISH] Main Post enabled-gate says %s, but composer has text; "
+                        "continuing with aggressive click path.",
+                        disabled_reason,
+                    )
+                    _log_publish_trace(
+                        "main_post_enabled_gate_bypassed",
+                        page=page,
+                        expected_video_url=expected_video_url,
+                        correlation_id=correlation_id,
+                        reason=disabled_reason,
+                        input_text_len=int(state.get("textLen") or len(str(state.get("text") or ""))),
+                        input_preview=str(state.get("text") or "")[:60],
+                        post_visible=state.get("postVisible"),
+                        post_disabled=state.get("postDisabled"),
+                        level=logging.WARNING,
+                    )
+                else:
+                    _log_publish_trace(
+                        "publish_result",
+                        page=page,
+                        expected_video_url=expected_video_url,
+                        correlation_id=correlation_id,
+                        status="dom_error",
+                        reason=disabled_reason,
+                        post_was_enabled=False,
+                        elapsed=round(time.monotonic() - started, 2),
+                        level=logging.WARNING,
+                    )
+                    return PublishResult(
+                        status="dom_error",
+                        error_reason=disabled_reason,
+                        dom_strategy=input_info.strategy or post_info.strategy,
+                        elapsed_seconds=time.monotonic() - started,
+                        post_was_enabled_at_click=False,
+                        network_request_attempted=False,
+                    )
+            else:
+                _log_publish_trace(
+                    "publish_result",
+                    page=page,
+                    expected_video_url=expected_video_url,
+                    correlation_id=correlation_id,
+                    status="dom_error",
+                    reason=disabled_reason,
+                    post_was_enabled=False,
+                    elapsed=round(time.monotonic() - started, 2),
+                    level=logging.WARNING,
+                )
+                return PublishResult(
+                    status="dom_error",
+                    error_reason=disabled_reason,
+                    dom_strategy=input_info.strategy or post_info.strategy,
+                    elapsed_seconds=time.monotonic() - started,
+                    post_was_enabled_at_click=False,
+                    network_request_attempted=False,
+                )
         logger.warning(
             "[PUBLISH] Post button not enabled after wait: %s. Trying legacy force-click anyway.",
             enabled_info.reason,

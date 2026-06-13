@@ -3251,6 +3251,28 @@ def _is_comment_composer_publish_failure(result: "PublishResult") -> bool:
     )
 
 
+def _main_publish_failure_may_leave_dirty_composer(
+    result: "PublishResult",
+    *,
+    post_was_enabled: bool = False,
+    network_attempted: bool = False,
+) -> bool:
+    """After these failures, do not type another main variant in the same page."""
+    if post_was_enabled or network_attempted:
+        return True
+    reason = result.error_reason or ""
+    return reason.startswith(
+        (
+            "publish_deadline_exceeded:typing",
+            "publish_deadline_exceeded:main_direct_post_click",
+            "main_direct_post_click_failed:",
+            "no_network_request_after_main_direct_post_click",
+            "no_network_response_after_main_direct_post_click",
+            "typing_failed",
+        )
+    )
+
+
 def _should_attempt_local_publish_confirmation(result: "PublishResult") -> bool:
     """Only verify local DOM after a submit could actually have happened."""
     if _is_critical_publish_failure(result):
@@ -3259,7 +3281,11 @@ def _should_attempt_local_publish_confirmation(result: "PublishResult") -> bool:
     reason = result.error_reason or ""
     if status == "pending_public_check":
         return True
-    if status == "timeout" and "no_network_request_after_post_click" in reason:
+    if status == "timeout" and reason in {
+        "no_network_request_after_post_click",
+        "no_network_request_after_main_direct_post_click",
+        "no_network_response_after_main_direct_post_click",
+    }:
         return True
     if "stealth_reject_empty_body" in reason:
         return True
@@ -3463,7 +3489,8 @@ async def _publish_all_variants_on_account(
                     str(exc)[:120],
                 )
 
-        success = result.status == "success" and bool(result.comment_id)
+        success_status = result.status == "success"
+        success = success_status and bool(result.comment_id)
         network_confirmed = success and bool(getattr(result, "network_captured", False))
         post_was_enabled = bool(getattr(result, "post_was_enabled_at_click", False))
         network_attempted = bool(
@@ -3532,11 +3559,11 @@ async def _publish_all_variants_on_account(
                     "false positive (likely wrapper-placeholder leak)",
                     sub_corr,
                 )
-        if success:
+        if success_status:
             local_confirmed = True
 
         submitted_unconfirmed = False
-        if not success and not local_confirmed and _main_publish_submitted_unconfirmed(sub_corr, result):
+        if not success_status and not local_confirmed and _main_publish_submitted_unconfirmed(sub_corr, result):
             submitted_unconfirmed = True
             logger.info(
                 "[USER_SCHEMA] main publish %s submitted_unconfirmed after %s; "
@@ -3602,6 +3629,19 @@ async def _publish_all_variants_on_account(
                 break
             # На обычных DOM ошибках идём к следующему варианту без паузы:
             # пауза имеет смысл только между УСПЕШНЫМИ публикациями.
+            if _main_publish_failure_may_leave_dirty_composer(
+                result,
+                post_was_enabled=post_was_enabled,
+                network_attempted=network_attempted,
+            ):
+                logger.warning(
+                    "[USER_SCHEMA] main publish %s left submit/composer state ambiguous (%s); "
+                    "stopping series on account=%s so the next variant starts in a fresh browser",
+                    sub_corr,
+                    last_failure_reason,
+                    account.id,
+                )
+                break
             continue
 
         published_comment_id = result.comment_id or (
@@ -3665,6 +3705,14 @@ async def _publish_all_variants_on_account(
             break
 
         # Пауза только если впереди ещё есть варианты для отправки.
+        if submitted_unconfirmed:
+            logger.info(
+                "[USER_SCHEMA] main publish %s submitted-unconfirmed; stopping this account series "
+                "so remaining variants use fresh composer/browser state",
+                sub_corr,
+            )
+            break
+
         if idx < len(text_variants):
             delay = _next_inter_publish_delay(len(published))
             logger.debug("[USER_SCHEMA] inter-variant delay %.1fs (already published %d)", delay, len(published))
@@ -4458,6 +4506,8 @@ def _main_publish_submitted_unconfirmed(correlation_id: Optional[str], result: P
     if reason not in {
         "stealth_reject_empty_body",
         "no_network_response_after_publish_request",
+        "no_network_response_after_main_direct_post_click",
+        "no_network_request_after_main_direct_post_click",
     }:
         return False
     post_was_enabled = bool(getattr(result, "post_was_enabled_at_click", False))
@@ -7839,7 +7889,12 @@ async def execute_user_schema_parallel(
         result.error = "no_text_variants"
         result.elapsed_seconds = time.monotonic() - started
         return result
-    result.expected_main_publications = len(main_texts) * parallel_main_account_slots
+    parallel_main_account_slots = min(parallel_main_account_slots, len(main_texts))
+    main_texts_by_slot: Dict[int, List[str]] = {
+        slot_index: [text]
+        for slot_index, text in enumerate(main_texts, start=1)
+    }
+    result.expected_main_publications = len(main_texts)
     reply_variants: List[str] = _reply_variants_from_task(task)
     result.expected_reply_variants = len(reply_variants)
 
@@ -8362,8 +8417,8 @@ async def execute_user_schema_parallel(
 
     max_empty_main_batches_before_fail = 2
     pending_main_slots: List[Tuple[int, List[str]]] = [
-        (slot_index, list(main_texts))
-        for slot_index in range(1, parallel_main_account_slots + 1)
+        (slot_index, list(slot_texts))
+        for slot_index, slot_texts in main_texts_by_slot.items()
     ]
     main_attempts_by_slot: Dict[int, int] = {}
     main_published_by_slot: Dict[int, List[PublishedMain]] = {}
@@ -8379,11 +8434,14 @@ async def execute_user_schema_parallel(
 
         active_main_tasks: Dict[asyncio.Task, Tuple[int, List[str]]] = {}
         empty_main_attempts_without_any_publication = 0
+        # Keep the empty-surface stop as a "two full waves" guard. After moving
+        # main publishing to one text per slot, small orders have fewer slots,
+        # but they should not be abandoned after just 1-2 flaky browser attempts.
+        empty_main_attempt_slots = max(3, parallel_main_account_slots)
         max_empty_main_attempts_before_fail = (
-            max_empty_main_batches_before_fail * max(1, parallel_main_account_slots)
+            max_empty_main_batches_before_fail * empty_main_attempt_slots
         )
         main_empty_threshold_reached = False
-        stop_main_scheduling_after_empty_threshold = False
 
         def _stream_main_publication(slot_index: int, published_main: PublishedMain) -> None:
             stored = main_published_by_slot.setdefault(slot_index, [])
@@ -8416,7 +8474,6 @@ async def execute_user_schema_parallel(
                 while (
                     pending_main_slots
                     and len(active_main_tasks) < parallel_worker_target
-                    and not stop_main_scheduling_after_empty_threshold
                     and not _is_stop_requested()
                 ):
                     slot_index, slot_texts = pending_main_slots.pop(0)
@@ -8535,7 +8592,10 @@ async def execute_user_schema_parallel(
                         main_failures_by_slot[slot_result.slot_index] = slot_result
                         retryable_error = slot_result.error not in {"no_free_main_accounts", "stopped_by_user"}
                         if retryable_error and main_attempts_by_slot.get(slot_result.slot_index, 0) < max_main_attempts:
-                            retry_texts = slot_result.remaining_texts or list(main_texts)
+                            retry_texts = (
+                                slot_result.remaining_texts
+                                or list(main_texts_by_slot.get(slot_result.slot_index) or slot_texts)
+                            )
                             logger.info(
                                 "Task %s: dynamic main slot %s scheduling replacement attempt %s/%s "
                                 "for %s text(s) after failure: %s",
@@ -8549,7 +8609,15 @@ async def execute_user_schema_parallel(
                             pending_main_slots.append((slot_result.slot_index, retry_texts))
 
                     total_main_publications = sum(len(items) for items in main_published_by_slot.values())
-                    if total_main_publications <= 0 and not slot_result.published:
+                    count_as_empty_surface_attempt = slot_result.error not in {
+                        "no_free_main_accounts",
+                        "stopped_by_user",
+                    }
+                    if (
+                        total_main_publications <= 0
+                        and not slot_result.published
+                        and count_as_empty_surface_attempt
+                    ):
                         empty_main_attempts_without_any_publication += 1
                         logger.warning(
                             "Task %s: dynamic parallel main attempt produced zero comments (%s/%s); "
@@ -8558,24 +8626,32 @@ async def execute_user_schema_parallel(
                             empty_main_attempts_without_any_publication,
                             max_empty_main_attempts_before_fail,
                         )
+                    elif total_main_publications <= 0 and not slot_result.published:
+                        logger.info(
+                            "Task %s: dynamic parallel main slot %s ended with %s; "
+                            "not counting it as a video/comment-surface empty attempt",
+                            task_id,
+                            slot_result.slot_index,
+                            slot_result.error or "main_not_published",
+                        )
                     else:
                         empty_main_attempts_without_any_publication = 0
 
                     if (
                         total_main_publications <= 0
-                        and empty_main_attempts_without_any_publication == max_empty_main_attempts_before_fail
+                        and empty_main_attempts_without_any_publication >= max_empty_main_attempts_before_fail
                     ):
                         main_empty_threshold_reached = True
-                        stop_main_scheduling_after_empty_threshold = True
-                        pending_main_slots.clear()
                         logger.warning(
                             "Task %s: dynamic parallel main phase reached %s empty attempt(s), "
-                            "stopping pending main workers and letting %s active worker(s) finish",
+                            "but continuing per-slot retries instead of clearing pending main workers "
+                            "(active=%s pending=%s)",
                             task_id,
                             empty_main_attempts_without_any_publication,
                             len(active_main_tasks),
+                            len(pending_main_slots),
                         )
-                        break
+                        empty_main_attempts_without_any_publication = 0
         finally:
             if active_main_tasks:
                 await _cancel_active_dynamic_main_tasks()
@@ -8681,7 +8757,10 @@ async def execute_user_schema_parallel(
             main_failures_by_slot[slot_result.slot_index] = slot_result
             retryable_error = slot_result.error not in {"no_free_main_accounts", "stopped_by_user"}
             if retryable_error and main_attempts_by_slot.get(slot_result.slot_index, 0) < max_main_attempts:
-                retry_texts = slot_result.remaining_texts or list(main_texts)
+                retry_texts = (
+                    slot_result.remaining_texts
+                    or list(main_texts_by_slot.get(slot_result.slot_index) or slot_texts)
+                )
                 retry_slots.append((slot_result.slot_index, retry_texts))
 
         total_main_publications = sum(len(items) for items in main_published_by_slot.values())
@@ -8720,7 +8799,7 @@ async def execute_user_schema_parallel(
         or main_failures_by_slot.get(slot_index)
         or _ParallelMainSlotResult(
             slot_index=slot_index,
-            text=" | ".join(main_texts),
+            text=" | ".join(main_texts_by_slot.get(slot_index, [])),
             published=list(main_published_by_slot.get(slot_index, [])),
             error="stopped_by_user" if _is_stop_requested() else "main_not_attempted",
         )
@@ -8785,7 +8864,7 @@ async def execute_user_schema_parallel(
         missing_slots = [
             str(slot.slot_index)
             for slot in main_results
-            if len(slot.published or []) < len(main_texts)
+            if len(slot.published or []) < len(main_texts_by_slot.get(slot.slot_index, []))
         ]
         has_reply_phase = bool(reply_variants)
         logger.warning(
@@ -8799,7 +8878,11 @@ async def execute_user_schema_parallel(
             ),
             len(result.published_mains),
             result.expected_main_publications,
-            sum(1 for slot in main_results if len(slot.published or []) >= len(main_texts)),
+            sum(
+                1
+                for slot in main_results
+                if len(slot.published or []) >= len(main_texts_by_slot.get(slot.slot_index, []))
+            ),
             parallel_main_account_slots,
             missing_slots,
         )

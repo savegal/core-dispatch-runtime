@@ -1432,6 +1432,83 @@ async def test_parallel_main_publish_records_submitted_unconfirmed_after_network
 
 @pytest.mark.unit
 @pytest.mark.asyncio
+async def test_parallel_main_submit_without_response_stops_current_account_series(monkeypatch):
+    from executor import user_schema
+    from executor.publish_action import PublishResult
+
+    calls = []
+
+    async def fake_publish(_page, text, **kwargs):
+        calls.append((text, kwargs["correlation_id"]))
+        return PublishResult(
+            status="timeout",
+            error_reason="no_network_response_after_main_direct_post_click",
+            network_request_attempted=True,
+            dom_strategy="main-direct-test",
+            post_was_enabled_at_click=True,
+        )
+
+    async def fake_username(_page):
+        return "main_user"
+
+    monkeypatch.setattr(user_schema, "publish_comment_hybrid", fake_publish)
+    monkeypatch.setattr(user_schema, "extract_tiktok_username", fake_username)
+    monkeypatch.setattr(user_schema, "find_comment_in_list", AsyncMock(return_value=(False, {})))
+    monkeypatch.setattr(user_schema, "_deny_if_visible_logged_out", AsyncMock(return_value=None))
+    monkeypatch.setattr(user_schema, "_register_runtime_success", lambda *_args, **_kwargs: None)
+
+    published, failure_reason = await user_schema._publish_all_variants_on_account(
+        SimpleNamespace(),
+        SimpleNamespace(url="https://www.tiktok.com/@demo/video/1234567890123456789"),
+        SimpleNamespace(id=44),
+        ["first", "second"],
+        correlation_id="task_1_parallel_main_v1_a1_acc44",
+        expected_video_url="https://www.tiktok.com/@demo/video/1234567890123456789",
+    )
+
+    assert calls == [("first", "task_1_parallel_main_v1_a1_acc44_v1")]
+    assert failure_reason is None
+    assert len(published) == 1
+    assert published[0].text == "first"
+    assert published[0].comment_id is None
+    assert published[0].local_confirmed is False
+
+
+@pytest.mark.unit
+@pytest.mark.asyncio
+async def test_publish_all_variants_stops_after_dirty_typing_timeout(monkeypatch):
+    from executor import user_schema
+    from executor.publish_action import PublishResult
+
+    calls = []
+
+    async def fake_publish(_page, text, **kwargs):
+        calls.append((text, kwargs["correlation_id"]))
+        return PublishResult(status="timeout", error_reason="publish_deadline_exceeded:typing")
+
+    async def fake_username(_page):
+        return "main_user"
+
+    monkeypatch.setattr(user_schema, "publish_comment_hybrid", fake_publish)
+    monkeypatch.setattr(user_schema, "extract_tiktok_username", fake_username)
+    monkeypatch.setattr(user_schema, "_deny_if_visible_logged_out", AsyncMock(return_value=None))
+
+    published, failure_reason = await user_schema._publish_all_variants_on_account(
+        SimpleNamespace(),
+        SimpleNamespace(url="https://www.tiktok.com/@demo/video/1234567890123456789"),
+        SimpleNamespace(id=44),
+        ["first", "second"],
+        correlation_id="task_1",
+        expected_video_url="https://www.tiktok.com/@demo/video/1234567890123456789",
+    )
+
+    assert calls == [("first", "task_1_v1")]
+    assert published == []
+    assert failure_reason == "publish_deadline_exceeded:typing"
+
+
+@pytest.mark.unit
+@pytest.mark.asyncio
 async def test_publish_all_variants_returns_comment_ui_failure_reason(monkeypatch):
     from executor import user_schema
     from executor.publish_action import PublishResult
@@ -5449,10 +5526,10 @@ async def test_parallel_mode_closes_pool_between_main_and_reply_batches(monkeypa
 
     assert result.error is None
     assert selected_main_ids == [101, 102, 103]
-    assert len(result.published_mains) == 9
+    assert len(result.published_mains) == 3
     assert selected_reply_ids == [201, 202, 203, 204]
     assert [variant for variant, _account_id in reply_calls] == [1, 2, 3, 4]
-    assert reply_candidate_counts == [9, 9, 9, 9]
+    assert reply_candidate_counts == [3, 3, 3, 3]
     assert capacity_requests == [4, 4]
     assert close_calls == ["close", "close"]
 
@@ -5770,20 +5847,20 @@ async def test_parallel_mode_retries_failed_main_slot_with_replacement_before_re
 
     assert result.error is None
     assert [event for event in events if event[0] == "main"] == [
-        ("main", 101, ("m1", "m2", "m3")),
-        ("main", 102, ("m1", "m2", "m3")),
-        ("main", 103, ("m1", "m2", "m3")),
-        ("main", 104, ("m1", "m2", "m3")),
+        ("main", 101, ("m1",)),
+        ("main", 102, ("m2",)),
+        ("main", 103, ("m3",)),
+        ("main", 104, ("m2",)),
     ]
     assert events[-1][0] == "reply"
-    assert [main.account_id for main in result.published_mains] == [101, 101, 101, 104, 104, 104, 103, 103, 103]
-    assert [main.text for main in result.published_mains] == ["m1", "m2", "m3"] * 3
+    assert [main.account_id for main in result.published_mains] == [101, 104, 103]
+    assert [main.text for main in result.published_mains] == ["m1", "m2", "m3"]
     assert close_calls == ["close", "close"]
 
 
 @pytest.mark.unit
 @pytest.mark.asyncio
-async def test_parallel_mode_keeps_partially_published_main_account_slot(monkeypatch):
+async def test_parallel_mode_passes_one_main_per_variant_to_replies(monkeypatch):
     from db import database as db_database
     from executor import browser_pool, user_schema
 
@@ -5871,14 +5948,13 @@ async def test_parallel_mode_keeps_partially_published_main_account_slot(monkeyp
 
     assert result.error is None
     assert main_calls[:3] == [
-        (101, ("m1", "m2", "m3")),
-        (102, ("m1", "m2", "m3")),
-        (103, ("m1", "m2", "m3")),
+        (101, ("m1",)),
+        (102, ("m2",)),
+        (103, ("m3",)),
     ]
-    assert (104, ("m3",)) in main_calls
-    assert len(result.published_mains) == 9
-    assert [main.text for main in result.published_mains].count("m3") == 3
-    assert reply_candidate_counts == [9]
+    assert len(result.published_mains) == 3
+    assert [main.text for main in result.published_mains].count("m3") == 1
+    assert reply_candidate_counts == [3]
     assert not any(item.get("code") == "parallel_main_partial" for item in result.warnings)
 
 
@@ -5887,7 +5963,7 @@ async def test_parallel_mode_keeps_partially_published_main_account_slot(monkeyp
 async def test_parallel_mode_blocks_replies_when_one_main_slot_exhausts(monkeypatch):
     # STRICT GATE: when a reply phase exists, the parallel flow must NOT start
     # replies unless every expected main publication landed. Here one slot's v2
-    # attempts keep hitting captcha after retries are exhausted, so only 6 of 9
+    # attempts keep hitting captcha after retries are exhausted, so only 2 of 3
     # expected mains publish and the reply phase must be blocked.
     from db import database as db_database
     from executor import browser_pool, user_schema
@@ -5973,8 +6049,8 @@ async def test_parallel_mode_blocks_replies_when_one_main_slot_exhausts(monkeypa
         boost_quantity=0,
     )
 
-    assert result.error == "parallel_main_incomplete:published=6/9"
-    assert len(result.published_mains) == 6
+    assert result.error == "parallel_main_incomplete:published=2/3"
+    assert len(result.published_mains) == 2
     # Reply phase must not have started with an incomplete set of mains.
     assert result.replies == []
     assert reply_candidate_counts == []
@@ -6052,7 +6128,7 @@ async def test_parallel_mode_main_only_proceeds_with_partial_mains(monkeypatch):
     )
 
     assert result.error is None
-    assert len(result.published_mains) == 6
+    assert len(result.published_mains) == 2
     # No reply phase requested: reply workers never run, and the strict block
     # warning is not emitted.
     assert reply_calls == []
@@ -6065,7 +6141,7 @@ async def test_parallel_mode_main_only_proceeds_with_partial_mains(monkeypatch):
 
 @pytest.mark.unit
 @pytest.mark.asyncio
-async def test_parallel_mode_reply_variant_targets_all_duplicate_main_comments(monkeypatch):
+async def test_parallel_mode_reply_variant_targets_each_main_comment(monkeypatch):
     from db import database as db_database
     from executor import browser_pool, user_schema
 
@@ -6144,21 +6220,20 @@ async def test_parallel_mode_reply_variant_targets_all_duplicate_main_comments(m
     )
 
     assert result.error is None
-    assert len(result.published_mains) == 9
+    assert len(result.published_mains) == 3
     assert len(seen_reply_targets) == 1
-    assert len(seen_reply_targets[0]) == 9
-    assert [text for _account_id, text, _cid in seen_reply_targets[0]] == ["m1", "m2", "m3"] * 3
-    assert len(result.replies) == 9
+    assert len(seen_reply_targets[0]) == 3
+    assert [text for _account_id, text, _cid in seen_reply_targets[0]] == ["m1", "m2", "m3"]
+    assert len(result.replies) == 3
     assert [outcome.parent_comment_id for outcome in result.replies] == [
-        f"cid-{account_id}-{idx}"
+        f"cid-{account_id}-1"
         for account_id in (101, 102, 103)
-        for idx in (1, 2, 3)
     ]
 
 
 @pytest.mark.unit
 @pytest.mark.asyncio
-async def test_parallel_mode_stops_main_phase_after_empty_dynamic_attempts(monkeypatch):
+async def test_parallel_mode_keeps_retrying_main_phase_after_empty_dynamic_threshold(monkeypatch):
     from db import database as db_database
     from executor import browser_pool, user_schema
 
@@ -6208,8 +6283,59 @@ async def test_parallel_mode_stops_main_phase_after_empty_dynamic_attempts(monke
     )
 
     assert result.error == "parallel_main_no_publications_after_two_batches"
-    assert len(main_attempts) == 6
+    assert len(main_attempts) == len(main_accounts)
+    assert len(main_attempts) > 6
     assert close_calls == ["close"]
+
+
+@pytest.mark.unit
+@pytest.mark.asyncio
+async def test_parallel_mode_single_main_uses_available_accounts_beyond_empty_threshold(monkeypatch):
+    from db import database as db_database
+    from executor import browser_pool, user_schema
+
+    @contextmanager
+    def fake_db_context():
+        yield SimpleNamespace(no_autoflush=SimpleNamespace())
+
+    main_accounts = [SimpleNamespace(id=101 + i, proxy=None) for i in range(8)]
+    main_attempts = []
+
+    def fake_get_main(_db, *, exclude_ids=None, **_kwargs):
+        excluded = set(exclude_ids or [])
+        return next((account for account in main_accounts if account.id not in excluded), None)
+
+    async def fake_try_main(_db, account, _video_url, texts, **_kwargs):
+        main_attempts.append((account.id, tuple(texts)))
+        return [], "comment_list_not_open"
+
+    monkeypatch.setattr(user_schema._settings, "MAX_RETRY_ACCOUNTS", 30, raising=False)
+    monkeypatch.setattr(user_schema._settings, "PARALLEL_COMMENTING_MAX_MAIN_ATTEMPTS", 30, raising=False)
+    monkeypatch.setattr(user_schema._settings, "PARALLEL_COMMENTING_MAX_REPLY_ATTEMPTS", 30, raising=False)
+    monkeypatch.setattr(db_database, "get_sync_db_context", fake_db_context)
+    monkeypatch.setattr(user_schema, "get_free_account_for_main_comment", fake_get_main)
+    monkeypatch.setattr(user_schema, "_try_main_account", fake_try_main)
+    monkeypatch.setattr(user_schema, "_record_main_retry_failure", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(user_schema, "release_main_account_reservation", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(user_schema, "_maybe_order_likes", AsyncMock(return_value=None))
+    monkeypatch.setattr(browser_pool, "ensure_thread_browser_pool_capacity", lambda _min_browsers: None)
+    monkeypatch.setattr(browser_pool, "close_browser_pool", AsyncMock(return_value=None))
+    monkeypatch.setattr(user_schema.asyncio, "sleep", AsyncMock(return_value=None))
+
+    result = await user_schema.execute_user_schema_parallel(
+        SimpleNamespace(),
+        SimpleNamespace(settings={"replies": ["r1"]}),
+        "https://www.tiktok.com/@demo/video/1234567890123456789",
+        ["only-main"],
+        509,
+        boost_enabled=False,
+        boost_quantity=0,
+    )
+
+    assert result.error == "parallel_main_no_publications_after_two_batches"
+    assert len(main_attempts) == len(main_accounts)
+    assert len(main_attempts) > 6
+    assert all(texts == ("only-main",) for _account_id, texts in main_attempts)
 
 
 @pytest.mark.unit
@@ -6397,8 +6523,8 @@ async def test_parallel_mode_caps_active_main_at_three_and_reply_at_target(monke
     )
 
     assert result.error is None
-    assert len(result.published_mains) == 9
-    assert len(result.replies) == 63
+    assert len(result.published_mains) == 3
+    assert len(result.replies) == 21
     assert max_active_main == 3
     assert max_active_reply == 4
     assert close_calls == ["close", "close"]
@@ -7058,7 +7184,8 @@ async def test_parallel_mode_preserves_active_main_publication_after_empty_thres
     )
 
     assert result.error is None
-    assert [main.account_id for main in result.published_mains] == [101, 101, 101]
+    assert [main.account_id for main in result.published_mains] == [101]
+    assert [main.text for main in result.published_mains] == ["m1"]
     assert cancelled_main_accounts == []
     assert close_calls == ["close"]
 
@@ -7177,7 +7304,7 @@ async def test_parallel_mode_carries_submitted_parent_keys_across_reply_retries(
 
 @pytest.mark.unit
 @pytest.mark.asyncio
-async def test_parallel_mode_retries_reply_variant_when_only_one_of_nine_mains_found(monkeypatch):
+async def test_parallel_mode_retries_reply_variant_when_only_one_of_three_mains_found(monkeypatch):
     from db import database as db_database
     from executor import browser_pool, user_schema
 
@@ -7226,7 +7353,7 @@ async def test_parallel_mode_retries_reply_variant_when_only_one_of_nine_mains_f
         if account.id == 201:
             found = [pending[0]]
         else:
-            assert len(pending) == 8
+            assert len(pending) == 2
             found = list(pending)
         return user_schema.ReplyAttemptResult(
             replies=[
@@ -7273,11 +7400,11 @@ async def test_parallel_mode_retries_reply_variant_when_only_one_of_nine_mains_f
     )
 
     assert result.error is None
-    assert len(result.published_mains) == 9
-    assert len(result.replies) == 9
-    assert reply_calls[0] == (201, set(), 9)
+    assert len(result.published_mains) == 3
+    assert len(result.replies) == 3
+    assert reply_calls[0] == (201, set(), 3)
     assert reply_calls[1][0] == 202
-    assert reply_calls[1][2] == 9
+    assert reply_calls[1][2] == 3
     assert "cid-101-1" in reply_calls[1][1]
 
 
