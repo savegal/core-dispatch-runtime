@@ -913,8 +913,8 @@ async def test_parallel_main_publish_continues_when_typing_timeout_has_committed
         calls["loose_probe"] += 1
         return {
             "ok": True,
-            "text": "visible composer text",
-            "textLen": 21,
+            "text": "hello",
+            "textLen": 5,
             "postVisible": True,
             "postDisabled": False,
         }
@@ -977,6 +977,62 @@ async def test_parallel_main_publish_does_not_post_mismatched_committed_composer
 
     async def _unexpected_post_search(*args, **kwargs):
         raise AssertionError("mismatched dirty composer text must not reach Post")
+
+    monkeypatch.setattr(publish_action, "_captcha_result_if_present", _fake_none)
+    monkeypatch.setattr(publish_action, "_logged_out_publish_result_if_visible", _fake_none)
+    monkeypatch.setattr(publish_action, "_publish_url_guard_result", lambda *args, **kwargs: None)
+    monkeypatch.setattr(publish_action, "suppress_keyboard_shortcuts_overlay", AsyncMock(return_value=0))
+    monkeypatch.setattr(publish_action, "ensure_click_target_clear", AsyncMock(return_value=None))
+    monkeypatch.setattr(publish_action, "find_comment_input_smart", _fake_find_comment_input_smart)
+    monkeypatch.setattr(publish_action, "type_into_comment", _fake_type_into_comment)
+    monkeypatch.setattr(publish_action, "comment_input_contains_expected_text", _fake_strict_text_visible)
+    monkeypatch.setattr(publish_action, "_main_comment_input_committed_text_state", _fake_loose_text_state)
+    monkeypatch.setattr(publish_action, "find_post_button_smart", _unexpected_post_search)
+
+    result = await publish_action._publish_via_current_input(
+        page,
+        "current variant",
+        max_total_seconds=18.0,
+        correlation_id="task_1_parallel_main_v1_a1_acc10",
+    )
+
+    assert result.status == "timeout"
+    assert result.error_reason == "publish_deadline_exceeded:typing"
+    assert calls == {"strict_probe": 1, "loose_probe": 1}
+    assert page.click_count == 0
+
+
+@pytest.mark.unit
+@pytest.mark.asyncio
+async def test_parallel_main_publish_does_not_post_concatenated_committed_text(monkeypatch):
+    page = _FakePage()
+    calls = {"strict_probe": 0, "loose_probe": 0}
+
+    async def _fake_none(*args, **kwargs):
+        return None
+
+    async def _fake_find_comment_input_smart(*args, **kwargs):
+        return _FakeInput(), SimpleNamespace(strategy="trusted-smart-id-input", elapsed_seconds=0.1, reason=None)
+
+    async def _fake_type_into_comment(*args, **kwargs):
+        raise asyncio.TimeoutError()
+
+    async def _fake_strict_text_visible(*args, **kwargs):
+        calls["strict_probe"] += 1
+        return False, ""
+
+    async def _fake_loose_text_state(*args, **kwargs):
+        calls["loose_probe"] += 1
+        return {
+            "ok": True,
+            "text": "old variant current variant",
+            "textLen": 27,
+            "postVisible": True,
+            "postDisabled": False,
+        }
+
+    async def _unexpected_post_search(*args, **kwargs):
+        raise AssertionError("concatenated dirty composer text must not reach Post")
 
     monkeypatch.setattr(publish_action, "_captcha_result_if_present", _fake_none)
     monkeypatch.setattr(publish_action, "_logged_out_publish_result_if_visible", _fake_none)

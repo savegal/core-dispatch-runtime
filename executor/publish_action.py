@@ -1681,23 +1681,12 @@ async def _main_comment_input_committed_text_state(
                         : (editor.textContent || editor.innerText || '');
                     return normalizeText(raw);
                 };
-                const tokensOf = (value) => normalizeText(value)
-                    .toLowerCase()
-                    .split(/[^0-9a-zA-Z\u00c0-\uffff]+/)
-                    .map(token => token.trim())
-                    .filter(token => token.length >= 2);
                 const textMatchesExpected = (actual, expectedValue) => {
                     if (!expectedValue) return true;
                     const actualLower = normalizeText(actual).toLowerCase();
                     const expectedLower = normalizeText(expectedValue).toLowerCase();
                     if (!actualLower || !expectedLower) return false;
-                    if (actualLower === expectedLower) return true;
-                    if (actualLower.includes(expectedLower) || expectedLower.includes(actualLower)) return true;
-                    const expectedTokens = tokensOf(expectedLower);
-                    if (!expectedTokens.length) return false;
-                    const hits = expectedTokens.filter(token => actualLower.includes(token)).length;
-                    return hits >= Math.min(2, expectedTokens.length) &&
-                        (hits / expectedTokens.length) >= 0.5;
+                    return actualLower === expectedLower;
                 };
                 const innerEditor = (raw) => {
                     if (!raw) return null;
@@ -1741,7 +1730,7 @@ async def _main_comment_input_committed_text_state(
                         return {
                             ok: false,
                             reason: 'text_mismatch',
-                            text: text.slice(0, 180),
+                            text,
                             textLen: text.length,
                             expected: expectedText.slice(0, 180),
                         };
@@ -1752,7 +1741,7 @@ async def _main_comment_input_committed_text_state(
                     );
                     return {
                         ok: true,
-                        text: text.slice(0, 180),
+                        text,
                         textLen: text.length,
                         postVisible: visible(post),
                         postDisabled: post ? disabled(post) : null,
@@ -2751,6 +2740,27 @@ async def _publish_via_current_input(
                 state = {"ok": False, "reason": "exception"}
             if isinstance(state, dict) and state.get("ok"):
                 visible_text = str(state.get("text") or "")
+                if _normalize_publish_text(visible_text) != _normalize_publish_text(text):
+                    logger.warning(
+                        "[PUBLISH] Main typing phase %s saw committed composer text, "
+                        "but it is not exactly the current variant; refusing to Post. "
+                        "actual='%s' expected='%s'",
+                        phase,
+                        visible_text[:80],
+                        text[:80],
+                    )
+                    _log_publish_trace(
+                        "main_typing_timeout_text_mismatch",
+                        page=page,
+                        expected_video_url=expected_video_url,
+                        correlation_id=correlation_id,
+                        phase=phase,
+                        dom_strategy=dom_strategy,
+                        input_preview=visible_text[:80],
+                        expected_preview=text[:80],
+                        level=logging.WARNING,
+                    )
+                    return False
                 logger.warning(
                     "[PUBLISH] Main typing phase %s timed out/unverified but composer has text; "
                     "continuing aggressively to Post: '%s'",
@@ -3212,6 +3222,26 @@ async def _publish_via_current_input(
             if main_comment_aggressive:
                 state = await _main_comment_input_committed_text_state(page, text)
                 if isinstance(state, dict) and state.get("ok"):
+                    visible_text = str(state.get("text") or "")
+                    if _normalize_publish_text(visible_text) != _normalize_publish_text(text):
+                        _log_publish_trace(
+                            "main_post_enabled_gate_text_mismatch",
+                            page=page,
+                            expected_video_url=expected_video_url,
+                            correlation_id=correlation_id,
+                            reason=disabled_reason,
+                            input_preview=visible_text[:80],
+                            expected_preview=text[:80],
+                            level=logging.WARNING,
+                        )
+                        return PublishResult(
+                            status="dom_error",
+                            error_reason="post_button_input_not_ready:text_mismatch",
+                            dom_strategy=input_info.strategy or post_info.strategy,
+                            elapsed_seconds=time.monotonic() - started,
+                            post_was_enabled_at_click=False,
+                            network_request_attempted=False,
+                        )
                     logger.warning(
                         "[PUBLISH] Main Post enabled-gate says %s, but composer has text; "
                         "continuing with aggressive click path.",

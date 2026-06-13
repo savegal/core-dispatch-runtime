@@ -9852,12 +9852,11 @@ async def execute_user_schema_full(
                 dead_reason,
             )
             if publish_blocked_attempts >= 3:
-                result.error = f"publish_blocked:{dead_reason}"[:200]
                 logger.warning(
-                    "Task %s: stopping main-account retries after repeated publish blocks.",
+                    "Task %s: repeated publish blocks on main accounts; continuing "
+                    "until max retry accounts is exhausted.",
                     task_id,
                 )
-                return True
         else:
             publish_blocked_attempts = 0
 
@@ -10071,12 +10070,11 @@ async def execute_user_schema_full(
                     dead_reason,
                 )
                 if publish_blocked_attempts >= 3:
-                    result.error = f"publish_blocked:{dead_reason}"[:200]
                     logger.warning(
-                        "Task %s: stopping main-account retries after repeated publish blocks.",
+                        "Task %s: repeated publish blocks on main accounts; continuing "
+                        "until max retry accounts is exhausted.",
                         task_id,
                     )
-                    break
             else:
                 publish_blocked_attempts = 0
             if not dead_reason:
