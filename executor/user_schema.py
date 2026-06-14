@@ -8274,6 +8274,12 @@ async def execute_user_schema_parallel(
         # смена IP через rotation_url, а не перебор аккаунтов на том же IP.
         return _looks_like_edge_access_denied(text) or _looks_like_proxy_failure(text)
 
+    def _main_failure_is_proxy_navigation(error: Optional[str]) -> bool:
+        text = str(error or "")
+        if not text:
+            return False
+        return _proxy_failure_needs_rotation(text) or _is_navigation_ambiguous(text)
+
     async def _rotate_mobile_proxy_after_failure(
         attempt_db: Session,
         proxy_value: str,
@@ -8884,6 +8890,7 @@ async def execute_user_schema_parallel(
     main_results_by_slot: Dict[int, _ParallelMainSlotResult] = {}
     main_failures_by_slot: Dict[int, _ParallelMainSlotResult] = {}
     empty_main_batches_without_any_publication = 0
+    proxy_main_batches_without_any_publication = 0
 
     if dynamic_worker_pool_enabled and pending_main_slots and not _is_stop_requested():
         if not _ensure_parallel_browser_capacity():
@@ -8903,6 +8910,7 @@ async def execute_user_schema_parallel(
             max_empty_main_batches_before_fail * empty_main_attempt_slots
         )
         main_empty_threshold_reached = False
+        main_proxy_threshold_reached = False
 
         def _stream_main_publication(slot_index: int, published_main: PublishedMain) -> None:
             stored = main_published_by_slot.setdefault(slot_index, [])
@@ -8939,6 +8947,7 @@ async def execute_user_schema_parallel(
                     pending_main_slots
                     and len(active_main_tasks) < parallel_worker_target
                     and not _is_stop_requested()
+                    and not main_proxy_threshold_reached
                 ):
                     if active_main_tasks:
                         if main_selection_waiting_for_active_change:
@@ -9075,7 +9084,7 @@ async def execute_user_schema_parallel(
                             and slot_result.error not in {"no_free_main_accounts", "stopped_by_user"}
                             and main_attempts_by_slot.get(slot_result.slot_index, 0) < max_main_attempts
                         )
-                        if retryable_partial:
+                        if retryable_partial and not main_proxy_threshold_reached:
                             logger.info(
                                 "Task %s: dynamic main slot %s scheduling replacement attempt %s/%s "
                                 "for %s remaining text(s) after partial result: %s",
@@ -9090,7 +9099,11 @@ async def execute_user_schema_parallel(
                     else:
                         main_failures_by_slot[slot_result.slot_index] = slot_result
                         retryable_error = slot_result.error not in {"no_free_main_accounts", "stopped_by_user"}
-                        if retryable_error and main_attempts_by_slot.get(slot_result.slot_index, 0) < max_main_attempts:
+                        if (
+                            retryable_error
+                            and not main_proxy_threshold_reached
+                            and main_attempts_by_slot.get(slot_result.slot_index, 0) < max_main_attempts
+                        ):
                             retry_texts = (
                                 slot_result.remaining_texts
                                 or list(main_texts_by_slot.get(slot_result.slot_index) or slot_texts)
@@ -9112,12 +9125,29 @@ async def execute_user_schema_parallel(
                         "no_free_main_accounts",
                         "stopped_by_user",
                     }
+                    proxy_navigation_failure = _main_failure_is_proxy_navigation(slot_result.error)
                     if (
+                        total_main_publications <= 0
+                        and not slot_result.published
+                        and proxy_navigation_failure
+                    ):
+                        empty_main_attempts_without_any_publication = 0
+                        proxy_main_batches_without_any_publication += 1
+                        logger.warning(
+                            "Task %s: dynamic parallel main attempt produced zero comments due to "
+                            "proxy/navigation failure (%s/%s); reason=%s",
+                            task_id,
+                            proxy_main_batches_without_any_publication,
+                            max_empty_main_attempts_before_fail,
+                            (slot_result.error or "")[:160],
+                        )
+                    elif (
                         total_main_publications <= 0
                         and not slot_result.published
                         and count_as_empty_surface_attempt
                     ):
                         empty_main_attempts_without_any_publication += 1
+                        proxy_main_batches_without_any_publication = 0
                         logger.warning(
                             "Task %s: dynamic parallel main attempt produced zero comments (%s/%s); "
                             "likely video/comment surface problem if it repeats",
@@ -9135,6 +9165,7 @@ async def execute_user_schema_parallel(
                         )
                     else:
                         empty_main_attempts_without_any_publication = 0
+                        proxy_main_batches_without_any_publication = 0
 
                 if processed_non_deferred_main_result:
                     next_main_selection_retry_at = 0.0
@@ -9158,11 +9189,32 @@ async def execute_user_schema_parallel(
                         len(pending_main_slots),
                     )
                     empty_main_attempts_without_any_publication = 0
+                if (
+                    total_main_publications <= 0
+                    and proxy_main_batches_without_any_publication >= max_empty_main_attempts_before_fail
+                ):
+                    main_proxy_threshold_reached = True
+                    logger.warning(
+                        "Task %s: dynamic parallel main phase reached %s proxy/navigation failure "
+                        "attempt(s); stopping new main retries (active=%s pending=%s)",
+                        task_id,
+                        proxy_main_batches_without_any_publication,
+                        len(active_main_tasks),
+                        len(pending_main_slots),
+                    )
+                    pending_main_slots = []
+                    proxy_main_batches_without_any_publication = 0
         finally:
             if active_main_tasks:
                 await _cancel_active_dynamic_main_tasks()
             await _close_parallel_phase_browsers("main_dynamic_phase")
         if (
+            main_proxy_threshold_reached
+            and not any(main_published_by_slot.values())
+            and not result.error
+        ):
+            result.error = "parallel_main_proxy_navigation_failed"
+        elif (
             main_empty_threshold_reached
             and not any(main_published_by_slot.values())
             and not result.error
@@ -9270,8 +9322,27 @@ async def execute_user_schema_parallel(
                 retry_slots.append((slot_result.slot_index, retry_texts))
 
         total_main_publications = sum(len(items) for items in main_published_by_slot.values())
-        if total_main_publications <= 0 and not any(slot.published for slot in batch_results):
+        all_batch_failures_are_proxy_navigation = bool(batch_results) and all(
+            (not slot.published) and _main_failure_is_proxy_navigation(slot.error)
+            for slot in batch_results
+        )
+        if (
+            total_main_publications <= 0
+            and not any(slot.published for slot in batch_results)
+            and all_batch_failures_are_proxy_navigation
+        ):
+            empty_main_batches_without_any_publication = 0
+            proxy_main_batches_without_any_publication += 1
+            logger.warning(
+                "Task %s: parallel main batch %s/%s produced zero comments due to "
+                "proxy/navigation failures",
+                task_id,
+                proxy_main_batches_without_any_publication,
+                max_empty_main_batches_before_fail,
+            )
+        elif total_main_publications <= 0 and not any(slot.published for slot in batch_results):
             empty_main_batches_without_any_publication += 1
+            proxy_main_batches_without_any_publication = 0
             logger.warning(
                 "Task %s: parallel main batch %s/%s produced zero comments; "
                 "likely video/comment surface problem if it repeats",
@@ -9281,6 +9352,21 @@ async def execute_user_schema_parallel(
             )
         else:
             empty_main_batches_without_any_publication = 0
+            proxy_main_batches_without_any_publication = 0
+
+        if (
+            total_main_publications <= 0
+            and proxy_main_batches_without_any_publication >= max_empty_main_batches_before_fail
+        ):
+            result.error = "parallel_main_proxy_navigation_failed"
+            logger.warning(
+                "Task %s: parallel main phase stopped after %s proxy/navigation failed batch(es); "
+                "no main comments were published",
+                task_id,
+                proxy_main_batches_without_any_publication,
+            )
+            pending_main_slots = []
+            break
 
         if (
             total_main_publications <= 0

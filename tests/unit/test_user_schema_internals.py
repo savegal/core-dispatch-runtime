@@ -6736,6 +6736,56 @@ async def test_parallel_mode_keeps_retrying_main_phase_after_empty_dynamic_thres
 
 @pytest.mark.unit
 @pytest.mark.asyncio
+async def test_parallel_mode_classifies_main_goto_failures_as_proxy_navigation(monkeypatch):
+    from db import database as db_database
+    from executor import browser_pool, user_schema
+
+    @contextmanager
+    def fake_db_context():
+        yield SimpleNamespace(no_autoflush=SimpleNamespace())
+
+    main_accounts = [SimpleNamespace(id=101 + i, proxy=f"http://proxy-{i}") for i in range(12)]
+    main_attempts = []
+
+    def fake_get_main(_db, *, exclude_ids=None, **_kwargs):
+        excluded = set(exclude_ids or [])
+        return next((account for account in main_accounts if account.id not in excluded), None)
+
+    async def fake_try_main(_db, account, _video_url, texts, **_kwargs):
+        main_attempts.append((account.id, tuple(texts)))
+        return [], "login_ambiguous:goto_failed:Page.goto: net::ERR_EMPTY_RESPONSE"
+
+    monkeypatch.setattr(user_schema._settings, "MAX_RETRY_ACCOUNTS", 30, raising=False)
+    monkeypatch.setattr(user_schema._settings, "PARALLEL_COMMENTING_MAX_MAIN_ATTEMPTS", 30, raising=False)
+    monkeypatch.setattr(user_schema._settings, "PARALLEL_COMMENTING_MAX_REPLY_ATTEMPTS", 30, raising=False)
+    monkeypatch.setattr(db_database, "get_sync_db_context", fake_db_context)
+    monkeypatch.setattr(user_schema, "get_free_account_for_main_comment", fake_get_main)
+    monkeypatch.setattr(user_schema, "_try_main_account", fake_try_main)
+    monkeypatch.setattr(user_schema, "_record_main_retry_failure", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(user_schema, "release_main_account_reservation", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(user_schema, "ensure_proxy_ip_rotated", AsyncMock(return_value="1.2.3.4"))
+    monkeypatch.setattr(user_schema, "clear_proxy_bad", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(user_schema, "_maybe_order_likes", AsyncMock(return_value=None))
+    monkeypatch.setattr(browser_pool, "ensure_thread_browser_pool_capacity", lambda _min_browsers: None)
+    monkeypatch.setattr(browser_pool, "close_browser_pool", AsyncMock(return_value=None))
+    monkeypatch.setattr(user_schema.asyncio, "sleep", AsyncMock(return_value=None))
+
+    result = await user_schema.execute_user_schema_parallel(
+        SimpleNamespace(),
+        SimpleNamespace(settings={"replies": ["r1"]}),
+        "https://www.tiktok.com/@demo/video/1234567890123456789",
+        ["m1", "m2", "m3"],
+        516,
+        boost_enabled=False,
+        boost_quantity=0,
+    )
+
+    assert result.error == "parallel_main_proxy_navigation_failed"
+    assert 6 <= len(main_attempts) < len(main_accounts)
+
+
+@pytest.mark.unit
+@pytest.mark.asyncio
 async def test_parallel_mode_single_main_uses_available_accounts_beyond_empty_threshold(monkeypatch):
     from db import database as db_database
     from executor import browser_pool, user_schema
