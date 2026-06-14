@@ -267,6 +267,15 @@ def _parallel_main_input_retry_max_seconds() -> float:
     )
 
 
+def _main_local_confirmation_timeout_seconds() -> float:
+    return _bounded_float_setting(
+        "MAIN_LOCAL_CONFIRMATION_TIMEOUT_SECONDS",
+        8.0,
+        minimum=1.0,
+        maximum=30.0,
+    )
+
+
 def _parallel_main_worker_attempt_timeout_seconds() -> float:
     return _bounded_float_setting(
         "PARALLEL_MAIN_WORKER_ATTEMPT_TIMEOUT_SECONDS",
@@ -1786,16 +1795,25 @@ class UserSchemaResult:
 # Helpers
 # ---------------------------------------------------------------------------
 
-async def _safe_close(context, page, *, reason: str = "user_schema_attempt_done") -> None:
+async def _safe_close(
+    context,
+    page,
+    *,
+    reason: str = "user_schema_attempt_done",
+    correlation_id: Optional[str] = None,
+) -> None:
     account_id = getattr(page, "_pool_account_id", None) if page is not None else None
+    current_url = str(getattr(page, "url", "") or "")[:240] if page is not None else ""
     if account_id is not None:
         try:
             from executor.browser_pool import close_pool_page
 
             logger.info(
-                "[USER_SCHEMA] closing pooled page account=%s reason=%s",
+                "[USER_SCHEMA] closing pooled page account=%s reason=%s correlation_id=%s url=%s",
                 account_id,
                 reason,
+                correlation_id or "n/a",
+                current_url or "n/a",
             )
             if await close_pool_page(page, reason=reason):
                 return
@@ -1809,6 +1827,13 @@ async def _safe_close(context, page, *, reason: str = "user_schema_attempt_done"
         return
     try:
         if page and not page.is_closed():
+            if correlation_id:
+                logger.info(
+                    "[USER_SCHEMA] closing standalone page reason=%s correlation_id=%s url=%s",
+                    reason,
+                    correlation_id,
+                    current_url or "n/a",
+                )
             await page.close()
     except Exception:
         pass
@@ -1879,6 +1904,25 @@ def _edge_access_denied_reason(raw_reason: str | None) -> str:
     else:
         code = "access_denied"
     return f"proxy_edge_access_denied:{code}"
+
+
+def _rotation_failure_should_cool_proxy(error: Optional[str]) -> bool:
+    text = str(error or "").lower()
+    if not text:
+        return False
+    return any(
+        marker in text
+        for marker in (
+            "http 403",
+            "status 403",
+            "403 forbidden",
+            "forbidden",
+            "proxy authentication required",
+            "407 proxy authentication required",
+            "access denied",
+            "access is denied",
+        )
+    )
 
 
 def _is_navigation_ambiguous(reason: str) -> bool:
@@ -3629,14 +3673,27 @@ async def _publish_all_variants_on_account(
                     )
                     local_ok = False
                 else:
-                    local_ok, local_info = await find_comment_in_list(
-                        page=page,
-                        expected_text=text,
-                        max_scrolls=2,
-                        scroll_delay_ms=300,
+                    local_confirm_timeout = _main_local_confirmation_timeout_seconds()
+                    local_ok, local_info = await asyncio.wait_for(
+                        find_comment_in_list(
+                            page=page,
+                            expected_text=text,
+                            max_scrolls=2,
+                            scroll_delay_ms=300,
+                        ),
+                        timeout=local_confirm_timeout,
                     )
+            except asyncio.TimeoutError:
+                logger.warning(
+                    "[USER_SCHEMA] main publish %s local confirmation timed out after %.1fs",
+                    sub_corr,
+                    _main_local_confirmation_timeout_seconds(),
+                )
+                local_ok = False
+                local_info = {}
             except Exception:
                 local_ok = False
+                local_info = {}
             if local_ok and (post_was_enabled or network_attempted):
                 local_confirmed = True
                 local_comment_id = str((local_info or {}).get("comment_id") or "").strip() or None
@@ -4137,7 +4194,7 @@ async def _try_main_account(
         close_reason = "main_attempt_cancelled"
         raise
     finally:
-        await _safe_close(context, page, reason=close_reason)
+        await _safe_close(context, page, reason=close_reason, correlation_id=correlation_id)
 
 
 # ---------------------------------------------------------------------------
@@ -6016,7 +6073,7 @@ async def _observe_main_texts_with_account(
         # возможный TikTok account-trust filter (его обработает caller).
         return [], "observer_open_list_no_target"
     finally:
-        await _safe_close(context, page)
+        await _safe_close(context, page, reason="observer_attempt_done", correlation_id=correlation_id)
 
 
 def _should_bypass_observer_for_replies(
@@ -7641,7 +7698,7 @@ async def _reply_with_variant_on_all_mains(
         close_reason = "reply_attempt_cancelled"
         raise
     finally:
-        await _safe_close(context, page, reason=close_reason)
+        await _safe_close(context, page, reason=close_reason, correlation_id=correlation_id)
 
 
 # ---------------------------------------------------------------------------
@@ -8296,6 +8353,33 @@ async def execute_user_schema_parallel(
         # смена IP через rotation_url, а не перебор аккаунтов на том же IP.
         return _looks_like_edge_access_denied(text) or _looks_like_proxy_failure(text)
 
+    def _cool_proxy_after_rotation_failure(
+        proxy_value: str,
+        *,
+        scope: str,
+        error: Optional[str],
+        counts: Dict[str, int],
+        cooled_values: set[str],
+    ) -> bool:
+        proxy_value = (proxy_value or "").strip()
+        if not proxy_value:
+            return False
+        hard_failure = _rotation_failure_should_cool_proxy(error)
+        if not hard_failure and counts.get(proxy_value, 0) < 2:
+            return False
+        cooled_values.add(proxy_value)
+        logger.warning(
+            "Task %s: cooling down proxy/source for this %s phase after mobile rotation failure "
+            "proxy=%s hard=%s count=%s reason=%s",
+            task_id,
+            scope,
+            _short_proxy_sig(proxy_value),
+            hard_failure,
+            counts.get(proxy_value, 0),
+            str(error or "")[:160],
+        )
+        return True
+
     def _main_failure_is_proxy_navigation(error: Optional[str]) -> bool:
         text = str(error or "")
         if not text:
@@ -8336,6 +8420,7 @@ async def execute_user_schema_parallel(
             if counts.get(proxy_value, 0) >= 2:
                 cooled_values.add(proxy_value)
             return False
+        rotation_error: Optional[str] = None
         try:
             new_ip = await asyncio.wait_for(
                 ensure_proxy_ip_rotated(proxy_obj, attempt_db),
@@ -8356,6 +8441,7 @@ async def execute_user_schema_parallel(
             )
             return True
         except (asyncio.TimeoutError, ProxyRotationError) as exc:
+            rotation_error = str(exc)
             logger.warning(
                 "Task %s: mobile proxy rotation after %s failure failed for %s: %s",
                 task_id,
@@ -8364,6 +8450,7 @@ async def execute_user_schema_parallel(
                 str(exc)[:160],
             )
         except Exception as exc:
+            rotation_error = str(exc)
             logger.warning(
                 "Task %s: unexpected mobile proxy rotation error after %s failure for %s: %s",
                 task_id,
@@ -8371,8 +8458,13 @@ async def execute_user_schema_parallel(
                 _short_proxy_sig(proxy_value),
                 str(exc)[:160],
             )
-        if counts.get(proxy_value, 0) >= 2:
-            cooled_values.add(proxy_value)
+        _cool_proxy_after_rotation_failure(
+            proxy_value,
+            scope=scope,
+            error=rotation_error,
+            counts=counts,
+            cooled_values=cooled_values,
+        )
         return False
 
     async def _handle_main_edge_access_denied(
@@ -8395,6 +8487,7 @@ async def execute_user_schema_parallel(
 
         # Rotation can be delayed while another browser still uses the proxy.
         # When it becomes free, try rotation before cooling it down.
+        rotation_error: Optional[str] = None
         if proxy_value not in edge_denied_main_proxy_rotated:
             if active_main_proxy_counts.get(proxy_value, 0) > 0:
                 pending_main_proxy_rotations.add(proxy_value)
@@ -8441,6 +8534,7 @@ async def execute_user_schema_parallel(
                     )
                     return
                 except (asyncio.TimeoutError, ProxyRotationError) as exc:
+                    rotation_error = str(exc)
                     logger.warning(
                         "Task %s: mobile proxy rotation after failure failed for %s: %s",
                         task_id,
@@ -8448,6 +8542,7 @@ async def execute_user_schema_parallel(
                         str(exc)[:160],
                     )
                 except Exception as exc:
+                    rotation_error = str(exc)
                     logger.warning(
                         "Task %s: unexpected mobile proxy rotation error for %s: %s",
                         task_id,
@@ -8455,7 +8550,16 @@ async def execute_user_schema_parallel(
                         str(exc)[:160],
                     )
 
-        if count >= 2:
+        if rotation_error:
+            _cool_proxy_after_rotation_failure(
+                proxy_value,
+                scope="main",
+                error=rotation_error,
+                counts=edge_denied_main_proxy_counts,
+                cooled_values=edge_denied_main_proxy_values,
+            )
+
+        if count >= 2 and proxy_value not in edge_denied_main_proxy_values:
             edge_denied_main_proxy_values.add(proxy_value)
             logger.warning(
                 "Task %s: cooling down proxy/source for this main phase after repeated edge access denied proxy=%s",
@@ -8481,6 +8585,7 @@ async def execute_user_schema_parallel(
             (variant_result.error or "")[:160],
         )
 
+        rotation_error: Optional[str] = None
         if proxy_value not in edge_denied_reply_proxy_rotated:
             if active_reply_proxy_counts.get(proxy_value, 0) > 0:
                 pending_reply_proxy_rotations.add(proxy_value)
@@ -8527,6 +8632,7 @@ async def execute_user_schema_parallel(
                     )
                     return
                 except (asyncio.TimeoutError, ProxyRotationError) as exc:
+                    rotation_error = str(exc)
                     logger.warning(
                         "Task %s: mobile proxy rotation after reply failure failed for %s: %s",
                         task_id,
@@ -8534,6 +8640,7 @@ async def execute_user_schema_parallel(
                         str(exc)[:160],
                     )
                 except Exception as exc:
+                    rotation_error = str(exc)
                     logger.warning(
                         "Task %s: unexpected reply mobile proxy rotation error for %s: %s",
                         task_id,
@@ -8541,7 +8648,16 @@ async def execute_user_schema_parallel(
                         str(exc)[:160],
                     )
 
-        if count >= 2:
+        if rotation_error:
+            _cool_proxy_after_rotation_failure(
+                proxy_value,
+                scope="reply",
+                error=rotation_error,
+                counts=edge_denied_reply_proxy_counts,
+                cooled_values=edge_denied_reply_proxy_values,
+            )
+
+        if count >= 2 and proxy_value not in edge_denied_reply_proxy_values:
             edge_denied_reply_proxy_values.add(proxy_value)
             logger.warning(
                 "Task %s: cooling down proxy/source for this reply phase after repeated edge access denied proxy=%s",
@@ -8574,6 +8690,7 @@ async def execute_user_schema_parallel(
                 active_proxy_snapshot = dict(active_main_proxy_counts)
                 used_proxy_snapshot = set(used_main_proxy_values)
                 edge_denied_snapshot = set(edge_denied_main_proxy_values)
+                pending_rotation_snapshot = set(pending_main_proxy_rotations)
                 tried_ids_snapshot = set(tried_main_ids) | set(local_rejected_ids)
 
             exclude_proxies = (
@@ -8581,7 +8698,7 @@ async def execute_user_schema_parallel(
                 if dynamic_worker_pool_enabled
                 else used_proxy_snapshot
             )
-            exclude_proxies |= edge_denied_snapshot | local_rejected_proxies
+            exclude_proxies |= edge_denied_snapshot | pending_rotation_snapshot | local_rejected_proxies
             candidate = await asyncio.to_thread(
                 _select_main_account_sync,
                 exclude_ids=tried_ids_snapshot,
@@ -8590,35 +8707,37 @@ async def execute_user_schema_parallel(
 
             if candidate is None and dynamic_worker_pool_enabled and active_proxy_snapshot:
                 capacity_exclude_proxies = _overloaded_active_proxies(active_proxy_snapshot)
-                capacity_exclude_proxies |= edge_denied_snapshot | local_rejected_proxies
+                capacity_exclude_proxies |= edge_denied_snapshot | pending_rotation_snapshot | local_rejected_proxies
                 logger.info(
                     "Task %s: no main account on inactive proxy; allowing an active proxy below capacity "
-                    "(max_per_proxy=%s active=%s)",
+                    "(max_per_proxy=%s active=%s pending_rotation=%s)",
                     task_id,
                     max_active_browsers_per_proxy,
                     {
                         _short_proxy_sig(proxy): count
                         for proxy, count in active_proxy_snapshot.items()
                     },
+                    [_short_proxy_sig(proxy) for proxy in pending_rotation_snapshot],
                 )
                 candidate = await asyncio.to_thread(
                     _select_main_account_sync,
                     exclude_ids=tried_ids_snapshot,
                     exclude_proxies=capacity_exclude_proxies,
                     exclude_proxy_source_hosts=(
-                        proxy_diversify_by_source_host and bool(edge_denied_snapshot)
+                        proxy_diversify_by_source_host and bool(edge_denied_snapshot | pending_rotation_snapshot)
                     ),
                 )
 
             if candidate is None:
-                if dynamic_worker_pool_enabled and active_proxy_snapshot:
+                if dynamic_worker_pool_enabled and (active_proxy_snapshot or pending_rotation_snapshot):
                     async with main_selection_lock:
-                        if active_main_proxy_counts:
+                        if active_main_proxy_counts or pending_main_proxy_rotations:
                             logger.info(
-                                "Task %s: no main account below per-proxy capacity while %s main browser(s) are active; "
-                                "deferring slot instead of opening another browser above the per-proxy limit",
+                                "Task %s: no main account below per-proxy capacity while %s main browser(s) are active "
+                                "or %s proxy rotation(s) are pending; deferring slot instead of opening another browser",
                                 task_id,
                                 sum(active_main_proxy_counts.values()),
+                                len(pending_main_proxy_rotations),
                             )
                             return None, temporary_main_selection_error
                     continue
@@ -8630,7 +8749,7 @@ async def execute_user_schema_parallel(
                     candidate = await asyncio.to_thread(
                         _select_main_account_sync,
                         exclude_ids=tried_ids_snapshot,
-                        exclude_proxies=edge_denied_snapshot | local_rejected_proxies,
+                        exclude_proxies=edge_denied_snapshot | pending_rotation_snapshot | local_rejected_proxies,
                     )
 
             if candidate is None:
@@ -8642,11 +8761,14 @@ async def execute_user_schema_parallel(
 
             async with main_selection_lock:
                 current_edge_denied = set(edge_denied_main_proxy_values)
+                current_pending_rotation = set(pending_main_proxy_rotations)
                 active_on_proxy = active_main_proxy_counts.get(proxy_value or "", 0)
                 if candidate_id in tried_main_ids:
                     reject_reason = "already_tried"
                 elif proxy_value and proxy_value in current_edge_denied:
                     reject_reason = "edge_denied_proxy"
+                elif proxy_value and proxy_value in current_pending_rotation:
+                    reject_reason = "pending_proxy_rotation"
                 elif (
                     dynamic_worker_pool_enabled
                     and proxy_value
@@ -8672,7 +8794,11 @@ async def execute_user_schema_parallel(
                     exc_info=True,
                 )
             local_rejected_ids.add(candidate_id)
-            if proxy_value and reject_reason == "proxy_capacity":
+            if proxy_value and reject_reason in {
+                "proxy_capacity",
+                "pending_proxy_rotation",
+                "edge_denied_proxy",
+            }:
                 local_rejected_proxies.add(proxy_value)
             logger.info(
                 "Task %s: rejected selected main account=%s after async selection (%s); retrying selection",

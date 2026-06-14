@@ -1558,6 +1558,52 @@ async def test_parallel_main_direct_no_response_ignores_text_only_local_match(mo
 
 @pytest.mark.unit
 @pytest.mark.asyncio
+async def test_parallel_main_local_confirmation_timeout_records_unconfirmed(monkeypatch):
+    from executor import user_schema
+    from executor.publish_action import PublishResult
+
+    async def fake_publish(_page, text, **kwargs):
+        assert text == "first"
+        assert kwargs["correlation_id"] == "task_1_parallel_main_v1_a1_acc44_v1"
+        return PublishResult(
+            status="failed",
+            error_reason="stealth_reject_empty_body",
+            network_request_attempted=True,
+            dom_strategy="side-panel",
+            post_was_enabled_at_click=True,
+        )
+
+    async def fake_username(_page):
+        return "main_user"
+
+    async def slow_find_comment(*_args, **_kwargs):
+        await asyncio.sleep(60)
+        return True, {"comment_id": "late-cid"}
+
+    monkeypatch.setattr(user_schema, "publish_comment_hybrid", fake_publish)
+    monkeypatch.setattr(user_schema, "extract_tiktok_username", fake_username)
+    monkeypatch.setattr(user_schema, "find_comment_in_list", slow_find_comment)
+    monkeypatch.setattr(user_schema, "_main_local_confirmation_timeout_seconds", lambda: 0.01)
+    monkeypatch.setattr(user_schema, "_deny_if_visible_logged_out", AsyncMock(return_value=None))
+
+    published, failure_reason = await user_schema._publish_all_variants_on_account(
+        SimpleNamespace(),
+        SimpleNamespace(url="https://www.tiktok.com/@demo/video/1234567890123456789"),
+        SimpleNamespace(id=44),
+        ["first", "second"],
+        correlation_id="task_1_parallel_main_v1_a1_acc44",
+        expected_video_url="https://www.tiktok.com/@demo/video/1234567890123456789",
+    )
+
+    assert failure_reason == "main_partial:published=1/2;remaining=1;reason=account_series_stopped"
+    assert len(published) == 1
+    assert published[0].text == "first"
+    assert published[0].comment_id is None
+    assert published[0].local_confirmed is False
+
+
+@pytest.mark.unit
+@pytest.mark.asyncio
 async def test_publish_all_variants_stops_after_dirty_typing_timeout(monkeypatch):
     from executor import user_schema
     from executor.publish_action import PublishResult
@@ -9557,6 +9603,23 @@ async def test_http_first_warmup_visible_login_blocks_session(monkeypatch):
 def test_looks_like_proxy_failure(reason, expected):
     from executor.user_schema import _looks_like_proxy_failure
     assert _looks_like_proxy_failure(reason) is expected
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize(
+    "reason,expected",
+    [
+        ("HTTP 403 when rotating proxy", True),
+        ("407 Proxy Authentication Required", True),
+        ("Forbidden rotation endpoint", True),
+        ("rotation timed out", False),
+        ("temporary provider timeout", False),
+    ],
+)
+def test_rotation_failure_should_cool_proxy(reason, expected):
+    from executor.user_schema import _rotation_failure_should_cool_proxy
+
+    assert _rotation_failure_should_cool_proxy(reason) is expected
 
 
 @pytest.mark.unit
