@@ -303,11 +303,59 @@ def test_user_schema_reply_summary_counts_not_started_variants():
     replies = res.to_dict()["engagement"]["replies"]
 
     assert replies["requested_variants"] == 10
+    assert replies["expected_submissions"] == 10
+    assert replies["expected_per_variant"] == 1
+    assert replies["missing"] == 6
     assert replies["total"] == 4
     assert replies["attempted"] == 4
     assert replies["submitted"] == 4
     assert replies["variant_outcomes"] == 3
     assert replies["variants_not_started"] == 7
+
+
+@pytest.mark.unit
+def test_user_schema_reply_summary_reports_matrix_expected_submissions():
+    res = UserSchemaResult(boost_enabled=False, boost_quantity=0)
+    res.expected_main_publications = 9
+    res.expected_reply_variants = 3
+    res.published_mains.append(
+        PublishedMain(
+            text="m1",
+            comment_id="cid-1",
+            network_confirmed=True,
+            local_confirmed=True,
+            method="hybrid_dom",
+            account_id=10,
+            tiktok_username=None,
+        )
+    )
+    res.main_found_by_observer = True
+    for idx in range(1, 10):
+        res.replies.append(
+            ReplyOutcome(
+                text="r1",
+                variant_index=1,
+                matched_main_text=f"m{idx}",
+                parent_comment_id=f"cid-{idx}",
+                success=True,
+                method="hybrid_dom",
+                error=None,
+                account_id=20,
+                attempted=True,
+            )
+        )
+
+    dct = res.to_dict()
+    replies = dct["engagement"]["replies"]
+
+    assert dct["status"] == "submitted_unconfirmed"
+    assert dct["error"] == "reply_publication_incomplete"
+    assert replies["requested_variants"] == 3
+    assert replies["expected_per_variant"] == 9
+    assert replies["expected_submissions"] == 27
+    assert replies["expected"] == 27
+    assert replies["submitted"] == 9
+    assert replies["missing"] == 18
 
 
 @pytest.mark.unit

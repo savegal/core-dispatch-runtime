@@ -621,7 +621,7 @@ def _order_publication_summary_lines(task: dict) -> list[str]:
     replies_unconfirmed = _safe_int(replies.get("submitted_unconfirmed"))
     if replies_requested or replies_submitted:
         if replies_requested:
-            line = f"Ответы: отправлено {replies_submitted}, вариантов заказано {replies_requested}"
+            line = f"Ответы: отправлено {replies_submitted}, ожидалось {replies_requested}"
         else:
             line = f"Ответы: отправлено {replies_submitted}"
         if replies_attempted and replies_attempted != replies_submitted:
@@ -1507,15 +1507,20 @@ def _order_text_variants(task: dict) -> list[str]:
 
 
 def _overview_status_lines(task: dict, *, content_page: int = 0, total_pages: int = 1) -> list[str]:
-    _summary, _display_status, status_text, icon = _get_order_display(task)
+    summary, _display_status, status_text, icon = _get_order_display(task)
+    video_info = summary.get("videos") or {}
     progress = int(task.get("progress") or 0)
     total_urls = len(task.get("video_urls", []))
     created_at = task.get("created_at", "")
     created_line = format_date(created_at, "%d.%m %H:%M") if created_at else "—"
+    video_line = (
+        f"Видео: {video_info.get('success', 0)} ок / {video_info.get('failed', 0)} ошибок"
+        + (f" / {video_info.get('with_warnings', 0)} предупреждений" if video_info.get("with_warnings", 0) else "")
+    )
     lines = [
         f"{icon} {_html(status_text)}",
-        f"Прогресс: {_html_inline_code(format_progress(progress, total_urls) if total_urls else '—')} · Создан: {_html(created_line)}",
-        f"Источник: {_html(_origin_label(_order_origin(task)))}",
+        _html(video_line),
+        f"Прогресс: {_html_inline_code(format_progress(progress, total_urls) if total_urls else '—')} · создан {_html(created_line)}",
     ]
     if _order_is_pending(task) and _order_queue_priority(task) == "high":
         lines.append("Приоритет: высокий")
@@ -1527,50 +1532,54 @@ def _overview_status_lines(task: dict, *, content_page: int = 0, total_pages: in
     return lines
 
 
-def _overview_order_plan_lines(task: dict) -> list[str]:
-    summary = _get_execution_summary(task)
-    video_info = summary.get("videos") or {}
-    variants = _order_text_variants(task)
-    replies = _order_replies(task)
-    is_engagement_only = _order_is_engagement_only(task)
-    main = summary.get("main") if isinstance(summary.get("main"), dict) else {}
-    replies_summary = summary.get("replies") if isinstance(summary.get("replies"), dict) else {}
-
-    video_line = (
-        f"Видео: {video_info.get('success', 0)} ок / {video_info.get('failed', 0)} ошибок"
-        + (f" / {video_info.get('with_warnings', 0)} предупреждений" if video_info.get("with_warnings", 0) else "")
-    )
-    lines = [video_line]
-
+def _overview_context_lines(task: dict) -> list[str]:
+    lines = [f"Источник: {_html(_origin_label(_order_origin(task)))}"]
     creator_username = _order_creator_username(task)
     if creator_username:
         lines.append(f"Блогер: {_html_inline_code('@' + creator_username)}")
     template_label = _order_template_label(task)
     if template_label:
         lines.append(f"Шаблон: {_html(template_label)}")
+    target_username = _order_engagement_username(task)
+    if _order_is_engagement_only(task) and target_username:
+        lines.append(f"Автор поиска: {_html_inline_code('@' + target_username)}")
+    return lines
+
+
+def _overview_order_plan_lines(task: dict) -> list[str]:
+    summary = _get_execution_summary(task)
+    variants = _order_text_variants(task)
+    replies = _order_replies(task)
+    is_engagement_only = _order_is_engagement_only(task)
+    main = summary.get("main") if isinstance(summary.get("main"), dict) else {}
+    replies_summary = summary.get("replies") if isinstance(summary.get("replies"), dict) else {}
+    lines: list[str] = []
 
     if is_engagement_only:
         lines.append("Тип: только ответы")
-        reply_line = f"Ответы: {len(replies)}"
+        reply_line = f"Ответы: {len(replies)} {_ru_plural(len(replies), 'текст', 'текста', 'текстов')}"
         replies_requested = _safe_int(replies_summary.get("requested"))
         replies_submitted = _safe_int(replies_summary.get("submitted"))
+        if replies_requested:
+            reply_line += f" · план отправок {replies_requested}"
         if replies_requested or replies_submitted:
             reply_line += f" · отправлено {_ratio_text(replies_submitted, replies_requested)}"
         lines.append(reply_line)
         lines.append(f"Лайки: {_html(_order_likes_label(task))}")
-        target_username = _order_engagement_username(task)
-        if target_username:
-            lines.append(f"Автор поиска: {_html_inline_code('@' + target_username)}")
     else:
         main_expected = _safe_int(main.get("expected"))
         main_submitted = _safe_int(main.get("submitted"))
         main_label = "Тексты главных" if main_expected > len(variants) else "Главные комментарии"
         main_line = f"{main_label}: {len(variants)}"
+        if main_expected:
+            main_line += f" · план {main_expected}"
         if main_expected or main_submitted:
             main_line += f" · опубликовано {_ratio_text(main_submitted, main_expected)}"
-        reply_line = f"Ответы: {len(replies)}"
+        reply_line = f"Ответы: {len(replies)} {_ru_plural(len(replies), 'текст', 'текста', 'текстов')}"
         replies_requested = _safe_int(replies_summary.get("requested"))
         replies_submitted = _safe_int(replies_summary.get("submitted"))
+        if replies_requested:
+            reply_line += f" · план отправок {replies_requested}"
         if replies_requested or replies_submitted:
             reply_line += f" · отправлено {_ratio_text(replies_submitted, replies_requested)}"
         lines.append(main_line)
@@ -1599,18 +1608,22 @@ def _overview_notice_lines(task: dict) -> list[str]:
 def _overview_header_lines(task: dict, *, content_page: int = 0, total_pages: int = 1) -> list[str]:
     lines = _overview_status_lines(task, content_page=content_page, total_pages=total_pages)
     lines.extend(_overview_order_plan_lines(task))
+    lines.extend(_overview_context_lines(task))
     lines.extend(_overview_notice_lines(task))
     return lines
 
 
 def _overview_header_blocks(task: dict, *, content_page: int = 0, total_pages: int = 1) -> list[str]:
+    context_lines = _overview_context_lines(task)
     blocks = [
         _html_block("Статус", _overview_status_lines(task, content_page=content_page, total_pages=total_pages)),
         _html_block("Состав заказа", _overview_order_plan_lines(task)),
     ]
+    if context_lines:
+        blocks.append(_html_block("Контекст", context_lines))
     notice_lines = _overview_notice_lines(task)
     if notice_lines:
-        blocks.append(_html_block("Сообщения", notice_lines))
+        blocks.append(_html_block("Требует внимания", notice_lines))
     return blocks
 
 
@@ -1719,7 +1732,12 @@ def _video_content_items(task: dict) -> list[str]:
             replies_info = engagement.get("replies") if isinstance(engagement.get("replies"), dict) else {}
             if replies_info:
                 submitted = _safe_int(replies_info.get("submitted")) or _safe_int(replies_info.get("ok"))
-                requested = _safe_int(replies_info.get("requested_variants")) or _safe_int(replies_info.get("total"))
+                requested = (
+                    _safe_int(replies_info.get("expected_submissions"))
+                    or _safe_int(replies_info.get("expected"))
+                    or _safe_int(replies_info.get("requested_variants"))
+                    or _safe_int(replies_info.get("total"))
+                )
                 not_started = _safe_int(replies_info.get("variants_not_started"))
                 if submitted or requested:
                     reply_line = f"Ответы: {_ratio_text(submitted, requested)}"

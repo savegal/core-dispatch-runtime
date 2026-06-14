@@ -22,6 +22,7 @@ from services.account_service import (
     mark_success,
     mark_monitor_use,
     mark_dead,
+    mark_needs_reauth,
     increment_main_comment
 )
 from db.models import Account, Proxy
@@ -342,6 +343,7 @@ class TestAccountService:
         assert payload["scope"] == "runtime"
         assert payload["category"] == "captcha"
         assert payload["cooldown_until"]
+        assert account.last_used_at is not None
 
     def test_mark_soft_error_serializes_blocked_comment_ui_error(self, db_session: Session):
         """Ready accounts with no usable comment UI should cool down as page_blocked."""
@@ -385,6 +387,22 @@ class TestAccountService:
         assert payload["category"] == account_service_module.RUNTIME_CATEGORY_COOKIE_ENRICHMENT
         assert payload["reason"] == "enrichment_failed:critical_cookies_not_generated"
         assert cooldown_until > datetime.now(timezone.utc) + timedelta(minutes=350)
+        assert account.last_used_at is not None
+
+    def test_mark_needs_reauth_updates_last_used_for_rotation(self, db_session: Session):
+        account = Account(
+            label="runtime_reauth_rotation",
+            status="active",
+            cookies="sessionid=runtime_reauth",
+        )
+        db_session.add(account)
+        db_session.commit()
+
+        mark_needs_reauth(db_session, account.id, "dead_session_detected")
+
+        db_session.refresh(account)
+        assert account.status == "reauth_needed"
+        assert account.last_used_at is not None
 
     def test_get_free_account_for_reply_skips_login_captcha_runtime_cooldown(self, db_session: Session):
         cooldown_until = (datetime.now(timezone.utc) + timedelta(minutes=20)).isoformat()

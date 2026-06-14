@@ -5891,6 +5891,7 @@ async def wait_for_post_button_enabled(
     *,
     max_wait_seconds: float = 5.0,
     reply_scoped: bool = False,
+    expected_text: Optional[str] = None,
 ) -> tuple[Optional[Any], DomActionResult]:
     """
     Wait for the Post button to become enabled.
@@ -5903,7 +5904,7 @@ async def wait_for_post_button_enabled(
     while time.monotonic() - started < max_wait_seconds:
         try:
             result = await page.evaluate(r"""
-                ([replyScoped]) => {
+                ([replyScoped, expectedText]) => {
                     document
                         .querySelectorAll('[data-smart-id="comment-post-ready"]')
                         .forEach(el => el.removeAttribute('data-smart-id'));
@@ -6000,6 +6001,15 @@ async def wait_for_post_button_enabled(
                             : (editor.textContent || editor.innerText || '');
                         return raw.trim();
                     };
+                    const normalizeSubmitText = (value) => {
+                        let text = String(value || '');
+                        try { text = text.normalize('NFC'); } catch (_) {}
+                        return text
+                            .replace(/[\u200b\u200c\ufeff]/g, '')
+                            .replace(/\u00a0/g, ' ')
+                            .replace(/\s+/g, ' ')
+                            .trim();
+                    };
                     const hasPlaceholderLeak = (txt) => {
                         if (!txt) return false;
                         const lower = txt.toLowerCase();
@@ -6018,6 +6028,10 @@ async def wait_for_post_button_enabled(
                     const inputEditor = resolveInnerEditor(inputWrapper);
                     const inputText = readEditorText(inputEditor);
                     const placeholderLeak = hasPlaceholderLeak(inputText);
+                    const actualNormalized = normalizeSubmitText(inputText);
+                    const expectedProvided = expectedText !== null && expectedText !== undefined;
+                    const expectedNormalized = expectedProvided ? normalizeSubmitText(expectedText) : '';
+                    const expectedMatches = !expectedProvided || actualNormalized === expectedNormalized;
 
                     for (const raw of rawCandidates) {
                         const el = clickTargetFor(raw);
@@ -6031,28 +6045,37 @@ async def wait_for_post_button_enabled(
                                          getComputedStyle(el).pointerEvents === 'none' ||
                                          parseFloat(getComputedStyle(el).opacity) < 0.5;
 
-                        if (!disabled && !placeholderLeak && inputText.length > 0) {
+                        if (!disabled && !placeholderLeak && inputText.length > 0 && expectedMatches) {
                             el.setAttribute('data-smart-id', 'comment-post-ready');
                             return {
                                 ready: true,
                                 tag: el.tagName,
-                                inputText: inputText.substring(0, 30),
+                                inputText: inputText.substring(0, 80),
                                 rawTag: raw.tagName,
                                 rawPointerEvents: getComputedStyle(raw).pointerEvents,
                                 targetPointerEvents: getComputedStyle(el).pointerEvents,
+                            };
+                        } else if (!placeholderLeak && inputText.length > 0 && !expectedMatches) {
+                            return {
+                                ready: false,
+                                reason: 'text_mismatch',
+                                inputText: inputText.substring(0, 80),
+                                expectedText: String(expectedText || '').substring(0, 80),
+                                inputNormalized: actualNormalized.substring(0, 80),
+                                expectedNormalized: expectedNormalized.substring(0, 80),
                             };
                         } else if (!disabled && (placeholderLeak || inputText.length === 0)) {
                             return {
                                 ready: false,
                                 reason: placeholderLeak ? 'placeholder_leak' : 'input_empty',
-                                inputText: inputText.substring(0, 30),
+                                inputText: inputText.substring(0, 80),
                                 placeholderLeak: placeholderLeak,
                             };
                         } else {
                             return {
                                 ready: false,
                                 reason: 'button_disabled',
-                                inputText: inputText.substring(0, 30),
+                                inputText: inputText.substring(0, 80),
                                 hasDisabledAttr: el.hasAttribute('disabled'),
                                 ariaDisabled: el.getAttribute('aria-disabled'),
                                 opacity: getComputedStyle(el).opacity,
@@ -6063,9 +6086,9 @@ async def wait_for_post_button_enabled(
                             };
                         }
                     }
-                    return { ready: false, reason: 'button_not_found', inputText: inputText.substring(0, 30) };
+                    return { ready: false, reason: 'button_not_found', inputText: inputText.substring(0, 80) };
                 }
-            """, [reply_scoped])
+            """, [reply_scoped, expected_text])
 
             if isinstance(result, dict):
                 if result.get("ready"):
@@ -6080,14 +6103,15 @@ async def wait_for_post_button_enabled(
                             result.get("targetPointerEvents"),
                         )
                         return el, DomActionResult(True, strategy="enabled-check", elapsed_seconds=time.monotonic() - started)
-                elif result.get("reason") in {"input_empty", "placeholder_leak"}:
+                elif result.get("reason") in {"input_empty", "placeholder_leak", "text_mismatch"}:
                     input_not_ready_streak += 1
                     last_disabled_reason = f"post_button_input_not_ready:{result.get('reason')}"
                     if attempt == 0:
                         logger.info(
-                            "[DOM] Post button not ready because composer text is not committed: reason=%s inputText='%s'",
+                            "[DOM] Post button not ready because composer text is not the expected variant: reason=%s inputText='%s' expected='%s'",
                             result.get("reason"),
                             result.get("inputText", ""),
+                            result.get("expectedText", ""),
                         )
                     if input_not_ready_streak >= 2:
                         return None, DomActionResult(

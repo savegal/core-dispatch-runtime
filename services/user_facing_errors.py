@@ -309,7 +309,7 @@ def humanize_warning(warning: Any, short: bool = False) -> str | None:
             if short:
                 return "Часть главных комментариев не отправилась"
             return "Часть главных комментариев не удалось отправить. Ответы продолжили работу по опубликованным комментариям."
-        if code == "parallel_main_incomplete_replies_skipped":
+        if code in {"parallel_main_incomplete_replies_skipped", "parallel_main_incomplete_replies_blocked"}:
             submitted = _safe_int(warning.get("submitted"))
             expected = _safe_int(warning.get("expected"))
             if submitted and expected:
@@ -572,7 +572,12 @@ def build_task_execution_summary(task: Mapping[str, Any] | None) -> dict[str, An
         if isinstance(replies, Mapping):
             replies_ok += _safe_int(replies.get("ok"))
             replies_total += _safe_int(replies.get("total"))
-            replies_requested += _safe_int(replies.get("requested_variants")) or _safe_int(replies.get("total"))
+            replies_requested += (
+                _safe_int(replies.get("expected_submissions"))
+                or _safe_int(replies.get("expected"))
+                or _safe_int(replies.get("requested_variants"))
+                or _safe_int(replies.get("total"))
+            )
             reply_attempted += _safe_int(replies.get("attempted"))
             reply_failed += _safe_int(replies.get("failed"))
             reply_variant_outcomes += _safe_int(replies.get("variant_outcomes"))

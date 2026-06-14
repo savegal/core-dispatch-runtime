@@ -338,13 +338,20 @@ def _build_reply_summary(
     account_signals: dict[int, dict[str, Any]],
 ) -> tuple[dict[str, Any], dict[str, Any]]:
     items = replies.get("items") if isinstance(replies.get("items"), list) else []
-    requested = _safe_int(replies.get("requested_variants")) or _safe_int(replies.get("total")) or len(items)
+    requested_variants = _safe_int(replies.get("requested_variants"))
+    requested = (
+        _safe_int(replies.get("expected_submissions"))
+        or _safe_int(replies.get("expected"))
+        or _safe_int(replies.get("total"))
+        or requested_variants
+        or len(items)
+    )
     variant_outcomes = _safe_int(replies.get("variant_outcomes"))
     if variant_outcomes <= 0:
         variant_outcomes = len({item.get("variant_index") for item in items if isinstance(item, Mapping) and item.get("variant_index")})
     variants_not_started = _safe_int(replies.get("variants_not_started"))
-    if requested and variant_outcomes:
-        variants_not_started = max(variants_not_started, requested - variant_outcomes)
+    if requested_variants and variant_outcomes:
+        variants_not_started = max(variants_not_started, requested_variants - variant_outcomes)
 
     aggregate_attempted = _safe_int(replies.get("attempted"))
     aggregate_submitted = _safe_int(replies.get("submitted"))
@@ -485,6 +492,7 @@ def _build_reply_summary(
 
     summary = {
         "requested": requested,
+        "requested_variants": requested_variants,
         "attempted": final_attempted,
         "submitted": final_submitted,
         "confirmed": final_confirmed,

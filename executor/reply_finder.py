@@ -39,6 +39,7 @@ async def find_comment_by_text_and_author(
     using_proxy: bool = False,
     max_scrolls: int = 10,
     min_match_ratio: float = 0.7,
+    top_level_only: bool = True,
 ) -> Tuple[Optional[Any], Dict[str, Any]]:
     """
     Находит комментарий по тексту, автору или ID.
@@ -59,7 +60,8 @@ async def find_comment_by_text_and_author(
         "author": expected_author,
         "comment_id": expected_comment_id[:20] if expected_comment_id else None,
         "min_match_ratio": min_match_ratio,
-        "proxy": using_proxy
+        "proxy": using_proxy,
+        "top_level_only": top_level_only,
     })
     
     info = {
@@ -126,6 +128,52 @@ async def find_comment_by_text_and_author(
 
     # Если указан comment_id - сначала пробуем найти по ID
     # If expected_comment_id is set, we will check it during each scroll pass.
+    async def _looks_like_top_level_parent(handle: Any) -> bool:
+        if not top_level_only:
+            return True
+        try:
+            return bool(
+                await handle.evaluate(
+                    """
+                    (el) => {
+                        const visible = (node) => {
+                            if (!node || !node.getBoundingClientRect) return false;
+                            const r = node.getBoundingClientRect();
+                            const s = getComputedStyle(node);
+                            return r.width > 0 && r.height > 0 && s.display !== 'none' && s.visibility !== 'hidden';
+                        };
+                        const labelOf = (node) => [
+                            node && node.getAttribute && (node.getAttribute('data-e2e') || ''),
+                            node && node.getAttribute && (node.getAttribute('aria-label') || ''),
+                            node && (node.id || ''),
+                            node && String(node.className || ''),
+                        ].join(' ').toLowerCase();
+                        const isReplyLevel = (node) => /comment-level-[23]/.test(labelOf(node));
+                        if (isReplyLevel(el)) return false;
+                        const strongSelf = el.querySelector && el.querySelector('[data-e2e="comment-level-1"], [data-e2e*="comment-text"]');
+                        const firstLevel = el.querySelector && el.querySelector('[data-e2e*="comment-level"]');
+                        if (firstLevel && isReplyLevel(firstLevel) && !strongSelf) return false;
+                        for (let cur = el.parentElement, depth = 0; cur && cur !== document.body && depth < 8; cur = cur.parentElement, depth++) {
+                            const label = labelOf(cur);
+                            if (isReplyLevel(cur)) return false;
+                            if (label.includes('reply-container') || label.includes('replyitem') || label.includes('reply-item')) return false;
+                            if (/(reply|Reply)/.test(String(cur.className || '')) && !label.includes('comment-reply')) return false;
+                        }
+                        if (strongSelf && visible(strongSelf)) return true;
+                        try {
+                            const r = el.getBoundingClientRect();
+                            const textNode = el.querySelector('[data-e2e*="comment-level"], [data-e2e*="comment-text"], p, span') || el;
+                            const tr = textNode.getBoundingClientRect();
+                            if (tr.left - r.left > 96) return false;
+                        } catch (_) {}
+                        return true;
+                    }
+                    """
+                )
+            )
+        except Exception:
+            return True
+
     for scroll in range(max_scrolls):
         try:
             # Проверяем, что страница жива
@@ -164,6 +212,8 @@ async def find_comment_by_text_and_author(
                                     await comment_root.get_attribute("id")
 
                         if expected_comment_id and comment_id and str(comment_id) == str(expected_comment_id):
+                            if not await _looks_like_top_level_parent(comment_root):
+                                continue
                             is_visible = await comment_root.is_visible()
                             if not is_visible:
                                 try:
@@ -195,6 +245,8 @@ async def find_comment_by_text_and_author(
 
                         text_span = await comment_root.query_selector(selectors.COMMENT_TEXT_SPAN)
                         if not text_span:
+                            continue
+                        if not await _looks_like_top_level_parent(text_span):
                             continue
                         
                         # Извлекаем текст из span[data-e2e="comment-level-1"]
@@ -755,4 +807,3 @@ async def find_reply_submit_button_fast(
     info["error"] = "Reply submit button not found after all attempts"
     log_step("Reply submit button not found", {"attempts": max_attempts})
     return None, info
-

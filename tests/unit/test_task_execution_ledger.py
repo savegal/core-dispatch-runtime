@@ -165,6 +165,44 @@ def test_task_execution_ledger_counts_expected_parent_targets_from_main_variants
 
 
 @pytest.mark.unit
+def test_url_execution_ledger_uses_reply_matrix_expected_submissions():
+    result = {
+        "status": "submitted_unconfirmed",
+        "engagement": {
+            "main": {
+                "posted": True,
+                "expected": 9,
+                "variants_published": [
+                    {"text": f"m{idx}", "comment_id": f"cid-{idx}", "network_confirmed": True}
+                    for idx in range(1, 10)
+                ],
+            },
+            "replies": {
+                "requested_variants": 1,
+                "expected_submissions": 9,
+                "submitted": 9,
+                "items": [
+                    {
+                        "variant_index": 1,
+                        "attempted": True,
+                        "success": True,
+                        "parent_comment_id": f"cid-{idx}",
+                    }
+                    for idx in range(1, 10)
+                ],
+            },
+            "likes": {},
+        },
+    }
+
+    ledger = build_url_execution_ledger(result, url="u1")
+
+    assert ledger["summary"]["replies"]["requested"] == 9
+    assert ledger["summary"]["replies"]["requested_variants"] == 1
+    assert ledger["summary"]["replies"]["submitted"] == 9
+
+
+@pytest.mark.unit
 def test_attach_url_execution_ledger_mutates_result_compatibly():
     result = {
         "status": "success",

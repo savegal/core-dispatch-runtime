@@ -3413,7 +3413,20 @@ def _defer_blogger_for_navigation_timeout(
 async def _close_monitor_resources(page, context) -> None:
     async def _do_close():
         page_managed_by_pool = bool(getattr(page, '_managed_by_pool', False)) if page else False
-        managed_account_id = getattr(page, "_pool_account_id", None) if page_managed_by_pool else None
+        if page_managed_by_pool:
+            try:
+                from executor.browser_pool import close_pool_page
+
+                if await close_pool_page(page, reason="monitor_check_done"):
+                    return
+            except Exception:
+                pass
+            try:
+                if page and not page.is_closed():
+                    await page.close()
+            except Exception:
+                pass
+            return
         if page:
             try:
                 from executor.page_utils import safe_close_page
@@ -3423,19 +3436,7 @@ async def _close_monitor_resources(page, context) -> None:
                     await page.close()
                 except Exception:
                     pass
-        if page_managed_by_pool and managed_account_id is not None:
-            try:
-                from executor.browser_pool import close_account_context
-
-                await close_account_context(managed_account_id, reason="monitor_check_done")
-            except Exception:
-                if context:
-                    try:
-                        await context.close()
-                    except Exception:
-                        pass
-            return
-        if context and (not page_managed_by_pool):
+        if context:
             try:
                 await context.close()
             except Exception:

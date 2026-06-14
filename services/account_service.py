@@ -2443,7 +2443,9 @@ def mark_soft_error(db: Session, account_id: int, error_message: str = None) -> 
                 )
             else:
                 account.last_error = normalized_reason[:500] if normalized_reason else None
-        account.last_checked_at = datetime.now(timezone.utc)
+        now = datetime.now(timezone.utc)
+        account.last_checked_at = now
+        account.last_used_at = now
 
         if account.error_count_recent >= ERROR_THRESHOLD:
             account.status = "error"
@@ -2484,7 +2486,9 @@ def mark_runtime_cooldown(
             scope=scope,
         )
     )
-    account.last_checked_at = datetime.now(timezone.utc)
+    now = datetime.now(timezone.utc)
+    account.last_checked_at = now
+    account.last_used_at = now
 
     if account.error_count_recent >= ERROR_THRESHOLD:
         account.status = "error"
@@ -2513,7 +2517,9 @@ def mark_needs_reauth(db: Session, account_id: int, reason: str | None = None) -
         return
 
     account.status = "reauth_needed"
-    account.last_checked_at = datetime.now(timezone.utc)
+    now = datetime.now(timezone.utc)
+    account.last_checked_at = now
+    account.last_used_at = now
     normalized_reason = _normalize_reason(reason or "Needs re-authentication")
     if normalized_reason:
         account.last_error = normalized_reason[:500]

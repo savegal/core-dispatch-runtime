@@ -1,5 +1,5 @@
 import asyncio
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
 
 import pytest
@@ -194,6 +194,204 @@ async def test_return_page_to_pool_marks_page_available():
 
 @pytest.mark.unit
 @pytest.mark.asyncio
+async def test_cleanup_old_contexts_keeps_busy_pages_open():
+    pool = BrowserPool(max_browsers=1)
+    pool._context_ttl_seconds = 0
+    active_page = DummyPage(url="https://www.tiktok.com/@demo/video/1")
+    active_page._pool_available = False
+    idle_page = DummyPage(url="about:blank")
+    idle_page._pool_available = True
+    active_context = DummyContext([active_page])
+    idle_context = DummyContext([idle_page])
+    old_time = datetime.now(timezone.utc) - timedelta(minutes=10)
+    pool._contexts[1] = active_context
+    pool._contexts[2] = idle_context
+    pool._context_last_used[1] = old_time
+    pool._context_last_used[2] = old_time
+
+    await pool._cleanup_old_contexts()
+
+    assert pool._contexts.get(1) is active_context
+    assert active_context._closed is False
+    assert active_page.is_closed() is False
+    assert 2 not in pool._contexts
+    assert idle_context._closed is True
+
+
+@pytest.mark.unit
+@pytest.mark.asyncio
+async def test_close_page_from_pool_does_not_close_other_live_pages():
+    pool = BrowserPool(max_browsers=1)
+    target_page = DummyPage(url="https://www.tiktok.com/@demo/video/1")
+    other_page = DummyPage(url="https://www.tiktok.com/@demo/video/2")
+    context = DummyContext([target_page, other_page])
+    pool._contexts[1] = context
+    pool._context_last_used[1] = datetime.now(timezone.utc)
+
+    closed = await pool.close_page_from_pool(target_page, reason="unit_test")
+
+    assert closed is True
+    assert target_page.is_closed() is True
+    assert other_page.is_closed() is False
+    assert context._closed is False
+    assert pool._contexts[1] is context
+
+
+@pytest.mark.unit
+@pytest.mark.asyncio
+async def test_close_already_closed_page_from_pool_keeps_other_live_pages():
+    pool = BrowserPool(max_browsers=1)
+    target_page = DummyPage(url="https://www.tiktok.com/@demo/video/1")
+    other_page = DummyPage(url="https://www.tiktok.com/@demo/video/2")
+    target_page._closed = True
+    context = DummyContext([target_page, other_page])
+    pool._contexts[1] = context
+    pool._context_last_used[1] = datetime.now(timezone.utc)
+
+    closed = await pool.close_page_from_pool(target_page, reason="unit_test_already_closed")
+
+    assert closed is True
+    assert target_page.is_closed() is True
+    assert other_page.is_closed() is False
+    assert context._closed is False
+    assert pool._contexts[1] is context
+
+
+@pytest.mark.unit
+@pytest.mark.asyncio
+async def test_close_page_from_pool_removes_empty_context_and_browser():
+    pool = BrowserPool(max_browsers=1)
+    target_page = DummyPage(url="https://www.tiktok.com/@demo/video/1")
+    context = DummyContext([target_page])
+    browser = LaunchProbeBrowser()
+    pool._contexts[1] = context
+    pool._context_last_used[1] = datetime.now(timezone.utc)
+    pool._account_browser_ids[1] = "browser-1"
+    pool._browsers["browser-1"] = browser
+
+    closed = await pool.close_page_from_pool(target_page, reason="unit_test")
+
+    assert closed is True
+    assert target_page.is_closed() is True
+    assert context._closed is True
+    assert browser.closed is True
+    assert 1 not in pool._contexts
+    assert 1 not in pool._context_last_used
+    assert 1 not in pool._account_browser_ids
+    assert "browser-1" not in pool._browsers
+
+
+@pytest.mark.unit
+@pytest.mark.asyncio
+async def test_close_page_from_pool_returns_false_when_page_stays_open():
+    class CloseFailPage(DummyPage):
+        async def close(self):
+            raise RuntimeError("close failed")
+
+    pool = BrowserPool(max_browsers=1)
+    target_page = CloseFailPage(url="https://www.tiktok.com/@demo/video/1")
+    context = DummyContext([target_page])
+    pool._contexts[1] = context
+    pool._context_last_used[1] = datetime.now(timezone.utc)
+
+    closed = await pool.close_page_from_pool(target_page, reason="unit_test_close_error")
+
+    assert closed is False
+    assert target_page.is_closed() is False
+    assert context._closed is False
+    assert pool._contexts[1] is context
+
+
+@pytest.mark.unit
+@pytest.mark.asyncio
+async def test_cleanup_unused_browsers_keeps_browser_with_live_context_even_if_mapping_missing():
+    pool = BrowserPool(max_browsers=1)
+    page = DummyPage(url="https://www.tiktok.com/@demo/video/1")
+    context = DummyContext([page])
+    browser = LaunchProbeBrowser()
+    browser.contexts.append(context)
+    pool._contexts[1] = context
+    pool._context_last_used[1] = datetime.now(timezone.utc)
+    pool._browsers["browser-1"] = browser
+
+    closed_count = await pool._cleanup_unused_browsers()
+
+    assert closed_count == 0
+    assert browser.closed is False
+    assert pool._browsers["browser-1"] is browser
+
+
+@pytest.mark.unit
+@pytest.mark.asyncio
+async def test_cleanup_unused_browsers_keeps_browser_with_inflight_page_acquire():
+    pool = BrowserPool(max_browsers=1)
+    browser = LaunchProbeBrowser()
+    pool._browsers["browser-1"] = browser
+    pool._browser_inflight_acquires["browser-1"] = 1
+
+    closed_count = await pool._cleanup_unused_browsers()
+
+    assert closed_count == 0
+    assert browser.closed is False
+    assert pool._browsers["browser-1"] is browser
+
+
+@pytest.mark.unit
+@pytest.mark.asyncio
+async def test_get_page_for_account_does_not_close_busy_pages_when_context_has_many_pages(monkeypatch):
+    pool = BrowserPool(max_browsers=1)
+    busy_pages = [
+        DummyPage(url=f"https://www.tiktok.com/@demo/video/{index}")
+        for index in range(3)
+    ]
+    for page in busy_pages:
+        page._pool_available = False
+    context = DummyContext(busy_pages)
+    pool._contexts[1] = context
+    pool._context_last_used[1] = datetime.now(timezone.utc)
+
+    async def noop_initialize():
+        return None
+
+    monkeypatch.setattr(pool, "initialize", noop_initialize)
+
+    reused_context, new_page = await pool.get_page_for_account(SimpleNamespace(id=1))
+
+    assert reused_context is context
+    assert new_page in context.pages
+    assert new_page._pool_available is False
+    assert all(page.is_closed() is False for page in busy_pages)
+
+
+@pytest.mark.unit
+@pytest.mark.asyncio
+async def test_get_page_for_account_preserves_busy_context_when_new_page_fails(monkeypatch):
+    class BrokenNewPageContext(DummyContext):
+        async def new_page(self):
+            raise RuntimeError("new page failed")
+
+    pool = BrowserPool(max_browsers=1)
+    busy_page = DummyPage(url="https://www.tiktok.com/@demo/video/1")
+    busy_page._pool_available = False
+    context = BrokenNewPageContext([busy_page])
+    pool._contexts[1] = context
+    pool._context_last_used[1] = datetime.now(timezone.utc)
+
+    async def noop_initialize():
+        return None
+
+    monkeypatch.setattr(pool, "initialize", noop_initialize)
+
+    with pytest.raises(browser_pool.TikTokClientError, match="busy"):
+        await pool.get_page_for_account(SimpleNamespace(id=1))
+
+    assert context._closed is False
+    assert busy_page.is_closed() is False
+    assert pool._contexts[1] is context
+
+
+@pytest.mark.unit
+@pytest.mark.asyncio
 async def test_get_page_for_account_reuses_available_page(monkeypatch):
     pool = BrowserPool(max_browsers=1)
     page = DummyPage(url="about:blank")
@@ -256,6 +454,54 @@ async def test_get_page_for_account_launches_distinct_browsers_concurrently(monk
     )
 
     assert max_active_launches == 2
+
+
+@pytest.mark.unit
+@pytest.mark.asyncio
+async def test_get_page_for_account_serializes_same_proxy_browser_launch(monkeypatch):
+    from executor import tiktok_client
+
+    pool = BrowserPool(max_browsers=2)
+    active_launches = 0
+    max_active_launches = 0
+    launch_count = 0
+
+    class FakeChromium:
+        async def launch(self, **_launch_options):
+            nonlocal active_launches, max_active_launches, launch_count
+            active_launches += 1
+            max_active_launches = max(max_active_launches, active_launches)
+            await asyncio.sleep(0.02)
+            active_launches -= 1
+            launch_count += 1
+            return LaunchProbeBrowser()
+
+    async def noop_initialize():
+        return None
+
+    monkeypatch.setattr(pool, "initialize", noop_initialize)
+    monkeypatch.setattr(pool, "_playwright", SimpleNamespace(chromium=FakeChromium()))
+    monkeypatch.setattr(tiktok_client, "_get_cookies_for_account", lambda _account: "[]")
+    monkeypatch.setattr(tiktok_client, "parse_cookies", lambda _raw: [])
+    monkeypatch.setattr(
+        tiktok_client,
+        "_normalize_proxy_for_playwright",
+        lambda proxy: {"server": proxy} if proxy else None,
+    )
+    monkeypatch.setattr(browser_pool.settings, "HUMAN_LIKE_BEHAVIOR", False, raising=False)
+
+    await asyncio.gather(
+        pool.get_page_for_account(
+            SimpleNamespace(id=1, label="a1", proxy="http://proxy-a:8000", user_agent=None, country_code="US")
+        ),
+        pool.get_page_for_account(
+            SimpleNamespace(id=2, label="a2", proxy="http://proxy-a:8000", user_agent=None, country_code="US")
+        ),
+    )
+
+    assert max_active_launches == 1
+    assert launch_count == 1
+    assert len(pool._browsers) == 1
 
 
 @pytest.mark.unit

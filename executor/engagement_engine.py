@@ -75,6 +75,34 @@ _SHORTLINK_HOST_MARKERS = ("vt.tiktok.com", "vm.tiktok.com")
 ENGAGEMENT_ONLY_REPLY_MAX_ATTEMPTS = 6
 
 
+async def _close_attempt_resources(page, context, *, reason: str) -> None:
+    if page is not None and getattr(page, "_managed_by_pool", False):
+        try:
+            from executor.browser_pool import close_pool_page
+
+            if await close_pool_page(page, reason=reason):
+                return
+        except Exception:
+            logger.debug("Failed to close pooled engagement page via pool", exc_info=True)
+        try:
+            if not page.is_closed():
+                await page.close()
+        except Exception:
+            pass
+        return
+
+    try:
+        if page and not page.is_closed():
+            await page.close()
+    except Exception:
+        pass
+    try:
+        if context:
+            await context.close()
+    except Exception:
+        pass
+
+
 def _bounded_float_setting(
     name: str,
     default: float,
@@ -1379,16 +1407,7 @@ async def find_comment_for_engagement(
                     exc_info=True
                 )
             finally:
-                try:
-                    if page and not page.is_closed():
-                        await page.close()
-                except Exception:
-                    pass
-                try:
-                    if context:
-                        await context.close()
-                except Exception:
-                    pass
+                await _close_attempt_resources(page, context, reason="engagement_verify_done")
 
         return False, None, None
 
@@ -2275,16 +2294,7 @@ async def _attempt_publish_on_account(
         _register_runtime_failure(db, account, f"exception: {str(e)[:100]}")
         return None, f"exception: {str(e)[:100]}", "error"
     finally:
-        try:
-            if page and not page.is_closed():
-                await page.close()
-        except Exception:
-            pass
-        try:
-            if context:
-                await context.close()
-        except Exception:
-            pass
+        await _close_attempt_resources(page, context, reason="engagement_publish_done")
 
 
 async def attempt_main_comment_on_account(
@@ -2789,6 +2799,10 @@ async def execute_engagement_only_replies_via_full_flow(
         max(3, requested_parallel_worker_target),
     )
     parallel_worker_target = min(requested_parallel_worker_target, parallel_browser_capacity)
+    max_active_browsers_per_proxy = min(
+        2,
+        _positive_int_setting("PARALLEL_MAX_ACTIVE_BROWSERS_PER_PROXY", 2),
+    )
     parallel_capacity_request = (
         parallel_browser_capacity
         if dynamic_worker_pool_enabled
@@ -2799,6 +2813,14 @@ async def execute_engagement_only_replies_via_full_flow(
     last_outcomes_by_variant: Dict[int, List[Any]] = {}
     last_reply_account_by_variant: Dict[int, Optional[int]] = {}
     active_reply_proxy_counts: Dict[str, int] = {}
+    temporary_reply_selection_error = "reply_account_temporarily_unavailable"
+    try:
+        reply_worker_attempt_timeout_seconds = max(
+            1.0,
+            float(getattr(settings, "PARALLEL_REPLY_WORKER_ATTEMPT_TIMEOUT_SECONDS", 240.0) or 240.0),
+        )
+    except Exception:
+        reply_worker_attempt_timeout_seconds = 240.0
 
     def _current_main_candidate() -> PublishedMain:
         return PublishedMain(
@@ -2834,69 +2856,107 @@ async def execute_engagement_only_replies_via_full_flow(
         min_uses = min(counts.values())
         return {proxy for proxy, count in counts.items() if count > min_uses}
 
-    async def _select_reply_account(attempt_db: Session) -> Optional[Account]:
+    async def _select_reply_account(attempt_db: Session) -> Tuple[Optional[Account], Optional[str]]:
         async with reply_selection_lock:
             strict_degraded_categories = {"captcha", "page_blocked"}
-            exclude_proxies = (
-                set(active_reply_proxy_counts) | set(used_reply_proxy_values)
-                if dynamic_worker_pool_enabled
-                else set(used_reply_proxy_values)
-            )
-            candidate = get_free_account_for_reply(
-                attempt_db,
-                exclude_ids=list(used_reply_accounts),
-                exclude_proxies=exclude_proxies,
-                exclude_degraded_categories=strict_degraded_categories,
-                pool_owner_user_id=pool_owner_user_id,
-            )
-            if candidate is None and exclude_proxies:
-                balanced_exclude_proxies = (
-                    _overloaded_active_proxies(active_reply_proxy_counts)
+            capacity_blocked_proxies: set[str] = set()
+            for _ in range(max(1, parallel_browser_capacity + 2)):
+                exclude_proxies = (
+                    set(active_reply_proxy_counts) | set(used_reply_proxy_values)
                     if dynamic_worker_pool_enabled
-                    else set()
+                    else set(used_reply_proxy_values)
                 )
-                if not balanced_exclude_proxies and used_reply_proxy_counts:
-                    min_uses = min(used_reply_proxy_counts.values())
-                    balanced_exclude_proxies = {
-                        proxy
-                        for proxy, count in used_reply_proxy_counts.items()
-                        if count > min_uses
-                    }
-                if balanced_exclude_proxies:
-                    logger.info(
-                        "Task %s: engagement_only no completely unused reply proxy; "
-                        "trying least-used proxy selection",
-                        task_id,
+                exclude_proxies |= capacity_blocked_proxies
+                candidate = get_free_account_for_reply(
+                    attempt_db,
+                    exclude_ids=list(used_reply_accounts),
+                    exclude_proxies=exclude_proxies,
+                    exclude_degraded_categories=strict_degraded_categories,
+                    pool_owner_user_id=pool_owner_user_id,
+                )
+                if candidate is None and exclude_proxies:
+                    balanced_exclude_proxies = (
+                        _overloaded_active_proxies(active_reply_proxy_counts)
+                        if dynamic_worker_pool_enabled
+                        else set()
                     )
-                    candidate = get_free_account_for_reply(
-                        attempt_db,
-                        exclude_ids=list(used_reply_accounts),
-                        exclude_proxies=balanced_exclude_proxies,
-                        exclude_proxy_source_hosts=False,
-                        exclude_degraded_categories=strict_degraded_categories,
-                        pool_owner_user_id=pool_owner_user_id,
-                    )
-                if candidate is None:
-                    logger.info(
-                        "Task %s: engagement_only no reply account on less-used proxy; "
-                        "falling back to account-only selection",
-                        task_id,
-                    )
-                    candidate = get_free_account_for_reply(
-                        attempt_db,
-                        exclude_ids=list(used_reply_accounts),
-                        exclude_degraded_categories=strict_degraded_categories,
-                        pool_owner_user_id=pool_owner_user_id,
-                    )
-            if candidate:
-                used_reply_accounts.append(candidate.id)
+                    if not balanced_exclude_proxies and used_reply_proxy_counts:
+                        min_uses = min(used_reply_proxy_counts.values())
+                        balanced_exclude_proxies = {
+                            proxy
+                            for proxy, count in used_reply_proxy_counts.items()
+                            if count > min_uses
+                        }
+                    if balanced_exclude_proxies:
+                        balanced_exclude_proxies |= capacity_blocked_proxies
+                        logger.info(
+                            "Task %s: engagement_only no completely unused reply proxy; "
+                            "trying least-used proxy selection",
+                            task_id,
+                        )
+                        candidate = get_free_account_for_reply(
+                            attempt_db,
+                            exclude_ids=list(used_reply_accounts),
+                            exclude_proxies=balanced_exclude_proxies,
+                            exclude_proxy_source_hosts=False,
+                            exclude_degraded_categories=strict_degraded_categories,
+                            pool_owner_user_id=pool_owner_user_id,
+                        )
+                    if candidate is None:
+                        logger.info(
+                            "Task %s: engagement_only no reply account on less-used proxy; "
+                            "falling back to account-only selection",
+                            task_id,
+                        )
+                        candidate = get_free_account_for_reply(
+                            attempt_db,
+                            exclude_ids=list(used_reply_accounts),
+                            exclude_proxies=capacity_blocked_proxies,
+                            exclude_degraded_categories=strict_degraded_categories,
+                            pool_owner_user_id=pool_owner_user_id,
+                        )
+                if not candidate:
+                    if dynamic_worker_pool_enabled and (
+                        active_reply_proxy_counts
+                        or capacity_blocked_proxies
+                    ):
+                        logger.info(
+                            "Task %s: engagement_only reply account selection deferred because proxy capacity is active "
+                            "(active=%s capacity_blocked=%s)",
+                            task_id,
+                            dict(active_reply_proxy_counts),
+                            list(capacity_blocked_proxies),
+                        )
+                        return None, temporary_reply_selection_error
+                    return None, None
                 proxy_value = _account_proxy_value(candidate)
+                if (
+                    dynamic_worker_pool_enabled
+                    and proxy_value
+                    and active_reply_proxy_counts.get(proxy_value, 0) >= max_active_browsers_per_proxy
+                ):
+                    capacity_blocked_proxies.add(proxy_value)
+                    logger.info(
+                        "Task %s: engagement_only reply account %s skipped because proxy already has %s/%s active browser(s)",
+                        task_id,
+                        candidate.id,
+                        active_reply_proxy_counts.get(proxy_value, 0),
+                        max_active_browsers_per_proxy,
+                    )
+                    continue
+                used_reply_accounts.append(candidate.id)
                 if proxy_value:
                     used_reply_proxy_values.add(proxy_value)
                     used_reply_proxy_counts[proxy_value] = used_reply_proxy_counts.get(proxy_value, 0) + 1
                     if dynamic_worker_pool_enabled:
                         _inc_proxy_count(active_reply_proxy_counts, proxy_value)
-            return candidate
+                return candidate, None
+            if dynamic_worker_pool_enabled and (
+                active_reply_proxy_counts
+                or capacity_blocked_proxies
+            ):
+                return None, temporary_reply_selection_error
+            return None, None
 
     def _ensure_parallel_browser_capacity() -> bool:
         try:
@@ -3041,14 +3101,21 @@ async def execute_engagement_only_replies_via_full_flow(
         from db.database import get_sync_db_context
 
         with get_sync_db_context() as attempt_db:
-            reply_account = await _select_reply_account(attempt_db)
+            reply_account, selection_error = await _select_reply_account(attempt_db)
             if not reply_account:
-                logger.warning(
-                    "Task %s: engagement_only out of reply accounts on variant %s",
-                    task_id,
-                    variant_idx,
-                )
-                attempt_info["error"] = "no_free_reply_accounts"
+                if selection_error == temporary_reply_selection_error:
+                    logger.info(
+                        "Task %s: engagement_only reply variant %s waiting for a free proxy/browser slot",
+                        task_id,
+                        variant_idx,
+                    )
+                else:
+                    logger.warning(
+                        "Task %s: engagement_only out of reply accounts on variant %s",
+                        task_id,
+                        variant_idx,
+                    )
+                attempt_info["error"] = selection_error or "no_free_reply_accounts"
                 return attempt_info
 
             attempt_info["account_id"] = reply_account.id
@@ -3070,19 +3137,32 @@ async def execute_engagement_only_replies_via_full_flow(
             allow_author_fallback = author_required and attempt_num == max_attempts
 
             try:
-                attempt_result = await _reply_with_variant_on_all_mains(
-                    attempt_db,
-                    reply_account,
-                    video_url,
-                    pending_parent,
-                    reply_text,
-                    variant_index=variant_idx,
-                    correlation_id=correlation_id,
-                    fallback_main_texts=None,
-                    already_replied_parent_keys=submitted_parent_keys,
-                    require_parent_author_match=author_required,
-                    allow_parent_author_fallback=allow_author_fallback,
+                attempt_result = await asyncio.wait_for(
+                    _reply_with_variant_on_all_mains(
+                        attempt_db,
+                        reply_account,
+                        video_url,
+                        pending_parent,
+                        reply_text,
+                        variant_index=variant_idx,
+                        correlation_id=correlation_id,
+                        fallback_main_texts=None,
+                        already_replied_parent_keys=submitted_parent_keys,
+                        require_parent_author_match=author_required,
+                        allow_parent_author_fallback=allow_author_fallback,
+                    ),
+                    timeout=reply_worker_attempt_timeout_seconds,
                 )
+            except asyncio.TimeoutError:
+                logger.warning(
+                    "Task %s: engagement_only parallel reply variant %s account=%s timed out after %.1fs",
+                    task_id,
+                    variant_idx,
+                    reply_account.id,
+                    reply_worker_attempt_timeout_seconds,
+                )
+                attempt_info["error"] = f"parallel_reply_attempt_timeout:{reply_worker_attempt_timeout_seconds:.1f}s"
+                return attempt_info
             except Exception as exc:
                 logger.warning(
                     "Task %s: engagement_only parallel reply variant %s account=%s raised: %s",
@@ -3286,6 +3366,26 @@ async def execute_engagement_only_replies_via_full_flow(
                         key=lambda row: 0 if row[2].get("completed") else 1
                     )
                     for variant_idx, reply_text, raw_result in completed_reply_results:
+                        if raw_result.get("error") == temporary_reply_selection_error:
+                            reply_rounds[variant_idx] = max(0, reply_rounds.get(variant_idx, 0) - 1)
+                            pending_reply_variants.append((variant_idx, reply_text))
+                            logger.info(
+                                "Task %s: engagement_only dynamic reply variant %s deferred until a proxy/browser slot frees up",
+                                task_id,
+                                variant_idx,
+                            )
+                            if await _sleep_or_stop(0.5):
+                                results.append(
+                                    _stopped_reply_row(
+                                        reply_text,
+                                        variant_idx,
+                                        attempts=reply_rounds.get(variant_idx, 0),
+                                        account_id=last_reply_account_by_variant.get(variant_idx),
+                                    )
+                                )
+                                return results, resolved_parent_id, resolved_author
+                            continue
+
                         surface_unavailable = (
                             raw_result.get("error") == "comment_list_not_open"
                             and not raw_result.get("completed")
@@ -3502,6 +3602,16 @@ async def execute_engagement_only_replies_via_full_flow(
 
             if raw_result.get("completed"):
                 results.extend(raw_result.get("replies") or [])
+                continue
+
+            if raw_result.get("error") == temporary_reply_selection_error:
+                reply_rounds[variant_idx] = max(0, reply_rounds.get(variant_idx, 0) - 1)
+                retry_variants.append((variant_idx, reply_text))
+                logger.info(
+                    "Task %s: engagement_only reply variant %s deferred until a proxy/browser slot frees up",
+                    task_id,
+                    variant_idx,
+                )
                 continue
 
             if raw_result.get("stopped"):

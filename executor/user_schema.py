@@ -267,6 +267,42 @@ def _parallel_main_input_retry_max_seconds() -> float:
     )
 
 
+def _parallel_main_worker_attempt_timeout_seconds() -> float:
+    return _bounded_float_setting(
+        "PARALLEL_MAIN_WORKER_ATTEMPT_TIMEOUT_SECONDS",
+        180.0,
+        minimum=0.1,
+        maximum=360.0,
+    )
+
+
+def _parallel_main_refill_poll_seconds() -> float:
+    return _bounded_float_setting(
+        "PARALLEL_MAIN_REFILL_POLL_SECONDS",
+        0.15,
+        minimum=0.05,
+        maximum=1.0,
+    )
+
+
+def _parallel_reply_worker_attempt_timeout_seconds() -> float:
+    return _bounded_float_setting(
+        "PARALLEL_REPLY_WORKER_ATTEMPT_TIMEOUT_SECONDS",
+        240.0,
+        minimum=0.1,
+        maximum=480.0,
+    )
+
+
+def _parallel_reply_refill_poll_seconds() -> float:
+    return _bounded_float_setting(
+        "PARALLEL_REPLY_REFILL_POLL_SECONDS",
+        0.15,
+        minimum=0.05,
+        maximum=1.0,
+    )
+
+
 def _parallel_reply_publish_max_seconds() -> float:
     return _bounded_float_setting(
         "PARALLEL_REPLY_PUBLISH_MAX_SECONDS",
@@ -1559,12 +1595,29 @@ class UserSchemaResult:
             else 0
         )
 
+        expected_main_publications = max(0, int(self.expected_main_publications or 0))
+        submitted_main_publications = len(self.published_mains)
         main_success = self.has_any_publish or self.fallback_main_via_reply
+        reply_parent_target_count = expected_main_publications or submitted_main_publications
+        if expected_reply_variants and reply_parent_target_count <= 0 and main_success:
+            reply_parent_target_count = 1
+        expected_reply_submissions = (
+            expected_reply_variants * reply_parent_target_count
+            if expected_reply_variants
+            else total_replies
+        )
+        missing_reply_submissions = (
+            max(0, expected_reply_submissions - submitted_replies)
+            if expected_reply_submissions
+            else 0
+        )
         replies_success = successful_replies == total_replies and (
-            expected_reply_variants == 0 or total_replies >= expected_reply_variants
+            expected_reply_submissions == 0
+            or successful_replies >= expected_reply_submissions
         )
         replies_submitted = submitted_replies == total_replies and (
-            expected_reply_variants == 0 or total_replies >= expected_reply_variants
+            expected_reply_submissions == 0
+            or submitted_replies >= expected_reply_submissions
         )
         main_unconfirmed = bool(main_success and not self.main_found_by_observer)
         reply_unconfirmed = bool(
@@ -1640,7 +1693,14 @@ class UserSchemaResult:
                     "local_confirmed": bool(first and first.local_confirmed),
                     "method": first.method if first else None,
                     "submitted_unconfirmed": main_unconfirmed,
-                    "expected": max(0, int(self.expected_main_publications or 0)),
+                    "expected": expected_main_publications,
+                    "submitted": submitted_main_publications,
+                    "missing": max(0, expected_main_publications - submitted_main_publications),
+                    "complete": (
+                        submitted_main_publications >= expected_main_publications
+                        if expected_main_publications
+                        else bool(submitted_main_publications)
+                    ),
                     "visibility_status": (
                         "public_confirmed"
                         if self.main_found_by_observer
@@ -1665,11 +1725,15 @@ class UserSchemaResult:
                     "ok": successful_replies,
                     "total": total_replies,
                     "requested_variants": expected_reply_variants,
+                    "expected": expected_reply_submissions,
+                    "expected_submissions": expected_reply_submissions,
+                    "expected_per_variant": reply_parent_target_count,
                     "variant_outcomes": reply_variants_recorded,
                     "variants_not_started": reply_variants_not_started,
                     "attempted": attempted_replies,
                     "failed": failed_replies,
                     "submitted": submitted_replies,
+                    "missing": missing_reply_submissions,
                     "submitted_unconfirmed": submitted_unconfirmed_replies,
                     "items": [
                         {
@@ -1722,16 +1786,27 @@ class UserSchemaResult:
 # Helpers
 # ---------------------------------------------------------------------------
 
-async def _safe_close(context, page) -> None:
+async def _safe_close(context, page, *, reason: str = "user_schema_attempt_done") -> None:
     account_id = getattr(page, "_pool_account_id", None) if page is not None else None
     if account_id is not None:
         try:
-            from executor.browser_pool import close_account_context
+            from executor.browser_pool import close_pool_page
 
-            if await close_account_context(account_id, reason="user_schema_attempt_done"):
+            logger.info(
+                "[USER_SCHEMA] closing pooled page account=%s reason=%s",
+                account_id,
+                reason,
+            )
+            if await close_pool_page(page, reason=reason):
                 return
         except Exception:
-            logger.debug("Failed to close pooled account context cleanly", exc_info=True)
+            logger.debug("Failed to close pooled page cleanly", exc_info=True)
+        try:
+            if page and not page.is_closed():
+                await page.close()
+        except Exception:
+            pass
+        return
     try:
         if page and not page.is_closed():
             await page.close()
@@ -3718,7 +3793,36 @@ async def _publish_all_variants_on_account(
             logger.debug("[USER_SCHEMA] inter-variant delay %.1fs (already published %d)", delay, len(published))
             await asyncio.sleep(delay)
 
-    return published, (None if published else last_failure_reason)
+    if not published:
+        return [], last_failure_reason
+
+    published_text_keys = {
+        _dedup_key(item.text)
+        for item in published
+        if (item.text or "").strip()
+    }
+    remaining_texts = [
+        text
+        for text in text_variants
+        if _dedup_key(text) not in published_text_keys
+    ]
+    if remaining_texts:
+        partial_reason = (
+            f"main_partial:published={len(published)}/{len(text_variants)};"
+            f"remaining={len(remaining_texts)};"
+            f"reason={last_failure_reason or 'account_series_stopped'}"
+        )
+        logger.warning(
+            "[USER_SCHEMA] %s partially published main variants: published=%s expected=%s remaining=%s reason=%s",
+            correlation_id,
+            len(published),
+            len(text_variants),
+            len(remaining_texts),
+            last_failure_reason or "account_series_stopped",
+        )
+        return published, partial_reason
+
+    return published, None
 
 
 async def _try_main_account(
@@ -3739,6 +3843,7 @@ async def _try_main_account(
     """
     context = None
     page = None
+    close_reason = "main_attempt_done"
     timeout_ms = _settings.PLAYWRIGHT_TIMEOUT * (2 if account.proxy else 1)
     preflight_deny = await _preflight_cookie_http_gate(
         db,
@@ -3780,6 +3885,7 @@ async def _try_main_account(
             correlation_id=correlation_id,
         )
         if not ok:
+            close_reason = f"main_login_not_ready:{deny or 'unknown'}"[:200]
             return [], deny
         target_media_url = _current_media_guard_url(page, video_url)
         if resolved_video_url_holder is not None and extract_tiktok_media_id(target_media_url):
@@ -3819,6 +3925,7 @@ async def _try_main_account(
                 enrich_result.log_summary(account.id, correlation_id)
                 if enrich_result.redirected:
                     mark_needs_reauth(db, account.id, reason="enrichment_redirect_dead_session")
+                    close_reason = "main_enrichment_redirect_dead_session"
                     return [], "dead_session_during_enrichment"
                 if not enrich_result.success or not enrich_result.all_cookies_json:
                     reason = f"enrichment_failed:{enrich_result.error or 'missing_required_browser_cookies'}"
@@ -3828,6 +3935,7 @@ async def _try_main_account(
                         correlation_id,
                         reason,
                     )
+                    close_reason = reason[:200]
                     return [], reason
                 else:
                     enriched_cookies_json = enrich_result.all_cookies_json
@@ -3841,6 +3949,7 @@ async def _try_main_account(
                     reason,
                 )
                 _register_runtime_failure(db, account, reason)
+                close_reason = reason[:200]
                 return [], reason
             # После enrichment возвращаем page обратно на видео, потому что
             # enricher заходил на /foryou.
@@ -3860,6 +3969,7 @@ async def _try_main_account(
                     timeout_ms=int(timeout_ms),
                 )
                 if deny_after_enrichment:
+                    close_reason = f"main_post_enrichment_denied:{deny_after_enrichment}"[:200]
                     return [], deny_after_enrichment
             except Exception as exc:
                 logger.warning(
@@ -3867,6 +3977,7 @@ async def _try_main_account(
                     correlation_id, str(exc)[:120],
                 )
                 _register_runtime_failure(db, account, f"post_enrichment_return_failed:{str(exc)[:80]}")
+                close_reason = f"post_enrichment_return_failed:{str(exc)[:80]}"[:200]
                 return [], f"post_enrichment_return_failed:{str(exc)[:80]}"
 
         # ----- Human-like idle delay -----
@@ -3892,6 +4003,7 @@ async def _try_main_account(
                 correlation_id,
                 captcha_reason,
             )
+            close_reason = captcha_reason[:200]
             return [], captcha_reason
         logged_out_deny = await _deny_if_visible_logged_out(
             db,
@@ -3901,6 +4013,7 @@ async def _try_main_account(
             phase="main_pre_warmup",
         )
         if logged_out_deny:
+            close_reason = f"main_pre_warmup_logged_out:{logged_out_deny}"[:200]
             return [], logged_out_deny
 
         # ----- Behavioral warmup -----
@@ -3940,6 +4053,7 @@ async def _try_main_account(
                 correlation_id,
                 captcha_reason,
             )
+            close_reason = captcha_reason[:200]
             return [], captcha_reason
         logged_out_deny = await _deny_if_visible_logged_out(
             db,
@@ -3949,6 +4063,7 @@ async def _try_main_account(
             phase="main_pre_publish",
         )
         if logged_out_deny:
+            close_reason = f"main_pre_publish_logged_out:{logged_out_deny}"[:200]
             return [], logged_out_deny
         if not await _ensure_page_on_target_media(
             page,
@@ -3958,6 +4073,7 @@ async def _try_main_account(
             correlation_id=correlation_id,
             phase="main_pre_publish",
         ):
+            close_reason = "url_drift_to_other_video"
             return [], "url_drift_to_other_video"
         if resolved_video_url_holder is not None and extract_tiktok_media_id(target_media_url):
             resolved_video_url_holder["video_url"] = target_media_url
@@ -3972,6 +4088,11 @@ async def _try_main_account(
             on_published=on_published,
         )
         if published:
+            close_reason = (
+                f"main_published_partial:{publish_reason}"[:200]
+                if publish_reason
+                else "main_published"
+            )
             await _persist_cookies_after_success(
                 db,
                 page,
@@ -3979,9 +4100,16 @@ async def _try_main_account(
                 scope="main",
                 correlation_id=correlation_id,
             )
+        elif publish_reason:
+            close_reason = f"main_publish_failed:{publish_reason}"[:200]
+        else:
+            close_reason = "main_publish_finished_without_publication"
         return published, publish_reason
+    except asyncio.CancelledError:
+        close_reason = "main_attempt_cancelled"
+        raise
     finally:
-        await _safe_close(context, page)
+        await _safe_close(context, page, reason=close_reason)
 
 
 # ---------------------------------------------------------------------------
@@ -4015,6 +4143,7 @@ async def _find_main_anchor_by_text_legacy(
                 scroll_delay_ms=_REPLY_MAIN_SEARCH_SCROLL_DELAY_MS,
                 ensure_open=False,
                 strict_scope=True,
+                top_level_only=True,
             )
         except Exception as exc:
             logger.debug("find_comment_in_list error: %s", exc)
@@ -4384,6 +4513,39 @@ def _pending_expected_mains_for_reply_variant(
         for main in candidates
         if not _main_is_submitted_for_reply_variant_with_counts(main, submitted_keys, text_key_counts)
     ]
+
+
+def _reply_pending_parent_report(
+    reply_variants: List[str],
+    main_candidates: List[PublishedMain],
+    submitted_keys_by_variant: Dict[int, set[str]],
+) -> List[Dict[str, Any]]:
+    report: List[Dict[str, Any]] = []
+    for variant_index, reply_text in enumerate(reply_variants or [], start=1):
+        pending_mains = _pending_expected_mains_for_reply_variant(
+            main_candidates,
+            submitted_keys_by_variant.get(variant_index, set()),
+        )
+        if not pending_mains:
+            continue
+        report.append(
+            {
+                "variant_index": variant_index,
+                "reply_text": reply_text,
+                "pending_count": len(pending_mains),
+                "pending_parents": [
+                    {
+                        "text": main.text,
+                        "comment_id": main.comment_id,
+                        "account_id": main.account_id,
+                        "tiktok_username": main.tiktok_username,
+                        "parent_key": _main_parent_key(main),
+                    }
+                    for main in pending_mains
+                ],
+            }
+        )
+    return report
 
 
 def _main_text_key_counts(main_candidates: List[PublishedMain]) -> Dict[str, int]:
@@ -4864,6 +5026,45 @@ async def _find_main_anchor(
                 root = None
             if not root:
                 continue
+            root_top_level = True
+            try:
+                root_top_level = await root.evaluate(
+                    """
+                    (el) => {
+                        const labelOf = (node) => [
+                            node && node.getAttribute && (node.getAttribute('data-e2e') || ''),
+                            node && node.getAttribute && (node.getAttribute('aria-label') || ''),
+                            node && (node.id || ''),
+                            node && String(node.className || ''),
+                        ].join(' ').toLowerCase();
+                        const isReplyLevel = (node) => /comment-level-[23]/.test(labelOf(node));
+                        if (isReplyLevel(el)) return false;
+                        const strongSelf = el.querySelector && el.querySelector('[data-e2e="comment-level-1"], [data-e2e*="comment-text"]');
+                        const firstLevel = el.querySelector && el.querySelector('[data-e2e*="comment-level"]');
+                        if (firstLevel && isReplyLevel(firstLevel) && !strongSelf) return false;
+                        for (let cur = el.parentElement, depth = 0; cur && cur !== document.body && depth < 8; cur = cur.parentElement, depth++) {
+                            const label = labelOf(cur);
+                            if (isReplyLevel(cur)) return false;
+                            if (label.includes('reply-container') || label.includes('replyitem') || label.includes('reply-item')) return false;
+                            if (/(reply|Reply)/.test(String(cur.className || '')) && !label.includes('comment-reply')) return false;
+                        }
+                        return true;
+                    }
+                    """
+                )
+            except Exception as exc:
+                logger.debug(
+                    "[USER_SCHEMA] _find_main_anchor top-level cid probe failed for %s: %s",
+                    cid[:24],
+                    exc,
+                )
+                root_top_level = True
+            if not root_top_level:
+                logger.info(
+                    "[USER_SCHEMA] _find_main_anchor ignored nested reply row for comment_id=%s",
+                    cid[:24],
+                )
+                continue
             try:
                 if not await root.is_visible():
                     try:
@@ -4995,6 +5196,7 @@ async def _find_main_anchor(
                     scroll_delay_ms=_REPLY_MAIN_SEARCH_SCROLL_DELAY_MS,
                     ensure_open=False,
                     strict_scope=True,
+                    top_level_only=True,
                 ),
                 timeout=single_search_timeout,
             )
@@ -5082,6 +5284,7 @@ async def _find_main_anchors_batch(
                 min_match_ratio=1.0 if author_match_requested else 0.7,
                 return_partial_on_found=True,
                 partial_found_sink=partial_found_map,
+                top_level_only=True,
             ),
             timeout=max(1.0, timeout_seconds),
         )
@@ -5748,6 +5951,7 @@ async def _observe_main_texts_with_account(
                 scroll_delay_ms=_REPLY_MAIN_SEARCH_SCROLL_DELAY_MS,
                 ensure_open=False,
                 strict_scope=True,
+                top_level_only=True,
             )
         except Exception as exc:
             logger.debug("[USER_SCHEMA] %s: observer batch find failed: %s", correlation_id, exc)
@@ -6045,6 +6249,7 @@ async def _reply_with_variant_on_all_mains(
         already_replied_parent_keys = set()
     context = None
     page = None
+    close_reason = "reply_attempt_done"
     timeout_ms = _settings.PLAYWRIGHT_TIMEOUT * (2 if account.proxy else 1)
     preflight_deny = await _preflight_cookie_http_gate(
         db,
@@ -6107,6 +6312,7 @@ async def _reply_with_variant_on_all_mains(
             correlation_id=correlation_id,
         )
         if not ok:
+            close_reason = f"reply_login_not_ready:{deny or 'unknown'}"[:200]
             results.append(
                 ReplyOutcome(
                     text=reply_text,
@@ -6425,10 +6631,25 @@ async def _reply_with_variant_on_all_mains(
             )
 
         async def _finish_reply_attempt(result: ReplyAttemptResult) -> ReplyAttemptResult:
+            nonlocal close_reason
             if result.submitted_parent_keys_count <= 0:
                 result.submitted_parent_keys_count = sum(
                     1 for outcome in result.replies if _reply_outcome_submitted(outcome)
                 )
+            if result.fallback_mains:
+                close_reason = "reply_fallback_main_published"
+            elif any(_reply_outcome_submitted(outcome) for outcome in result.replies):
+                close_reason = "reply_submitted"
+            elif result.replies:
+                last_error = next(
+                    (str(outcome.error or "").strip() for outcome in reversed(result.replies) if outcome.error),
+                    "unknown",
+                )
+                close_reason = f"reply_failed:{last_error}"[:200]
+            elif result.searched:
+                close_reason = "reply_searched_no_submission"
+            else:
+                close_reason = "reply_finished_without_search"
             if result.fallback_mains or any(_reply_outcome_submitted(outcome) for outcome in result.replies):
                 await _persist_cookies_after_success(
                     db,
@@ -7388,8 +7609,11 @@ async def _reply_with_variant_on_all_mains(
                 parent_search_unique_rows_seen=parent_search_unique_rows_seen,
             )
         )
+    except asyncio.CancelledError:
+        close_reason = "reply_attempt_cancelled"
+        raise
     finally:
-        await _safe_close(context, page)
+        await _safe_close(context, page, reason=close_reason)
 
 
 # ---------------------------------------------------------------------------
@@ -7889,12 +8113,11 @@ async def execute_user_schema_parallel(
         result.error = "no_text_variants"
         result.elapsed_seconds = time.monotonic() - started
         return result
-    parallel_main_account_slots = min(parallel_main_account_slots, len(main_texts))
     main_texts_by_slot: Dict[int, List[str]] = {
-        slot_index: [text]
-        for slot_index, text in enumerate(main_texts, start=1)
+        slot_index: list(main_texts)
+        for slot_index in range(1, parallel_main_account_slots + 1)
     }
-    result.expected_main_publications = len(main_texts)
+    result.expected_main_publications = len(main_texts) * parallel_main_account_slots
     reply_variants: List[str] = _reply_variants_from_task(task)
     result.expected_reply_variants = len(reply_variants)
 
@@ -7936,13 +8159,17 @@ async def execute_user_schema_parallel(
         minimum=0.05,
         maximum=1.0,
     )
+    main_worker_attempt_timeout_seconds = _parallel_main_worker_attempt_timeout_seconds()
+    main_refill_poll_seconds = _parallel_main_refill_poll_seconds()
+    reply_worker_attempt_timeout_seconds = _parallel_reply_worker_attempt_timeout_seconds()
+    reply_refill_poll_seconds = _parallel_reply_refill_poll_seconds()
     parallel_capacity_request = (
         parallel_browser_capacity
         if dynamic_worker_pool_enabled
         else parallel_main_account_slots
     )
     logger.info(
-        "Task %s: parallel commenting limits main_attempts=%s reply_attempts=%s retry_account_limit=%s dynamic_pool=%s target_browsers=%s browser_capacity=%s per_proxy_capacity=%s proxy_refill_backoff=%.2fs",
+        "Task %s: parallel commenting limits main_attempts=%s reply_attempts=%s retry_account_limit=%s dynamic_pool=%s target_browsers=%s browser_capacity=%s per_proxy_capacity=%s proxy_refill_backoff=%.2fs main_worker_timeout=%.1fs main_refill_poll=%.2fs reply_worker_timeout=%.1fs reply_refill_poll=%.2fs",
         task_id,
         max_main_attempts,
         max_reply_attempts,
@@ -7952,6 +8179,10 @@ async def execute_user_schema_parallel(
         parallel_browser_capacity,
         max_active_browsers_per_proxy,
         proxy_slot_refill_backoff_seconds,
+        main_worker_attempt_timeout_seconds,
+        main_refill_poll_seconds,
+        reply_worker_attempt_timeout_seconds,
+        reply_refill_poll_seconds,
     )
     main_selection_lock = asyncio.Lock()
     reply_selection_lock = asyncio.Lock()
@@ -7967,10 +8198,13 @@ async def execute_user_schema_parallel(
     edge_denied_main_proxy_counts: Dict[str, int] = {}
     edge_denied_main_proxy_values: set[str] = set()
     edge_denied_main_proxy_rotated: set[str] = set()
+    pending_main_proxy_rotations: set[str] = set()
     edge_denied_reply_proxy_counts: Dict[str, int] = {}
     edge_denied_reply_proxy_values: set[str] = set()
     edge_denied_reply_proxy_rotated: set[str] = set()
+    pending_reply_proxy_rotations: set[str] = set()
     temporary_main_selection_error = "main_account_temporarily_unavailable"
+    temporary_reply_selection_error = "reply_account_temporarily_unavailable"
 
     def _short_proxy_sig(proxy_value: Optional[str]) -> str:
         raw = str(proxy_value or "").strip()
@@ -8029,6 +8263,79 @@ async def execute_user_schema_parallel(
         # смена IP через rotation_url, а не перебор аккаунтов на том же IP.
         return _looks_like_edge_access_denied(text) or _looks_like_proxy_failure(text)
 
+    async def _rotate_mobile_proxy_after_failure(
+        attempt_db: Session,
+        proxy_value: str,
+        *,
+        scope: str,
+        rotated_set: set[str],
+        counts: Dict[str, int],
+        cooled_values: set[str],
+    ) -> bool:
+        proxy_value = (proxy_value or "").strip()
+        if not proxy_value or proxy_value in rotated_set:
+            return False
+        try:
+            proxy_obj = (
+                attempt_db.query(Proxy)
+                .filter(Proxy.proxy == proxy_value)
+                .first()
+            )
+        except Exception as exc:
+            proxy_obj = None
+            logger.debug(
+                "Task %s: failed to load %s proxy for rotation: %s",
+                task_id,
+                scope,
+                str(exc)[:120],
+            )
+        if not (
+            proxy_obj is not None
+            and getattr(proxy_obj, "is_mobile", None) == "Y"
+            and getattr(proxy_obj, "rotation_url", None)
+        ):
+            if counts.get(proxy_value, 0) >= 2:
+                cooled_values.add(proxy_value)
+            return False
+        try:
+            new_ip = await asyncio.wait_for(
+                ensure_proxy_ip_rotated(proxy_obj, attempt_db),
+                timeout=35.0,
+            )
+            rotated_set.add(proxy_value)
+            counts[proxy_value] = 0
+            try:
+                clear_proxy_bad(proxy_value)
+            except Exception:
+                logger.debug("clear_proxy_bad after %s rotation failed", scope, exc_info=True)
+            logger.info(
+                "Task %s: rotated mobile proxy after %s failure proxy=%s new_ip=%s",
+                task_id,
+                scope,
+                _short_proxy_sig(proxy_value),
+                new_ip,
+            )
+            return True
+        except (asyncio.TimeoutError, ProxyRotationError) as exc:
+            logger.warning(
+                "Task %s: mobile proxy rotation after %s failure failed for %s: %s",
+                task_id,
+                scope,
+                _short_proxy_sig(proxy_value),
+                str(exc)[:160],
+            )
+        except Exception as exc:
+            logger.warning(
+                "Task %s: unexpected mobile proxy rotation error after %s failure for %s: %s",
+                task_id,
+                scope,
+                _short_proxy_sig(proxy_value),
+                str(exc)[:160],
+            )
+        if counts.get(proxy_value, 0) >= 2:
+            cooled_values.add(proxy_value)
+        return False
+
     async def _handle_main_edge_access_denied(
         attempt_db: Session,
         slot_result: _ParallelMainSlotResult,
@@ -8051,6 +8358,7 @@ async def execute_user_schema_parallel(
         # When it becomes free, try rotation before cooling it down.
         if proxy_value not in edge_denied_main_proxy_rotated:
             if active_main_proxy_counts.get(proxy_value, 0) > 0:
+                pending_main_proxy_rotations.add(proxy_value)
                 logger.info(
                     "Task %s: delaying mobile proxy rotation for %s because another main browser is active on it",
                     task_id,
@@ -8136,6 +8444,7 @@ async def execute_user_schema_parallel(
 
         if proxy_value not in edge_denied_reply_proxy_rotated:
             if active_reply_proxy_counts.get(proxy_value, 0) > 0:
+                pending_reply_proxy_rotations.add(proxy_value)
                 logger.info(
                     "Task %s: delaying mobile proxy rotation for %s because another reply browser is active on it",
                     task_id,
@@ -8430,21 +8739,35 @@ async def execute_user_schema_parallel(
             resolved_video_url_holder: Dict[str, str] = {}
             try:
                 try:
-                    published, dead_reason = await _try_main_account(
-                        attempt_db,
-                        candidate,
-                        target_video_url,
-                        slot_texts,
-                        correlation_id=corr,
-                        resolved_video_url_holder=resolved_video_url_holder,
-                        on_published=(
-                            lambda published_main, _slot_index=slot_index: _stream_main_publication(
-                                _slot_index,
-                                published_main,
+                    published, dead_reason = await asyncio.wait_for(
+                        _try_main_account(
+                            attempt_db,
+                            candidate,
+                            target_video_url,
+                            slot_texts,
+                            correlation_id=corr,
+                            resolved_video_url_holder=resolved_video_url_holder,
+                            on_published=(
+                                lambda published_main, _slot_index=slot_index: _stream_main_publication(
+                                    _slot_index,
+                                    published_main,
+                                )
                             )
-                        )
-                        if dynamic_worker_pool_enabled
-                        else None,
+                            if dynamic_worker_pool_enabled
+                            else None,
+                        ),
+                        timeout=main_worker_attempt_timeout_seconds,
+                    )
+                except asyncio.TimeoutError:
+                    published = []
+                    dead_reason = f"parallel_main_attempt_timeout:{main_worker_attempt_timeout_seconds:.1f}s"
+                    logger.warning(
+                        "Task %s: parallel main slot %s account=%s timed out after %.1fs; "
+                        "releasing slot for replacement browser",
+                        task_id,
+                        slot_index,
+                        candidate.id,
+                        main_worker_attempt_timeout_seconds,
                     )
                 except Exception as exc:
                     published = []
@@ -8467,8 +8790,26 @@ async def execute_user_schema_parallel(
                         str(exc)[:120],
                     )
                 if dynamic_worker_pool_enabled:
+                    pending_rotation_proxy = None
                     async with main_selection_lock:
                         _dec_proxy_count(active_main_proxy_counts, slot_result.proxy_value)
+                        proxy_value = (slot_result.proxy_value or "").strip()
+                        if (
+                            proxy_value
+                            and active_main_proxy_counts.get(proxy_value, 0) <= 0
+                            and proxy_value in pending_main_proxy_rotations
+                        ):
+                            pending_main_proxy_rotations.discard(proxy_value)
+                            pending_rotation_proxy = proxy_value
+                    if pending_rotation_proxy:
+                        await _rotate_mobile_proxy_after_failure(
+                            attempt_db,
+                            pending_rotation_proxy,
+                            scope="main",
+                            rotated_set=edge_denied_main_proxy_rotated,
+                            counts=edge_denied_main_proxy_counts,
+                            cooled_values=edge_denied_main_proxy_values,
+                        )
             resolved_url = resolved_video_url_holder.get("video_url")
             if resolved_url and extract_tiktok_media_id(resolved_url):
                 slot_result.resolved_video_url = resolved_url
@@ -8540,9 +8881,9 @@ async def execute_user_schema_parallel(
         active_main_tasks: Dict[asyncio.Task, Tuple[int, List[str]]] = {}
         next_main_selection_retry_at = 0.0
         empty_main_attempts_without_any_publication = 0
-        # Keep the empty-surface stop as a "two full waves" guard. After moving
-        # main publishing to one text per slot, small orders have fewer slots,
-        # but they should not be abandoned after just 1-2 flaky browser attempts.
+        # Keep the empty-surface stop as a "two full waves" guard. Each parallel
+        # main slot represents one account seat that should publish all main
+        # variants, so the guard is based on account slots, not text count.
         empty_main_attempt_slots = max(3, parallel_main_account_slots)
         max_empty_main_attempts_before_fail = (
             max_empty_main_batches_before_fail * empty_main_attempt_slots
@@ -8610,7 +8951,7 @@ async def execute_user_schema_parallel(
 
                 done, _pending = await asyncio.wait(
                     list(active_main_tasks.keys()),
-                    timeout=0.5,
+                    timeout=main_refill_poll_seconds,
                     return_when=asyncio.FIRST_COMPLETED,
                 )
                 if not done:
@@ -9004,11 +9345,36 @@ async def execute_user_schema_parallel(
         result.elapsed_seconds = time.monotonic() - started
         return result
 
+    def _parallel_slot_remaining_texts(slot_result: _ParallelMainSlotResult) -> List[str]:
+        expected_texts = list(main_texts_by_slot.get(slot_result.slot_index, []))
+        if not expected_texts:
+            return []
+        slot_published_keys = {
+            _dedup_key(main.text)
+            for main in (slot_result.published or [])
+            if (main.text or "").strip()
+        }
+        return [
+            text
+            for text in expected_texts
+            if _dedup_key(text) not in slot_published_keys
+        ]
+
     if len(result.published_mains) < result.expected_main_publications:
         missing_slots = [
             str(slot.slot_index)
             for slot in main_results
             if len(slot.published or []) < len(main_texts_by_slot.get(slot.slot_index, []))
+        ]
+        remaining_by_slot = {
+            str(slot.slot_index): _parallel_slot_remaining_texts(slot)
+            for slot in main_results
+            if len(slot.published or []) < len(main_texts_by_slot.get(slot.slot_index, []))
+        }
+        remaining_texts = [
+            text
+            for slot in main_results
+            for text in _parallel_slot_remaining_texts(slot)
         ]
         has_reply_phase = bool(reply_variants)
         logger.warning(
@@ -9016,7 +9382,7 @@ async def execute_user_schema_parallel(
             "published=%s expected=%s complete_slots=%s expected_slots=%s missing_slots=%s",
             task_id,
             (
-                "continuing to replies with submitted main comments"
+                "blocking replies until all expected main comments are published"
                 if has_reply_phase
                 else "no reply phase requested"
             ),
@@ -9037,6 +9403,8 @@ async def execute_user_schema_parallel(
                     "submitted": len(result.published_mains),
                     "expected": result.expected_main_publications,
                     "missing_slots": missing_slots,
+                    "remaining_texts": remaining_texts,
+                    "remaining_by_slot": remaining_by_slot,
                     "message": (
                         f"{len(result.published_mains)}/{result.expected_main_publications} "
                         "main comments were submitted"
@@ -9055,6 +9423,8 @@ async def execute_user_schema_parallel(
                         "submitted": len(result.published_mains),
                         "expected": result.expected_main_publications,
                         "missing_slots": missing_slots,
+                        "remaining_texts": remaining_texts,
+                        "remaining_by_slot": remaining_by_slot,
                         "message": (
                             "Reply phase blocked because not all expected main "
                             "comments were published"
@@ -9103,93 +9473,146 @@ async def execute_user_schema_parallel(
             if await _sleep_or_stop(visibility_delay):
                 return _mark_stopped()
 
-    async def _select_reply_account(attempt_db: Session) -> Optional[Account]:
+    async def _select_reply_account(attempt_db: Session) -> Tuple[Optional[Account], Optional[str]]:
         async with reply_selection_lock:
             strict_degraded_categories = {"captcha", "page_blocked"}
-            exclude_proxies = (
-                set(active_reply_proxy_counts)
-                if dynamic_worker_pool_enabled
-                else set(used_main_proxy_values) | set(used_reply_proxy_values)
-            )
-            exclude_proxies |= set(edge_denied_reply_proxy_values)
-            candidate = get_free_account_for_reply(
-                attempt_db,
-                exclude_ids=list(used_reply_ids),
-                exclude_proxies=exclude_proxies,
-                exclude_proxy_source_hosts=bool(edge_denied_reply_proxy_values),
-                exclude_degraded_categories=strict_degraded_categories,
-                pool_owner_user_id=pool_owner_user_id,
-            )
-            if candidate is None and exclude_proxies:
-                reply_only_exclude_proxies = (
-                    set(active_reply_proxy_counts) | set(used_reply_proxy_values)
+            capacity_blocked_proxies: set[str] = set()
+            for _ in range(max(1, parallel_browser_capacity + 2)):
+                pending_rotation_snapshot = set(pending_reply_proxy_rotations)
+                exclude_proxies = (
+                    set(active_reply_proxy_counts)
                     if dynamic_worker_pool_enabled
-                    else set(used_reply_proxy_values)
+                    else set(used_main_proxy_values) | set(used_reply_proxy_values)
                 )
-                reply_only_exclude_proxies |= set(edge_denied_reply_proxy_values)
-                if reply_only_exclude_proxies and reply_only_exclude_proxies != exclude_proxies:
-                    logger.info(
-                        "Task %s: no reply account on proxy unused by main phase; "
-                        "trying to balance within reply batch",
-                        task_id,
-                    )
-                    candidate = get_free_account_for_reply(
-                        attempt_db,
-                        exclude_ids=list(used_reply_ids),
-                        exclude_proxies=reply_only_exclude_proxies,
-                        exclude_proxy_source_hosts=bool(edge_denied_reply_proxy_values),
-                        exclude_degraded_categories=strict_degraded_categories,
-                        pool_owner_user_id=pool_owner_user_id,
-                    )
-                if candidate is None:
-                    balanced_exclude_proxies = (
-                        _overloaded_active_proxies(active_reply_proxy_counts)
+                exclude_proxies |= set(edge_denied_reply_proxy_values)
+                exclude_proxies |= pending_rotation_snapshot
+                exclude_proxies |= capacity_blocked_proxies
+                candidate = get_free_account_for_reply(
+                    attempt_db,
+                    exclude_ids=list(used_reply_ids),
+                    exclude_proxies=exclude_proxies,
+                    exclude_proxy_source_hosts=bool(edge_denied_reply_proxy_values),
+                    exclude_degraded_categories=strict_degraded_categories,
+                    pool_owner_user_id=pool_owner_user_id,
+                )
+                if candidate is None and exclude_proxies:
+                    reply_only_exclude_proxies = (
+                        set(active_reply_proxy_counts) | set(used_reply_proxy_values)
                         if dynamic_worker_pool_enabled
-                        else set()
+                        else set(used_reply_proxy_values)
                     )
-                    if not balanced_exclude_proxies and used_reply_proxy_counts:
-                        min_uses = min(used_reply_proxy_counts.values())
-                        balanced_exclude_proxies = {
-                            proxy
-                            for proxy, count in used_reply_proxy_counts.items()
-                            if count > min_uses
-                        }
-                    if balanced_exclude_proxies:
-                        balanced_exclude_proxies |= set(edge_denied_reply_proxy_values)
+                    reply_only_exclude_proxies |= set(edge_denied_reply_proxy_values)
+                    reply_only_exclude_proxies |= pending_rotation_snapshot
+                    reply_only_exclude_proxies |= capacity_blocked_proxies
+                    if reply_only_exclude_proxies and reply_only_exclude_proxies != exclude_proxies:
                         logger.info(
-                            "Task %s: no reply account on unused proxy; trying least-used proxy selection",
+                            "Task %s: no reply account on proxy unused by main phase; "
+                            "trying to balance within reply batch",
                             task_id,
                         )
                         candidate = get_free_account_for_reply(
                             attempt_db,
                             exclude_ids=list(used_reply_ids),
-                            exclude_proxies=balanced_exclude_proxies,
+                            exclude_proxies=reply_only_exclude_proxies,
                             exclude_proxy_source_hosts=bool(edge_denied_reply_proxy_values),
                             exclude_degraded_categories=strict_degraded_categories,
                             pool_owner_user_id=pool_owner_user_id,
                         )
-                if candidate is None:
-                    logger.info(
-                        "Task %s: no reply account on less-used proxy; falling back to account-only selection",
-                        task_id,
-                    )
-                    candidate = get_free_account_for_reply(
-                        attempt_db,
-                        exclude_ids=list(used_reply_ids),
-                        exclude_proxies=set(edge_denied_reply_proxy_values),
-                        exclude_proxy_source_hosts=bool(edge_denied_reply_proxy_values),
-                        exclude_degraded_categories=strict_degraded_categories,
-                        pool_owner_user_id=pool_owner_user_id,
-                    )
-            if candidate:
-                used_reply_ids.add(candidate.id)
+                    if candidate is None:
+                        balanced_exclude_proxies = (
+                            _overloaded_active_proxies(active_reply_proxy_counts)
+                            if dynamic_worker_pool_enabled
+                            else set()
+                        )
+                        if not balanced_exclude_proxies and used_reply_proxy_counts:
+                            min_uses = min(used_reply_proxy_counts.values())
+                            balanced_exclude_proxies = {
+                                proxy
+                                for proxy, count in used_reply_proxy_counts.items()
+                                if count > min_uses
+                            }
+                        if balanced_exclude_proxies:
+                            balanced_exclude_proxies |= set(edge_denied_reply_proxy_values)
+                            balanced_exclude_proxies |= pending_rotation_snapshot
+                            balanced_exclude_proxies |= capacity_blocked_proxies
+                            logger.info(
+                                "Task %s: no reply account on unused proxy; trying least-used proxy selection",
+                                task_id,
+                            )
+                            candidate = get_free_account_for_reply(
+                                attempt_db,
+                                exclude_ids=list(used_reply_ids),
+                                exclude_proxies=balanced_exclude_proxies,
+                                exclude_proxy_source_hosts=bool(edge_denied_reply_proxy_values),
+                                exclude_degraded_categories=strict_degraded_categories,
+                                pool_owner_user_id=pool_owner_user_id,
+                            )
+                    if candidate is None:
+                        logger.info(
+                            "Task %s: no reply account on less-used proxy; falling back to account-only selection",
+                            task_id,
+                        )
+                        candidate = get_free_account_for_reply(
+                            attempt_db,
+                            exclude_ids=list(used_reply_ids),
+                            exclude_proxies=(
+                                set(edge_denied_reply_proxy_values)
+                                | pending_rotation_snapshot
+                                | capacity_blocked_proxies
+                            ),
+                            exclude_proxy_source_hosts=bool(edge_denied_reply_proxy_values),
+                            exclude_degraded_categories=strict_degraded_categories,
+                            pool_owner_user_id=pool_owner_user_id,
+                        )
+                if not candidate:
+                    if dynamic_worker_pool_enabled and (
+                        active_reply_proxy_counts
+                        or capacity_blocked_proxies
+                        or pending_reply_proxy_rotations
+                    ):
+                        logger.info(
+                            "Task %s: reply account selection deferred because proxy capacity/rotation is still active "
+                            "(active=%s pending_rotation=%s capacity_blocked=%s)",
+                            task_id,
+                            {
+                                _short_proxy_sig(proxy): count
+                                for proxy, count in active_reply_proxy_counts.items()
+                            },
+                            [_short_proxy_sig(proxy) for proxy in pending_reply_proxy_rotations],
+                            [_short_proxy_sig(proxy) for proxy in capacity_blocked_proxies],
+                        )
+                        return None, temporary_reply_selection_error
+                    return None, None
                 proxy_value = _account_proxy_value(candidate)
+                if (
+                    dynamic_worker_pool_enabled
+                    and proxy_value
+                    and active_reply_proxy_counts.get(proxy_value, 0) >= max_active_browsers_per_proxy
+                ):
+                    capacity_blocked_proxies.add(proxy_value)
+                    logger.info(
+                        "Task %s: reply account %s skipped because proxy %s already has %s/%s active browser(s)",
+                        task_id,
+                        candidate.id,
+                        _short_proxy_sig(proxy_value),
+                        active_reply_proxy_counts.get(proxy_value, 0),
+                        max_active_browsers_per_proxy,
+                    )
+                    continue
+                used_reply_ids.add(candidate.id)
                 if proxy_value:
                     used_reply_proxy_values.add(proxy_value)
                     used_reply_proxy_counts[proxy_value] = used_reply_proxy_counts.get(proxy_value, 0) + 1
                     if dynamic_worker_pool_enabled:
                         _inc_proxy_count(active_reply_proxy_counts, proxy_value)
-            return candidate
+                return candidate, None
+            if dynamic_worker_pool_enabled and (
+                active_reply_proxy_counts
+                or capacity_blocked_proxies
+                or pending_reply_proxy_rotations
+            ):
+                return None, temporary_reply_selection_error
+            return None, None
 
     def _merge_parallel_active_mains(candidates: List[PublishedMain]) -> List[PublishedMain]:
         return _merge_distinct_main_candidates(candidates)
@@ -9215,9 +9638,9 @@ async def execute_user_schema_parallel(
             variant_result.error = "stopped_by_user"
             return variant_result
         with get_sync_db_context() as attempt_db:
-            reply_account = await _select_reply_account(attempt_db)
+            reply_account, selection_error = await _select_reply_account(attempt_db)
             if not reply_account:
-                variant_result.error = "no_free_reply_accounts"
+                variant_result.error = selection_error or "no_free_reply_accounts"
                 return variant_result
             variant_result.account_id = reply_account.id
             variant_result.proxy_value = _account_proxy_value(reply_account)
@@ -9233,20 +9656,43 @@ async def execute_user_schema_parallel(
             )
             try:
                 author_required = any((main.tiktok_username or "").strip() for main in main_candidates)
-                attempt_result = await _reply_with_variant_on_all_mains(
-                    attempt_db,
-                    reply_account,
-                    working_video_url,
-                    main_candidates,
-                    reply_text,
-                    variant_index=variant_index,
-                    correlation_id=corr,
-                    fallback_main_texts=None,
-                    already_replied_parent_keys=submitted_parent_keys,
-                    fallback_allowed=False,
-                    require_parent_author_match=author_required,
-                    allow_parent_author_fallback=author_required and attempt >= max_reply_attempts,
-                    shared_parent_cache=shared_parent_cache,
+                attempt_result = await asyncio.wait_for(
+                    _reply_with_variant_on_all_mains(
+                        attempt_db,
+                        reply_account,
+                        working_video_url,
+                        main_candidates,
+                        reply_text,
+                        variant_index=variant_index,
+                        correlation_id=corr,
+                        fallback_main_texts=None,
+                        already_replied_parent_keys=submitted_parent_keys,
+                        fallback_allowed=False,
+                        require_parent_author_match=author_required,
+                        allow_parent_author_fallback=author_required and attempt >= max_reply_attempts,
+                        shared_parent_cache=shared_parent_cache,
+                    ),
+                    timeout=reply_worker_attempt_timeout_seconds,
+                )
+            except asyncio.TimeoutError:
+                timeout_error = f"parallel_reply_attempt_timeout:{reply_worker_attempt_timeout_seconds:.1f}s"
+                logger.warning(
+                    "Task %s: parallel reply variant %s account=%s timed out after %.1fs; "
+                    "releasing slot for replacement browser",
+                    task_id,
+                    variant_index,
+                    reply_account.id,
+                    reply_worker_attempt_timeout_seconds,
+                )
+                attempt_result = ReplyAttemptResult(
+                    replies=[
+                        _reply_failure_outcome(
+                            reply_text=reply_text,
+                            variant_index=variant_index,
+                            account_id=reply_account.id,
+                            error=timeout_error,
+                        )
+                    ]
                 )
             except Exception as exc:
                 logger.warning(
@@ -9268,8 +9714,26 @@ async def execute_user_schema_parallel(
                 )
             finally:
                 if dynamic_worker_pool_enabled:
+                    pending_rotation_proxy = None
                     async with reply_selection_lock:
                         _dec_proxy_count(active_reply_proxy_counts, variant_result.proxy_value)
+                        proxy_value = (variant_result.proxy_value or "").strip()
+                        if (
+                            proxy_value
+                            and active_reply_proxy_counts.get(proxy_value, 0) <= 0
+                            and proxy_value in pending_reply_proxy_rotations
+                        ):
+                            pending_reply_proxy_rotations.discard(proxy_value)
+                            pending_rotation_proxy = proxy_value
+                    if pending_rotation_proxy:
+                        await _rotate_mobile_proxy_after_failure(
+                            attempt_db,
+                            pending_rotation_proxy,
+                            scope="reply",
+                            rotated_set=edge_denied_reply_proxy_rotated,
+                            counts=edge_denied_reply_proxy_counts,
+                            cooled_values=edge_denied_reply_proxy_values,
+                        )
 
         outcomes = attempt_result.replies
         variant_result.parent_search_saw_rows = bool(attempt_result.saw_comment_rows)
@@ -9431,7 +9895,7 @@ async def execute_user_schema_parallel(
 
                     done, _pending = await asyncio.wait(
                         list(active_reply_tasks.keys()),
-                        timeout=0.5,
+                        timeout=reply_refill_poll_seconds,
                         return_when=asyncio.FIRST_COMPLETED,
                     )
                     if not done:
@@ -9478,6 +9942,21 @@ async def execute_user_schema_parallel(
                         key=lambda row: 0 if (row[2].completed or row[2].found_any_main) else 1
                     )
                     for variant_index, reply_text, item in completed_reply_results:
+                        if item.error == temporary_reply_selection_error:
+                            reply_rounds[item.variant_index] = max(
+                                0,
+                                reply_rounds.get(item.variant_index, 0) - 1,
+                            )
+                            pending_reply_variants.append((item.variant_index, item.text))
+                            logger.info(
+                                "Task %s: dynamic reply variant %s deferred until a proxy/browser slot frees up",
+                                task_id,
+                                item.variant_index,
+                            )
+                            if await _sleep_or_stop(reply_refill_poll_seconds):
+                                return _mark_stopped()
+                            continue
+
                         if not item.completed:
                             await _handle_reply_edge_access_denied(db, item)
 
@@ -9751,6 +10230,19 @@ async def execute_user_schema_parallel(
         retry_variants: List[Tuple[int, str]] = []
         fatal_reply_error: Optional[_ParallelReplyVariantResult] = None
         for item in sorted(batch_results, key=lambda value: value.variant_index):
+            if item.error == temporary_reply_selection_error:
+                reply_rounds[item.variant_index] = max(
+                    0,
+                    reply_rounds.get(item.variant_index, 0) - 1,
+                )
+                retry_variants.append((item.variant_index, item.text))
+                logger.info(
+                    "Task %s: parallel reply variant %s deferred until a proxy/browser slot frees up",
+                    task_id,
+                    item.variant_index,
+                )
+                continue
+
             if not item.completed:
                 await _handle_reply_edge_access_denied(db, item)
 
@@ -9814,6 +10306,21 @@ async def execute_user_schema_parallel(
         )
 
     _merge_reported_reply_outcomes_into_result()
+
+    reply_pending_report = _reply_pending_parent_report(
+        reply_variants,
+        active_mains,
+        reply_submitted_parent_keys_by_variant,
+    )
+    if reply_pending_report and not result.error and result.replies:
+        result.error = "reply_publication_incomplete"
+        result.warnings.append(
+            {
+                "code": "parallel_reply_incomplete",
+                "pending": reply_pending_report,
+                "message": "Not every reply variant was submitted to every expected main comment",
+            }
+        )
 
     if boost_enabled and not reply_variants:
         result.boost_enabled = False
@@ -10104,15 +10611,30 @@ async def execute_user_schema_full(
                         len(main_texts_to_publish),
                         len(result.published_mains),
                     )
+                    result.warnings.append(
+                        {
+                            "code": "main_publication_incomplete",
+                            "submitted": len(result.published_mains),
+                            "expected": len(main_texts_to_publish),
+                            "remaining_texts": main_texts_to_publish[variant_index - 1 :],
+                            "message": (
+                                f"{len(result.published_mains)}/{len(main_texts_to_publish)} "
+                                "main comments were submitted"
+                            ),
+                        }
+                    )
                     if stop_main_attempts or attempt >= max_main_attempts:
                         break
 
+        remaining_main_texts = list(main_texts_to_publish)
         legacy_main_attempts = (
             range(1, max_main_attempts + 1)
             if not publish_main_variants_separately
             else ()
         )
         for attempt in legacy_main_attempts:
+            if not remaining_main_texts:
+                break
             if _is_stop_requested():
                 logger.info("Task %s: user stop detected before main attempt %s", task_id, attempt)
                 _mark_stopped()
@@ -10135,7 +10657,7 @@ async def execute_user_schema_full(
                 db,
                 candidate,
                 video_url,
-                text_variants,
+                remaining_main_texts,
                 correlation_id=corr,
                 resolved_video_url_holder=resolved_video_url_holder,
             )
@@ -10162,7 +10684,45 @@ async def execute_user_schema_full(
                 # этого main-аккаунта в чужих параллельных задачах).
                 release_main_account_reservation(candidate.id)
                 reserved_main.discard(candidate.id)
-                break
+                published_text_keys = {
+                    _dedup_key(item.text)
+                    for item in published
+                    if (item.text or "").strip()
+                }
+                remaining_main_texts = [
+                    text
+                    for text in remaining_main_texts
+                    if _dedup_key(text) not in published_text_keys
+                ]
+                if not remaining_main_texts:
+                    break
+                logger.warning(
+                    "Task %s: main attempt %s account=%s published %s text(s), "
+                    "%s remain; reason=%s",
+                    task_id,
+                    attempt,
+                    candidate.id,
+                    len(published),
+                    len(remaining_main_texts),
+                    dead_reason or "partial",
+                )
+                result.warnings.append(
+                    {
+                        "code": "main_partial_attempt",
+                        "account_id": candidate.id,
+                        "submitted": len(result.published_mains),
+                        "expected": len(main_texts_to_publish),
+                        "remaining_texts": list(remaining_main_texts),
+                        "reason": dead_reason or "partial",
+                        "message": (
+                            f"{len(result.published_mains)}/{len(main_texts_to_publish)} "
+                            "main comments were submitted; retrying remaining texts"
+                        ),
+                    }
+                )
+                if attempt < max_main_attempts:
+                    await asyncio.sleep(random.uniform(*_RETRY_ACCOUNT_DELAY_RANGE))
+                continue
             # Не получилось — освобождаем и идём к следующему.
             # NB: про dead_session / login_ambiguous уже отчитался cookie_health
             # (он же решил, штрафовать ли validation_fail_count). Здесь только
@@ -10234,6 +10794,42 @@ async def execute_user_schema_full(
             logger.info("Task %s: user stop detected before reply phase", task_id)
             return _mark_stopped()
 
+        if (
+            result.published_mains
+            and len(result.published_mains) < result.expected_main_publications
+        ):
+            published_keys = {
+                _dedup_key(main.text)
+                for main in result.published_mains
+                if (main.text or "").strip()
+            }
+            remaining_report_texts = [
+                text
+                for text in main_texts_to_publish
+                if _dedup_key(text) not in published_keys
+            ]
+            if not result.error:
+                result.error = (
+                    "main_publication_incomplete:published="
+                    f"{len(result.published_mains)}/{result.expected_main_publications}"
+                )
+            if not any(
+                isinstance(item, dict) and item.get("code") == "main_publication_incomplete"
+                for item in result.warnings
+            ):
+                result.warnings.append(
+                    {
+                        "code": "main_publication_incomplete",
+                        "submitted": len(result.published_mains),
+                        "expected": result.expected_main_publications,
+                        "remaining_texts": remaining_report_texts,
+                        "message": (
+                            f"{len(result.published_mains)}/{result.expected_main_publications} "
+                            "main comments were submitted"
+                        ),
+                    }
+                )
+
         used_reply_accounts: List[int] = []
         if result.main_account_id is not None:
             used_reply_accounts.append(result.main_account_id)
@@ -10241,7 +10837,7 @@ async def execute_user_schema_full(
             if main.account_id is not None and main.account_id not in used_reply_accounts:
                 used_reply_accounts.append(main.account_id)
         active_mains: List[PublishedMain] = []
-        if result.published_mains and reply_variants:
+        if result.published_mains and reply_variants and not result.error:
             active_mains = await _prepare_public_mains_before_replies(
                 db,
                 working_video_url,
@@ -10251,12 +10847,13 @@ async def execute_user_schema_full(
                 used_reply_accounts=used_reply_accounts,
                 pool_owner_user_id=pool_owner_user_id,
             )
-        if reply_variants and result.error != "comment_ui_not_found":
+        if reply_variants and not result.error:
             max_reply_attempts = max(2, max(1, int(_settings.MAX_RETRY_ACCOUNTS)) + 1)
             fallback_main_attempts = 0
             task_fallback_used = False
             task_any_account_found_main = bool(result.main_found_by_observer)
             task_confident_empty_misses = 0
+            full_reply_submitted_parent_keys_by_variant: Dict[int, set[str]] = {}
 
             for variant_idx, reply_text in enumerate(reply_variants, start=1):
                 if not active_mains:
@@ -10272,7 +10869,10 @@ async def execute_user_schema_full(
                 last_outcomes: List[ReplyOutcome] = []
                 last_reply_account_id: Optional[int] = None
                 variant_completed = False
-                variant_submitted_parent_keys: set[str] = set()
+                variant_submitted_parent_keys = full_reply_submitted_parent_keys_by_variant.setdefault(
+                    variant_idx,
+                    set(),
+                )
                 variant_reported_outcomes: List[ReplyOutcome] = []
                 variant_found_mains_by_key: Dict[str, PublishedMain] = {}
 
@@ -10492,6 +11092,24 @@ async def execute_user_schema_full(
                         )
                     if not result.error and result.main_found_by_observer:
                         result.error = "reply_publication_incomplete"
+                    pending_report = _reply_pending_parent_report(
+                        reply_variants,
+                        active_mains,
+                        full_reply_submitted_parent_keys_by_variant,
+                    )
+                    if pending_report and not any(
+                        isinstance(item, dict) and item.get("code") == "reply_incomplete"
+                        for item in result.warnings
+                    ):
+                        result.warnings.append(
+                            {
+                                "code": "reply_incomplete",
+                                "pending": pending_report,
+                                "message": (
+                                    "Not every reply variant was submitted to every expected main comment"
+                                ),
+                            }
+                        )
                     break
 
         # ----- LIKES -----

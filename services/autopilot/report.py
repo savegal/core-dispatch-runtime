@@ -322,7 +322,13 @@ def _row_engagement_counts(row: dict[str, Any]) -> tuple[int, int, int | None, i
 
     replies_expected = None
     try:
-        replies_expected = int(replies.get("total") or replies.get("requested_variants") or 0)
+        replies_expected = int(
+            replies.get("expected_submissions")
+            or replies.get("expected")
+            or replies.get("total")
+            or replies.get("requested_variants")
+            or 0
+        )
     except (TypeError, ValueError):
         replies_expected = None
     try:

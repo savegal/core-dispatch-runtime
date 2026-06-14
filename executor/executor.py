@@ -1508,7 +1508,12 @@ def process_task(task_id: int) -> None:
                         replies_info = engagement.get("replies", {})
                         likes_info = engagement.get("likes", {})
                         likes_str = _format_likes_status(likes_info)
-                        replies_expected = replies_info.get("requested_variants") or replies_info.get("total", 0)
+                        replies_expected = (
+                            replies_info.get("expected_submissions")
+                            or replies_info.get("expected")
+                            or replies_info.get("requested_variants")
+                            or replies_info.get("total", 0)
+                        )
                         log_level = logger.warning if result_status in _URL_UNCONFIRMED_STATUSES else logger.info
                         log_level(
                             f"Task {task_id}, URL {idx+1}: ENGAGEMENT_ONLY processed. "
@@ -1522,7 +1527,12 @@ def process_task(task_id: int) -> None:
                         replies_info = engagement.get("replies", {})
                         likes_info = engagement.get("likes", {})
                         likes_str = _format_likes_status(likes_info)
-                        replies_expected = replies_info.get("requested_variants") or replies_info.get("total", 0)
+                        replies_expected = (
+                            replies_info.get("expected_submissions")
+                            or replies_info.get("expected")
+                            or replies_info.get("requested_variants")
+                            or replies_info.get("total", 0)
+                        )
                         logger.warning(
                             f"Task {task_id}, URL {idx+1}: ENGAGEMENT_ONLY failed. "
                             f"Status: {result_dict.get('status')}, Error: {result_dict.get('error')}, "
@@ -1867,7 +1877,12 @@ def process_task(task_id: int) -> None:
                             int(replies_info.get("ok") or 0)
                             + int(replies_info.get("submitted_unconfirmed") or 0)
                         )
-                    replies_expected = replies_info.get("requested_variants") or replies_info.get("total", 0)
+                    replies_expected = (
+                        replies_info.get("expected_submissions")
+                        or replies_info.get("expected")
+                        or replies_info.get("requested_variants")
+                        or replies_info.get("total", 0)
+                    )
                     if result_status in _URL_UNCONFIRMED_STATUSES:
                         logger.warning(
                             f"Task {task_id}, URL {idx+1}: HYBRID FULL submitted but awaiting public confirmation. "
@@ -1894,7 +1909,12 @@ def process_task(task_id: int) -> None:
                     replies_info = engagement.get("replies", {})
                     likes_info = engagement.get("likes", {})
                     likes_str = _format_likes_status(likes_info)
-                    replies_expected = replies_info.get("requested_variants") or replies_info.get("total", 0)
+                    replies_expected = (
+                        replies_info.get("expected_submissions")
+                        or replies_info.get("expected")
+                        or replies_info.get("requested_variants")
+                        or replies_info.get("total", 0)
+                    )
                     logger.warning(
                         f"Task {task_id}, URL {idx+1}: HYBRID FULL failed. "
                         f"Status: {result_dict.get('status')}, Error: {result_dict.get('error')}, "

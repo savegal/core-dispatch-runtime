@@ -196,7 +196,7 @@ def test_order_overview_counts_unconfirmed_reply_submissions_as_sent():
 
     overview = _render_order_detail(task, "overview")
 
-    assert "Ответы: отправлено 3, вариантов заказано 3" in overview
+    assert "Ответы: отправлено 3, ожидалось 3" in overview
     assert "подтверждено 1" in overview
     assert "без публичной проверки 2" in overview
 
@@ -507,9 +507,9 @@ def test_order_overview_shows_publication_and_boost_like_targets():
     assert "main_b" in overview
     assert "Boost" in overview
     assert "Лайки: 50 частично" in overview
-    assert "2, вариантов заказано 3" in overview
+    assert "2, ожидалось 3" in overview
     assert "1/2" in overview
-    assert "Ответы: отправлено 2, вариантов заказано 3, подтверждено 1, без публичной проверки 1" in overview
+    assert "Ответы: отправлено 2, ожидалось 3, подтверждено 1, без публичной проверки 1" in overview
     assert "main_a" in videos
 
 

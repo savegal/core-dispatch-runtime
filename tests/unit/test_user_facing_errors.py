@@ -236,9 +236,16 @@ def test_humanize_warning_reports_parallel_main_partial_without_raw_message():
 
 
 @pytest.mark.unit
-def test_humanize_warning_reports_parallel_main_incomplete_replies_skipped():
+@pytest.mark.parametrize(
+    "warning_code",
+    [
+        "parallel_main_incomplete_replies_skipped",
+        "parallel_main_incomplete_replies_blocked",
+    ],
+)
+def test_humanize_warning_reports_parallel_main_incomplete_replies_skipped(warning_code):
     warning = {
-        "code": "parallel_main_incomplete_replies_skipped",
+        "code": warning_code,
         "submitted": 6,
         "expected": 9,
         "message": "Reply phase skipped because not all expected main comments were submitted",

@@ -1571,6 +1571,40 @@ async def test_wait_for_post_button_enabled_fails_fast_when_composer_stays_empty
 
 
 @pytest.mark.unit
+@pytest.mark.asyncio
+async def test_wait_for_post_button_enabled_fails_fast_when_composer_text_mismatches_expected(monkeypatch):
+    calls = {"evaluate": 0, "sleep": 0}
+
+    class _Page:
+        async def evaluate(self, _script, args):
+            calls["evaluate"] += 1
+            assert args[1] == "fresh text"
+            return {
+                "ready": False,
+                "reason": "text_mismatch",
+                "inputText": "old text",
+                "expectedText": "fresh text",
+            }
+
+    async def _fake_sleep(_seconds):
+        calls["sleep"] += 1
+
+    monkeypatch.setattr(dom_actions.asyncio, "sleep", _fake_sleep)
+
+    button, result = await dom_actions.wait_for_post_button_enabled(
+        _Page(),
+        max_wait_seconds=10.0,
+        expected_text="fresh text",
+    )
+
+    assert button is None
+    assert result.success is False
+    assert result.reason == "post_button_input_not_ready:text_mismatch"
+    assert calls["evaluate"] == 2
+    assert calls["sleep"] == 1
+
+
+@pytest.mark.unit
 def test_post_button_enabled_probe_keeps_empty_input_distinct_from_placeholder():
     source = inspect.getsource(dom_actions.wait_for_post_button_enabled)
 

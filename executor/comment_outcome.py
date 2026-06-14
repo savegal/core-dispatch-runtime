@@ -630,6 +630,7 @@ async def find_comment_in_list(
     ensure_open: bool = True,
     strict_scope: bool = False,
     min_match_ratio: float = 0.7,
+    top_level_only: bool = False,
 ) -> Tuple[bool, Dict[str, Any]]:
     """
     Find a comment by text inside the TikTok comment list.
@@ -648,6 +649,8 @@ async def find_comment_in_list(
             page-wide selectors like <li>/<article>/<p> match sidebar feed
             cards ("one-column-item-N") and produce false signals.
             Default False preserves legacy publish-flow behaviour.
+        top_level_only: When True, reject nested reply rows while searching
+            for a parent/main comment. Keep False for reply visibility checks.
 
     Returns:
         (found, info_dict). When strict_scope=True and the container is not
@@ -666,6 +669,7 @@ async def find_comment_in_list(
             "stage": stage,
             "expected": expected[:120],
             "strict_scope": strict_scope,
+            "top_level_only": top_level_only,
             "ensure_open": ensure_open,
             "max_scrolls": max_scrolls,
             "min_match_ratio": min_match_ratio,
@@ -1023,6 +1027,52 @@ async def find_comment_in_list(
             return await comment_list.query_selector_all(comment_root_selector)
         return await page.query_selector_all(comment_root_selector)
 
+    async def _looks_like_top_level_parent(handle: Any) -> bool:
+        if not top_level_only:
+            return True
+        try:
+            return bool(
+                await handle.evaluate(
+                    """
+                    (el) => {
+                        const visible = (node) => {
+                            if (!node || !node.getBoundingClientRect) return false;
+                            const r = node.getBoundingClientRect();
+                            const s = getComputedStyle(node);
+                            return r.width > 0 && r.height > 0 && s.display !== 'none' && s.visibility !== 'hidden';
+                        };
+                        const labelOf = (node) => [
+                            node && node.getAttribute && (node.getAttribute('data-e2e') || ''),
+                            node && node.getAttribute && (node.getAttribute('aria-label') || ''),
+                            node && (node.id || ''),
+                            node && String(node.className || ''),
+                        ].join(' ').toLowerCase();
+                        const isReplyLevel = (node) => /comment-level-[23]/.test(labelOf(node));
+                        if (isReplyLevel(el)) return false;
+                        const strongSelf = el.querySelector && el.querySelector('[data-e2e="comment-level-1"], [data-e2e*="comment-text"]');
+                        const firstLevel = el.querySelector && el.querySelector('[data-e2e*="comment-level"]');
+                        if (firstLevel && isReplyLevel(firstLevel) && !strongSelf) return false;
+                        for (let cur = el.parentElement, depth = 0; cur && cur !== document.body && depth < 8; cur = cur.parentElement, depth++) {
+                            const label = labelOf(cur);
+                            if (isReplyLevel(cur)) return false;
+                            if (label.includes('reply-container') || label.includes('replyitem') || label.includes('reply-item')) return false;
+                            if (/(reply|Reply)/.test(String(cur.className || '')) && !label.includes('comment-reply')) return false;
+                        }
+                        if (strongSelf && visible(strongSelf)) return true;
+                        try {
+                            const r = el.getBoundingClientRect();
+                            const textNode = el.querySelector('[data-e2e*="comment-level"], [data-e2e*="comment-text"], p, span') || el;
+                            const tr = textNode.getBoundingClientRect();
+                            if (tr.left - r.left > 96) return false;
+                        } catch (_) {}
+                        return true;
+                    }
+                    """
+                )
+            )
+        except Exception:
+            return True
+
     # Цикл поиска с прокруткой
     if strict_scope and scroll_target is not None:
         try:
@@ -1061,6 +1111,8 @@ async def find_comment_in_list(
                     for text_selector in comment_text_selectors:
                         text_span = await comment_root.query_selector(text_selector)
                         if not text_span:
+                            continue
+                        if not await _looks_like_top_level_parent(text_span):
                             continue
 
                         candidate_text = await text_span.evaluate("el => el.textContent || el.innerText || ''")
@@ -1372,6 +1424,7 @@ async def find_comments_in_list_batch(
     min_match_ratio: float = 0.7,
     return_partial_on_found: bool = False,
     partial_found_sink: Optional[Dict[int, Dict[str, Any]]] = None,
+    top_level_only: bool = False,
     _stabilize_retry: bool = False,
 ) -> Tuple[Dict[int, Dict[str, Any]], Dict[str, Any]]:
     """Find multiple target comments in one scoped pass through the comment list.
@@ -1723,6 +1776,7 @@ async def find_comments_in_list_batch(
                         min_match_ratio=min_match_ratio,
                         return_partial_on_found=return_partial_on_found,
                         partial_found_sink=partial_found_sink,
+                        top_level_only=top_level_only,
                         _stabilize_retry=True,
                     )
                 except Exception as exc:
@@ -1836,7 +1890,7 @@ async def find_comments_in_list_batch(
             scan_token = _new_parent_anchor_token()
             scan = await page.evaluate(
                 """
-                ({rootSelector, textSelectors, scopeSelector, scrollSelector, scanToken}) => {
+                ({rootSelector, textSelectors, scopeSelector, scrollSelector, scanToken, topLevelOnly}) => {
                     const visible = (el) => {
                         if (!el || !el.getBoundingClientRect) return false;
                         const r = el.getBoundingClientRect();
@@ -1862,6 +1916,13 @@ async def find_comments_in_list_batch(
                         return value.includes('data-e2e') &&
                             (value.includes('comment-level') || value.includes('comment-text'));
                     };
+                    const labelOf = (el) => [
+                        el && el.getAttribute && (el.getAttribute('data-e2e') || ''),
+                        el && el.getAttribute && (el.getAttribute('aria-label') || ''),
+                        el && (el.id || ''),
+                        el && String(el.className || ''),
+                    ].join(' ').toLowerCase();
+                    const isReplyLevel = (el) => /comment-level-[23]/.test(labelOf(el));
                     const containerSelector = [
                         '[data-cid]:not([data-cid^="one-column-item"])',
                         '[data-comment-id]',
@@ -1873,6 +1934,32 @@ async def find_comments_in_list_batch(
                         'li'
                     ].join(', ');
                     const cidSelector = '[data-cid], [data-comment-id], [id^="comment-"], [data-id]';
+                    const isTopLevelCommentText = (container, node) => {
+                        if (!topLevelOnly) return true;
+                        if (!container || !node) return true;
+                        if (isReplyLevel(container) || isReplyLevel(node)) return false;
+                        for (let cur = node.parentElement, depth = 0; cur && cur !== container && depth < 10; cur = cur.parentElement, depth++) {
+                            const label = labelOf(cur);
+                            if (isReplyLevel(cur)) return false;
+                            if (label.includes('reply-container') || label.includes('replyitem') || label.includes('reply-item')) return false;
+                            if (/(reply|Reply)/.test(String(cur.className || '')) && !label.includes('comment-reply')) return false;
+                        }
+                        const strongSelf = container.querySelector('[data-e2e="comment-level-1"], [data-e2e*="comment-text"]');
+                        const firstLevel = container.querySelector('[data-e2e*="comment-level"]');
+                        if (firstLevel && isReplyLevel(firstLevel) && !strongSelf) return false;
+                        if (strongSelf && (strongSelf === node || strongSelf.contains(node) || node.contains(strongSelf))) return true;
+                        try {
+                            const cr = container.getBoundingClientRect();
+                            const nr = node.getBoundingClientRect();
+                            if (nr.left - cr.left > 96) return false;
+                        } catch (_) {}
+                        try {
+                            for (let cur = container.parentElement, depth = 0; cur && cur !== scope && cur !== document.body && depth < 6; cur = cur.parentElement, depth++) {
+                                if (cur.matches && cur.matches(containerSelector)) return false;
+                            }
+                        } catch (_) {}
+                        return true;
+                    };
                     const readCid = (el) => {
                         if (!el) return null;
                         const reliableRaw =
@@ -1915,6 +2002,7 @@ async def find_comments_in_list_batch(
                                     node.closest('button, [role="button"], a[href*="/@"]')
                                 ) continue;
                             } catch (_) {}
+                            if (!isTopLevelCommentText(container, node)) continue;
                             if ((sel === 'p' || sel === 'span') && !structurallyCommentLike) continue;
                             text = (node.innerText || node.textContent || '').trim().replace(/\\s+/g, ' ');
                             if (text) {
@@ -1970,6 +2058,7 @@ async def find_comments_in_list_batch(
                         else None
                     ),
                     "scanToken": scan_token,
+                    "topLevelOnly": bool(top_level_only),
                 },
             )
         except Exception as exc:

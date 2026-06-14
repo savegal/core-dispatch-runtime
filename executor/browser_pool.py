@@ -268,6 +268,8 @@ class BrowserPool:
         self.max_browsers = max(1, int(configured_max or 1))
         self._playwright: Optional[Playwright] = None
         self._browsers: Dict[str, Browser] = {}  # {browser_id: Browser}
+        self._browser_id_locks: Dict[str, asyncio.Lock] = {}
+        self._browser_inflight_acquires: Dict[str, int] = {}
         self._browser_proxy_keys: Dict[str, str] = {}  # {browser_id: original proxy string}
         self._account_browser_ids: Dict[int, str] = {}  # {account_id: browser_id}
         self._contexts: Dict[int, BrowserContext] = {}  # {account_id: BrowserContext}
@@ -571,6 +573,73 @@ class BrowserPool:
                 self._sync_pool_metrics()
         return closed_targets
 
+    async def close_page_from_pool(self, page: Page | None, *, reason: str | None = None) -> bool:
+        """Close one managed page and only close its context when it becomes empty."""
+        if page is None:
+            return False
+        account_id = getattr(page, "_pool_account_id", None)
+        try:
+            page_already_closed = page.is_closed()
+        except Exception:
+            page_already_closed = True
+        if account_id is None:
+            if page_already_closed:
+                return False
+            try:
+                await page.close()
+                return True
+            except Exception:
+                return False
+
+        async with self._lock:
+            context = self._contexts.get(account_id)
+            logger.debug(
+                "Closing pooled page account=%s reason=%s",
+                account_id,
+                reason or "pooled_page_close",
+            )
+            if not page_already_closed:
+                try:
+                    await page.close()
+                except Exception as exc:
+                    logger.debug("Error closing pooled page account=%s: %s", account_id, exc)
+                try:
+                    target_still_open = not page.is_closed()
+                except Exception:
+                    target_still_open = True
+                if target_still_open:
+                    logger.debug(
+                        "Pooled page account=%s remained open after close attempt; caller should use fallback",
+                        account_id,
+                    )
+                    self._sync_pool_metrics()
+                    return False
+
+            if not context:
+                self._sync_pool_metrics()
+                return True
+
+            try:
+                remaining_pages = [candidate for candidate in context.pages if not candidate.is_closed()]
+            except Exception:
+                remaining_pages = []
+
+            if remaining_pages:
+                self._context_last_used[account_id] = datetime.now(timezone.utc)
+                self._sync_pool_metrics()
+                return True
+
+            try:
+                await context.close()
+            except Exception as exc:
+                logger.debug("Error closing empty pooled context account=%s: %s", account_id, exc)
+            self._contexts.pop(account_id, None)
+            self._context_last_used.pop(account_id, None)
+            self._account_browser_ids.pop(account_id, None)
+            await self._cleanup_unused_browsers()
+            self._sync_pool_metrics()
+            return True
+
     async def close_context_for_account(self, account_id: int, *, reason: str | None = None) -> bool:
         """Close and forget one account context from the current pool."""
         try:
@@ -637,6 +706,19 @@ class BrowserPool:
 
     async def _cleanup_unused_browsers(self) -> int:
         referenced_browser_ids = set(self._account_browser_ids.values())
+        referenced_browser_ids.update(
+            browser_id
+            for browser_id, count in self._browser_inflight_acquires.items()
+            if count > 0
+        )
+        live_context_ids = {id(context) for context in self._contexts.values() if context is not None}
+        for browser_id, browser in list(self._browsers.items()):
+            try:
+                browser_context_ids = {id(context) for context in browser.contexts}
+            except Exception:
+                browser_context_ids = set()
+            if live_context_ids.intersection(browser_context_ids):
+                referenced_browser_ids.add(browser_id)
         stale_browser_ids = [
             browser_id
             for browser_id in list(self._browsers.keys())
@@ -682,6 +764,17 @@ class BrowserPool:
             self._sync_pool_metrics()
             logger.info("Browser pool closed")
     
+    def _context_has_busy_pages(self, account_id: int) -> bool:
+        """Return True when a context still owns an in-use page."""
+        context = self._contexts.get(account_id)
+        if context is None:
+            return False
+        try:
+            pages = [page for page in context.pages if not page.is_closed()]
+        except Exception:
+            return False
+        return any(getattr(page, "_pool_available", None) is not True for page in pages)
+
     async def _cleanup_old_contexts(self):
         """
         Удаляет старые контексты (старше TTL) и контролирует размер пула.
@@ -690,18 +783,27 @@ class BrowserPool:
         """
         now = datetime.now(timezone.utc)
         to_remove = []
+        busy_contexts = {
+            account_id
+            for account_id in list(self._contexts)
+            if self._context_has_busy_pages(account_id)
+        }
         
         # Очистка по TTL
         for account_id, last_used in list(self._context_last_used.items()):
             age = (now - last_used).total_seconds()
-            if age > self._context_ttl_seconds:
+            if age > self._context_ttl_seconds and account_id not in busy_contexts:
                 to_remove.append(account_id)
         
         # ИСПРАВЛЕНО: Если пул переполнен - удаляем самые старые контексты (LRU)
         if len(self._contexts) > self._max_pool_size:
             # Сортируем по времени последнего использования
             sorted_contexts = sorted(
-                self._context_last_used.items(),
+                (
+                    (account_id, last_used)
+                    for account_id, last_used in self._context_last_used.items()
+                    if account_id not in busy_contexts
+                ),
                 key=lambda x: x[1]
             )
             # Удаляем самые старые
@@ -709,13 +811,17 @@ class BrowserPool:
             for account_id, _ in sorted_contexts[:excess_count]:
                 if account_id not in to_remove:
                     to_remove.append(account_id)
-            logger.warning(
-                f"Pool size ({len(self._contexts)}) exceeds max ({self._max_pool_size}), "
-                f"removing {excess_count} oldest contexts"
-            )
+            if to_remove:
+                logger.warning(
+                    f"Pool size ({len(self._contexts)}) exceeds max ({self._max_pool_size}), "
+                    f"removing {len(to_remove)} idle context(s); busy contexts kept={len(busy_contexts)}"
+                )
         
         # Закрываем и удаляем контексты
         for account_id in to_remove:
+            if self._context_has_busy_pages(account_id):
+                logger.debug("Skipping busy context cleanup for active account %s", account_id)
+                continue
             if account_id in self._contexts:
                 try:
                     await self._contexts[account_id].close()
@@ -737,7 +843,29 @@ class BrowserPool:
             logger.debug(f"Cleaned up {cleaned_browsers} unused browsers after context eviction")
         self._sync_pool_metrics()
     
-    async def get_page_for_account(self, account: Account, retry_count: int = 0) -> Tuple[BrowserContext, Page]:
+    def _browser_id_lock(self, browser_id: str) -> asyncio.Lock:
+        lock = self._browser_id_locks.get(browser_id)
+        if lock is None:
+            lock = asyncio.Lock()
+            self._browser_id_locks[browser_id] = lock
+        return lock
+
+    def _mark_browser_acquire_started(self, browser_id: str) -> None:
+        self._browser_inflight_acquires[browser_id] = self._browser_inflight_acquires.get(browser_id, 0) + 1
+
+    def _mark_browser_acquire_finished(self, browser_id: str) -> None:
+        current = self._browser_inflight_acquires.get(browser_id, 0)
+        if current <= 1:
+            self._browser_inflight_acquires.pop(browser_id, None)
+        else:
+            self._browser_inflight_acquires[browser_id] = current - 1
+
+    async def get_page_for_account(
+        self,
+        account: Account,
+        retry_count: int = 0,
+        _browser_id_lock_held: bool = False,
+    ) -> Tuple[BrowserContext, Page]:
         """
         Получает или создаёт страницу для аккаунта.
         
@@ -751,6 +879,21 @@ class BrowserPool:
         Raises:
             TikTokClientError: При ошибке создания контекста
         """
+        if not _browser_id_lock_held:
+            account_proxy_for_lock = str(getattr(account, "proxy", "") or "").strip()
+            proxy_source_for_lock = account_proxy_for_lock or None
+            browser_id_for_lock = self._make_browser_id(proxy_source_for_lock)
+            async with self._browser_id_lock(browser_id_for_lock):
+                self._mark_browser_acquire_started(browser_id_for_lock)
+                try:
+                    return await self.get_page_for_account(
+                        account,
+                        retry_count=retry_count,
+                        _browser_id_lock_held=True,
+                    )
+                finally:
+                    self._mark_browser_acquire_finished(browser_id_for_lock)
+
         while True:
             # ИСПРАВЛЕНО: Защита от бесконечной рекурсии и ручного release/acquire lock
             if retry_count > 3:
@@ -790,7 +933,7 @@ class BrowserPool:
                             if len(existing_pages) > 2:  # Держим максимум 2 страницы на контекст
                                 for old_page in existing_pages[:-1]:
                                     try:
-                                        if not old_page.is_closed():
+                                        if self._is_page_available(old_page, account_id):
                                             await old_page.close()
                                     except Exception:
                                         pass
@@ -806,6 +949,16 @@ class BrowserPool:
                         except Exception as e:
                             # Контекст закрыт или стал невалидным, удаляем его
                             logger.debug(f"Context for account {account_id} is closed or invalid, creating new one: {e}")
+                            if self._context_has_busy_pages(account_id):
+                                logger.warning(
+                                    "Context for account %s failed during page acquire, but busy page(s) are still active; "
+                                    "preserving context instead of closing it: %s",
+                                    account_id,
+                                    str(e)[:160],
+                                )
+                                raise TikTokClientError(
+                                    f"Context for account {account_id} is busy and cannot create a new page: {str(e)[:160]}"
+                                )
                             try:
                                 await context.close()
                             except Exception:
@@ -828,7 +981,8 @@ class BrowserPool:
                 # ИСПРАВЛЕНО: Используем отдельный браузер для каждого прокси
                 # Это предотвращает проблемы, когда разные прокси требуют разных настроек браузера
                 # Используем хеш прокси как ID браузера (или 0 если прокси нет)
-                proxy_source = account.proxy.strip() if account.proxy and account.proxy.strip() else None
+                account_proxy = str(getattr(account, "proxy", "") or "").strip()
+                proxy_source = account_proxy or None
                 browser_id = self._make_browser_id(proxy_source)
                 
                 # ИСПРАВЛЕНО: Гарантируем, что Playwright инициализирован (внутри блокировки)
@@ -888,26 +1042,26 @@ class BrowserPool:
                     leased_proxy_source = None
                     
                     # Добавляем прокси, если есть
-                    if account.proxy and account.proxy.strip():
-                        proxy_dict = _normalize_proxy_for_playwright(account.proxy)
+                    if account_proxy:
+                        proxy_dict = _normalize_proxy_for_playwright(account_proxy)
                         if proxy_dict:
                             proxy_server = proxy_dict.get("server", "")
                             
                             # Обработка SOCKS5 с авторизацией
                             # ИСПРАВЛЕНО: Проверяем SOCKS5 прокси (с префиксом или без) с авторизацией
                             is_socks5 = proxy_server.startswith("socks5://") or (
-                                "@" in account.proxy and "://" not in account.proxy
+                                "@" in account_proxy and "://" not in account_proxy
                             )
                             has_auth = "username" in proxy_dict or "password" in proxy_dict
                             
                             if is_socks5 and has_auth:
                                 try:
-                                    local_proxy_port = get_local_http_proxy_for_socks5(proxy_source or account.proxy)
+                                    local_proxy_port = get_local_http_proxy_for_socks5(proxy_source or account_proxy)
                                     if local_proxy_port:
                                         launch_options["proxy"] = {
                                             "server": f"http://127.0.0.1:{local_proxy_port}"
                                         }
-                                        leased_proxy_source = proxy_source or account.proxy
+                                        leased_proxy_source = proxy_source or account_proxy
                                         logger.debug(f"Account {account.id}: Using local HTTP proxy (port {local_proxy_port}) for SOCKS5")
                                     else:
                                         logger.warning(f"Account {account.id}: Failed to create local HTTP proxy for SOCKS5")
@@ -1749,3 +1903,11 @@ async def close_account_context(account_id: int, *, reason: str | None = None) -
     if not pool:
         return False
     return await pool.close_context_for_account(account_id, reason=reason)
+
+
+async def close_pool_page(page: Page | None, *, reason: str | None = None) -> bool:
+    """Close one managed page in the current worker thread's browser pool."""
+    pool = _get_thread_local_pool()
+    if not pool:
+        return False
+    return await pool.close_page_from_pool(page, reason=reason)

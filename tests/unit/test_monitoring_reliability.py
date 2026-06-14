@@ -2539,20 +2539,16 @@ async def test_close_monitor_resources_closes_pool_context_for_account(monkeypat
         async def close(self):
             self.closed = True
 
-    async def fake_safe_close_page(page):
+    pool_closed_pages = []
+
+    async def fake_close_pool_page(page, *, reason=None):
         page.returned = True
-
-    closed_accounts = []
-
-    async def fake_close_account_context(account_id, *, reason=None):
-        closed_accounts.append((account_id, reason))
+        pool_closed_pages.append((page._pool_account_id, reason))
         return True
 
-    import executor.page_utils as page_utils
     import executor.browser_pool as browser_pool
 
-    monkeypatch.setattr(page_utils, "safe_close_page", fake_safe_close_page)
-    monkeypatch.setattr(browser_pool, "close_account_context", fake_close_account_context)
+    monkeypatch.setattr(browser_pool, "close_pool_page", fake_close_pool_page)
     page = FakePage()
     context = FakeContext()
 
@@ -2561,7 +2557,45 @@ async def test_close_monitor_resources_closes_pool_context_for_account(monkeypat
     assert page.returned is True
     assert page.closed is False
     assert context.closed is False
-    assert closed_accounts == [(661, "monitor_check_done")]
+    assert pool_closed_pages == [(661, "monitor_check_done")]
+
+
+@pytest.mark.unit
+@pytest.mark.asyncio
+async def test_close_monitor_resources_falls_back_when_pool_declines_page(monkeypatch):
+    class FakePage:
+        _managed_by_pool = True
+
+        def __init__(self):
+            self.closed = False
+            self._pool_account_id = 662
+
+        def is_closed(self):
+            return self.closed
+
+        async def close(self):
+            self.closed = True
+
+    class FakeContext:
+        def __init__(self):
+            self.closed = False
+
+        async def close(self):
+            self.closed = True
+
+    async def fake_close_pool_page(_page, *, reason=None):
+        return False
+
+    import executor.browser_pool as browser_pool
+
+    monkeypatch.setattr(browser_pool, "close_pool_page", fake_close_pool_page)
+    page = FakePage()
+    context = FakeContext()
+
+    await monitor_worker._close_monitor_resources(page, context)
+
+    assert page.closed is True
+    assert context.closed is False
 
 
 @pytest.mark.unit

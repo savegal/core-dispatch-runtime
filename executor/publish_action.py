@@ -1187,6 +1187,8 @@ async def _clear_post_click_blockers(
     *,
     max_rounds: int = 5,
     reselect_enabled: bool = True,
+    expected_text: Optional[str] = None,
+    reply_scoped: bool = False,
 ) -> tuple[Any, Optional[dict[str, Any]], bool]:
     """Clear overlays blocking the center of Post button.
 
@@ -1196,7 +1198,12 @@ async def _clear_post_click_blockers(
     for round_index in range(max_rounds):
         if reselect_enabled:
             try:
-                fresh_button, fresh_info = await wait_for_post_button_enabled(page, max_wait_seconds=2.0)
+                fresh_button, fresh_info = await wait_for_post_button_enabled(
+                    page,
+                    max_wait_seconds=2.0,
+                    reply_scoped=reply_scoped,
+                    expected_text=expected_text,
+                )
                 if fresh_button:
                     post_button = fresh_button
                     logger.info(
@@ -3038,6 +3045,7 @@ async def _publish_via_current_input(
                         page,
                         max_wait_seconds=min(0.8, max(0.2, _remaining())),
                         reply_scoped=False,
+                        expected_text=text,
                     )
                 except Exception:
                     enabled_button, enabled_info = None, None
@@ -3557,6 +3565,7 @@ async def _publish_via_current_input(
         page,
         max_wait_seconds=min(post_enabled_wait_seconds, max(remaining, 0.5)),
         reply_scoped=reply_scoped,
+        expected_text=text,
     )
     # Track whether Post passed the enabled-gate. False means the click below will
     # be via synthetic dispatch on a disabled button; treat such submits as
@@ -3838,6 +3847,8 @@ async def _publish_via_current_input(
                 post_button,
                 max_rounds=1 if fast_main_click_path else (3 if fast_publish else 6),
                 reselect_enabled=not fast_main_click_path,
+                expected_text=text,
+                reply_scoped=reply_scoped,
             ),
             timeout=max(_remaining(), 0.5),
         )
@@ -3870,6 +3881,7 @@ async def _publish_via_current_input(
                 page,
                 max_wait_seconds=0.8 if fast_publish else 2.0,
                 reply_scoped=reply_scoped,
+                expected_text=text,
             )
             if retry_fresh:
                 post_button = retry_fresh
@@ -3888,6 +3900,7 @@ async def _publish_via_current_input(
                 page,
                 max_wait_seconds=0.5,
                 reply_scoped=reply_scoped,
+                expected_text=text,
             )
             if _gate_button:
                 post_was_enabled = True
@@ -4074,6 +4087,7 @@ async def _publish_via_current_input(
                 page,
                 max_wait_seconds=min(2.0, max(_remaining(), 0.5)),
                 reply_scoped=reply_scoped,
+                expected_text=text,
             )
             if retry_button:
                 retry_box = await retry_button.bounding_box()
@@ -4085,6 +4099,8 @@ async def _publish_via_current_input(
                             page,
                             retry_button,
                             max_rounds=4,
+                            expected_text=text,
+                            reply_scoped=reply_scoped,
                         ),
                         timeout=max(_remaining(), 0.5),
                     )
