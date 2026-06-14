@@ -3548,9 +3548,14 @@ async def _publish_via_current_input(
     remaining = max_total_seconds - (time.monotonic() - started)
     if remaining <= 0:
         return _deadline_result("before_post_enabled_gate", input_info.strategy or post_info.strategy)
+    post_enabled_wait_seconds = (
+        2.8
+        if main_comment_aggressive
+        else (1.5 if aggressive else (3.0 if fast_publish else 8.0))
+    )
     enabled_button, enabled_info = await wait_for_post_button_enabled(
         page,
-        max_wait_seconds=min(1.5 if aggressive else (3.0 if fast_publish else 8.0), max(remaining, 0.5)),
+        max_wait_seconds=min(post_enabled_wait_seconds, max(remaining, 0.5)),
         reply_scoped=reply_scoped,
     )
     # Track whether Post passed the enabled-gate. False means the click below will
