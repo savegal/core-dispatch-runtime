@@ -1345,8 +1345,8 @@ async def test_atomic_set_comment_text_holds_back_last_char_when_requested():
 
 @pytest.mark.unit
 @pytest.mark.asyncio
-async def test_type_into_comment_uses_atomic_prefix_tail_first(monkeypatch):
-    """Happy path: atomic prefix + one trusted tail insert; no slow typing chain."""
+async def test_type_into_comment_reply_uses_atomic_prefix_tail_first(monkeypatch):
+    """Reply path keeps the scoped atomic prefix + one trusted tail insert."""
     keyboard_calls = {"type": 0, "insert_text": 0, "press": 0}
 
     class _Keyboard:
@@ -1375,9 +1375,64 @@ async def test_type_into_comment_uses_atomic_prefix_tail_first(monkeypatch):
                     "ok": False,
                     "reason": "verify_failed",
                     "text": payload[0],
-                    "scoped": "global",
+                    "scoped": "reply",
                 }
             # _page_text_contains_expected verification
+            return {"ok": True, "text": "hello"}
+
+    async def _fake_suppress(_page):
+        return 0
+
+    async def _fake_sleep(_seconds):
+        return None
+
+    monkeypatch.setattr(dom_actions, "suppress_keyboard_shortcuts_overlay", _fake_suppress)
+    monkeypatch.setattr(dom_actions.asyncio, "sleep", _fake_sleep)
+
+    page = _Page()
+    ok = await dom_actions.type_into_comment(
+        page,
+        object(),
+        "hello",
+        fast=True,
+        reply_scoped=True,
+        anchor_token="pa-123",
+    )
+
+    assert ok is True
+    assert dom_actions._JS_ATOMIC_SET_COMMENT_TEXT in page.scripts
+    assert page.atomic_calls == [["hell", "hello", "pa-123", True, False]]
+    assert keyboard_calls["insert_text"] == 1
+    assert keyboard_calls["press"] == 0
+    assert keyboard_calls["type"] == 0
+
+
+@pytest.mark.unit
+@pytest.mark.asyncio
+async def test_type_into_comment_main_prefers_focus_insert_over_prefix_tail(monkeypatch):
+    keyboard_calls = {"insert_text": [], "press": []}
+
+    class _Keyboard:
+        async def insert_text(self, text):
+            keyboard_calls["insert_text"].append(text)
+
+        async def press(self, key):
+            keyboard_calls["press"].append(key)
+
+        async def type(self, *_args, **_kwargs):
+            raise AssertionError("main fast path should not reach slow keyboard.type")
+
+    class _Page:
+        keyboard = _Keyboard()
+
+        def __init__(self):
+            self.atomic_calls = []
+
+        async def evaluate(self, script, *args):
+            if script == dom_actions._JS_ATOMIC_SET_COMMENT_TEXT:
+                payload = args[0] if args else None
+                self.atomic_calls.append(payload)
+                return {"ok": True, "reason": "focused", "scoped": "global"}
             return {"ok": True, "text": "hello"}
 
     async def _fake_suppress(_page):
@@ -1393,11 +1448,9 @@ async def test_type_into_comment_uses_atomic_prefix_tail_first(monkeypatch):
     ok = await dom_actions.type_into_comment(page, object(), "hello", fast=True)
 
     assert ok is True
-    assert dom_actions._JS_ATOMIC_SET_COMMENT_TEXT in page.scripts
-    assert page.atomic_calls == [["hell", "hello", "", False, False]]
-    assert keyboard_calls["insert_text"] == 1
-    assert keyboard_calls["press"] == 0
-    assert keyboard_calls["type"] == 0
+    assert page.atomic_calls == [["", "hello", "", False, True]]
+    assert keyboard_calls["press"] == ["Control+A", "Backspace"]
+    assert keyboard_calls["insert_text"] == ["hello"]
 
 
 @pytest.mark.unit
@@ -1418,7 +1471,12 @@ async def test_type_into_comment_reply_scoped_forwards_anchor_to_atomic(monkeypa
         async def evaluate(self, script, *args):
             if script == dom_actions._JS_ATOMIC_SET_COMMENT_TEXT:
                 captured["atomic_args"] = args[0]
-                return {"ok": True, "reason": "focused", "scoped": "reply"}
+                return {
+                    "ok": True,
+                    "reason": "focused",
+                    "text": args[0][0],
+                    "scoped": "reply",
+                }
             return {"ok": True, "text": "hi there"}
 
     async def _fake_suppress(_page):
@@ -1443,7 +1501,7 @@ async def test_type_into_comment_reply_scoped_forwards_anchor_to_atomic(monkeypa
     # replyScoped True and the anchor token are forwarded into the atomic JS.
     assert captured["atomic_args"][2] == "pa-xyz"
     assert captured["atomic_args"][3] is True
-    assert captured["atomic_args"][4] is True  # focusOnly
+    assert captured["atomic_args"][4] is False  # prefix path, not focusOnly
 
 
 @pytest.mark.unit

@@ -1,3 +1,4 @@
+import asyncio
 from datetime import datetime, timezone
 from types import SimpleNamespace
 
@@ -37,6 +38,64 @@ class DummyContext:
 
     async def close(self):
         self._closed = True
+
+
+class LaunchProbePage(DummyPage):
+    async def evaluate(self, _script):
+        return {
+            "innerWidth": 1920,
+            "innerHeight": 960,
+            "outerWidth": 1936,
+            "outerHeight": 1048,
+            "devicePixelRatio": 1,
+            "screenWidth": 1920,
+            "screenHeight": 960,
+            "docClientWidth": 1920,
+            "docScrollWidth": 1920,
+        }
+
+
+class LaunchProbeContext:
+    def __init__(self):
+        self.pages = []
+        self._closed = False
+
+    def set_default_timeout(self, _timeout):
+        return None
+
+    async def add_init_script(self, _script):
+        return None
+
+    async def set_extra_http_headers(self, _headers):
+        return None
+
+    async def add_cookies(self, _cookies):
+        return None
+
+    async def route(self, _pattern, _handler):
+        return None
+
+    async def new_page(self):
+        page = LaunchProbePage(url="about:blank")
+        self.pages.append(page)
+        return page
+
+    async def close(self):
+        self._closed = True
+
+
+class LaunchProbeBrowser:
+    def __init__(self):
+        self.contexts = []
+        self.closed = False
+
+    async def new_context(self, **_options):
+        context = LaunchProbeContext()
+        self.contexts.append(context)
+        return context
+
+    async def close(self):
+        self.closed = True
 
 
 @pytest.mark.unit
@@ -153,6 +212,50 @@ async def test_get_page_for_account_reuses_available_page(monkeypatch):
     assert reused_context is context
     assert reused_page is page
     assert reused_page._pool_available is False
+
+
+@pytest.mark.unit
+@pytest.mark.asyncio
+async def test_get_page_for_account_launches_distinct_browsers_concurrently(monkeypatch):
+    from executor import tiktok_client
+
+    pool = BrowserPool(max_browsers=2)
+    active_launches = 0
+    max_active_launches = 0
+
+    class FakeChromium:
+        async def launch(self, **_launch_options):
+            nonlocal active_launches, max_active_launches
+            active_launches += 1
+            max_active_launches = max(max_active_launches, active_launches)
+            await asyncio.sleep(0.02)
+            active_launches -= 1
+            return LaunchProbeBrowser()
+
+    async def noop_initialize():
+        return None
+
+    monkeypatch.setattr(pool, "initialize", noop_initialize)
+    monkeypatch.setattr(pool, "_playwright", SimpleNamespace(chromium=FakeChromium()))
+    monkeypatch.setattr(tiktok_client, "_get_cookies_for_account", lambda _account: "[]")
+    monkeypatch.setattr(tiktok_client, "parse_cookies", lambda _raw: [])
+    monkeypatch.setattr(
+        tiktok_client,
+        "_normalize_proxy_for_playwright",
+        lambda proxy: {"server": proxy} if proxy else None,
+    )
+    monkeypatch.setattr(browser_pool.settings, "HUMAN_LIKE_BEHAVIOR", False, raising=False)
+
+    await asyncio.gather(
+        pool.get_page_for_account(
+            SimpleNamespace(id=1, label="a1", proxy="http://proxy-a:8000", user_agent=None, country_code="US")
+        ),
+        pool.get_page_for_account(
+            SimpleNamespace(id=2, label="a2", proxy="http://proxy-b:8000", user_agent=None, country_code="US")
+        ),
+    )
+
+    assert max_active_launches == 2
 
 
 @pytest.mark.unit

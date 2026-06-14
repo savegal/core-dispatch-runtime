@@ -1060,6 +1060,72 @@ async def test_parallel_main_publish_does_not_post_concatenated_committed_text(m
 
 @pytest.mark.unit
 @pytest.mark.asyncio
+async def test_parallel_main_publish_does_not_post_when_text_visible_but_post_disabled(monkeypatch):
+    page = _FakePage()
+    calls = {"strict_probe": 0, "loose_probe": 0, "clear": 0, "enabled_gate": 0}
+
+    async def _fake_none(*args, **kwargs):
+        return None
+
+    async def _fake_find_comment_input_smart(*args, **kwargs):
+        return _FakeInput(), SimpleNamespace(strategy="trusted-smart-id-input", elapsed_seconds=0.1, reason=None)
+
+    async def _fake_type_into_comment(*args, **kwargs):
+        raise asyncio.TimeoutError()
+
+    async def _fake_strict_text_visible(*args, **kwargs):
+        calls["strict_probe"] += 1
+        return True, "hello"
+
+    async def _fake_loose_text_state(*args, **kwargs):
+        calls["loose_probe"] += 1
+        return {
+            "ok": True,
+            "text": "hello",
+            "textLen": 5,
+            "postVisible": True,
+            "postDisabled": True,
+        }
+
+    async def _fake_wait_for_post_button_enabled(*args, **kwargs):
+        calls["enabled_gate"] += 1
+        return None, SimpleNamespace(strategy=None, reason="post_button_input_not_ready:input_empty")
+
+    async def _fake_clear(*args, **kwargs):
+        calls["clear"] += 1
+        return True
+
+    async def _unexpected_post_search(*args, **kwargs):
+        raise AssertionError("disabled Post must not be clicked or searched after typing timeout")
+
+    monkeypatch.setattr(publish_action, "_captcha_result_if_present", _fake_none)
+    monkeypatch.setattr(publish_action, "_logged_out_publish_result_if_visible", _fake_none)
+    monkeypatch.setattr(publish_action, "_publish_url_guard_result", lambda *args, **kwargs: None)
+    monkeypatch.setattr(publish_action, "suppress_keyboard_shortcuts_overlay", AsyncMock(return_value=0))
+    monkeypatch.setattr(publish_action, "ensure_click_target_clear", AsyncMock(return_value=None))
+    monkeypatch.setattr(publish_action, "find_comment_input_smart", _fake_find_comment_input_smart)
+    monkeypatch.setattr(publish_action, "type_into_comment", _fake_type_into_comment)
+    monkeypatch.setattr(publish_action, "comment_input_contains_expected_text", _fake_strict_text_visible)
+    monkeypatch.setattr(publish_action, "_main_comment_input_committed_text_state", _fake_loose_text_state)
+    monkeypatch.setattr(publish_action, "wait_for_post_button_enabled", _fake_wait_for_post_button_enabled)
+    monkeypatch.setattr(publish_action, "_clear_main_comment_composer_best_effort", _fake_clear)
+    monkeypatch.setattr(publish_action, "find_post_button_smart", _unexpected_post_search)
+
+    result = await publish_action._publish_via_current_input(
+        page,
+        "hello",
+        max_total_seconds=18.0,
+        correlation_id="task_1_parallel_main_v1_a1_acc10",
+    )
+
+    assert result.status == "timeout"
+    assert result.error_reason == "publish_deadline_exceeded:typing"
+    assert calls == {"strict_probe": 1, "loose_probe": 1, "clear": 1, "enabled_gate": 1}
+    assert page.click_count == 0
+
+
+@pytest.mark.unit
+@pytest.mark.asyncio
 async def test_publish_surface_ready_still_resolves_real_input_handle(monkeypatch):
     page = _FakePage()
     button = _FakeButton()

@@ -7731,6 +7731,13 @@ class _ParallelReplyVariantResult:
 
 
 def _record_main_retry_failure(db: Session, account: Account, dead_reason: Optional[str]) -> None:
+    if dead_reason and _is_soft_publish_deadline_failure(dead_reason):
+        logger.info(
+            "[USER_SCHEMA] soft publish deadline on account=%s; keeping account health/cooldown unchanged: %s",
+            getattr(account, "id", None),
+            dead_reason,
+        )
+        return
     try:
         record_main_comment_attempt(db, account.id)
     except Exception as exc:
@@ -7741,13 +7748,6 @@ def _record_main_retry_failure(db: Session, account: Account, dead_reason: Optio
         )
     if not dead_reason:
         _register_runtime_failure(db, account, "no_publish_after_login_ok")
-        return
-    if _is_soft_publish_deadline_failure(dead_reason):
-        logger.info(
-            "[USER_SCHEMA] soft publish deadline on account=%s; keeping account health unchanged: %s",
-            getattr(account, "id", None),
-            dead_reason,
-        )
         return
     if _should_record_publish_runtime_failure(dead_reason):
         _register_runtime_failure(db, account, f"publish_failed:{dead_reason}"[:200])
@@ -7926,13 +7926,23 @@ async def execute_user_schema_parallel(
         max(parallel_main_account_slots, requested_parallel_worker_target),
     )
     parallel_worker_target = min(requested_parallel_worker_target, parallel_browser_capacity)
+    max_active_browsers_per_proxy = min(
+        2,
+        _positive_int_setting("PARALLEL_MAX_ACTIVE_BROWSERS_PER_PROXY", 2),
+    )
+    proxy_slot_refill_backoff_seconds = _bounded_float_setting(
+        "PARALLEL_PROXY_SLOT_REFILL_BACKOFF_SECONDS",
+        0.25,
+        minimum=0.05,
+        maximum=1.0,
+    )
     parallel_capacity_request = (
         parallel_browser_capacity
         if dynamic_worker_pool_enabled
         else parallel_main_account_slots
     )
     logger.info(
-        "Task %s: parallel commenting limits main_attempts=%s reply_attempts=%s retry_account_limit=%s dynamic_pool=%s target_browsers=%s browser_capacity=%s",
+        "Task %s: parallel commenting limits main_attempts=%s reply_attempts=%s retry_account_limit=%s dynamic_pool=%s target_browsers=%s browser_capacity=%s per_proxy_capacity=%s proxy_refill_backoff=%.2fs",
         task_id,
         max_main_attempts,
         max_reply_attempts,
@@ -7940,6 +7950,8 @@ async def execute_user_schema_parallel(
         dynamic_worker_pool_enabled,
         parallel_worker_target,
         parallel_browser_capacity,
+        max_active_browsers_per_proxy,
+        proxy_slot_refill_backoff_seconds,
     )
     main_selection_lock = asyncio.Lock()
     reply_selection_lock = asyncio.Lock()
@@ -7958,6 +7970,7 @@ async def execute_user_schema_parallel(
     edge_denied_reply_proxy_counts: Dict[str, int] = {}
     edge_denied_reply_proxy_values: set[str] = set()
     edge_denied_reply_proxy_rotated: set[str] = set()
+    temporary_main_selection_error = "main_account_temporarily_unavailable"
 
     def _short_proxy_sig(proxy_value: Optional[str]) -> str:
         raw = str(proxy_value or "").strip()
@@ -7993,7 +8006,11 @@ async def execute_user_schema_parallel(
         if not counts:
             return set()
         min_uses = min(counts.values())
-        return {proxy for proxy, count in counts.items() if count > min_uses}
+        return {
+            proxy
+            for proxy, count in counts.items()
+            if count > min_uses or count >= max_active_browsers_per_proxy
+        }
 
     async def _sleep_or_stop(seconds: float) -> bool:
         deadline = time.monotonic() + max(0.0, seconds)
@@ -8030,9 +8047,9 @@ async def execute_user_schema_parallel(
             (slot_result.error or "")[:160],
         )
 
-        # count<=2: первая попытка могла быть отложена из-за активного браузера
-        # на том же прокси — даём ротации второй шанс перед исключением.
-        if count <= 2 and proxy_value not in edge_denied_main_proxy_rotated:
+        # Rotation can be delayed while another browser still uses the proxy.
+        # When it becomes free, try rotation before cooling it down.
+        if proxy_value not in edge_denied_main_proxy_rotated:
             if active_main_proxy_counts.get(proxy_value, 0) > 0:
                 logger.info(
                     "Task %s: delaying mobile proxy rotation for %s because another main browser is active on it",
@@ -8117,7 +8134,7 @@ async def execute_user_schema_parallel(
             (variant_result.error or "")[:160],
         )
 
-        if count <= 2 and proxy_value not in edge_denied_reply_proxy_rotated:
+        if proxy_value not in edge_denied_reply_proxy_rotated:
             if active_reply_proxy_counts.get(proxy_value, 0) > 0:
                 logger.info(
                     "Task %s: delaying mobile proxy rotation for %s because another reply browser is active on it",
@@ -8184,62 +8201,140 @@ async def execute_user_schema_parallel(
                 _short_proxy_sig(proxy_value),
             )
 
-    async def _select_main_account(attempt_db: Session) -> Optional[Account]:
-        async with main_selection_lock:
-            exclude_proxies = (
-                set(active_main_proxy_counts)
-                if dynamic_worker_pool_enabled
-                else set(used_main_proxy_values)
-            )
-            exclude_proxies |= set(edge_denied_main_proxy_values)
-            candidate = get_free_account_for_main_comment(
-                attempt_db,
-                exclude_ids=list(tried_main_ids),
+    def _select_main_account_sync(
+        *,
+        exclude_ids: set[int],
+        exclude_proxies: set[str],
+        exclude_proxy_source_hosts: Optional[bool] = None,
+    ) -> Optional[Account]:
+        with get_sync_db_context() as selection_db:
+            return get_free_account_for_main_comment(
+                selection_db,
+                exclude_ids=list(exclude_ids),
                 exclude_proxies=exclude_proxies,
+                exclude_proxy_source_hosts=exclude_proxy_source_hosts,
                 pool_owner_user_id=pool_owner_user_id,
             )
-            if candidate is None and dynamic_worker_pool_enabled:
-                balanced_exclude_proxies = _overloaded_active_proxies(active_main_proxy_counts)
-                if not balanced_exclude_proxies and used_main_proxy_counts:
-                    min_uses = min(used_main_proxy_counts.values())
-                    balanced_exclude_proxies = {
-                        proxy
-                        for proxy, count in used_main_proxy_counts.items()
-                        if count > min_uses
-                    }
-                if balanced_exclude_proxies:
-                    balanced_exclude_proxies |= set(edge_denied_main_proxy_values)
+
+    async def _select_main_account() -> Tuple[Optional[Account], Optional[str]]:
+        local_rejected_ids: set[int] = set()
+        local_rejected_proxies: set[str] = set()
+        selection_rounds = max(3, parallel_worker_target + 2)
+
+        for _round in range(selection_rounds):
+            async with main_selection_lock:
+                active_proxy_snapshot = dict(active_main_proxy_counts)
+                used_proxy_snapshot = set(used_main_proxy_values)
+                edge_denied_snapshot = set(edge_denied_main_proxy_values)
+                tried_ids_snapshot = set(tried_main_ids) | set(local_rejected_ids)
+
+            exclude_proxies = (
+                set(active_proxy_snapshot)
+                if dynamic_worker_pool_enabled
+                else used_proxy_snapshot
+            )
+            exclude_proxies |= edge_denied_snapshot | local_rejected_proxies
+            candidate = await asyncio.to_thread(
+                _select_main_account_sync,
+                exclude_ids=tried_ids_snapshot,
+                exclude_proxies=exclude_proxies,
+            )
+
+            if candidate is None and dynamic_worker_pool_enabled and active_proxy_snapshot:
+                capacity_exclude_proxies = _overloaded_active_proxies(active_proxy_snapshot)
+                capacity_exclude_proxies |= edge_denied_snapshot | local_rejected_proxies
+                logger.info(
+                    "Task %s: no main account on inactive proxy; allowing an active proxy below capacity "
+                    "(max_per_proxy=%s active=%s)",
+                    task_id,
+                    max_active_browsers_per_proxy,
+                    {
+                        _short_proxy_sig(proxy): count
+                        for proxy, count in active_proxy_snapshot.items()
+                    },
+                )
+                candidate = await asyncio.to_thread(
+                    _select_main_account_sync,
+                    exclude_ids=tried_ids_snapshot,
+                    exclude_proxies=capacity_exclude_proxies,
+                    exclude_proxy_source_hosts=bool(edge_denied_snapshot),
+                )
+
+            if candidate is None:
+                if dynamic_worker_pool_enabled and active_proxy_snapshot:
+                    async with main_selection_lock:
+                        if active_main_proxy_counts:
+                            logger.info(
+                                "Task %s: no main account below per-proxy capacity while %s main browser(s) are active; "
+                                "deferring slot instead of opening another browser above the per-proxy limit",
+                                task_id,
+                                sum(active_main_proxy_counts.values()),
+                            )
+                            return None, temporary_main_selection_error
+                    continue
+                if exclude_proxies:
                     logger.info(
-                        "Task %s: no main account on inactive proxy; trying least-used active proxy selection",
+                        "Task %s: no main account on unused proxy; falling back to account-only selection",
                         task_id,
                     )
-                    candidate = get_free_account_for_main_comment(
-                        attempt_db,
-                        exclude_ids=list(tried_main_ids),
-                        exclude_proxies=balanced_exclude_proxies,
-                        exclude_proxy_source_hosts=bool(edge_denied_main_proxy_values),
-                        pool_owner_user_id=pool_owner_user_id,
+                    candidate = await asyncio.to_thread(
+                        _select_main_account_sync,
+                        exclude_ids=tried_ids_snapshot,
+                        exclude_proxies=edge_denied_snapshot | local_rejected_proxies,
                     )
-            if candidate is None and exclude_proxies:
-                logger.info(
-                    "Task %s: no main account on unused proxy; falling back to account-only selection",
+
+            if candidate is None:
+                return None, None
+
+            candidate_id = int(getattr(candidate, "id", 0) or 0)
+            proxy_value = _account_proxy_value(candidate)
+            reject_reason: Optional[str] = None
+
+            async with main_selection_lock:
+                current_edge_denied = set(edge_denied_main_proxy_values)
+                active_on_proxy = active_main_proxy_counts.get(proxy_value or "", 0)
+                if candidate_id in tried_main_ids:
+                    reject_reason = "already_tried"
+                elif proxy_value and proxy_value in current_edge_denied:
+                    reject_reason = "edge_denied_proxy"
+                elif (
+                    dynamic_worker_pool_enabled
+                    and proxy_value
+                    and active_on_proxy >= max_active_browsers_per_proxy
+                ):
+                    reject_reason = "proxy_capacity"
+                else:
+                    tried_main_ids.add(candidate_id)
+                    if proxy_value:
+                        used_main_proxy_values.add(proxy_value)
+                        used_main_proxy_counts[proxy_value] = used_main_proxy_counts.get(proxy_value, 0) + 1
+                        if dynamic_worker_pool_enabled:
+                            _inc_proxy_count(active_main_proxy_counts, proxy_value)
+                    return candidate, None
+
+            try:
+                release_main_account_reservation(candidate_id)
+            except Exception:
+                logger.debug(
+                    "Task %s: failed to release rejected main account reservation account=%s",
                     task_id,
+                    candidate_id,
+                    exc_info=True,
                 )
-                candidate = get_free_account_for_main_comment(
-                    attempt_db,
-                    exclude_ids=list(tried_main_ids),
-                    exclude_proxies=set(edge_denied_main_proxy_values),
-                    pool_owner_user_id=pool_owner_user_id,
-                )
-            if candidate:
-                tried_main_ids.add(candidate.id)
-                proxy_value = _account_proxy_value(candidate)
-                if proxy_value:
-                    used_main_proxy_values.add(proxy_value)
-                    used_main_proxy_counts[proxy_value] = used_main_proxy_counts.get(proxy_value, 0) + 1
-                    if dynamic_worker_pool_enabled:
-                        _inc_proxy_count(active_main_proxy_counts, proxy_value)
-            return candidate
+            local_rejected_ids.add(candidate_id)
+            if proxy_value and reject_reason == "proxy_capacity":
+                local_rejected_proxies.add(proxy_value)
+            logger.info(
+                "Task %s: rejected selected main account=%s after async selection (%s); retrying selection",
+                task_id,
+                candidate_id,
+                reject_reason or "unknown",
+            )
+            await asyncio.sleep(0)
+
+        if dynamic_worker_pool_enabled and active_main_proxy_counts:
+            return None, temporary_main_selection_error
+        return None, None
 
     def _maybe_update_shared_main_video_url(
         resolved_url: Optional[str],
@@ -8303,10 +8398,20 @@ async def execute_user_schema_parallel(
             slot_result.remaining_texts = []
             return slot_result
         with get_sync_db_context() as attempt_db:
-            candidate = await _select_main_account(attempt_db)
+            candidate, selection_error = await _select_main_account()
             if not candidate:
-                slot_result.error = "no_free_main_accounts"
+                slot_result.error = selection_error or "no_free_main_accounts"
                 return slot_result
+            try:
+                if hasattr(attempt_db, "get"):
+                    candidate = attempt_db.get(Account, candidate.id) or candidate
+            except Exception as exc:
+                logger.debug(
+                    "Task %s: failed to reattach selected main account=%s to attempt session: %s",
+                    task_id,
+                    getattr(candidate, "id", None),
+                    str(exc)[:120],
+                )
             slot_result.account_id = candidate.id
             slot_result.proxy_value = _account_proxy_value(candidate)
             slot_result.attempts = attempt
@@ -8433,6 +8538,7 @@ async def execute_user_schema_parallel(
             return result
 
         active_main_tasks: Dict[asyncio.Task, Tuple[int, List[str]]] = {}
+        next_main_selection_retry_at = 0.0
         empty_main_attempts_without_any_publication = 0
         # Keep the empty-surface stop as a "two full waves" guard. After moving
         # main publishing to one text per slot, small orders have fewer slots,
@@ -8471,11 +8577,15 @@ async def execute_user_schema_parallel(
 
         try:
             while (pending_main_slots or active_main_tasks) and not _is_stop_requested():
+                if not active_main_tasks:
+                    next_main_selection_retry_at = 0.0
                 while (
                     pending_main_slots
                     and len(active_main_tasks) < parallel_worker_target
                     and not _is_stop_requested()
                 ):
+                    if active_main_tasks and next_main_selection_retry_at > time.monotonic():
+                        break
                     slot_index, slot_texts = pending_main_slots.pop(0)
                     main_attempts_by_slot[slot_index] = main_attempts_by_slot.get(slot_index, 0) + 1
                     task_obj = asyncio.create_task(
@@ -8537,7 +8647,35 @@ async def execute_user_schema_parallel(
                     completed_main_results.append((slot_index, slot_texts, slot_result))
 
                 completed_main_results.sort(key=lambda item: 0 if item[2].published else 1)
+                deferred_main_selection_seen = False
+                processed_non_deferred_main_result = False
+                total_main_publications = sum(len(items) for items in main_published_by_slot.values())
                 for slot_index, slot_texts, slot_result in completed_main_results:
+                    if slot_result.error == temporary_main_selection_error:
+                        deferred_main_selection_seen = True
+                        next_main_selection_retry_at = max(
+                            next_main_selection_retry_at,
+                            time.monotonic() + proxy_slot_refill_backoff_seconds,
+                        )
+                        current_attempt = main_attempts_by_slot.get(slot_result.slot_index, 0)
+                        if current_attempt > 0:
+                            main_attempts_by_slot[slot_result.slot_index] = current_attempt - 1
+                        retry_texts = (
+                            slot_result.remaining_texts
+                            or list(main_texts_by_slot.get(slot_result.slot_index) or slot_texts)
+                        )
+                        pending_main_slots.append((slot_result.slot_index, retry_texts))
+                        logger.info(
+                            "Task %s: dynamic main slot %s deferred because active proxy slots are busy; "
+                            "will retry without consuming attempt budget (active=%s pending=%s)",
+                            task_id,
+                            slot_result.slot_index,
+                            len(active_main_tasks),
+                            len(pending_main_slots),
+                        )
+                        continue
+                    processed_non_deferred_main_result = True
+
                     if slot_result.resolved_video_url and extract_tiktok_media_id(slot_result.resolved_video_url):
                         _maybe_update_shared_main_video_url(
                             slot_result.resolved_video_url,
@@ -8637,21 +8775,27 @@ async def execute_user_schema_parallel(
                     else:
                         empty_main_attempts_without_any_publication = 0
 
-                    if (
-                        total_main_publications <= 0
-                        and empty_main_attempts_without_any_publication >= max_empty_main_attempts_before_fail
-                    ):
-                        main_empty_threshold_reached = True
-                        logger.warning(
-                            "Task %s: dynamic parallel main phase reached %s empty attempt(s), "
-                            "but continuing per-slot retries instead of clearing pending main workers "
-                            "(active=%s pending=%s)",
-                            task_id,
-                            empty_main_attempts_without_any_publication,
-                            len(active_main_tasks),
-                            len(pending_main_slots),
-                        )
-                        empty_main_attempts_without_any_publication = 0
+                if processed_non_deferred_main_result:
+                    next_main_selection_retry_at = 0.0
+
+                if deferred_main_selection_seen and active_main_tasks:
+                    await asyncio.sleep(proxy_slot_refill_backoff_seconds)
+
+                if (
+                    total_main_publications <= 0
+                    and empty_main_attempts_without_any_publication >= max_empty_main_attempts_before_fail
+                ):
+                    main_empty_threshold_reached = True
+                    logger.warning(
+                        "Task %s: dynamic parallel main phase reached %s empty attempt(s), "
+                        "but continuing per-slot retries instead of clearing pending main workers "
+                        "(active=%s pending=%s)",
+                        task_id,
+                        empty_main_attempts_without_any_publication,
+                        len(active_main_tasks),
+                        len(pending_main_slots),
+                    )
+                    empty_main_attempts_without_any_publication = 0
         finally:
             if active_main_tasks:
                 await _cancel_active_dynamic_main_tasks()

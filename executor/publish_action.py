@@ -86,11 +86,7 @@ def _is_parallel_fast_publish(correlation_id: Optional[str]) -> bool:
 
 def _post_click_fallback_selector(*, reply_scoped: bool) -> str:
     if reply_scoped:
-        return (
-            '[data-smart-reply-post="1"], '
-            '[data-smart-id="comment-post-ready"], '
-            '[data-smart-id="comment-post"]'
-        )
+        return '[data-smart-reply-post="1"]'
     return (
         '[data-smart-id="comment-post-ready"], '
         '[data-smart-id="comment-post"], '
@@ -144,15 +140,267 @@ _JS_COMPOSER_CLEARED = r"""
 """
 
 
+_JS_COMPOSER_CLEARED_V2 = r"""
+([replyScoped]) => {
+    const placeholderMarkers = [
+        'add comment', 'add a comment', 'say something', 'leave a comment',
+        '\u0434\u043e\u0431\u0430\u0432\u044c\u0442\u0435 \u043a\u043e\u043c\u043c\u0435\u043d\u0442\u0430\u0440',
+        '\u043d\u0430\u043f\u0438\u0448\u0438\u0442\u0435 \u043a\u043e\u043c\u043c\u0435\u043d\u0442\u0430\u0440',
+        '\u0434\u043e\u0434\u0430\u0442\u0438 \u043a\u043e\u043c\u0435\u043d\u0442\u0430\u0440',
+        '\u0434\u043e\u0434\u0430\u0442\u0438 \u0432\u0456\u0434\u043f\u043e\u0432\u0456\u0434\u044c'
+    ];
+    const visible = (el) => {
+        if (!el || !el.getBoundingClientRect) return false;
+        const r = el.getBoundingClientRect();
+        const st = getComputedStyle(el);
+        return r.width > 0 && r.height > 0 && st.display !== 'none' && st.visibility !== 'hidden';
+    };
+    const isRealEditor = (el) => el && (
+        el.isContentEditable ||
+        (el.getAttribute && el.getAttribute('contenteditable') === 'true') ||
+        el.tagName === 'TEXTAREA' ||
+        el.tagName === 'INPUT' ||
+        (el.getAttribute && el.getAttribute('role') === 'textbox')
+    );
+    const labelOf = (el) => [
+        el && el.getAttribute && (el.getAttribute('data-e2e') || ''),
+        el && el.getAttribute && (el.getAttribute('data-smart-id') || ''),
+        el && el.getAttribute && (el.getAttribute('aria-label') || ''),
+        el && el.getAttribute && (el.getAttribute('placeholder') || ''),
+        el && el.getAttribute && (el.getAttribute('data-placeholder') || ''),
+        el && String(el.className || ''),
+        el && (el.id || ''),
+        el && (el.tagName || ''),
+    ].join(' ').toLowerCase();
+    const rejectScope = (el) => {
+        for (let cur = el, depth = 0; cur && cur !== document.body && depth < 9; cur = cur.parentElement, depth++) {
+            const label = labelOf(cur);
+            if (label.includes('search') || label.includes('captcha') || label.includes('challenge')) return true;
+            if (label.includes('login') || label.includes('sign in') || label.includes('signup')) return true;
+            if (!replyScoped && (label.includes('data-smart-reply') || label.includes('smart-reply'))) return true;
+        }
+        return false;
+    };
+    const addEditor = (editors, raw) => {
+        if (!raw || !visible(raw) || rejectScope(raw)) return;
+        if (isRealEditor(raw)) {
+            editors.push(raw);
+            return;
+        }
+        const inner = raw.querySelector && raw.querySelector(
+            'div[contenteditable="true"], [contenteditable="true"], textarea, input, [role="textbox"]'
+        );
+        if (inner && visible(inner) && isRealEditor(inner) && !rejectScope(inner)) {
+            editors.push(inner);
+        }
+    };
+    const editors = [];
+    if (replyScoped) {
+        addEditor(editors, document.querySelector('[data-smart-reply-input="1"]'));
+    }
+    for (const selector of [
+        '[data-smart-id="comment-input"]',
+        '[data-e2e="comment-input"]',
+        '[data-e2e*="comment-input"]',
+        '[data-e2e*="CommentInput"]'
+    ]) {
+        for (const raw of document.querySelectorAll(selector)) addEditor(editors, raw);
+    }
+    for (const raw of document.querySelectorAll(
+        'div[contenteditable="true"], [contenteditable="true"], textarea, input, [role="textbox"]'
+    )) {
+        addEditor(editors, raw);
+    }
+    const el = editors[0] || null;
+    if (!el) return { exists: false, empty: false, text: '' };
+    const raw = (el.value !== undefined && el.value !== null && el.value !== '')
+        ? el.value
+        : (el.textContent || el.innerText || '');
+    const txt = String(raw).trim();
+    const lower = txt.toLowerCase();
+    const isPlaceholder = placeholderMarkers.some(m => lower.startsWith(m));
+    return {
+        exists: true,
+        empty: txt.length === 0 || isPlaceholder,
+        text: txt.slice(0, 160),
+        tag: el.tagName,
+        e2e: el.getAttribute && el.getAttribute('data-e2e'),
+        smart: el.getAttribute && el.getAttribute('data-smart-id'),
+        contenteditable: el.getAttribute && el.getAttribute('contenteditable'),
+    };
+}
+"""
+
+
+_JS_CLEAR_MAIN_COMMENT_COMPOSER = r"""
+() => {
+    const visible = (el) => {
+        if (!el || !el.getBoundingClientRect) return false;
+        const r = el.getBoundingClientRect();
+        const st = getComputedStyle(el);
+        return r.width > 0 && r.height > 0 && st.display !== 'none' && st.visibility !== 'hidden';
+    };
+    const isRealEditor = (el) => el && (
+        el.isContentEditable ||
+        (el.getAttribute && el.getAttribute('contenteditable') === 'true') ||
+        el.tagName === 'TEXTAREA' ||
+        el.tagName === 'INPUT' ||
+        (el.getAttribute && el.getAttribute('role') === 'textbox')
+    );
+    const labelOf = (el) => [
+        el && el.getAttribute && (el.getAttribute('data-e2e') || ''),
+        el && el.getAttribute && (el.getAttribute('data-smart-id') || ''),
+        el && el.getAttribute && (el.getAttribute('aria-label') || ''),
+        el && el.getAttribute && (el.getAttribute('placeholder') || ''),
+        el && el.getAttribute && (el.getAttribute('data-placeholder') || ''),
+        el && String(el.className || ''),
+        el && (el.id || ''),
+        el && (el.tagName || ''),
+    ].join(' ').toLowerCase();
+    const rejectScope = (el) => {
+        for (let cur = el, depth = 0; cur && cur !== document.body && depth < 9; cur = cur.parentElement, depth++) {
+            const label = labelOf(cur);
+            if (label.includes('search') || label.includes('captcha') || label.includes('challenge')) return true;
+            if (label.includes('login') || label.includes('sign in') || label.includes('signup')) return true;
+            if (label.includes('data-smart-reply') || label.includes('smart-reply')) return true;
+        }
+        return false;
+    };
+    const candidates = [];
+    const addEditor = (raw) => {
+        if (!raw || !visible(raw) || rejectScope(raw)) return;
+        if (isRealEditor(raw)) {
+            candidates.push(raw);
+            return;
+        }
+        const inner = raw.querySelector && raw.querySelector(
+            'div[contenteditable="true"], [contenteditable="true"], textarea, input, [role="textbox"]'
+        );
+        if (inner && visible(inner) && isRealEditor(inner) && !rejectScope(inner)) {
+            candidates.push(inner);
+        }
+    };
+    for (const selector of [
+        '[data-smart-id="comment-input"]',
+        '[data-e2e="comment-input"]',
+        '[data-e2e*="comment-input"]',
+        '[data-e2e*="CommentInput"]'
+    ]) {
+        for (const raw of document.querySelectorAll(selector)) addEditor(raw);
+    }
+    for (const raw of document.querySelectorAll(
+        'div[contenteditable="true"], [contenteditable="true"], textarea, input, [role="textbox"]'
+    )) {
+        addEditor(raw);
+    }
+    const el = candidates[0] || null;
+    if (!el) return { ok: false, reason: 'no_editor' };
+    try { el.focus(); } catch (_) {}
+    try {
+        if (el.tagName === 'TEXTAREA' || el.tagName === 'INPUT') {
+            const proto = el.tagName === 'TEXTAREA'
+                ? window.HTMLTextAreaElement.prototype
+                : window.HTMLInputElement.prototype;
+            const desc = Object.getOwnPropertyDescriptor(proto, 'value');
+            if (desc && desc.set) desc.set.call(el, '');
+            else el.value = '';
+        } else {
+            const sel = window.getSelection && window.getSelection();
+            if (sel) {
+                const range = document.createRange();
+                range.selectNodeContents(el);
+                sel.removeAllRanges();
+                sel.addRange(range);
+                range.deleteContents();
+                sel.removeAllRanges();
+            }
+            el.textContent = '';
+        }
+        for (const ev of [
+            new InputEvent('beforeinput', {bubbles: true, cancelable: true, inputType: 'deleteContentBackward', data: null}),
+            new InputEvent('input', {bubbles: true, cancelable: true, inputType: 'deleteContentBackward', data: null}),
+            new Event('change', {bubbles: true, cancelable: true}),
+            new KeyboardEvent('keyup', {bubbles: true, cancelable: true, key: 'Backspace'})
+        ]) {
+            try { el.dispatchEvent(ev); } catch (_) {}
+        }
+    } catch (exc) {
+        return { ok: false, reason: 'clear_exception:' + String(exc).slice(0, 80) };
+    }
+    const txt = (el.value !== undefined && el.value !== null && el.value !== '')
+        ? el.value
+        : (el.textContent || el.innerText || '');
+    return { ok: String(txt || '').trim().length === 0, reason: 'cleared', text: String(txt || '').slice(0, 120) };
+}
+"""
+
+
 async def _composer_cleared_state(page: Page, *, reply_scoped: bool) -> Dict[str, Any]:
     """Return {exists, empty, text} for the comment/reply composer."""
     try:
-        state = await page.evaluate(_JS_COMPOSER_CLEARED, [bool(reply_scoped)])
+        state = await page.evaluate(_JS_COMPOSER_CLEARED_V2, [bool(reply_scoped)])
         if isinstance(state, dict):
             return state
     except Exception as exc:
         logger.debug("[PUBLISH] composer-cleared probe failed: %s", str(exc)[:120])
     return {"exists": False, "empty": False, "text": ""}
+
+
+async def _clear_main_comment_composer_best_effort(
+    page: Page,
+    *,
+    reason: str,
+    expected_video_url: Optional[str] = None,
+    correlation_id: Optional[str] = None,
+    timeout_seconds: float = 1.2,
+) -> bool:
+    """Clear dirty main composer state before retrying another variant/account."""
+    deadline = time.monotonic() + max(0.2, timeout_seconds)
+    cleared = False
+    try:
+        target = await _asyncio_wait_for(
+            page.evaluate(_JS_MAIN_COMMENT_KEYBOARD_FOCUS_TARGET),
+            timeout=max(0.1, min(0.35, deadline - time.monotonic())),
+        )
+    except Exception:
+        target = None
+
+    if isinstance(target, dict) and target.get("found"):
+        rect = target.get("rect") if isinstance(target.get("rect"), dict) else {}
+        try:
+            x = float(rect.get("left") or 0.0) + max(2.0, float(rect.get("width") or 0.0) / 2.0)
+            y = float(rect.get("top") or 0.0) + max(2.0, float(rect.get("height") or 0.0) / 2.0)
+            await page.mouse.click(x, y)
+            await page.keyboard.press("Control+A")
+            await page.keyboard.press("Backspace")
+            state = await _asyncio_wait_for(
+                _composer_cleared_state(page, reply_scoped=False),
+                timeout=max(0.1, min(0.35, deadline - time.monotonic())),
+            )
+            cleared = bool(state.get("exists") and state.get("empty"))
+        except Exception:
+            cleared = False
+
+    if not cleared and deadline - time.monotonic() > 0.1:
+        try:
+            result = await _asyncio_wait_for(
+                page.evaluate(_JS_CLEAR_MAIN_COMMENT_COMPOSER),
+                timeout=max(0.1, min(0.75, deadline - time.monotonic())),
+            )
+            cleared = bool(isinstance(result, dict) and result.get("ok"))
+        except Exception:
+            cleared = False
+
+    _log_publish_trace(
+        "main_composer_clear_after_failure",
+        page=page,
+        expected_video_url=expected_video_url,
+        correlation_id=correlation_id,
+        reason=reason,
+        cleared=cleared,
+        level=logging.INFO if cleared else logging.WARNING,
+    )
+    return cleared
 
 
 async def _enter_submit_fast_path(
@@ -1843,38 +2091,6 @@ async def _type_main_comment_without_handle(page: Page, text: str, *, fast: bool
     keyboard_reason = str(keyboard_result.get("reason") if isinstance(keyboard_result, dict) else "keyboard_failed")
     logger.debug("[PUBLISH] Direct main keyboard typing did not verify: %s", keyboard_reason[:160])
 
-    prefix = text[:-1]
-    tail = text[-1:]
-    result = await atomic_set_comment_text(
-        page,
-        text,
-        reply_scoped=False,
-        insert_text=prefix,
-    )
-    landed = str(result.get("text") or "") if isinstance(result, dict) else ""
-    if isinstance(result, dict) and result.get("reason") == "no_editor":
-        return {"ok": False, "reason": "no_editor"}
-    if prefix and len(prefix) <= 120 and _normalize_publish_text(landed) != _normalize_publish_text(prefix):
-        logger.debug(
-            "[PUBLISH] Direct main input prefix did not land cleanly: reason=%s text='%s'",
-            result.get("reason") if isinstance(result, dict) else "non_dict_result",
-            landed[:60],
-        )
-    else:
-        try:
-            await suppress_keyboard_shortcuts_overlay(page)
-            await page.keyboard.insert_text(tail)
-            await asyncio.sleep(0.10 if fast else 0.18)
-            ok, found_text = await comment_input_contains_expected_text(page, text)
-            if ok:
-                return {
-                    "ok": True,
-                    "strategy": "main-direct-atomic-prefix-tail",
-                    "text": found_text,
-                }
-        except Exception as exc:
-            logger.debug("[PUBLISH] Direct main trusted tail failed: %s", str(exc)[:120])
-
     focus_result = await atomic_set_comment_text(
         page,
         text,
@@ -1898,17 +2114,18 @@ async def _type_main_comment_without_handle(page: Page, text: str, *, fast: bool
         except Exception as exc:
             logger.debug("[PUBLISH] Direct main focus+insert_text failed: %s", str(exc)[:120])
 
-    full_result = await atomic_set_comment_text(page, text, reply_scoped=False)
-    if isinstance(full_result, dict) and full_result.get("ok"):
-        return {
-            "ok": True,
-            "strategy": "main-direct-atomic-full",
-            "text": str(full_result.get("text") or ""),
-        }
     return {
         "ok": False,
-        "reason": str((full_result or {}).get("reason") if isinstance(full_result, dict) else "typing_failed"),
-        "last_text": str((full_result or {}).get("text") if isinstance(full_result, dict) else "")[:120],
+        "reason": str(
+            (focus_result or {}).get("reason")
+            if isinstance(focus_result, dict)
+            else keyboard_reason or "typing_failed"
+        ),
+        "last_text": str(
+            (focus_result or {}).get("text")
+            if isinstance(focus_result, dict)
+            else keyboard_result.get("last_text", "") if isinstance(keyboard_result, dict) else ""
+        )[:120],
     }
 
 
@@ -2046,6 +2263,12 @@ async def _publish_main_comment_direct_dom(
             timeout=type_timeout,
         )
     except asyncio.TimeoutError:
+        await _clear_main_comment_composer_best_effort(
+            page,
+            reason="main_direct_typing_timeout",
+            expected_video_url=expected_video_url,
+            correlation_id=correlation_id,
+        )
         _log_publish_trace(
             "main_direct_dom_fallback_typing_failed",
             page=page,
@@ -2057,6 +2280,12 @@ async def _publish_main_comment_direct_dom(
         return None
     if not isinstance(type_result, dict) or not type_result.get("ok"):
         reason = str(type_result.get("reason") if isinstance(type_result, dict) else "typing_failed")
+        await _clear_main_comment_composer_best_effort(
+            page,
+            reason=f"main_direct_typing_failed:{reason}"[:160],
+            expected_video_url=expected_video_url,
+            correlation_id=correlation_id,
+        )
         _log_publish_trace(
             "main_direct_dom_fallback_typing_failed",
             page=page,
@@ -2190,6 +2419,13 @@ async def _publish_main_comment_direct_dom(
             )
         if not isinstance(click_result, dict) or not click_result.get("clicked"):
             reason = str(click_result.get("reason") if isinstance(click_result, dict) else "click_failed")
+            if any(marker in reason for marker in ("disabled", "input", "empty", "not_found", "not_ready")):
+                await _clear_main_comment_composer_best_effort(
+                    page,
+                    reason=f"main_direct_post_click_failed:{reason}"[:160],
+                    expected_video_url=expected_video_url,
+                    correlation_id=correlation_id,
+                )
             _log_publish_trace(
                 "publish_result",
                 page=page,
@@ -2321,6 +2557,13 @@ async def _publish_main_comment_direct_dom(
             if request_attempted
             else "no_network_request_after_main_direct_post_click"
         )
+        if not request_attempted:
+            await _clear_main_comment_composer_best_effort(
+                page,
+                reason=error_reason,
+                expected_video_url=expected_video_url,
+                correlation_id=correlation_id,
+            )
         _log_publish_trace(
             "publish_result",
             page=page,
@@ -2728,7 +2971,8 @@ async def _publish_via_current_input(
             ok, visible_text = False, ""
         except Exception:
             ok, visible_text = False, ""
-        if not ok and main_comment_aggressive:
+        if main_comment_aggressive:
+            state: Dict[str, Any] = {"ok": False, "reason": "not_checked"}
             try:
                 state = await _asyncio_wait_for(
                     _main_comment_input_committed_text_state(page, text),
@@ -2738,8 +2982,13 @@ async def _publish_via_current_input(
                 state = {"ok": False, "reason": "timeout"}
             except Exception:
                 state = {"ok": False, "reason": "exception"}
-            if isinstance(state, dict) and state.get("ok"):
+            if not ok and isinstance(state, dict) and state.get("ok"):
                 visible_text = str(state.get("text") or "")
+
+            exact_text = bool(
+                _normalize_publish_text(visible_text) == _normalize_publish_text(text)
+            )
+            if isinstance(state, dict) and state.get("ok"):
                 if _normalize_publish_text(visible_text) != _normalize_publish_text(text):
                     logger.warning(
                         "[PUBLISH] Main typing phase %s saw committed composer text, "
@@ -2761,26 +3010,85 @@ async def _publish_via_current_input(
                         level=logging.WARNING,
                     )
                     return False
-                logger.warning(
-                    "[PUBLISH] Main typing phase %s timed out/unverified but composer has text; "
-                    "continuing aggressively to Post: '%s'",
-                    phase,
-                    visible_text[:60],
-                )
+                if state.get("postDisabled") is False:
+                    logger.warning(
+                        "[PUBLISH] Main typing phase %s timed out/unverified but composer has text "
+                        "and Post is enabled; continuing to Post: '%s'",
+                        phase,
+                        visible_text[:60],
+                    )
+                    _log_publish_trace(
+                        "main_typing_timeout_text_present",
+                        page=page,
+                        expected_video_url=expected_video_url,
+                        correlation_id=correlation_id,
+                        phase=phase,
+                        dom_strategy=dom_strategy,
+                        input_text_len=int(state.get("textLen") or len(visible_text or "")),
+                        input_preview=visible_text[:60],
+                        post_visible=state.get("postVisible"),
+                        post_disabled=state.get("postDisabled"),
+                        level=logging.WARNING,
+                    )
+                    return True
+
+            if exact_text and _remaining() > 0.2:
+                try:
+                    enabled_button, enabled_info = await wait_for_post_button_enabled(
+                        page,
+                        max_wait_seconds=min(0.8, max(0.2, _remaining())),
+                        reply_scoped=False,
+                    )
+                except Exception:
+                    enabled_button, enabled_info = None, None
+                if enabled_button:
+                    logger.warning(
+                        "[PUBLISH] Main typing phase %s timed out/unverified but exact text "
+                        "and enabled Post are visible; continuing to Post: '%s'",
+                        phase,
+                        visible_text[:60],
+                    )
+                    _log_publish_trace(
+                        "main_typing_timeout_text_ready_for_post",
+                        page=page,
+                        expected_video_url=expected_video_url,
+                        correlation_id=correlation_id,
+                        phase=phase,
+                        dom_strategy=dom_strategy,
+                        input_text_len=len(visible_text or ""),
+                        input_preview=visible_text[:60],
+                        post_enabled=True,
+                        level=logging.WARNING,
+                    )
+                    return True
                 _log_publish_trace(
-                    "main_typing_timeout_text_present",
+                    "main_typing_timeout_text_not_ready_for_post",
                     page=page,
                     expected_video_url=expected_video_url,
                     correlation_id=correlation_id,
                     phase=phase,
                     dom_strategy=dom_strategy,
-                    input_text_len=int(state.get("textLen") or len(visible_text or "")),
+                    input_text_len=len(visible_text or ""),
                     input_preview=visible_text[:60],
-                    post_visible=state.get("postVisible"),
-                    post_disabled=state.get("postDisabled"),
+                    post_visible=state.get("postVisible") if isinstance(state, dict) else None,
+                    post_disabled=state.get("postDisabled") if isinstance(state, dict) else None,
+                    enabled_reason=getattr(enabled_info, "reason", None),
                     level=logging.WARNING,
                 )
-                return True
+                return False
+            if not exact_text and visible_text:
+                _log_publish_trace(
+                    "main_typing_timeout_text_mismatch",
+                    page=page,
+                    expected_video_url=expected_video_url,
+                    correlation_id=correlation_id,
+                    phase=phase,
+                    dom_strategy=dom_strategy,
+                    input_preview=visible_text[:80],
+                    expected_preview=text[:80],
+                    level=logging.WARNING,
+                )
+            return False
         if not ok:
             return False
         logger.info(
@@ -3050,6 +3358,13 @@ async def _publish_via_current_input(
         if await _text_visible_after_typing_timeout("typing", input_info.strategy):
             typed_ok = True
         else:
+            if main_comment_aggressive:
+                await _clear_main_comment_composer_best_effort(
+                    page,
+                    reason="typing_timeout_not_ready",
+                    expected_video_url=expected_video_url,
+                    correlation_id=correlation_id,
+                )
             return _deadline_result("typing", input_info.strategy)
 
     if not typed_ok:
@@ -3058,6 +3373,13 @@ async def _publish_via_current_input(
 
     if not typed_ok:
         logger.warning("[PUBLISH] type_into_comment failed on first attempt; retrying with fresh input handle")
+        if main_comment_aggressive:
+            await _clear_main_comment_composer_best_effort(
+                page,
+                reason="typing_first_attempt_failed_before_retry",
+                expected_video_url=expected_video_url,
+                correlation_id=correlation_id,
+            )
         await asyncio.sleep(0.2 if aggressive else 0.5)
         if _remaining() <= 0:
             return _deadline_result("after_typing_retry_delay", input_info.strategy)
@@ -3080,6 +3402,13 @@ async def _publish_via_current_input(
                 timeout=retry_input_search_timeout,
             )
         except asyncio.TimeoutError:
+            if main_comment_aggressive:
+                await _clear_main_comment_composer_best_effort(
+                    page,
+                    reason="typing_retry_input_search_timeout",
+                    expected_video_url=expected_video_url,
+                    correlation_id=correlation_id,
+                )
             return _deadline_result("typing_retry_input_search", input_info.strategy)
         if not retry_handle:
             retry_handle = input_handle
@@ -3105,11 +3434,25 @@ async def _publish_via_current_input(
             if await _text_visible_after_typing_timeout("typing_retry", input_info.strategy):
                 retry_typed_ok = True
             else:
+                if main_comment_aggressive:
+                    await _clear_main_comment_composer_best_effort(
+                        page,
+                        reason="typing_retry_timeout_not_ready",
+                        expected_video_url=expected_video_url,
+                        correlation_id=correlation_id,
+                    )
                 return _deadline_result("typing_retry", input_info.strategy)
         if not retry_typed_ok:
             if await _text_visible_after_typing_timeout("typing_retry_unverified", input_info.strategy):
                 retry_typed_ok = True
             else:
+                if main_comment_aggressive:
+                    await _clear_main_comment_composer_best_effort(
+                        page,
+                        reason="typing_retry_failed",
+                        expected_video_url=expected_video_url,
+                        correlation_id=correlation_id,
+                    )
                 return PublishResult(
                     status="dom_error",
                     error_reason="typing_failed",
@@ -3180,6 +3523,13 @@ async def _publish_via_current_input(
         )
         if captcha_result:
             return captcha_result
+        if main_comment_aggressive:
+            await _clear_main_comment_composer_best_effort(
+                page,
+                reason="post_button_not_found",
+                expected_video_url=expected_video_url,
+                correlation_id=correlation_id,
+            )
         return PublishResult(
             status="dom_error",
             error_reason="post_button_not_found",
@@ -3224,6 +3574,12 @@ async def _publish_via_current_input(
                 if isinstance(state, dict) and state.get("ok"):
                     visible_text = str(state.get("text") or "")
                     if _normalize_publish_text(visible_text) != _normalize_publish_text(text):
+                        await _clear_main_comment_composer_best_effort(
+                            page,
+                            reason="post_enabled_gate_text_mismatch",
+                            expected_video_url=expected_video_url,
+                            correlation_id=correlation_id,
+                        )
                         _log_publish_trace(
                             "main_post_enabled_gate_text_mismatch",
                             page=page,
@@ -3242,24 +3598,59 @@ async def _publish_via_current_input(
                             post_was_enabled_at_click=False,
                             network_request_attempted=False,
                         )
-                    logger.warning(
-                        "[PUBLISH] Main Post enabled-gate says %s, but composer has text; "
-                        "continuing with aggressive click path.",
-                        disabled_reason,
-                    )
-                    _log_publish_trace(
-                        "main_post_enabled_gate_bypassed",
-                        page=page,
+                    if state.get("postDisabled") is False:
+                        logger.warning(
+                            "[PUBLISH] Main Post enabled-gate says %s, but composer state shows "
+                            "the current variant and Post is enabled; continuing with aggressive click path.",
+                            disabled_reason,
+                        )
+                        _log_publish_trace(
+                            "main_post_enabled_gate_bypassed",
+                            page=page,
+                            expected_video_url=expected_video_url,
+                            correlation_id=correlation_id,
+                            reason=disabled_reason,
+                            input_text_len=int(state.get("textLen") or len(str(state.get("text") or ""))),
+                            input_preview=str(state.get("text") or "")[:60],
+                            post_visible=state.get("postVisible"),
+                            post_disabled=state.get("postDisabled"),
+                            level=logging.WARNING,
+                        )
+                    else:
+                        await _clear_main_comment_composer_best_effort(
+                            page,
+                            reason=f"post_enabled_gate_not_ready:{disabled_reason}"[:160],
+                            expected_video_url=expected_video_url,
+                            correlation_id=correlation_id,
+                        )
+                        _log_publish_trace(
+                            "publish_result",
+                            page=page,
+                            expected_video_url=expected_video_url,
+                            correlation_id=correlation_id,
+                            status="dom_error",
+                            reason=disabled_reason,
+                            post_visible=state.get("postVisible"),
+                            post_disabled=state.get("postDisabled"),
+                            post_was_enabled=False,
+                            elapsed=round(time.monotonic() - started, 2),
+                            level=logging.WARNING,
+                        )
+                        return PublishResult(
+                            status="dom_error",
+                            error_reason=disabled_reason,
+                            dom_strategy=input_info.strategy or post_info.strategy,
+                            elapsed_seconds=time.monotonic() - started,
+                            post_was_enabled_at_click=False,
+                            network_request_attempted=False,
+                        )
+                else:
+                    await _clear_main_comment_composer_best_effort(
+                        page,
+                        reason=f"post_enabled_gate_uncommitted:{disabled_reason}"[:160],
                         expected_video_url=expected_video_url,
                         correlation_id=correlation_id,
-                        reason=disabled_reason,
-                        input_text_len=int(state.get("textLen") or len(str(state.get("text") or ""))),
-                        input_preview=str(state.get("text") or "")[:60],
-                        post_visible=state.get("postVisible"),
-                        post_disabled=state.get("postDisabled"),
-                        level=logging.WARNING,
                     )
-                else:
                     _log_publish_trace(
                         "publish_result",
                         page=page,
@@ -4002,6 +4393,13 @@ async def _publish_via_current_input(
     #      AMBIGUOUS_POST_SUBMIT_ERRORS) so downstream logic does NOT consider
     #      a local DOM match alone as proof of publication.
     if not post_was_enabled and not request_attempted:
+        if main_comment_aggressive:
+            await _clear_main_comment_composer_best_effort(
+                page,
+                reason="submitted_unverified_disabled_post",
+                expected_video_url=expected_video_url,
+                correlation_id=correlation_id,
+            )
         _log_publish_trace(
             "publish_result",
             page=page,
@@ -4047,6 +4445,13 @@ async def _publish_via_current_input(
             network_request_attempted=True,
         )
 
+    if main_comment_aggressive:
+        await _clear_main_comment_composer_best_effort(
+            page,
+            reason="no_network_request_after_post_click",
+            expected_video_url=expected_video_url,
+            correlation_id=correlation_id,
+        )
     _log_publish_trace(
         "publish_result",
         page=page,

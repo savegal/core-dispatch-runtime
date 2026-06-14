@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import asyncio
 import inspect
+import threading
 import time
 from contextlib import contextmanager
 from types import SimpleNamespace
@@ -250,7 +251,7 @@ def test_record_main_retry_failure_does_not_penalize_soft_publish_deadline(monke
     )
 
     assert calls == []
-    assert attempt_calls == [777]
+    assert attempt_calls == []
 
 
 @pytest.mark.unit
@@ -5446,13 +5447,17 @@ async def test_parallel_mode_closes_pool_between_main_and_reply_batches(monkeypa
     reply_candidate_counts = []
     close_calls = []
     capacity_requests = []
+    selected_main_reserved: set[int] = set()
+    selected_main_lock = threading.Lock()
 
     def fake_get_main(_db, *, exclude_ids=None, **_kwargs):
         excluded = set(exclude_ids or [])
-        for account in main_accounts:
-            if account.id not in excluded:
-                selected_main_ids.append(account.id)
-                return account
+        with selected_main_lock:
+            for account in main_accounts:
+                if account.id not in excluded and account.id not in selected_main_reserved:
+                    selected_main_reserved.add(account.id)
+                    selected_main_ids.append(account.id)
+                    return account
         return None
 
     async def fake_try_main(_db, account, _video_url, texts, **_kwargs):
@@ -5680,10 +5685,23 @@ async def test_parallel_mode_all_reply_accounts_missing_mains_fails_without_fall
     reply_accounts = [SimpleNamespace(id=201 + i, proxy=None) for i in range(3)]
     fallback_seen = []
     close_calls = []
+    selected_main_ids: set[int] = set()
+    select_lock = threading.Lock()
 
     def fake_get_main(_db, *, exclude_ids=None, **_kwargs):
         excluded = set(exclude_ids or [])
-        return next((account for account in main_accounts if account.id not in excluded), None)
+        with select_lock:
+            candidate = next(
+                (
+                    account
+                    for account in main_accounts
+                    if account.id not in excluded and account.id not in selected_main_ids
+                ),
+                None,
+            )
+            if candidate is not None:
+                selected_main_ids.add(candidate.id)
+            return candidate
 
     async def fake_try_main(_db, account, _video_url, texts, **_kwargs):
         return [
@@ -5856,6 +5874,189 @@ async def test_parallel_mode_retries_failed_main_slot_with_replacement_before_re
     assert [main.account_id for main in result.published_mains] == [101, 104, 103]
     assert [main.text for main in result.published_mains] == ["m1", "m2", "m3"]
     assert close_calls == ["close", "close"]
+
+
+@pytest.mark.unit
+@pytest.mark.asyncio
+async def test_parallel_mode_refills_main_worker_while_other_browsers_are_active(monkeypatch):
+    from db import database as db_database
+    from executor import browser_pool, user_schema
+
+    @contextmanager
+    def fake_db_context():
+        yield SimpleNamespace(no_autoflush=SimpleNamespace())
+
+    main_accounts = [
+        SimpleNamespace(id=101 + i, proxy=f"http://proxy-{i}:1000")
+        for i in range(4)
+    ]
+    events = []
+    close_calls = []
+    replacement_started = asyncio.Event()
+    selected_ids: set[int] = set()
+    select_lock = threading.Lock()
+
+    def fake_get_main(_db, *, exclude_ids=None, exclude_proxies=None, **_kwargs):
+        excluded = set(exclude_ids or [])
+        excluded_proxies = {str(proxy).strip() for proxy in (exclude_proxies or []) if proxy}
+        with select_lock:
+            candidate = next(
+                (
+                    account
+                    for account in main_accounts
+                    if account.id not in excluded
+                    and account.id not in selected_ids
+                    and str(account.proxy or "").strip() not in excluded_proxies
+                ),
+                None,
+            )
+            if candidate is not None:
+                selected_ids.add(candidate.id)
+            return candidate
+
+    async def fake_try_main(_db, account, _video_url, texts, **_kwargs):
+        events.append(("start", account.id, tuple(texts)))
+        if account.id == 102:
+            events.append(("finish", account.id))
+            return [], "captcha_challenge:visible"
+        if account.id in {101, 103}:
+            await asyncio.wait_for(replacement_started.wait(), timeout=1.0)
+        if account.id == 104:
+            replacement_started.set()
+        events.append(("finish", account.id))
+        return [
+            user_schema.PublishedMain(
+                text=text,
+                comment_id=f"cid-{account.id}-{text}",
+                network_confirmed=True,
+                local_confirmed=True,
+                method="hybrid_dom",
+                account_id=account.id,
+                tiktok_username=f"user_{account.id}",
+            )
+            for text in texts
+        ], None
+
+    async def fake_close_pool():
+        close_calls.append("close")
+
+    monkeypatch.setattr(user_schema._settings, "PARALLEL_COMMENTING_TARGET_BROWSERS", 3, raising=False)
+    monkeypatch.setattr(user_schema._settings, "PARALLEL_COMMENTING_MAX_BROWSERS", 3, raising=False)
+    monkeypatch.setattr(user_schema._settings, "PARALLEL_COMMENTING_MAX_MAIN_ATTEMPTS", 6, raising=False)
+    monkeypatch.setattr(db_database, "get_sync_db_context", fake_db_context)
+    monkeypatch.setattr(user_schema, "get_free_account_for_main_comment", fake_get_main)
+    monkeypatch.setattr(user_schema, "_try_main_account", fake_try_main)
+    monkeypatch.setattr(user_schema, "_record_main_retry_failure", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(user_schema, "release_main_account_reservation", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(user_schema, "_maybe_order_likes", AsyncMock(return_value=None))
+    monkeypatch.setattr(browser_pool, "ensure_thread_browser_pool_capacity", lambda _min_browsers: None)
+    monkeypatch.setattr(browser_pool, "close_browser_pool", fake_close_pool)
+
+    result = await user_schema.execute_user_schema_parallel(
+        SimpleNamespace(),
+        SimpleNamespace(settings={"replies": [], "reply_count": 0}),
+        "https://www.tiktok.com/@demo/video/1234567890123456789",
+        ["m1", "m2", "m3"],
+        506,
+        boost_enabled=False,
+        boost_quantity=0,
+    )
+
+    assert result.error is None
+    replacement_start_index = events.index(("start", 104, ("m2",)))
+    assert replacement_start_index < events.index(("finish", 101))
+    assert replacement_start_index < events.index(("finish", 103))
+    assert [main.text for main in result.published_mains] == ["m1", "m2", "m3"]
+    assert close_calls == ["close"]
+
+
+@pytest.mark.unit
+@pytest.mark.asyncio
+async def test_parallel_mode_selects_main_accounts_without_blocking_event_loop(monkeypatch):
+    from db import database as db_database
+    from executor import browser_pool, user_schema
+
+    @contextmanager
+    def fake_db_context():
+        yield SimpleNamespace(no_autoflush=SimpleNamespace())
+
+    main_accounts = [
+        SimpleNamespace(id=101 + i, proxy=f"http://proxy-{i}:1000")
+        for i in range(3)
+    ]
+    select_lock = threading.Lock()
+    selected_ids: set[int] = set()
+    active_selects = 0
+    max_active_selects = 0
+    main_starts = []
+
+    def fake_get_main(_db, *, exclude_ids=None, exclude_proxies=None, **_kwargs):
+        nonlocal active_selects, max_active_selects
+        with select_lock:
+            active_selects += 1
+            max_active_selects = max(max_active_selects, active_selects)
+        try:
+            time.sleep(0.05)
+            excluded = set(exclude_ids or [])
+            excluded_proxies = {str(proxy).strip() for proxy in (exclude_proxies or []) if proxy}
+            with select_lock:
+                candidate = next(
+                    (
+                        account
+                        for account in main_accounts
+                        if account.id not in excluded
+                        and account.id not in selected_ids
+                        and str(account.proxy or "").strip() not in excluded_proxies
+                    ),
+                    None,
+                )
+                if candidate is not None:
+                    selected_ids.add(candidate.id)
+                return candidate
+        finally:
+            with select_lock:
+                active_selects -= 1
+
+    async def fake_try_main(_db, account, _video_url, texts, **_kwargs):
+        main_starts.append((account.id, tuple(texts)))
+        return [
+            user_schema.PublishedMain(
+                text=text,
+                comment_id=f"cid-{account.id}-{text}",
+                network_confirmed=True,
+                local_confirmed=True,
+                method="hybrid_dom",
+                account_id=account.id,
+                tiktok_username=f"user_{account.id}",
+            )
+            for text in texts
+        ], None
+
+    monkeypatch.setattr(user_schema._settings, "PARALLEL_COMMENTING_TARGET_BROWSERS", 3, raising=False)
+    monkeypatch.setattr(user_schema._settings, "PARALLEL_COMMENTING_MAX_BROWSERS", 3, raising=False)
+    monkeypatch.setattr(user_schema._settings, "PARALLEL_COMMENTING_MAX_MAIN_ATTEMPTS", 3, raising=False)
+    monkeypatch.setattr(db_database, "get_sync_db_context", fake_db_context)
+    monkeypatch.setattr(user_schema, "get_free_account_for_main_comment", fake_get_main)
+    monkeypatch.setattr(user_schema, "_try_main_account", fake_try_main)
+    monkeypatch.setattr(user_schema, "release_main_account_reservation", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(user_schema, "_maybe_order_likes", AsyncMock(return_value=None))
+    monkeypatch.setattr(browser_pool, "ensure_thread_browser_pool_capacity", lambda _min_browsers: None)
+    monkeypatch.setattr(browser_pool, "close_browser_pool", AsyncMock(return_value=None))
+
+    result = await user_schema.execute_user_schema_parallel(
+        SimpleNamespace(),
+        SimpleNamespace(settings={"replies": [], "reply_count": 0}),
+        "https://www.tiktok.com/@demo/video/1234567890123456789",
+        ["m1", "m2", "m3"],
+        507,
+        boost_enabled=False,
+        boost_quantity=0,
+    )
+
+    assert result.error is None
+    assert max_active_selects > 1
+    assert [main.text for main in result.published_mains] == ["m1", "m2", "m3"]
+    assert sorted(account_id for account_id, _texts in main_starts) == [101, 102, 103]
 
 
 @pytest.mark.unit
@@ -6445,10 +6646,23 @@ async def test_parallel_mode_caps_active_main_at_three_and_reply_at_target(monke
     max_active_main = 0
     max_active_reply = 0
     close_calls = []
+    selected_main_ids: set[int] = set()
+    select_lock = threading.Lock()
 
     def fake_get_main(_db, *, exclude_ids=None, **_kwargs):
         excluded = set(exclude_ids or [])
-        return next((account for account in main_accounts if account.id not in excluded), None)
+        with select_lock:
+            candidate = next(
+                (
+                    account
+                    for account in main_accounts
+                    if account.id not in excluded and account.id not in selected_main_ids
+                ),
+                None,
+            )
+            if candidate is not None:
+                selected_main_ids.add(candidate.id)
+            return candidate
 
     async def fake_try_main(_db, account, _video_url, texts, **_kwargs):
         nonlocal active_main, max_active_main
@@ -6528,6 +6742,97 @@ async def test_parallel_mode_caps_active_main_at_three_and_reply_at_target(monke
     assert max_active_main == 3
     assert max_active_reply == 4
     assert close_calls == ["close", "close"]
+
+
+@pytest.mark.unit
+@pytest.mark.asyncio
+async def test_parallel_mode_limits_main_proxy_to_two_active_browsers(monkeypatch):
+    from db import database as db_database
+    from executor import browser_pool, user_schema
+
+    @contextmanager
+    def fake_db_context():
+        yield SimpleNamespace(no_autoflush=SimpleNamespace())
+
+    shared_proxy = "http://proxy-a:1000"
+    main_accounts = [
+        SimpleNamespace(id=101 + i, proxy=shared_proxy)
+        for i in range(3)
+    ]
+    main_attempts = []
+    selection_snapshots = []
+    active_by_proxy: dict[str, int] = {}
+    max_active_by_proxy: dict[str, int] = {}
+    close_calls = []
+    real_sleep = asyncio.sleep
+
+    def fake_get_main(_db, *, exclude_ids=None, exclude_proxies=None, **_kwargs):
+        excluded = set(exclude_ids or [])
+        excluded_proxies = {str(proxy).strip() for proxy in (exclude_proxies or []) if proxy}
+        selection_snapshots.append((tuple(sorted(excluded)), tuple(sorted(excluded_proxies))))
+        return next(
+            (
+                account
+                for account in main_accounts
+                if account.id not in excluded
+                and str(account.proxy or "").strip() not in excluded_proxies
+            ),
+            None,
+        )
+
+    async def fake_try_main(_db, account, _video_url, texts, **_kwargs):
+        proxy = str(account.proxy or "")
+        active_by_proxy[proxy] = active_by_proxy.get(proxy, 0) + 1
+        max_active_by_proxy[proxy] = max(
+            max_active_by_proxy.get(proxy, 0),
+            active_by_proxy[proxy],
+        )
+        main_attempts.append((account.id, tuple(texts)))
+        await real_sleep(0.02)
+        active_by_proxy[proxy] -= 1
+        return [
+            user_schema.PublishedMain(
+                text=text,
+                comment_id=f"cid-{account.id}-{text}",
+                network_confirmed=True,
+                local_confirmed=True,
+                method="hybrid_dom",
+                account_id=account.id,
+                tiktok_username=f"user_{account.id}",
+            )
+            for text in texts
+        ], None
+
+    async def fake_close_pool():
+        close_calls.append("close")
+
+    monkeypatch.setattr(user_schema._settings, "PARALLEL_COMMENTING_TARGET_BROWSERS", 3, raising=False)
+    monkeypatch.setattr(user_schema._settings, "PARALLEL_COMMENTING_MAX_BROWSERS", 3, raising=False)
+    monkeypatch.setattr(user_schema._settings, "PARALLEL_COMMENTING_MAX_MAIN_ATTEMPTS", 6, raising=False)
+    monkeypatch.setattr(db_database, "get_sync_db_context", fake_db_context)
+    monkeypatch.setattr(user_schema, "get_free_account_for_main_comment", fake_get_main)
+    monkeypatch.setattr(user_schema, "_try_main_account", fake_try_main)
+    monkeypatch.setattr(user_schema, "release_main_account_reservation", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(user_schema, "_maybe_order_likes", AsyncMock(return_value=None))
+    monkeypatch.setattr(browser_pool, "ensure_thread_browser_pool_capacity", lambda _min_browsers: None)
+    monkeypatch.setattr(browser_pool, "close_browser_pool", fake_close_pool)
+
+    result = await user_schema.execute_user_schema_parallel(
+        SimpleNamespace(),
+        SimpleNamespace(settings={"replies": [], "reply_count": 0}),
+        "https://www.tiktok.com/@demo/video/1234567890123456789",
+        ["m1", "m2", "m3"],
+        505,
+        boost_enabled=False,
+        boost_quantity=0,
+    )
+
+    assert result.error is None
+    assert [main.text for main in result.published_mains] == ["m1", "m2", "m3"]
+    assert [attempt[0] for attempt in main_attempts] == [101, 102, 103]
+    assert max_active_by_proxy[shared_proxy] == 2
+    assert any(shared_proxy in excluded_proxies for _excluded_ids, excluded_proxies in selection_snapshots)
+    assert close_calls == ["close"]
 
 
 @pytest.mark.unit
@@ -7200,12 +7505,26 @@ async def test_parallel_mode_carries_submitted_parent_keys_across_reply_retries(
     def fake_db_context():
         yield SimpleNamespace(no_autoflush=SimpleNamespace())
 
-    main_account = SimpleNamespace(id=101, proxy=None)
+    main_accounts = [SimpleNamespace(id=101, proxy=None), SimpleNamespace(id=102, proxy=None)]
     reply_accounts = [SimpleNamespace(id=201, proxy=None), SimpleNamespace(id=202, proxy=None)]
     reply_calls = []
+    selected_main_ids: set[int] = set()
+    select_lock = threading.Lock()
 
     def fake_get_main(_db, *, exclude_ids=None, **_kwargs):
-        return main_account
+        excluded = set(exclude_ids or [])
+        with select_lock:
+            candidate = next(
+                (
+                    account
+                    for account in main_accounts
+                    if account.id not in excluded and account.id not in selected_main_ids
+                ),
+                None,
+            )
+            if candidate is not None:
+                selected_main_ids.add(candidate.id)
+            return candidate
 
     async def fake_try_main(_db, account, _video_url, texts, **_kwargs):
         return [
@@ -7298,7 +7617,7 @@ async def test_parallel_mode_carries_submitted_parent_keys_across_reply_retries(
     assert reply_calls[1][0] == 202
     assert "cid-101-m1" in reply_calls[1][1]
     assert "m1" not in reply_calls[1][1]
-    assert [outcome.parent_comment_id for outcome in result.replies] == ["cid-101-m1", "cid-101-m2"]
+    assert [outcome.parent_comment_id for outcome in result.replies] == ["cid-101-m1", "cid-102-m2"]
     assert result.replies[0].submitted_unconfirmed is True
 
 

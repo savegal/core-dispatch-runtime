@@ -6890,7 +6890,7 @@ async def type_into_comment(
         logger.debug("[DOM] Focus+insert_text primary failed global re-verify; falling back")
         return False
 
-    if not _deadline_exceeded():
+    if reply_scoped and not _deadline_exceeded():
         if await _atomic_prefix_then_trusted_tail():
             return True
 
