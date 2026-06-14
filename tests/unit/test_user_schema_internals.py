@@ -1514,6 +1514,50 @@ async def test_parallel_main_submit_without_response_stops_current_account_serie
 
 @pytest.mark.unit
 @pytest.mark.asyncio
+async def test_parallel_main_direct_no_response_ignores_text_only_local_match(monkeypatch):
+    from executor import user_schema
+    from executor.publish_action import PublishResult
+
+    async def fake_publish(_page, text, **kwargs):
+        assert text == "first"
+        assert kwargs["correlation_id"] == "task_1_parallel_main_v1_a1_acc44_v1"
+        return PublishResult(
+            status="timeout",
+            error_reason="no_network_response_after_main_direct_post_click",
+            network_request_attempted=True,
+            dom_strategy="main-direct-test",
+            post_was_enabled_at_click=True,
+        )
+
+    async def fake_username(_page):
+        return "main_user"
+
+    finder = AsyncMock(return_value=(True, {"comment_id": "stale-or-other-account-cid"}))
+
+    monkeypatch.setattr(user_schema, "publish_comment_hybrid", fake_publish)
+    monkeypatch.setattr(user_schema, "extract_tiktok_username", fake_username)
+    monkeypatch.setattr(user_schema, "find_comment_in_list", finder)
+    monkeypatch.setattr(user_schema, "_deny_if_visible_logged_out", AsyncMock(return_value=None))
+
+    published, failure_reason = await user_schema._publish_all_variants_on_account(
+        SimpleNamespace(),
+        SimpleNamespace(url="https://www.tiktok.com/@demo/video/1234567890123456789"),
+        SimpleNamespace(id=44),
+        ["first", "second"],
+        correlation_id="task_1_parallel_main_v1_a1_acc44",
+        expected_video_url="https://www.tiktok.com/@demo/video/1234567890123456789",
+    )
+
+    finder.assert_not_awaited()
+    assert failure_reason == "main_partial:published=1/2;remaining=1;reason=account_series_stopped"
+    assert len(published) == 1
+    assert published[0].text == "first"
+    assert published[0].comment_id is None
+    assert published[0].local_confirmed is False
+
+
+@pytest.mark.unit
+@pytest.mark.asyncio
 async def test_publish_all_variants_stops_after_dirty_typing_timeout(monkeypatch):
     from executor import user_schema
     from executor.publish_action import PublishResult

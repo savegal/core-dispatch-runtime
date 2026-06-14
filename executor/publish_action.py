@@ -2616,7 +2616,8 @@ async def _publish_main_comment_direct_dom(
             if request_attempted
             else "no_network_request_after_main_direct_post_click"
         )
-        if not request_attempted:
+        dirty_composer_after_click = bool(cleared.get("exists") and not cleared.get("empty"))
+        if not request_attempted or dirty_composer_after_click:
             await _clear_main_comment_composer_best_effort(
                 page,
                 reason=error_reason,

@@ -3372,6 +3372,17 @@ def _should_attempt_local_publish_confirmation(result: "PublishResult") -> bool:
     return False
 
 
+def _main_publish_allows_local_text_confirmation(result: "PublishResult") -> bool:
+    """Do not trust text-only matches after ambiguous main direct Post clicks."""
+    reason = result.error_reason or ""
+    if result.status == "timeout" and reason in {
+        "no_network_request_after_main_direct_post_click",
+        "no_network_response_after_main_direct_post_click",
+    }:
+        return False
+    return True
+
+
 async def _recover_page_before_input_retry(page: Page, *, correlation_id: str) -> bool:
     logger.warning(
         "[USER_SCHEMA] %s got composer/open-comments failure with login-ready page; soft-recovering composer without reload",
@@ -3582,6 +3593,14 @@ async def _publish_all_variants_on_account(
         local_confirmed = False
         local_comment_id: Optional[str] = None
         if not success and _should_attempt_local_publish_confirmation(result):
+            local_text_allowed = _main_publish_allows_local_text_confirmation(result)
+            if not local_text_allowed:
+                logger.warning(
+                    "[USER_SCHEMA] main publish %s skipped text-only local confirmation after %s; "
+                    "parallel main variants can share text across accounts, so this remains submitted_unconfirmed",
+                    sub_corr,
+                    result.error_reason or result.status,
+                )
             # publish_action did not return success+comment_id. Run a quick
             # local DOM probe to see what's there, but be strict about when we
             # treat it as local_confirmed.
@@ -3598,7 +3617,10 @@ async def _publish_all_variants_on_account(
             # synthetic dispatch produces no network event → text is in our
             # composer, not in any actual published comment list.
             try:
-                if expected_video_url and not is_on_expected_media_url(getattr(page, "url", None), expected_video_url):
+                if not local_text_allowed:
+                    local_ok = False
+                    local_info = {}
+                elif expected_video_url and not is_on_expected_media_url(getattr(page, "url", None), expected_video_url):
                     logger.warning(
                         "[USER_SCHEMA] main publish %s skipped local confirmation due to URL drift: expected=%s current=%s",
                         sub_corr,

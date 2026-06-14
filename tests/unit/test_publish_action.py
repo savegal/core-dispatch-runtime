@@ -2203,9 +2203,20 @@ async def test_main_direct_dom_fallback_reports_no_response_after_publish_reques
     async def _fake_composer_cleared_state(*args, **kwargs):
         return {"exists": True, "empty": False}
 
+    clear_calls = []
+
+    async def _fake_clear_main_comment_composer_best_effort(*args, **kwargs):
+        clear_calls.append(kwargs.get("reason"))
+        return True
+
     page = _RequestOnlyDirectPage()
     monkeypatch.setattr(publish_action, "_type_main_comment_without_handle", _fake_type_main_comment_without_handle)
     monkeypatch.setattr(publish_action, "_composer_cleared_state", _fake_composer_cleared_state)
+    monkeypatch.setattr(
+        publish_action,
+        "_clear_main_comment_composer_best_effort",
+        _fake_clear_main_comment_composer_best_effort,
+    )
     monkeypatch.setattr(publish_action, "_PARALLEL_POST_RESPONSE_GRACE_SECONDS", 0.01)
 
     result = await publish_action._publish_main_comment_direct_dom(
@@ -2223,6 +2234,7 @@ async def test_main_direct_dom_fallback_reports_no_response_after_publish_reques
     assert result.error_reason == "no_network_response_after_main_direct_post_click"
     assert result.network_request_attempted is True
     assert result.post_was_enabled_at_click is True
+    assert clear_calls == ["no_network_response_after_main_direct_post_click"]
     assert set(page.removed) == {"request", "response"}
 
 
