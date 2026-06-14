@@ -2136,6 +2136,46 @@ async def test_type_main_comment_without_handle_uses_smart_typing_before_legacy_
 
 @pytest.mark.unit
 @pytest.mark.asyncio
+async def test_type_reply_comment_without_handle_uses_scoped_smart_typing_first(monkeypatch):
+    calls = {"smart": 0, "scoped_probe": 0, "atomic": 0}
+
+    async def _fake_type_into_comment(*args, **kwargs):
+        calls["smart"] += 1
+        assert kwargs["deadline"] == 123.0
+        assert kwargs["reply_scoped"] is True
+        assert kwargs["anchor_token"] == "pa-1"
+        return True
+
+    async def _fake_reply_contains(*args, **kwargs):
+        calls["scoped_probe"] += 1
+        return True, "reply text"
+
+    async def _unexpected_atomic(*args, **kwargs):
+        calls["atomic"] += 1
+        raise AssertionError("atomic fallback should not run after scoped smart typing succeeds")
+
+    monkeypatch.setattr(publish_action, "type_into_comment", _fake_type_into_comment)
+    monkeypatch.setattr(publish_action, "_reply_scoped_input_contains_expected_text", _fake_reply_contains)
+    monkeypatch.setattr(publish_action, "atomic_set_comment_text", _unexpected_atomic)
+
+    result = await publish_action._type_reply_comment_without_handle(
+        _FakePage(),
+        "reply text",
+        parent_anchor_token="pa-1",
+        fast=True,
+        deadline=123.0,
+    )
+
+    assert result == {
+        "ok": True,
+        "strategy": "reply-direct-smart-type",
+        "text": "reply text",
+    }
+    assert calls == {"smart": 1, "scoped_probe": 1, "atomic": 0}
+
+
+@pytest.mark.unit
+@pytest.mark.asyncio
 async def test_main_direct_dom_fallback_reports_no_response_after_publish_request(monkeypatch):
     class _RequestOnlyDirectPage(_FakePage):
         async def evaluate(self, script, *args):

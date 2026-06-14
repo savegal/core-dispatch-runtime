@@ -1510,6 +1510,70 @@ async def test_type_into_comment_main_uses_atomic_prefix_tail_after_keyboard_mis
 
 @pytest.mark.unit
 @pytest.mark.asyncio
+async def test_type_into_comment_reply_uses_scoped_full_insert_after_keyboard_miss(monkeypatch):
+    keyboard_calls = {"insert_text": [], "press": []}
+    atomic_calls = []
+
+    class _Keyboard:
+        async def insert_text(self, text):
+            keyboard_calls["insert_text"].append(text)
+
+        async def press(self, key):
+            keyboard_calls["press"].append(key)
+
+        async def type(self, *_args, **_kwargs):
+            raise AssertionError("reply fallback should not reach slow keyboard.type")
+
+    class _Page:
+        keyboard = _Keyboard()
+
+        async def evaluate(self, script, *args):
+            script_text = str(script)
+            if "document.activeElement" in script_text:
+                return True
+            if 'data-smart-reply-input="1"' in script_text:
+                return {"ok": False, "text": ""}
+            return {"ok": False, "text": ""}
+
+    async def _fake_atomic(_page, text, **kwargs):
+        atomic_calls.append((text, kwargs))
+        if kwargs.get("insert_text") == "hell":
+            return {"ok": False, "reason": "verify_failed", "text": "he", "scoped": "reply"}
+        if kwargs.get("focus_only"):
+            return {"ok": True, "reason": "focused", "scoped": "reply"}
+        return {"ok": True, "reason": "inserted", "text": text, "scoped": "reply"}
+
+    async def _fake_suppress(_page):
+        return 0
+
+    async def _fake_sleep(_seconds):
+        return None
+
+    monkeypatch.setattr(dom_actions, "atomic_set_comment_text", _fake_atomic)
+    monkeypatch.setattr(dom_actions, "suppress_keyboard_shortcuts_overlay", _fake_suppress)
+    monkeypatch.setattr(dom_actions.asyncio, "sleep", _fake_sleep)
+
+    ok = await dom_actions.type_into_comment(
+        _Page(),
+        None,
+        "hello",
+        fast=True,
+        reply_scoped=True,
+        anchor_token="pa-777",
+    )
+
+    assert ok is True
+    assert [kwargs for _text, kwargs in atomic_calls] == [
+        {"reply_scoped": True, "anchor_token": "pa-777", "insert_text": "hell"},
+        {"reply_scoped": True, "anchor_token": "pa-777", "focus_only": True},
+        {"reply_scoped": True, "anchor_token": "pa-777"},
+    ]
+    assert keyboard_calls["press"] == ["Control+A", "Backspace"]
+    assert keyboard_calls["insert_text"] == ["hello"]
+
+
+@pytest.mark.unit
+@pytest.mark.asyncio
 async def test_type_into_comment_reply_scoped_forwards_anchor_to_atomic(monkeypatch):
     captured = {}
 
@@ -1557,6 +1621,15 @@ async def test_type_into_comment_reply_scoped_forwards_anchor_to_atomic(monkeypa
     assert captured["atomic_args"][2] == "pa-xyz"
     assert captured["atomic_args"][3] is True
     assert captured["atomic_args"][4] is False  # prefix path, not focusOnly
+
+
+@pytest.mark.unit
+def test_reply_typing_stays_scoped_and_skips_unscoped_js_fallback():
+    source = inspect.getsource(dom_actions.type_into_comment)
+
+    assert "document.querySelector('[data-smart-reply-input=\"1\"]')" in source
+    assert "Scoped reply typing did not verify; skipping unscoped JS fallback" in source
+    assert "anchor_token=anchor_token if reply_scoped else None" in source
 
 
 @pytest.mark.unit

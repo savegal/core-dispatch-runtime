@@ -6336,6 +6336,23 @@ async def type_into_comment(
         When inner contenteditable has h=0 (unfocused), returns the WRAPPER
         so that click lands on the visible area and the browser focuses the inner.
         """
+        if reply_scoped:
+            if element is not None:
+                try:
+                    await element.evaluate(
+                        "el => { try { el.setAttribute('data-smart-reply-input', '1'); el.setAttribute('data-smart-id', 'comment-input'); } catch (_) {} }"
+                    )
+                except Exception:
+                    pass
+                return element
+            try:
+                marked_reply = await page.query_selector('[data-smart-reply-input="1"]')
+                if marked_reply:
+                    return marked_reply
+            except Exception:
+                pass
+            return None
+
         # Comment-specific selectors FIRST to avoid picking an unrelated input (e.g. search box)
         selectors = [
             '[data-smart-id="comment-input"]',
@@ -6555,16 +6572,60 @@ async def type_into_comment(
             pass
         return False, ""
 
+    async def _scoped_text_contains_expected() -> tuple[bool, str]:
+        if not reply_scoped:
+            return await _page_text_contains_expected()
+        try:
+            found = await page.evaluate(
+                r"""
+                (expected) => {
+                    const input = document.querySelector('[data-smart-reply-input="1"]');
+                    if (!input) return { ok: false, text: '', reason: 'reply_input_missing' };
+                    const normalizeText = (value) => String(value || '').replace(/\s+/g, ' ').trim();
+                    const placeholderMarkers = [
+                        'add comment',
+                        'add a comment',
+                        'say something',
+                        'leave a comment',
+                        '\u0434\u043e\u0431\u0430\u0432\u044c\u0442\u0435 \u043a\u043e\u043c\u043c\u0435\u043d\u0442\u0430\u0440',
+                        '\u043d\u0430\u043f\u0438\u0448\u0438\u0442\u0435 \u043a\u043e\u043c\u043c\u0435\u043d\u0442\u0430\u0440',
+                        '\u0434\u043e\u0434\u0430\u0442\u0438 \u0432\u0456\u0434\u043f\u043e\u0432\u0456\u0434\u044c'
+                    ];
+                    const raw = (input.value !== undefined && input.value !== null && input.value !== '')
+                        ? input.value
+                        : (input.textContent || input.innerText || '');
+                    const txt = normalizeText(raw);
+                    const lower = txt.toLowerCase();
+                    const placeholderLeak = placeholderMarkers.some(marker => lower.startsWith(marker));
+                    return {
+                        ok: Boolean(txt && !placeholderLeak && txt === normalizeText(expected)),
+                        text: txt.slice(0, 120),
+                        reason: placeholderLeak ? 'placeholder_leak' : 'checked',
+                    };
+                }
+                """,
+                text,
+            )
+            if isinstance(found, dict):
+                return bool(found.get("ok")), str(found.get("text") or "")
+        except Exception:
+            pass
+        return False, ""
+
     async def _focus_ok() -> bool:
         try:
             result = await page.evaluate(
                 r"""
-                () => {
+                ([replyScoped]) => {
                     const active = document.activeElement;
                     if (!active) return false;
+                    if (replyScoped) {
+                        const replyInput = document.querySelector('[data-smart-reply-input="1"]');
+                        return Boolean(replyInput && (replyInput === active || replyInput.contains(active)));
+                    }
                     const scopedEditor = () => {
                         const wrapper = document.querySelector(
-                            '[data-smart-id="comment-input"], [data-e2e="comment-input"], [data-e2e*="comment-input"], [data-e2e*="CommentInput"]'
+                            '[data-smart-id="comment-input"]:not([data-smart-reply-input="1"]), [data-e2e="comment-input"], [data-e2e*="comment-input"], [data-e2e*="CommentInput"]'
                         );
                         if (wrapper) {
                             return wrapper.querySelector(
@@ -6581,6 +6642,8 @@ async def type_into_comment(
                             let cur = el;
                             for (let depth = 0; depth < 8 && cur && cur !== document.body; depth++, cur = cur.parentElement) {
                                 const label = labelOf(cur);
+                                if (label.includes('data-smart-reply') || label.includes('smart-reply')) return false;
+                                if (label.includes('replycommenteditor') || label.includes('reply-comment-editor')) return false;
                                 if (label.includes('search') || label.includes('captcha') || label.includes('challenge')) return false;
                                 if (label.includes('comment') || label.includes('reply')) return true;
                             }
@@ -6595,7 +6658,8 @@ async def type_into_comment(
                         editor && (editor === active || editor.contains(active))
                     );
                 }
-                """
+                """,
+                [reply_scoped],
             )
             return bool(result)
         except Exception:
@@ -6876,7 +6940,7 @@ async def type_into_comment(
             logger.debug("[DOM] Atomic prefix primary trusted tail failed (%s); falling back", str(exc)[:120])
             return False
 
-        ok, found_text = await _page_text_contains_expected()
+        ok, found_text = await _scoped_text_contains_expected()
         if ok:
             logger.info(
                 "[DOM] Text set via atomic-prefix+trusted-tail primary: '%s'",
@@ -6917,7 +6981,7 @@ async def type_into_comment(
             logger.debug("[DOM] Trusted insert_text primary failed (%s); falling back", str(exc)[:120])
             return False
 
-        ok, found_text = await _page_text_contains_expected()
+        ok, found_text = await _scoped_text_contains_expected()
         if ok:
             logger.info(
                 "[DOM] Text set via focus+insert_text primary (%s): '%s'",
@@ -6930,36 +6994,34 @@ async def type_into_comment(
         return False
 
     async def _atomic_full_insert_fallback() -> bool:
-        """Last-resort exact DOM insert for main comments.
+        """Last-resort exact DOM insert for comments and anchored replies.
 
         The publish layer still gates the Post click on exact current text and
         an enabled button. This fallback only gives TikTok/Draft.js another
         chance to receive input events when trusted keyboard insertion does not
         commit into contenteditable.
         """
-        if reply_scoped or not text:
+        if not text:
             return False
         result = await atomic_set_comment_text(
             page,
             text,
-            reply_scoped=False,
-            anchor_token=None,
+            reply_scoped=reply_scoped,
+            anchor_token=anchor_token if reply_scoped else None,
         )
         if not isinstance(result, dict) or not result.get("ok"):
             logger.debug(
-                "[DOM] Atomic full main insert failed (%s); falling back",
+                "[DOM] Atomic full %s insert failed (%s); falling back",
+                "reply" if reply_scoped else "main",
                 result.get("reason") if isinstance(result, dict) else "no_result",
             )
             return False
-        ok, found_text = await _page_text_contains_expected()
-        if ok:
-            logger.info(
-                "[DOM] Text set via atomic full main insert: '%s'",
-                found_text[:30],
-            )
-            return True
-        logger.debug("[DOM] Atomic full main insert failed global re-verify; falling back")
-        return False
+        logger.info(
+            "[DOM] Text set via atomic full %s insert: '%s'",
+            "reply" if reply_scoped else "main",
+            str(result.get("text") or text)[:30],
+        )
+        return True
 
     if reply_scoped and not _deadline_exceeded():
         if await _atomic_prefix_then_trusted_tail():
@@ -6973,11 +7035,14 @@ async def type_into_comment(
         if await _atomic_prefix_then_trusted_tail():
             return True
 
-    if not reply_scoped and not _deadline_exceeded():
+    if not _deadline_exceeded():
         if await _atomic_full_insert_fallback():
             return True
 
     editor = await _resolve_editor_handle()
+    if editor is None:
+        logger.debug("[DOM] No scoped comment editor handle available after atomic attempts")
+        return False
 
     # Placeholder before typing. Used only for sanity check, not as hard gate.
     placeholder_text = ""
@@ -7067,7 +7132,7 @@ async def type_into_comment(
                     await page.keyboard.type(text, delay=30)
                 await asyncio.sleep(0.45)
 
-                ok, found_text = await _page_text_contains_expected()
+                ok, found_text = await _scoped_text_contains_expected()
                 if ok:
                     logger.info("[DOM] Text typed and verified: '%s' (%d chars)", found_text[:30], len(found_text))
                     return True
@@ -7085,11 +7150,15 @@ async def type_into_comment(
     if _deadline_exceeded():
         return False
 
+    if reply_scoped:
+        logger.warning("[DOM] Scoped reply typing did not verify; skipping unscoped JS fallback")
+        return False
+
     if await _js_insert_text("focus_failed_or_keyboard_unverified"):
         return True
 
     # One last check: maybe text is already there but handle was stale.
-    ok, found_text = await _page_text_contains_expected()
+    ok, found_text = await _scoped_text_contains_expected()
     if ok:
         logger.info("[DOM] Text verified after final global check: '%s'", found_text[:30])
         return True

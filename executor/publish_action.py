@@ -2167,6 +2167,7 @@ async def _type_reply_comment_without_handle(
     *,
     parent_anchor_token: Optional[str],
     fast: bool = True,
+    deadline: Optional[float] = None,
 ) -> dict[str, Any]:
     """Type a reply without first resolving an ElementHandle.
 
@@ -2177,6 +2178,27 @@ async def _type_reply_comment_without_handle(
         return {"ok": False, "reason": "empty_text"}
     if not parent_anchor_token:
         return {"ok": False, "reason": "missing_parent_anchor"}
+
+    try:
+        typed_ok = await type_into_comment(
+            page,
+            None,
+            text,
+            deadline=deadline,
+            fast=fast,
+            reply_scoped=True,
+            anchor_token=parent_anchor_token,
+        )
+        if typed_ok:
+            ok, found_text = await _reply_scoped_input_contains_expected_text(page, text)
+            if ok:
+                return {
+                    "ok": True,
+                    "strategy": "reply-direct-smart-type",
+                    "text": found_text,
+                }
+    except Exception as exc:
+        logger.debug("[PUBLISH] Direct reply smart typing failed: %s", str(exc)[:120])
 
     prefix = text[:-1]
     tail = text[-1:]
@@ -2653,7 +2675,7 @@ async def _publish_reply_comment_direct_dom(
         previous_reason=previous_reason,
     )
 
-    type_timeout = min(3.2, max(0.5, _remaining() - 1.2))
+    type_timeout = min(7.0, max(0.8, _remaining() - 1.5))
     try:
         type_result = await _asyncio_wait_for(
             _type_reply_comment_without_handle(
@@ -2661,6 +2683,7 @@ async def _publish_reply_comment_direct_dom(
                 text,
                 parent_anchor_token=parent_anchor_token,
                 fast=True,
+                deadline=time.monotonic() + type_timeout,
             ),
             timeout=type_timeout,
         )
