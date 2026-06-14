@@ -2082,7 +2082,13 @@ async def _type_main_comment_by_mouse_keyboard(page: Page, text: str, *, fast: b
         return {"ok": False, "reason": f"keyboard_type_failed:{str(exc)[:100]}"}
 
 
-async def _type_main_comment_without_handle(page: Page, text: str, *, fast: bool = True) -> dict[str, Any]:
+async def _type_main_comment_without_handle(
+    page: Page,
+    text: str,
+    *,
+    fast: bool = True,
+    deadline: Optional[float] = None,
+) -> dict[str, Any]:
     """Type a top-level comment without first resolving an ElementHandle.
 
     This is intentionally main-comment only. Prefer a human-like click/focus
@@ -2091,6 +2097,25 @@ async def _type_main_comment_without_handle(page: Page, text: str, *, fast: bool
     """
     if not text:
         return {"ok": False, "reason": "empty_text"}
+
+    try:
+        typed_ok = await type_into_comment(
+            page,
+            None,
+            text,
+            deadline=deadline,
+            fast=fast,
+            reply_scoped=False,
+        )
+        if typed_ok:
+            ok, found_text = await comment_input_contains_expected_text(page, text)
+            return {
+                "ok": True,
+                "strategy": "main-direct-smart-type",
+                "text": found_text if ok else text,
+            }
+    except Exception as exc:
+        logger.debug("[PUBLISH] Direct main smart typing failed: %s", str(exc)[:120])
 
     keyboard_result = await _type_main_comment_by_mouse_keyboard(page, text, fast=fast)
     if isinstance(keyboard_result, dict) and keyboard_result.get("ok"):
@@ -2266,7 +2291,12 @@ async def _publish_main_comment_direct_dom(
     type_timeout = min(9.0, max(1.2, _remaining() - 1.5))
     try:
         type_result = await _asyncio_wait_for(
-            _type_main_comment_without_handle(page, text, fast=True),
+            _type_main_comment_without_handle(
+                page,
+                text,
+                fast=True,
+                deadline=time.monotonic() + type_timeout,
+            ),
             timeout=type_timeout,
         )
     except asyncio.TimeoutError:

@@ -6929,12 +6929,52 @@ async def type_into_comment(
         logger.debug("[DOM] Focus+insert_text primary failed global re-verify; falling back")
         return False
 
+    async def _atomic_full_insert_fallback() -> bool:
+        """Last-resort exact DOM insert for main comments.
+
+        The publish layer still gates the Post click on exact current text and
+        an enabled button. This fallback only gives TikTok/Draft.js another
+        chance to receive input events when trusted keyboard insertion does not
+        commit into contenteditable.
+        """
+        if reply_scoped or not text:
+            return False
+        result = await atomic_set_comment_text(
+            page,
+            text,
+            reply_scoped=False,
+            anchor_token=None,
+        )
+        if not isinstance(result, dict) or not result.get("ok"):
+            logger.debug(
+                "[DOM] Atomic full main insert failed (%s); falling back",
+                result.get("reason") if isinstance(result, dict) else "no_result",
+            )
+            return False
+        ok, found_text = await _page_text_contains_expected()
+        if ok:
+            logger.info(
+                "[DOM] Text set via atomic full main insert: '%s'",
+                found_text[:30],
+            )
+            return True
+        logger.debug("[DOM] Atomic full main insert failed global re-verify; falling back")
+        return False
+
     if reply_scoped and not _deadline_exceeded():
         if await _atomic_prefix_then_trusted_tail():
             return True
 
     if not _deadline_exceeded():
         if await _atomic_primary():
+            return True
+
+    if not reply_scoped and not _deadline_exceeded():
+        if await _atomic_prefix_then_trusted_tail():
+            return True
+
+    if not reply_scoped and not _deadline_exceeded():
+        if await _atomic_full_insert_fallback():
             return True
 
     editor = await _resolve_editor_handle()

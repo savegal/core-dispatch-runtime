@@ -1253,6 +1253,9 @@ async def test_publish_surface_ready_still_resolves_real_input_handle(monkeypatc
         calls["type_handle"] = input_handle
         return True
 
+    async def _fake_direct_dom_unavailable(*args, **kwargs):
+        return None
+
     monkeypatch.setattr(publish_action.asyncio, "sleep", _fake_sleep)
     monkeypatch.setattr(publish_action, "_captcha_result_if_present", _fake_none)
     monkeypatch.setattr(publish_action, "_logged_out_publish_result_if_visible", _fake_none)
@@ -1264,6 +1267,7 @@ async def test_publish_surface_ready_still_resolves_real_input_handle(monkeypatc
     monkeypatch.setattr(publish_action, "_clear_post_click_blockers", _fake_clear_post_click_blockers)
     monkeypatch.setattr(publish_action, "ensure_click_target_clear", _fake_ensure_click_target_clear)
     monkeypatch.setattr(publish_action, "type_into_comment", _fake_type_into_comment)
+    monkeypatch.setattr(publish_action, "_publish_main_comment_direct_dom", _fake_direct_dom_unavailable)
 
     result = await publish_action._publish_via_current_input(
         page,
@@ -2091,6 +2095,43 @@ async def test_main_direct_dom_fallback_returns_success_from_publish_response(mo
     assert result.network_captured is True
     assert result.post_was_enabled_at_click is True
     assert set(page.removed) == {"request", "response"}
+
+
+@pytest.mark.unit
+@pytest.mark.asyncio
+async def test_type_main_comment_without_handle_uses_smart_typing_before_legacy_keyboard(monkeypatch):
+    calls = {"smart": 0, "legacy": 0}
+
+    async def _fake_type_into_comment(*args, **kwargs):
+        calls["smart"] += 1
+        assert kwargs["deadline"] == 123.0
+        assert kwargs["reply_scoped"] is False
+        return True
+
+    async def _fake_contains_expected(*args, **kwargs):
+        return True, "hello"
+
+    async def _unexpected_legacy_keyboard(*args, **kwargs):
+        calls["legacy"] += 1
+        raise AssertionError("legacy mouse/keyboard path should not run after smart typing succeeds")
+
+    monkeypatch.setattr(publish_action, "type_into_comment", _fake_type_into_comment)
+    monkeypatch.setattr(publish_action, "comment_input_contains_expected_text", _fake_contains_expected)
+    monkeypatch.setattr(publish_action, "_type_main_comment_by_mouse_keyboard", _unexpected_legacy_keyboard)
+
+    result = await publish_action._type_main_comment_without_handle(
+        _FakePage(),
+        "hello",
+        fast=True,
+        deadline=123.0,
+    )
+
+    assert result == {
+        "ok": True,
+        "strategy": "main-direct-smart-type",
+        "text": "hello",
+    }
+    assert calls == {"smart": 1, "legacy": 0}
 
 
 @pytest.mark.unit

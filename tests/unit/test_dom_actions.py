@@ -1455,6 +1455,61 @@ async def test_type_into_comment_main_prefers_focus_insert_over_prefix_tail(monk
 
 @pytest.mark.unit
 @pytest.mark.asyncio
+async def test_type_into_comment_main_uses_atomic_prefix_tail_after_keyboard_miss(monkeypatch):
+    keyboard_calls = {"insert_text": [], "press": []}
+    atomic_calls = []
+
+    class _Keyboard:
+        async def insert_text(self, text):
+            keyboard_calls["insert_text"].append(text)
+
+        async def press(self, key):
+            keyboard_calls["press"].append(key)
+
+        async def type(self, *_args, **_kwargs):
+            raise AssertionError("main fallback should not reach slow keyboard.type")
+
+    class _Page:
+        keyboard = _Keyboard()
+
+        async def evaluate(self, script, *args):
+            if "document.activeElement" in str(script):
+                return True
+            if keyboard_calls["insert_text"] == ["hello", "o"]:
+                return {"ok": True, "text": "hello"}
+            return {"ok": False, "text": ""}
+
+    async def _fake_atomic(_page, text, **kwargs):
+        atomic_calls.append((text, kwargs))
+        if kwargs.get("focus_only"):
+            return {"ok": True, "reason": "focused", "scoped": "global"}
+        if kwargs.get("insert_text") == "hell":
+            return {"ok": False, "reason": "verify_failed", "text": "hell", "scoped": "global"}
+        return {"ok": False, "reason": "unexpected_atomic_call", "text": "", "scoped": "global"}
+
+    async def _fake_suppress(_page):
+        return 0
+
+    async def _fake_sleep(_seconds):
+        return None
+
+    monkeypatch.setattr(dom_actions, "atomic_set_comment_text", _fake_atomic)
+    monkeypatch.setattr(dom_actions, "suppress_keyboard_shortcuts_overlay", _fake_suppress)
+    monkeypatch.setattr(dom_actions.asyncio, "sleep", _fake_sleep)
+
+    ok = await dom_actions.type_into_comment(_Page(), object(), "hello", fast=True)
+
+    assert ok is True
+    assert [kwargs for _text, kwargs in atomic_calls] == [
+        {"reply_scoped": False, "anchor_token": None, "focus_only": True},
+        {"reply_scoped": False, "anchor_token": None, "insert_text": "hell"},
+    ]
+    assert keyboard_calls["press"] == ["Control+A", "Backspace"]
+    assert keyboard_calls["insert_text"] == ["hello", "o"]
+
+
+@pytest.mark.unit
+@pytest.mark.asyncio
 async def test_type_into_comment_reply_scoped_forwards_anchor_to_atomic(monkeypatch):
     captured = {}
 
