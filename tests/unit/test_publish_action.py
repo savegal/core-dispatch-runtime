@@ -503,11 +503,86 @@ async def test_publish_via_current_input_hard_limits_input_clear(monkeypatch):
         page,
         "hello",
         max_total_seconds=5.0,
-        correlation_id="task_1_parallel_main_v1_a1_acc2",
+        correlation_id="manual_comment",
     )
 
     assert result.status == "timeout"
     assert result.error_reason == "publish_deadline_exceeded:input_clear"
+
+
+@pytest.mark.unit
+@pytest.mark.asyncio
+async def test_parallel_main_publish_soft_continues_after_input_clear_timeout(monkeypatch):
+    page = _FakePage()
+    calls = {"clear": 0, "type": 0}
+
+    class _ImmediateResponseMouse:
+        def __init__(self, page):
+            self.page = page
+
+        async def move(self, *_args, **_kwargs):
+            return None
+
+        async def down(self, *_args, **_kwargs):
+            return None
+
+        async def up(self, *_args, **_kwargs):
+            self.page.click_count += 1
+            handler = self.page.listeners.get("response")
+            assert handler is not None
+            handler(_FakeResponse())
+
+    page.mouse = _ImmediateResponseMouse(page)
+
+    async def _fake_none(*args, **kwargs):
+        return None
+
+    async def _fake_suppress_keyboard_shortcuts_overlay(*args, **kwargs):
+        return 0
+
+    async def _fake_find_comment_input_smart(*args, **kwargs):
+        return _FakeInput(), SimpleNamespace(strategy="input", elapsed_seconds=0.1, reason=None)
+
+    async def _timeout_clear(*args, **kwargs):
+        calls["clear"] += 1
+        if calls["clear"] == 1:
+            raise asyncio.TimeoutError()
+        return None
+
+    async def _fake_type(*args, **kwargs):
+        calls["type"] += 1
+        return True
+
+    async def _fake_find_post_button_smart(*args, **kwargs):
+        return _FakeButton(), SimpleNamespace(strategy="post")
+
+    async def _fake_wait_for_post_button_enabled(*args, **kwargs):
+        return _FakeButton(), SimpleNamespace(strategy="post", reason=None)
+
+    async def _fake_clear_post_click_blockers(*args, **kwargs):
+        return _FakeButton(), {"tag": "BUTTON"}, True
+
+    monkeypatch.setattr(publish_action, "_captcha_result_if_present", _fake_none)
+    monkeypatch.setattr(publish_action, "_logged_out_publish_result_if_visible", _fake_none)
+    monkeypatch.setattr(publish_action, "_publish_url_guard_result", lambda *args, **kwargs: None)
+    monkeypatch.setattr(publish_action, "suppress_keyboard_shortcuts_overlay", _fake_suppress_keyboard_shortcuts_overlay)
+    monkeypatch.setattr(publish_action, "find_comment_input_smart", _fake_find_comment_input_smart)
+    monkeypatch.setattr(publish_action, "ensure_click_target_clear", _timeout_clear)
+    monkeypatch.setattr(publish_action, "type_into_comment", _fake_type)
+    monkeypatch.setattr(publish_action, "find_post_button_smart", _fake_find_post_button_smart)
+    monkeypatch.setattr(publish_action, "wait_for_post_button_enabled", _fake_wait_for_post_button_enabled)
+    monkeypatch.setattr(publish_action, "_clear_post_click_blockers", _fake_clear_post_click_blockers)
+
+    result = await publish_action._publish_via_current_input(
+        page,
+        "hello",
+        max_total_seconds=18.0,
+        correlation_id="task_1_parallel_main_v1_a1_acc2",
+    )
+
+    assert result.status == "success", result.error_reason
+    assert result.comment_id == "cid_retry_123"
+    assert calls == {"clear": 2, "type": 1}
 
 
 @pytest.mark.unit
@@ -1851,7 +1926,7 @@ async def test_publish_current_input_gives_parallel_main_extra_hydration_time(mo
     assert result.error_reason == "input_not_found: comment_input_open_deadline"
     assert calls["aggressive"] is True
     assert calls["main_comment_aggressive"] is True
-    assert 5.8 <= calls["max_total_seconds"] <= 6.1
+    assert 6.8 <= calls["max_total_seconds"] <= 7.1
     assert calls["direct_previous_reason"] == "comment_input_open_deadline"
 
 

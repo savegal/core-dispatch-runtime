@@ -7083,6 +7083,108 @@ async def test_parallel_mode_limits_main_proxy_to_two_active_browsers(monkeypatc
 
 @pytest.mark.unit
 @pytest.mark.asyncio
+async def test_parallel_mode_does_not_spin_main_selection_while_proxy_slots_are_full(monkeypatch):
+    from db import database as db_database
+    from executor import browser_pool, user_schema
+
+    @contextmanager
+    def fake_db_context():
+        yield SimpleNamespace(no_autoflush=SimpleNamespace())
+
+    shared_proxy = "http://proxy-spin:1000"
+    main_accounts = [
+        SimpleNamespace(id=101 + i, proxy=shared_proxy)
+        for i in range(3)
+    ]
+    selection_calls = 0
+    started_accounts: set[int] = set()
+    two_active_started = asyncio.Event()
+    release_active = asyncio.Event()
+
+    def fake_get_main(_db, *, exclude_ids=None, exclude_proxies=None, **_kwargs):
+        nonlocal selection_calls
+        selection_calls += 1
+        excluded = set(exclude_ids or [])
+        excluded_proxies = {str(proxy).strip() for proxy in (exclude_proxies or []) if proxy}
+        return next(
+            (
+                account
+                for account in main_accounts
+                if account.id not in excluded
+                and str(account.proxy or "").strip() not in excluded_proxies
+            ),
+            None,
+        )
+
+    async def fake_try_main(_db, account, _video_url, texts, **_kwargs):
+        started_accounts.add(account.id)
+        if len(started_accounts & {101, 102}) == 2:
+            two_active_started.set()
+        if account.id in {101, 102}:
+            await release_active.wait()
+        return [
+            user_schema.PublishedMain(
+                text=text,
+                comment_id=f"cid-{account.id}-{text}",
+                network_confirmed=True,
+                local_confirmed=True,
+                method="hybrid_dom",
+                account_id=account.id,
+                tiktok_username=f"user_{account.id}",
+            )
+            for text in texts
+        ], None
+
+    monkeypatch.setattr(user_schema._settings, "PARALLEL_COMMENTING_TARGET_BROWSERS", 3, raising=False)
+    monkeypatch.setattr(user_schema._settings, "PARALLEL_COMMENTING_MAX_BROWSERS", 3, raising=False)
+    monkeypatch.setattr(user_schema._settings, "PARALLEL_COMMENTING_MAX_MAIN_ATTEMPTS", 4, raising=False)
+    monkeypatch.setattr(user_schema._settings, "PARALLEL_MAIN_REFILL_POLL_SECONDS", 0.05, raising=False)
+    monkeypatch.setattr(user_schema._settings, "PARALLEL_PROXY_SLOT_REFILL_BACKOFF_SECONDS", 0.05, raising=False)
+    monkeypatch.setattr(db_database, "get_sync_db_context", fake_db_context)
+    monkeypatch.setattr(user_schema, "get_free_account_for_main_comment", fake_get_main)
+    monkeypatch.setattr(user_schema, "_try_main_account", fake_try_main)
+    monkeypatch.setattr(user_schema, "release_main_account_reservation", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(user_schema, "_maybe_order_likes", AsyncMock(return_value=None))
+    monkeypatch.setattr(browser_pool, "ensure_thread_browser_pool_capacity", lambda _min_browsers: None)
+    monkeypatch.setattr(browser_pool, "close_browser_pool", AsyncMock(return_value=None))
+
+    run_task = asyncio.create_task(
+        user_schema.execute_user_schema_parallel(
+            SimpleNamespace(),
+            SimpleNamespace(settings={"replies": [], "reply_count": 0}),
+            "https://www.tiktok.com/@demo/video/1234567890123456789",
+            ["m1", "m2", "m3"],
+            509,
+            boost_enabled=False,
+            boost_quantity=0,
+        )
+    )
+
+    await asyncio.wait_for(two_active_started.wait(), timeout=1.0)
+    stable_selection_rounds = 0
+    last_selection_calls = -1
+    selection_deadline = time.monotonic() + 1.0
+    while stable_selection_rounds < 3 and time.monotonic() < selection_deadline:
+        await asyncio.sleep(0.01)
+        if selection_calls == last_selection_calls:
+            stable_selection_rounds += 1
+        else:
+            stable_selection_rounds = 0
+            last_selection_calls = selection_calls
+    calls_after_defer = selection_calls
+    await asyncio.sleep(0.2)
+    assert selection_calls == calls_after_defer
+
+    release_active.set()
+    result = await asyncio.wait_for(run_task, timeout=2.0)
+
+    assert result.error is None
+    assert sorted(started_accounts) == [101, 102, 103]
+    assert [main.text for main in result.published_mains] == ["m1", "m2", "m3"] * 3
+
+
+@pytest.mark.unit
+@pytest.mark.asyncio
 async def test_parallel_mode_defers_reply_selection_when_proxy_slots_are_full(monkeypatch):
     from db import database as db_database
     from executor import browser_pool, user_schema

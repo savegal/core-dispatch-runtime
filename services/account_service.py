@@ -562,7 +562,7 @@ def _proxy_source_host(proxy_value: str | None) -> str:
 
 
 def _parallel_proxy_diversify_by_source_host() -> bool:
-    return bool(getattr(settings, "PARALLEL_PROXY_DIVERSIFY_BY_SOURCE_HOST", True))
+    return bool(getattr(settings, "PARALLEL_PROXY_DIVERSIFY_BY_SOURCE_HOST", False))
 
 
 def _account_cookie_key_diag(account: Account, max_keys: int = 40) -> list[str]:
@@ -1804,6 +1804,7 @@ def get_free_account_for_main_comment(
                 f"Error (with low error_count): {error_accounts}, "
                 f"Excluded: {excluded_count}, "
                 f"Excluded proxies: {len(normalized_exclude_proxies)}, "
+                f"Excluded proxy hosts: {len(normalized_exclude_proxy_hosts)}, "
                 f"Not in cooldown: {accounts_not_in_cooldown}, "
                 f"Below limit: {accounts_below_limit}, "
                 f"MAX_ACTIONS_PER_ACCOUNT={settings.MAX_ACTIONS_PER_ACCOUNT}, "
@@ -1941,9 +1942,15 @@ def get_free_account_for_main_comment(
                     diag_lifecycle = _read_account_lifecycle(diag_acc, now)
                     diag_session = _read_account_session_quality(diag_acc, MAIN_SCOPE, now)
                     diag_lane = _read_account_spend_lane(diag_acc, MAIN_SCOPE, now)
+                    diag_proxy = str(getattr(diag_acc, "proxy", "") or "").strip()
+                    diag_proxy_host = _proxy_source_host(diag_proxy)
 
                     if not _has_auth_material(diag_acc):
                         reasons.append("no_auth_material")
+                    if diag_proxy and diag_proxy in normalized_exclude_proxies:
+                        reasons.append("excluded_exact_proxy")
+                    if diag_proxy_host and diag_proxy_host in normalized_exclude_proxy_hosts:
+                        reasons.append(f"excluded_proxy_source_host={diag_proxy_host}")
                     if diag_lifecycle.get("hard_expired"):
                         reasons.append("hard_expired")
                     if diag_state.get("active_cooldown"):
@@ -1952,6 +1959,10 @@ def get_free_account_for_main_comment(
                         reasons.append(f"runtime_bucket={diag_state.get('bucket')}")
                     if diag_session.get("bucket") == SESSION_BUCKET_DEAD:
                         reasons.append("session_dead")
+                    if _is_publish_session_last_resort(diag_session):
+                        reasons.append("publish_session_last_resort")
+                        if not _allow_publish_session_last_resort():
+                            reasons.append("publish_session_last_resort_disabled")
                     if diag_lane.get("lane") == ACCOUNT_LANE_RETIRE:
                         reasons.append("lane_retire")
 

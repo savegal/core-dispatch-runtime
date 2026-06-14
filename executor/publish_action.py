@@ -48,8 +48,8 @@ _PARALLEL_FAST_PUBLISH_MARKERS = (
     "_parallel_reply_",
     "_engagement_reply_",
 )
-_PARALLEL_MAIN_OPEN_COMMENTS_SECONDS_DEFAULT = 5.5
-_PARALLEL_MAIN_INPUT_SEARCH_SECONDS_DEFAULT = 6.5
+_PARALLEL_MAIN_OPEN_COMMENTS_SECONDS_DEFAULT = 12.0
+_PARALLEL_MAIN_INPUT_SEARCH_SECONDS_DEFAULT = 8.0
 
 
 @dataclass
@@ -499,7 +499,7 @@ def _parallel_main_open_comments_seconds() -> float:
         "PARALLEL_MAIN_OPEN_COMMENTS_MAX_SECONDS",
         _PARALLEL_MAIN_OPEN_COMMENTS_SECONDS_DEFAULT,
         minimum=4.0,
-        maximum=12.0,
+        maximum=25.0,
     )
 
 
@@ -508,7 +508,7 @@ def _parallel_main_input_search_seconds() -> float:
         "PARALLEL_MAIN_INPUT_SEARCH_MAX_SECONDS",
         _PARALLEL_MAIN_INPUT_SEARCH_SECONDS_DEFAULT,
         minimum=3.0,
-        maximum=10.0,
+        maximum=15.0,
     )
 
 
@@ -2263,7 +2263,7 @@ async def _publish_main_comment_direct_dom(
         previous_reason=previous_reason,
     )
 
-    type_timeout = min(5.0, max(0.8, _remaining() - 1.2))
+    type_timeout = min(9.0, max(1.2, _remaining() - 1.5))
     try:
         type_result = await _asyncio_wait_for(
             _type_main_comment_without_handle(page, text, fast=True),
@@ -2956,9 +2956,9 @@ async def _publish_via_current_input(
         remaining = _remaining()
         if remaining <= 0:
             return 0.0
-        cap = 4.5 if aggressive else (6.0 if fast_publish else 10.0)
+        cap = 8.0 if aggressive else (6.0 if fast_publish else 10.0)
         if retry:
-            cap = min(cap, 3.5 if aggressive else 5.0)
+            cap = min(cap, 5.5 if aggressive else 5.0)
         reserve_for_post = 4.0 if aggressive else (5.0 if fast_publish else 6.0)
         if remaining > reserve_for_post + 0.75:
             return max(0.5, min(cap, remaining - reserve_for_post))
@@ -3332,10 +3332,20 @@ async def _publish_via_current_input(
         try:
             await _asyncio_wait_for(
                 ensure_click_target_clear(page, input_handle),
-                timeout=max(0.1, min(_remaining(), 1.5 if aggressive else 3.0)),
+                timeout=max(0.1, min(_remaining(), 2.5 if aggressive else 3.0)),
             )
         except asyncio.TimeoutError:
-            return _deadline_result("input_clear", input_info.strategy)
+            if not main_comment_aggressive:
+                return _deadline_result("input_clear", input_info.strategy)
+            _log_publish_trace(
+                "input_clear_soft_timeout",
+                page=page,
+                expected_video_url=expected_video_url,
+                correlation_id=correlation_id,
+                strategy=input_info.strategy,
+                remaining=round(_remaining(), 2),
+                level=logging.WARNING,
+            )
     captcha_result = await _captcha_result_if_present(
         page,
         started,

@@ -252,27 +252,27 @@ def _bounded_float_setting(
 def _parallel_main_publish_max_seconds() -> float:
     return _bounded_float_setting(
         "PARALLEL_MAIN_PUBLISH_MAX_SECONDS",
-        32.0,
+        50.0,
         minimum=15.0,
-        maximum=90.0,
+        maximum=120.0,
     )
 
 
 def _parallel_main_input_retry_max_seconds() -> float:
     return _bounded_float_setting(
         "PARALLEL_MAIN_INPUT_RETRY_MAX_SECONDS",
-        max(32.0, _parallel_main_publish_max_seconds()),
+        max(35.0, _parallel_main_publish_max_seconds()),
         minimum=15.0,
-        maximum=90.0,
+        maximum=120.0,
     )
 
 
 def _parallel_main_worker_attempt_timeout_seconds() -> float:
     return _bounded_float_setting(
         "PARALLEL_MAIN_WORKER_ATTEMPT_TIMEOUT_SECONDS",
-        180.0,
+        300.0,
         minimum=0.1,
-        maximum=360.0,
+        maximum=600.0,
     )
 
 
@@ -3401,14 +3401,20 @@ async def _recover_page_before_input_retry(page: Page, *, correlation_id: str) -
                 or surface.get("publish_input_candidate_visible")
             )
         if not surface_has_input:
+            recover_open_budget = _bounded_float_setting(
+                "PARALLEL_MAIN_OPEN_COMMENTS_MAX_SECONDS",
+                18.0,
+                minimum=6.0,
+                maximum=25.0,
+            )
             await asyncio.wait_for(
                 open_comment_section(
                     page,
-                    max_wait=6.0,
+                    max_wait=recover_open_budget,
                     require_input=True,
                     aggressive=True,
                 ),
-                timeout=7.0,
+                timeout=recover_open_budget + 2.0,
             )
             try:
                 surface = await get_comment_surface_state(page)
@@ -8153,6 +8159,10 @@ async def execute_user_schema_parallel(
         2,
         _positive_int_setting("PARALLEL_MAX_ACTIVE_BROWSERS_PER_PROXY", 2),
     )
+    proxy_diversify_by_source_host = _bool_setting(
+        "PARALLEL_PROXY_DIVERSIFY_BY_SOURCE_HOST",
+        False,
+    )
     proxy_slot_refill_backoff_seconds = _bounded_float_setting(
         "PARALLEL_PROXY_SLOT_REFILL_BACKOFF_SECONDS",
         0.25,
@@ -8169,7 +8179,7 @@ async def execute_user_schema_parallel(
         else parallel_main_account_slots
     )
     logger.info(
-        "Task %s: parallel commenting limits main_attempts=%s reply_attempts=%s retry_account_limit=%s dynamic_pool=%s target_browsers=%s browser_capacity=%s per_proxy_capacity=%s proxy_refill_backoff=%.2fs main_worker_timeout=%.1fs main_refill_poll=%.2fs reply_worker_timeout=%.1fs reply_refill_poll=%.2fs",
+        "Task %s: parallel commenting limits main_attempts=%s reply_attempts=%s retry_account_limit=%s dynamic_pool=%s target_browsers=%s browser_capacity=%s per_proxy_capacity=%s source_host_diversify=%s proxy_refill_backoff=%.2fs main_worker_timeout=%.1fs main_refill_poll=%.2fs reply_worker_timeout=%.1fs reply_refill_poll=%.2fs",
         task_id,
         max_main_attempts,
         max_reply_attempts,
@@ -8178,6 +8188,7 @@ async def execute_user_schema_parallel(
         parallel_worker_target,
         parallel_browser_capacity,
         max_active_browsers_per_proxy,
+        proxy_diversify_by_source_host,
         proxy_slot_refill_backoff_seconds,
         main_worker_attempt_timeout_seconds,
         main_refill_poll_seconds,
@@ -8566,7 +8577,9 @@ async def execute_user_schema_parallel(
                     _select_main_account_sync,
                     exclude_ids=tried_ids_snapshot,
                     exclude_proxies=capacity_exclude_proxies,
-                    exclude_proxy_source_hosts=bool(edge_denied_snapshot),
+                    exclude_proxy_source_hosts=(
+                        proxy_diversify_by_source_host and bool(edge_denied_snapshot)
+                    ),
                 )
 
             if candidate is None:
@@ -8880,6 +8893,7 @@ async def execute_user_schema_parallel(
 
         active_main_tasks: Dict[asyncio.Task, Tuple[int, List[str]]] = {}
         next_main_selection_retry_at = 0.0
+        main_selection_waiting_for_active_change = False
         empty_main_attempts_without_any_publication = 0
         # Keep the empty-surface stop as a "two full waves" guard. Each parallel
         # main slot represents one account seat that should publish all main
@@ -8920,13 +8934,17 @@ async def execute_user_schema_parallel(
             while (pending_main_slots or active_main_tasks) and not _is_stop_requested():
                 if not active_main_tasks:
                     next_main_selection_retry_at = 0.0
+                    main_selection_waiting_for_active_change = False
                 while (
                     pending_main_slots
                     and len(active_main_tasks) < parallel_worker_target
                     and not _is_stop_requested()
                 ):
-                    if active_main_tasks and next_main_selection_retry_at > time.monotonic():
-                        break
+                    if active_main_tasks:
+                        if main_selection_waiting_for_active_change:
+                            break
+                        if next_main_selection_retry_at > time.monotonic():
+                            break
                     slot_index, slot_texts = pending_main_slots.pop(0)
                     main_attempts_by_slot[slot_index] = main_attempts_by_slot.get(slot_index, 0) + 1
                     task_obj = asyncio.create_task(
@@ -9006,6 +9024,8 @@ async def execute_user_schema_parallel(
                             or list(main_texts_by_slot.get(slot_result.slot_index) or slot_texts)
                         )
                         pending_main_slots.append((slot_result.slot_index, retry_texts))
+                        if active_main_tasks:
+                            main_selection_waiting_for_active_change = True
                         logger.info(
                             "Task %s: dynamic main slot %s deferred because active proxy slots are busy; "
                             "will retry without consuming attempt budget (active=%s pending=%s)",
@@ -9118,9 +9138,10 @@ async def execute_user_schema_parallel(
 
                 if processed_non_deferred_main_result:
                     next_main_selection_retry_at = 0.0
+                    main_selection_waiting_for_active_change = False
 
                 if deferred_main_selection_seen and active_main_tasks:
-                    await asyncio.sleep(proxy_slot_refill_backoff_seconds)
+                    await asyncio.sleep(min(proxy_slot_refill_backoff_seconds, main_refill_poll_seconds))
 
                 if (
                     total_main_publications <= 0
@@ -9491,7 +9512,9 @@ async def execute_user_schema_parallel(
                     attempt_db,
                     exclude_ids=list(used_reply_ids),
                     exclude_proxies=exclude_proxies,
-                    exclude_proxy_source_hosts=bool(edge_denied_reply_proxy_values),
+                    exclude_proxy_source_hosts=(
+                        proxy_diversify_by_source_host and bool(edge_denied_reply_proxy_values)
+                    ),
                     exclude_degraded_categories=strict_degraded_categories,
                     pool_owner_user_id=pool_owner_user_id,
                 )
@@ -9514,7 +9537,9 @@ async def execute_user_schema_parallel(
                             attempt_db,
                             exclude_ids=list(used_reply_ids),
                             exclude_proxies=reply_only_exclude_proxies,
-                            exclude_proxy_source_hosts=bool(edge_denied_reply_proxy_values),
+                            exclude_proxy_source_hosts=(
+                                proxy_diversify_by_source_host and bool(edge_denied_reply_proxy_values)
+                            ),
                             exclude_degraded_categories=strict_degraded_categories,
                             pool_owner_user_id=pool_owner_user_id,
                         )
@@ -9543,7 +9568,9 @@ async def execute_user_schema_parallel(
                                 attempt_db,
                                 exclude_ids=list(used_reply_ids),
                                 exclude_proxies=balanced_exclude_proxies,
-                                exclude_proxy_source_hosts=bool(edge_denied_reply_proxy_values),
+                                exclude_proxy_source_hosts=(
+                                    proxy_diversify_by_source_host and bool(edge_denied_reply_proxy_values)
+                                ),
                                 exclude_degraded_categories=strict_degraded_categories,
                                 pool_owner_user_id=pool_owner_user_id,
                             )
@@ -9560,7 +9587,9 @@ async def execute_user_schema_parallel(
                                 | pending_rotation_snapshot
                                 | capacity_blocked_proxies
                             ),
-                            exclude_proxy_source_hosts=bool(edge_denied_reply_proxy_values),
+                            exclude_proxy_source_hosts=(
+                                proxy_diversify_by_source_host and bool(edge_denied_reply_proxy_values)
+                            ),
                             exclude_degraded_categories=strict_degraded_categories,
                             pool_owner_user_id=pool_owner_user_id,
                         )
@@ -9819,6 +9848,7 @@ async def execute_user_schema_parallel(
             active_reply_tasks: Dict[asyncio.Task, Tuple[int, str]] = {}
             inflight_reply_variants: set[int] = set()
             stop_reply_scheduling = False
+            reply_selection_waiting_for_active_change = False
             consecutive_surface_unavailable_attempts = 0
             max_surface_unavailable_attempts = (
                 max_reply_surface_unavailable_batches * max(1, parallel_worker_target)
@@ -9860,12 +9890,16 @@ async def execute_user_schema_parallel(
                     ((pending_reply_variants and not stop_reply_scheduling) or active_reply_tasks)
                     and not _is_stop_requested()
                 ):
+                    if not active_reply_tasks:
+                        reply_selection_waiting_for_active_change = False
                     while (
                         pending_reply_variants
                         and not stop_reply_scheduling
                         and len(active_reply_tasks) < parallel_worker_target
                         and not _is_stop_requested()
                     ):
+                        if active_reply_tasks and reply_selection_waiting_for_active_change:
+                            break
                         variant_index, reply_text = pending_reply_variants.pop(0)
                         if variant_index in inflight_reply_variants:
                             pending_reply_variants.append((variant_index, reply_text))
@@ -9941,6 +9975,7 @@ async def execute_user_schema_parallel(
                     completed_reply_results.sort(
                         key=lambda row: 0 if (row[2].completed or row[2].found_any_main) else 1
                     )
+                    processed_non_deferred_reply_result = False
                     for variant_index, reply_text, item in completed_reply_results:
                         if item.error == temporary_reply_selection_error:
                             reply_rounds[item.variant_index] = max(
@@ -9948,6 +9983,8 @@ async def execute_user_schema_parallel(
                                 reply_rounds.get(item.variant_index, 0) - 1,
                             )
                             pending_reply_variants.append((item.variant_index, item.text))
+                            if active_reply_tasks:
+                                reply_selection_waiting_for_active_change = True
                             logger.info(
                                 "Task %s: dynamic reply variant %s deferred until a proxy/browser slot frees up",
                                 task_id,
@@ -9956,6 +9993,7 @@ async def execute_user_schema_parallel(
                             if await _sleep_or_stop(reply_refill_poll_seconds):
                                 return _mark_stopped()
                             continue
+                        processed_non_deferred_reply_result = True
 
                         if not item.completed:
                             await _handle_reply_edge_access_denied(db, item)
@@ -10107,6 +10145,9 @@ async def execute_user_schema_parallel(
                                 reply_rounds.get(item.variant_index, 0),
                                 terminal_error,
                             )
+
+                    if processed_non_deferred_reply_result:
+                        reply_selection_waiting_for_active_change = False
             finally:
                 if active_reply_tasks:
                     for task_obj in active_reply_tasks:

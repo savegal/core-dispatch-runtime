@@ -11,6 +11,27 @@ from patchright.async_api import Page
 
 logger = logging.getLogger("executor.dom_actions")
 
+_JS_DISPATCH_UNTRUSTED_MOUSE_CLICK = r"""
+el => {
+    if (!el || !el.dispatchEvent) return false;
+    try { el.scrollIntoView({block:'center', inline:'center'}); } catch (_) {}
+    const opts = {bubbles:true, cancelable:true, view:window};
+    for (const type of ['pointerdown', 'mousedown', 'pointerup', 'mouseup', 'click']) {
+        try { el.dispatchEvent(new MouseEvent(type, opts)); } catch (_) {}
+    }
+    try { el.click(); } catch (_) {}
+    return true;
+}
+"""
+
+
+async def _dispatch_untrusted_mouse_click(handle: Any) -> bool:
+    try:
+        return bool(await handle.evaluate(_JS_DISPATCH_UNTRUSTED_MOUSE_CLICK))
+    except Exception:
+        return False
+
+
 _JS_FIND_COMMENT_INPUT = r"""
 () => {
     const url = window.location.pathname || '';
@@ -3761,24 +3782,18 @@ async def open_comment_section(
                 h = float(result.get("h") or 0)
                 clicked = False
                 if trigger:
-                    try:
-                        await trigger.click(timeout=1500, force=True)
-                        clicked = True
-                    except Exception:
-                        clicked = False
+                    clicked = await _dispatch_untrusted_mouse_click(trigger)
                 if not clicked and w > 0 and h > 0:
                     await page.mouse.click(x + w / 2, y + h / 2)
                     clicked = True
                 if not clicked and trigger:
-                    await trigger.evaluate(
-                        "el => el.dispatchEvent(new MouseEvent('click', { bubbles: true, cancelable: true, view: window }))"
-                    )
+                    await _dispatch_untrusted_mouse_click(trigger)
             except Exception:
                 try:
                     if not trigger:
                         trigger = await page.query_selector('[data-smart-id="comment-open-trigger"]')
                     if trigger:
-                        await trigger.click(timeout=1500, force=True)
+                        await _dispatch_untrusted_mouse_click(trigger)
                 except Exception:
                     pass
 
@@ -5307,7 +5322,7 @@ async def find_comment_input_smart(
                                         # Inner has h=0 — focus wrapper to render the editor,
                                         # then return inner (re-fetched to be safe).
                                         try:
-                                            await wrapper.click(timeout=1500, force=True)
+                                            await _dispatch_untrusted_mouse_click(wrapper)
                                             await asyncio.sleep(0.25)
                                             # Re-query inner — after focus, TikTok may have
                                             # replaced the contenteditable node.
@@ -6392,7 +6407,7 @@ async def type_into_comment(
                 # writing into wrapper leaves placeholder visible.
                 if is_real_editor and inner is real and inner is not candidate:
                     try:
-                        await candidate.click(timeout=1500, force=True)
+                        await _dispatch_untrusted_mouse_click(candidate)
                         await asyncio.sleep(0.25)
                     except Exception:
                         pass
