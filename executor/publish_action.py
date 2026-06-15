@@ -197,19 +197,20 @@ _JS_COMPOSER_CLEARED_V2 = r"""
     const editors = [];
     if (replyScoped) {
         addEditor(editors, document.querySelector('[data-smart-reply-input="1"]'));
-    }
-    for (const selector of [
-        '[data-smart-id="comment-input"]',
-        '[data-e2e="comment-input"]',
-        '[data-e2e*="comment-input"]',
-        '[data-e2e*="CommentInput"]'
-    ]) {
-        for (const raw of document.querySelectorAll(selector)) addEditor(editors, raw);
-    }
-    for (const raw of document.querySelectorAll(
-        'div[contenteditable="true"], [contenteditable="true"], textarea, input, [role="textbox"]'
-    )) {
-        addEditor(editors, raw);
+    } else {
+        for (const selector of [
+            '[data-smart-id="comment-input"]',
+            '[data-e2e="comment-input"]',
+            '[data-e2e*="comment-input"]',
+            '[data-e2e*="CommentInput"]'
+        ]) {
+            for (const raw of document.querySelectorAll(selector)) addEditor(editors, raw);
+        }
+        for (const raw of document.querySelectorAll(
+            'div[contenteditable="true"], [contenteditable="true"], textarea, input, [role="textbox"]'
+        )) {
+            addEditor(editors, raw);
+        }
     }
     const el = editors[0] || null;
     if (!el) return { exists: false, empty: false, text: '' };
@@ -228,6 +229,71 @@ _JS_COMPOSER_CLEARED_V2 = r"""
         smart: el.getAttribute && el.getAttribute('data-smart-id'),
         contenteditable: el.getAttribute && el.getAttribute('contenteditable'),
     };
+}
+"""
+
+
+_JS_CLEAR_REPLY_COMMENT_COMPOSER = r"""
+() => {
+    const visible = (el) => {
+        if (!el || !el.getBoundingClientRect) return false;
+        const r = el.getBoundingClientRect();
+        const st = getComputedStyle(el);
+        return r.width > 0 && r.height > 0 && st.display !== 'none' && st.visibility !== 'hidden';
+    };
+    const isRealEditor = (el) => el && (
+        el.isContentEditable ||
+        (el.getAttribute && el.getAttribute('contenteditable') === 'true') ||
+        el.tagName === 'TEXTAREA' ||
+        el.tagName === 'INPUT' ||
+        (el.getAttribute && el.getAttribute('role') === 'textbox')
+    );
+    const raw = document.querySelector('[data-smart-reply-input="1"]');
+    if (!raw) return { ok: false, reason: 'reply_input_missing' };
+    const el = isRealEditor(raw)
+        ? raw
+        : raw.querySelector && raw.querySelector(
+            'div[contenteditable="true"], [contenteditable="true"], textarea, input, [role="textbox"]'
+        );
+    if (!el || !isRealEditor(el) || (!visible(el) && !visible(raw))) {
+        return { ok: false, reason: 'reply_editor_not_visible' };
+    }
+    try { el.focus(); } catch (_) {}
+    try {
+        if (el.tagName === 'TEXTAREA' || el.tagName === 'INPUT') {
+            const proto = el.tagName === 'TEXTAREA'
+                ? window.HTMLTextAreaElement.prototype
+                : window.HTMLInputElement.prototype;
+            const desc = Object.getOwnPropertyDescriptor(proto, 'value');
+            if (desc && desc.set) desc.set.call(el, '');
+            else el.value = '';
+        } else {
+            const sel = window.getSelection && window.getSelection();
+            if (sel) {
+                const range = document.createRange();
+                range.selectNodeContents(el);
+                sel.removeAllRanges();
+                sel.addRange(range);
+                range.deleteContents();
+                sel.removeAllRanges();
+            }
+            el.textContent = '';
+        }
+        for (const ev of [
+            new InputEvent('beforeinput', {bubbles: true, cancelable: true, inputType: 'deleteContentBackward', data: null}),
+            new InputEvent('input', {bubbles: true, cancelable: true, inputType: 'deleteContentBackward', data: null}),
+            new Event('change', {bubbles: true, cancelable: true}),
+            new KeyboardEvent('keyup', {bubbles: true, cancelable: true, key: 'Backspace'})
+        ]) {
+            try { el.dispatchEvent(ev); } catch (_) {}
+        }
+    } catch (exc) {
+        return { ok: false, reason: 'clear_exception:' + String(exc).slice(0, 80) };
+    }
+    const txt = (el.value !== undefined && el.value !== null && el.value !== '')
+        ? el.value
+        : (el.textContent || el.innerText || '');
+    return { ok: String(txt || '').trim().length === 0, reason: 'cleared', text: String(txt || '').slice(0, 120) };
 }
 """
 
@@ -401,6 +467,73 @@ async def _clear_main_comment_composer_best_effort(
         level=logging.INFO if cleared else logging.WARNING,
     )
     return cleared
+
+
+async def _clear_reply_comment_composer_best_effort(
+    page: Page,
+    *,
+    reason: str,
+    expected_video_url: Optional[str] = None,
+    correlation_id: Optional[str] = None,
+    timeout_seconds: float = 0.9,
+) -> bool:
+    """Clear dirty reply composer state without touching the global comment box."""
+    try:
+        result = await _asyncio_wait_for(
+            page.evaluate(_JS_CLEAR_REPLY_COMMENT_COMPOSER),
+            timeout=max(0.1, timeout_seconds),
+        )
+        cleared = bool(isinstance(result, dict) and result.get("ok"))
+    except Exception:
+        cleared = False
+    _log_publish_trace(
+        "reply_composer_clear_after_failure",
+        page=page,
+        expected_video_url=expected_video_url,
+        correlation_id=correlation_id,
+        reason=reason,
+        cleared=cleared,
+        level=logging.INFO if cleared else logging.WARNING,
+    )
+    return cleared
+
+
+async def _clear_dirty_composer_after_submit_timeout(
+    page: Page,
+    *,
+    reply_scoped: bool,
+    reason: str,
+    expected_video_url: Optional[str] = None,
+    correlation_id: Optional[str] = None,
+) -> None:
+    """Remove a visible draft after TikTok accepted a publish request but hid the response."""
+    try:
+        state = await _asyncio_wait_for(
+            _composer_cleared_state(page, reply_scoped=reply_scoped),
+            timeout=0.7,
+        )
+    except Exception:
+        state = {}
+    if not isinstance(state, dict):
+        state = {}
+    if not state.get("exists") or state.get("empty"):
+        return
+    if reply_scoped:
+        await _clear_reply_comment_composer_best_effort(
+            page,
+            reason=reason,
+            expected_video_url=expected_video_url,
+            correlation_id=correlation_id,
+        )
+    else:
+        await _clear_main_comment_composer_best_effort(
+            page,
+            reason=reason,
+            expected_video_url=expected_video_url,
+            correlation_id=correlation_id,
+            timeout_seconds=0.9,
+        )
+
 
 def _looks_like_driver_closed_error(text: Optional[str]) -> bool:
     safe = (text or "").lower()
@@ -2940,9 +3073,22 @@ async def _publish_reply_comment_direct_dom(
                 dom_strategy=combined_strategy,
                 post_was_enabled_at_click=post_was_enabled,
             )
+        error_reason = (
+            "no_network_response_after_publish_request"
+            if request_attempted
+            else "no_network_request_after_reply_direct_post_click"
+        )
+        if request_attempted:
+            await _clear_dirty_composer_after_submit_timeout(
+                page,
+                reply_scoped=True,
+                reason=error_reason,
+                expected_video_url=expected_video_url,
+                correlation_id=correlation_id,
+            )
         return PublishResult(
             status="timeout",
-            error_reason="no_network_request_after_reply_direct_post_click",
+            error_reason=error_reason,
             network_captured=False,
             network_request_attempted=request_attempted,
             elapsed_seconds=elapsed,
@@ -4450,10 +4596,26 @@ async def _publish_via_current_input(
                     };
                 });
 
-            const input = document.querySelector(
-                '[data-smart-id="comment-input"], [data-e2e="comment-input"], div[contenteditable="true"], textarea'
+            const isRealEditor = (el) => el && (
+                el.isContentEditable ||
+                (el.getAttribute && el.getAttribute('contenteditable') === 'true') ||
+                el.tagName === 'TEXTAREA' ||
+                el.tagName === 'INPUT' ||
+                (el.getAttribute && el.getAttribute('role') === 'textbox')
             );
-            const inputText = input ? (input.textContent || input.value || input.innerText || '').trim() : '';
+            const resolveInnerEditor = (raw) => {
+                if (!raw) return null;
+                if (isRealEditor(raw)) return raw;
+                if (!raw.querySelector) return null;
+                return raw.querySelector(
+                    'div[contenteditable="true"], [contenteditable="true"], textarea, input, [role="textbox"]'
+                );
+            };
+            const inputWrapper = document.querySelector(
+                '[data-smart-reply-input="1"], [data-smart-id="comment-input"], [data-e2e="comment-input"], [data-e2e*="comment-input"], div[contenteditable="true"], textarea'
+            );
+            const input = resolveInnerEditor(inputWrapper);
+            const inputText = input ? (input.value || input.textContent || input.innerText || '').trim() : '';
 
             const postCandidates = buttons
                 .filter(b => {
@@ -4519,6 +4681,13 @@ async def _publish_via_current_input(
         )
 
     if request_attempted:
+        await _clear_dirty_composer_after_submit_timeout(
+            page,
+            reply_scoped=reply_scoped,
+            reason="no_network_response_after_publish_request",
+            expected_video_url=expected_video_url,
+            correlation_id=correlation_id,
+        )
         _log_publish_trace(
             "publish_result",
             page=page,

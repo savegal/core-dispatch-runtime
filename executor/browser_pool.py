@@ -7,6 +7,7 @@ import contextlib
 import contextvars
 import hashlib
 import logging
+import re
 import threading
 from typing import Optional, Dict, Tuple
 from datetime import datetime, timezone, timedelta
@@ -23,10 +24,57 @@ from services.metrics import set_gauge
 
 logger = logging.getLogger("executor.browser_pool")
 
+_MEDIA_EXTENSION_RE = re.compile(r"\.(?:mp4|m4v|webm|mov|m3u8|mpd)(?:[?#]|$)", re.IGNORECASE)
+_TIKTOK_VIDEO_URL_MARKERS = (
+    "/aweme/v1/play",
+    "/video/tos/",
+    "mime_type=video",
+    "mime=video",
+    "content_type=video",
+    "video_mp4",
+    "video_webm",
+    "video_data",
+)
+_TIKTOK_VIDEO_HOST_MARKERS = (
+    "v16-webapp-prime",
+    "v19-webapp-prime",
+    "v26-webapp-prime",
+    "v16m-",
+    "v19-",
+    "v26-",
+)
+
 _current_task_id: contextvars.ContextVar[int | None] = contextvars.ContextVar(
     "browser_pool_current_task_id",
     default=None,
 )
+
+
+def _looks_like_blockable_video_url(url: str | None) -> bool:
+    safe_url = str(url or "").strip().lower()
+    if not safe_url:
+        return False
+    if _MEDIA_EXTENSION_RE.search(safe_url):
+        return True
+    if any(marker in safe_url for marker in _TIKTOK_VIDEO_URL_MARKERS):
+        return True
+    return any(marker in safe_url for marker in _TIKTOK_VIDEO_HOST_MARKERS)
+
+
+def _should_abort_resource(resource_type: str | None, url: str | None = None) -> bool:
+    """Return True when the current resource-blocking settings should abort a request."""
+    resource = str(resource_type or "").strip().lower()
+    if resource == "image" and settings.BLOCK_IMAGES:
+        return True
+    if resource == "media" and settings.BLOCK_MEDIA:
+        return True
+    if settings.BLOCK_MEDIA and _looks_like_blockable_video_url(url):
+        return True
+    if resource == "font" and settings.BLOCK_FONTS:
+        return True
+    if resource == "stylesheet" and settings.BLOCK_STYLESHEETS:
+        return True
+    return False
 
 
 @contextlib.contextmanager
@@ -1404,6 +1452,8 @@ class BrowserPool:
                 # КРИТИЧНО: Отключаем WebRTC для предотвращения утечки реального IP
                 # permissions=[] запрещает камеру/микрофон, что предотвращает WebRTC запросы
                 context_options["permissions"] = []  # Отключаем все permissions (включая geolocation для безопасности)
+                if settings.BLOCK_MEDIA:
+                    context_options["service_workers"] = "block"
                 
                 # Если нужна geolocation - можно добавить позже, но WebRTC важнее
                 
@@ -1581,16 +1631,28 @@ class BrowserPool:
                             await temp_page.close()
                 
                 # Применяем блокировку ресурсов
+                if (
+                    settings.BLOCK_IMAGES
+                    or settings.BLOCK_MEDIA
+                    or settings.BLOCK_FONTS
+                    or settings.BLOCK_STYLESHEETS
+                ):
+                    logger.info(
+                        "[BROWSER_RESOURCE_BLOCK] account=%s images=%s media=%s fonts=%s stylesheets=%s service_workers=%s",
+                        account.id,
+                        bool(settings.BLOCK_IMAGES),
+                        bool(settings.BLOCK_MEDIA),
+                        bool(settings.BLOCK_FONTS),
+                        bool(settings.BLOCK_STYLESHEETS),
+                        "block" if settings.BLOCK_MEDIA else "default",
+                    )
+
                 async def route_handler(route):
                     try:
-                        resource_type = route.request.resource_type
-                        if settings.BLOCK_IMAGES and resource_type == "image":
-                            await route.abort()
-                            return
-                        if settings.BLOCK_FONTS and resource_type == "font":
-                            await route.abort()
-                            return
-                        if settings.BLOCK_STYLESHEETS and resource_type == "stylesheet":
+                        request = route.request
+                        resource_type = request.resource_type
+                        request_url = request.url
+                        if _should_abort_resource(resource_type, request_url):
                             await route.abort()
                             return
                         # ИСПРАВЛЕНО: Обрабатываем TargetClosedError при continue_()

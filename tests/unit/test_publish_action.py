@@ -846,6 +846,80 @@ async def test_parallel_publish_returns_after_request_without_slow_retry(monkeyp
 
 @pytest.mark.unit
 @pytest.mark.asyncio
+async def test_parallel_main_request_timeout_clears_dirty_composer_without_second_click(monkeypatch):
+    page = _FakePage()
+    page.mouse = _RequestOnlyMouse(page)
+    button = _FakeButton()
+    clear_calls = []
+
+    async def _fake_sleep(_seconds):
+        return None
+
+    async def _fake_detect_captcha(*args, **kwargs):
+        return False, None
+
+    async def _fake_find_comment_input_smart(*args, **kwargs):
+        return _FakeInput(), SimpleNamespace(strategy="input", elapsed_seconds=0.1, reason=None)
+
+    async def _fake_find_post_button_smart(*args, **kwargs):
+        return button, SimpleNamespace(strategy="post")
+
+    async def _fake_wait_for_post_button_enabled(*args, **kwargs):
+        return button, SimpleNamespace(strategy="post", reason=None)
+
+    async def _fake_clear_post_click_blockers(*args, **kwargs):
+        return button, {"tag": "BUTTON", "e2e": "comment-post"}, True
+
+    async def _fake_suppress_keyboard_shortcuts_overlay(*args, **kwargs):
+        return 0
+
+    async def _fake_ensure_click_target_clear(*args, **kwargs):
+        return None
+
+    async def _fake_type_into_comment(*args, **kwargs):
+        return True
+
+    async def _fake_composer_cleared_state(*args, **kwargs):
+        return {"exists": True, "empty": False, "text": "hello"}
+
+    async def _fake_clear_main_comment_composer_best_effort(*args, **kwargs):
+        clear_calls.append(kwargs.get("reason"))
+        return True
+
+    monkeypatch.setattr(publish_action.asyncio, "sleep", _fake_sleep)
+    monkeypatch.setattr(publish_action, "detect_captcha", _fake_detect_captcha)
+    monkeypatch.setattr(publish_action, "suppress_keyboard_shortcuts_overlay", _fake_suppress_keyboard_shortcuts_overlay)
+    monkeypatch.setattr(publish_action, "find_comment_input_smart", _fake_find_comment_input_smart)
+    monkeypatch.setattr(publish_action, "find_post_button_smart", _fake_find_post_button_smart)
+    monkeypatch.setattr(publish_action, "wait_for_post_button_enabled", _fake_wait_for_post_button_enabled)
+    monkeypatch.setattr(publish_action, "_clear_post_click_blockers", _fake_clear_post_click_blockers)
+    monkeypatch.setattr(publish_action, "ensure_click_target_clear", _fake_ensure_click_target_clear)
+    monkeypatch.setattr(publish_action, "type_into_comment", _fake_type_into_comment)
+    monkeypatch.setattr(publish_action, "_composer_cleared_state", _fake_composer_cleared_state)
+    monkeypatch.setattr(
+        publish_action,
+        "_clear_main_comment_composer_best_effort",
+        _fake_clear_main_comment_composer_best_effort,
+    )
+
+    result = await publish_action._publish_via_current_input(
+        page,
+        "hello",
+        max_total_seconds=30.0,
+        correlation_id="task_1_parallel_main_v1_a1_acc10",
+    )
+
+    assert result.status == "timeout"
+    assert result.error_reason == "no_network_response_after_publish_request"
+    assert result.network_request_attempted is True
+    assert result.post_was_enabled_at_click is True
+    assert page.click_count == 1
+    assert clear_calls == ["no_network_response_after_publish_request"]
+    assert page.removed == ["request", "response"]
+
+
+@pytest.mark.unit
+@pytest.mark.asyncio
 async def test_publish_continues_when_typing_times_out_but_text_is_visible(monkeypatch):
     page = _FakePage()
     button = _FakeButton()
@@ -2235,6 +2309,71 @@ async def test_main_direct_dom_fallback_reports_no_response_after_publish_reques
     assert result.network_request_attempted is True
     assert result.post_was_enabled_at_click is True
     assert clear_calls == ["no_network_response_after_main_direct_post_click"]
+    assert set(page.removed) == {"request", "response"}
+
+
+@pytest.mark.unit
+@pytest.mark.asyncio
+async def test_reply_direct_dom_fallback_reports_no_response_after_publish_request(monkeypatch):
+    class _RequestOnlyReplyPage(_FakePage):
+        async def evaluate(self, script, *args):
+            if script == publish_action._JS_REPLY_DIRECT_POST_CLICK:
+                handler = self.listeners.get("request")
+                assert handler is not None
+                handler(SimpleNamespace(
+                    url="https://www.tiktok.com/api/comment/publish/?aid=1988",
+                    method="POST",
+                ))
+                return {
+                    "clicked": True,
+                    "postWasEnabled": True,
+                    "strategy": "reply-direct-test-post",
+                }
+            return await super().evaluate(script, *args)
+
+    async def _fake_type_reply_comment_without_handle(*args, **kwargs):
+        return {
+            "ok": True,
+            "strategy": "reply-direct-test-type",
+            "text": "reply",
+        }
+
+    async def _fake_composer_cleared_state(*args, **kwargs):
+        return {"exists": True, "empty": False}
+
+    clear_calls = []
+
+    async def _fake_clear_reply_comment_composer_best_effort(*args, **kwargs):
+        clear_calls.append(kwargs.get("reason"))
+        return True
+
+    page = _RequestOnlyReplyPage()
+    monkeypatch.setattr(publish_action, "_type_reply_comment_without_handle", _fake_type_reply_comment_without_handle)
+    monkeypatch.setattr(publish_action, "_composer_cleared_state", _fake_composer_cleared_state)
+    monkeypatch.setattr(
+        publish_action,
+        "_clear_reply_comment_composer_best_effort",
+        _fake_clear_reply_comment_composer_best_effort,
+    )
+    monkeypatch.setattr(publish_action, "_PARALLEL_POST_RESPONSE_GRACE_SECONDS", 0.01)
+
+    result = await publish_action._publish_reply_comment_direct_dom(
+        page,
+        "reply",
+        started=time.monotonic(),
+        max_total_seconds=10.0,
+        expected_video_url=page.url,
+        correlation_id="task_1_parallel_reply_v1_a1_acc2",
+        parent_anchor_token="pa-1",
+        previous_reason="timeout",
+    )
+
+    assert result is not None
+    assert result.status == "timeout"
+    assert result.error_reason == "no_network_response_after_publish_request"
+    assert result.network_request_attempted is True
+    assert result.post_was_enabled_at_click is True
+    assert clear_calls == ["no_network_response_after_publish_request"]
     assert set(page.removed) == {"request", "response"}
 
 

@@ -1,4 +1,5 @@
 import asyncio
+import time
 from contextlib import contextmanager
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
@@ -2041,6 +2042,116 @@ async def test_engagement_only_full_flow_balances_four_workers_across_two_proxie
     assert len(proxy_by_variant) == 4
     assert list(proxy_by_variant.values()).count("http://proxy-a:1000") == 2
     assert list(proxy_by_variant.values()).count("http://proxy-b:1000") == 2
+
+
+@pytest.mark.unit
+@pytest.mark.asyncio
+async def test_engagement_only_dynamic_capacity_defer_waits_before_reselecting(db_session, monkeypatch):
+    import db.database as db_database
+    import executor.browser_pool as browser_pool
+    import executor.user_schema as user_schema
+
+    shared_proxy = "http://proxy-shared:1000"
+    accounts = [
+        Account(id=441 + i, label=f"reply-shared-{i}", status="active", cookies='{"sessionid":"x"}', proxy=shared_proxy)
+        for i in range(3)
+    ]
+    started: list[int] = []
+    selection_calls: list[float] = []
+    blocked_selection_calls = 0
+    capacity_deferred = asyncio.Event()
+    release_first_reply = asyncio.Event()
+
+    @contextmanager
+    def _fake_db_context():
+        yield db_session
+
+    def _fake_get_free_account_for_reply(_db, exclude_ids=None, exclude_proxies=None, **_kwargs):
+        nonlocal blocked_selection_calls
+        selection_calls.append(time.monotonic())
+        if started == [1] and not release_first_reply.is_set():
+            blocked_selection_calls += 1
+            if blocked_selection_calls >= 3:
+                capacity_deferred.set()
+        excluded = set(exclude_ids or [])
+        excluded_proxies = set(exclude_proxies or [])
+        return next(
+            (
+                account
+                for account in accounts
+                if account.id not in excluded
+                and str(account.proxy or "").strip() not in excluded_proxies
+            ),
+            None,
+        )
+
+    async def _fake_reply_with_variant_on_all_mains(
+        _db,
+        reply_account,
+        _video_url,
+        pending_parent,
+        reply_text,
+        *,
+        variant_index,
+        **_kwargs,
+    ):
+        parent = pending_parent[0]
+        started.append(variant_index)
+        if variant_index == 1:
+            await asyncio.wait_for(release_first_reply.wait(), timeout=2)
+        return user_schema.ReplyAttemptResult(
+            replies=[
+                user_schema.ReplyOutcome(
+                    text=reply_text,
+                    variant_index=variant_index,
+                    matched_main_text=parent.text,
+                    parent_comment_id=parent.comment_id,
+                    success=True,
+                    method="hybrid_dom",
+                    error=None,
+                    account_id=reply_account.id,
+                    attempted=True,
+                )
+            ],
+            found_mains=[parent],
+            searched=True,
+        )
+
+    monkeypatch.setattr(engagement_engine.settings, "PARALLEL_COMMENTING_TARGET_BROWSERS", 2, raising=False)
+    monkeypatch.setattr(engagement_engine.settings, "PARALLEL_COMMENTING_MAX_BROWSERS", 2, raising=False)
+    monkeypatch.setattr(engagement_engine.settings, "PARALLEL_MAX_ACTIVE_BROWSERS_PER_PROXY", 1, raising=False)
+    monkeypatch.setattr(db_database, "get_sync_db_context", _fake_db_context)
+    monkeypatch.setattr(engagement_engine, "get_free_account_for_reply", _fake_get_free_account_for_reply)
+    monkeypatch.setattr(user_schema, "_reply_with_variant_on_all_mains", _fake_reply_with_variant_on_all_mains)
+    monkeypatch.setattr(browser_pool, "ensure_thread_browser_pool_capacity", lambda _value: None)
+    monkeypatch.setattr(browser_pool, "close_browser_pool", AsyncMock(return_value=None))
+
+    run_task = asyncio.create_task(
+        engagement_engine.execute_engagement_only_replies_via_full_flow(
+            db=db_session,
+            video_url="https://www.tiktok.com/@demo/video/1234567890123456789",
+            comment_text="target comment",
+            comment_id="parent_123",
+            comment_author="main_author",
+            replies=["reply one", "reply two", "reply three"],
+            task_id=207,
+        )
+    )
+    try:
+        await asyncio.wait_for(capacity_deferred.wait(), timeout=1)
+        await asyncio.sleep(0.05)
+        calls_after_defer = len(selection_calls)
+        await asyncio.sleep(0.8)
+        assert len(selection_calls) == calls_after_defer
+        release_first_reply.set()
+        results, _resolved_parent_id, _resolved_author = await asyncio.wait_for(run_task, timeout=3)
+    finally:
+        if not run_task.done():
+            run_task.cancel()
+            await asyncio.gather(run_task, return_exceptions=True)
+
+    assert [row["variant_index"] for row in results] == [1, 2, 3]
+    assert all(row["success"] is True for row in results)
 
 
 @pytest.mark.unit

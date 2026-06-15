@@ -9659,10 +9659,6 @@ async def execute_user_schema_parallel(
         )
         result.error = None
 
-    if result.error:
-        result.elapsed_seconds = time.monotonic() - started
-        return result
-
     def _parallel_slot_remaining_texts(slot_result: _ParallelMainSlotResult) -> List[str]:
         expected_texts = list(main_texts_by_slot.get(slot_result.slot_index, []))
         if not expected_texts:
@@ -9677,6 +9673,90 @@ async def execute_user_schema_parallel(
             for text in expected_texts
             if _dedup_key(text) not in slot_published_keys
         ]
+
+    def _parallel_summary_reason_bucket(reason: Optional[str]) -> Optional[str]:
+        value = str(reason or "").strip().lower()
+        if not value:
+            return None
+        if (
+            "goto_failed" in value
+            or "connection timeout" in value
+            or "cannot connect" in value
+            or "err_timed_out" in value
+            or "net::" in value
+            or "proxy" in value
+        ):
+            return "proxy"
+        if (
+            "login_not_ready" in value
+            or "login_ambiguous" in value
+            or "logged_out" in value
+            or "login_required" in value
+            or "page_loading" in value
+            or "tiktok_shell" in value
+        ):
+            return "login_not_ready"
+        if "typing" in value or "composer" in value or "input" in value:
+            return "typing"
+        if "cancel" in value:
+            return "cancelled"
+        return "other"
+
+    def _log_parallel_order_summary(phase: str) -> None:
+        reason_counts: Dict[str, int] = {}
+        for slot_result in main_results:
+            bucket = _parallel_summary_reason_bucket(slot_result.error)
+            if bucket:
+                reason_counts[bucket] = reason_counts.get(bucket, 0) + 1
+        for reply in result.replies:
+            bucket = _parallel_summary_reason_bucket(getattr(reply, "error", None))
+            if bucket:
+                reason_counts[bucket] = reason_counts.get(bucket, 0) + 1
+
+        main_submitted = len(result.published_mains)
+        main_unconfirmed = sum(
+            1
+            for main in result.published_mains
+            if not getattr(main, "network_confirmed", False)
+            and not getattr(main, "local_confirmed", False)
+        )
+        main_remaining = max(0, int(result.expected_main_publications or 0) - main_submitted)
+        reply_expected = (
+            int(result.expected_reply_variants or 0)
+            * max(int(result.expected_main_publications or 0), main_submitted)
+        )
+        reply_submitted = sum(1 for reply in result.replies if _reply_outcome_submitted(reply))
+        reply_unconfirmed = sum(
+            1
+            for reply in result.replies
+            if getattr(reply, "submitted_unconfirmed", False)
+        )
+        reply_remaining = max(0, reply_expected - reply_submitted) if reply_expected else 0
+        submitted_unconfirmed_total = main_unconfirmed + reply_unconfirmed
+        if submitted_unconfirmed_total:
+            reason_counts["submitted_unconfirmed"] = submitted_unconfirmed_total
+        logger.info(
+            "Task %s: parallel order summary phase=%s main=%s/%s "
+            "main_unconfirmed=%s main_remaining=%s replies=%s/%s "
+            "reply_unconfirmed=%s reply_remaining=%s close_reasons=%s error=%s",
+            task_id,
+            phase,
+            main_submitted,
+            int(result.expected_main_publications or 0),
+            main_unconfirmed,
+            main_remaining,
+            reply_submitted,
+            reply_expected,
+            reply_unconfirmed,
+            reply_remaining,
+            dict(sorted(reason_counts.items())),
+            result.error or "none",
+        )
+
+    if result.error:
+        result.elapsed_seconds = time.monotonic() - started
+        _log_parallel_order_summary("main_error")
+        return result
 
     if len(result.published_mains) < result.expected_main_publications:
         missing_slots = [
@@ -9762,10 +9842,12 @@ async def execute_user_schema_parallel(
                     f"{len(result.published_mains)}/{result.expected_main_publications}"
                 )
                 result.elapsed_seconds = time.monotonic() - started
+                _log_parallel_order_summary("main_partial_replies_blocked")
                 return result
         else:
             result.error = f"parallel_main_incomplete:slots={','.join(missing_slots)}"
             result.elapsed_seconds = time.monotonic() - started
+            _log_parallel_order_summary("main_partial_empty")
             return result
 
     for main in result.published_mains:
@@ -10733,6 +10815,7 @@ async def execute_user_schema_parallel(
     if not result.published_mains and not result.error:
         result.error = "no_main_published"
     result.elapsed_seconds = time.monotonic() - started
+    _log_parallel_order_summary("final")
     return result
 
 

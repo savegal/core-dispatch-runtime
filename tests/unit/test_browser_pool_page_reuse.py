@@ -87,9 +87,11 @@ class LaunchProbeContext:
 class LaunchProbeBrowser:
     def __init__(self):
         self.contexts = []
+        self.new_context_options = []
         self.closed = False
 
     async def new_context(self, **_options):
+        self.new_context_options.append(dict(_options))
         context = LaunchProbeContext()
         self.contexts.append(context)
         return context
@@ -114,6 +116,74 @@ def test_browser_pool_capacity_can_be_raised_for_parallel_mode():
 
     assert pool.max_browsers == 3
     assert pool._max_pool_size == 6
+
+
+@pytest.mark.unit
+def test_resource_blocking_honors_media_toggle(monkeypatch):
+    monkeypatch.setattr(browser_pool.settings, "BLOCK_IMAGES", True, raising=False)
+    monkeypatch.setattr(browser_pool.settings, "BLOCK_MEDIA", False, raising=False)
+    monkeypatch.setattr(browser_pool.settings, "BLOCK_FONTS", True, raising=False)
+    monkeypatch.setattr(browser_pool.settings, "BLOCK_STYLESHEETS", False, raising=False)
+
+    assert browser_pool._should_abort_resource("image") is True
+    assert browser_pool._should_abort_resource("font") is True
+    assert browser_pool._should_abort_resource("stylesheet") is False
+    assert browser_pool._should_abort_resource("media") is False
+    assert browser_pool._should_abort_resource(
+        "fetch",
+        "https://v16-webapp-prime.tiktok.com/video/tos/example?mime_type=video_mp4",
+    ) is False
+
+    monkeypatch.setattr(browser_pool.settings, "BLOCK_MEDIA", True, raising=False)
+
+    assert browser_pool._should_abort_resource("media") is True
+    assert browser_pool._should_abort_resource(
+        "fetch",
+        "https://v16-webapp-prime.tiktok.com/video/tos/example?mime_type=video_mp4",
+    ) is True
+    assert browser_pool._should_abort_resource(
+        "xhr",
+        "https://www.tiktok.com/api/comment/list/?aweme_id=123",
+    ) is False
+
+
+@pytest.mark.unit
+@pytest.mark.asyncio
+async def test_get_page_for_account_blocks_service_workers_when_media_blocked(monkeypatch):
+    from executor import tiktok_client
+
+    pool = BrowserPool(max_browsers=1)
+    launched_browsers = []
+
+    class FakeChromium:
+        async def launch(self, **_launch_options):
+            browser = LaunchProbeBrowser()
+            launched_browsers.append(browser)
+            return browser
+
+    async def noop_initialize():
+        return None
+
+    monkeypatch.setattr(pool, "initialize", noop_initialize)
+    monkeypatch.setattr(pool, "_playwright", SimpleNamespace(chromium=FakeChromium()))
+    monkeypatch.setattr(tiktok_client, "_get_cookies_for_account", lambda _account: "[]")
+    monkeypatch.setattr(tiktok_client, "parse_cookies", lambda _raw: [])
+    monkeypatch.setattr(
+        tiktok_client,
+        "_normalize_proxy_for_playwright",
+        lambda proxy: {"server": proxy} if proxy else None,
+    )
+    monkeypatch.setattr(browser_pool.settings, "BLOCK_MEDIA", True, raising=False)
+    monkeypatch.setattr(browser_pool.settings, "HUMAN_LIKE_BEHAVIOR", False, raising=False)
+
+    try:
+        await pool.get_page_for_account(
+            SimpleNamespace(id=1, label="a1", proxy="http://proxy-a:8000", user_agent=None, country_code="US")
+        )
+
+        assert launched_browsers[0].new_context_options[0]["service_workers"] == "block"
+    finally:
+        await pool.close_all()
 
 
 @pytest.mark.unit

@@ -2814,6 +2814,13 @@ async def execute_engagement_only_replies_via_full_flow(
     last_reply_account_by_variant: Dict[int, Optional[int]] = {}
     active_reply_proxy_counts: Dict[str, int] = {}
     temporary_reply_selection_error = "reply_account_temporarily_unavailable"
+    scheduler_stats: Dict[str, int] = {
+        "selection_deferred": 0,
+        "capacity_skips": 0,
+        "least_used_fallbacks": 0,
+    }
+    attempt_reason_counts: Dict[str, int] = {}
+    reply_selection_capacity_backoff_seconds = 1.5
     try:
         reply_worker_attempt_timeout_seconds = max(
             1.0,
@@ -2821,6 +2828,23 @@ async def execute_engagement_only_replies_via_full_flow(
         )
     except Exception:
         reply_worker_attempt_timeout_seconds = 240.0
+    try:
+        reply_selection_capacity_backoff_seconds = min(
+            5.0,
+            max(
+                0.5,
+                float(
+                    getattr(
+                        settings,
+                        "PARALLEL_REPLY_SELECTION_CAPACITY_BACKOFF_SECONDS",
+                        reply_selection_capacity_backoff_seconds,
+                    )
+                    or reply_selection_capacity_backoff_seconds
+                ),
+            ),
+        )
+    except Exception:
+        reply_selection_capacity_backoff_seconds = 1.5
 
     def _current_main_candidate() -> PublishedMain:
         return PublishedMain(
@@ -2856,6 +2880,82 @@ async def execute_engagement_only_replies_via_full_flow(
         min_uses = min(counts.values())
         return {proxy for proxy, count in counts.items() if count > min_uses}
 
+    def _summary_reason_bucket(reason: Optional[str]) -> Optional[str]:
+        value = str(reason or "").strip().lower()
+        if not value:
+            return None
+        if (
+            "goto_failed" in value
+            or "connection timeout" in value
+            or "cannot connect" in value
+            or "err_timed_out" in value
+            or "net::" in value
+            or "proxy" in value
+        ):
+            return "proxy"
+        if (
+            "login_not_ready" in value
+            or "login_ambiguous" in value
+            or "logged_out" in value
+            or "login_required" in value
+            or "page_loading" in value
+            or "tiktok_shell" in value
+        ):
+            return "login_not_ready"
+        if "typing" in value or "composer" in value or "input" in value:
+            return "typing"
+        if "cancel" in value:
+            return "cancelled"
+        return "other"
+
+    def _record_attempt_reason(reason: Optional[str]) -> None:
+        bucket = _summary_reason_bucket(reason)
+        if not bucket:
+            return
+        attempt_reason_counts[bucket] = attempt_reason_counts.get(bucket, 0) + 1
+
+    def _log_engagement_only_reply_summary() -> None:
+        expected = len([reply_text for reply_text in replies if str(reply_text or "").strip()])
+        submitted = sum(
+            1
+            for row in results
+            if row.get("success")
+            or row.get("submitted_unconfirmed")
+            or row.get("visibility_status") == "submitted_unconfirmed"
+        )
+        submitted_unconfirmed = sum(
+            1
+            for row in results
+            if row.get("submitted_unconfirmed")
+            or row.get("visibility_status") == "submitted_unconfirmed"
+        )
+        failed = sum(
+            1
+            for row in results
+            if not (
+                row.get("success")
+                or row.get("submitted_unconfirmed")
+                or row.get("visibility_status") == "submitted_unconfirmed"
+            )
+        )
+        remaining = max(0, expected - submitted)
+        logger.info(
+            "Task %s: engagement_only reply summary submitted=%s/%s "
+            "submitted_unconfirmed=%s failed=%s remaining=%s "
+            "close_reasons=%s selection_deferred=%s capacity_skips=%s "
+            "least_used_fallbacks=%s",
+            task_id,
+            submitted,
+            expected,
+            submitted_unconfirmed,
+            failed,
+            remaining,
+            dict(sorted(attempt_reason_counts.items())),
+            scheduler_stats.get("selection_deferred", 0),
+            scheduler_stats.get("capacity_skips", 0),
+            scheduler_stats.get("least_used_fallbacks", 0),
+        )
+
     async def _select_reply_account(attempt_db: Session) -> Tuple[Optional[Account], Optional[str]]:
         async with reply_selection_lock:
             strict_degraded_categories = {"captcha", "page_blocked"}
@@ -2889,6 +2989,7 @@ async def execute_engagement_only_replies_via_full_flow(
                         }
                     if balanced_exclude_proxies:
                         balanced_exclude_proxies |= capacity_blocked_proxies
+                        scheduler_stats["least_used_fallbacks"] += 1
                         logger.info(
                             "Task %s: engagement_only no completely unused reply proxy; "
                             "trying least-used proxy selection",
@@ -2927,6 +3028,7 @@ async def execute_engagement_only_replies_via_full_flow(
                             dict(active_reply_proxy_counts),
                             list(capacity_blocked_proxies),
                         )
+                        scheduler_stats["selection_deferred"] += 1
                         return None, temporary_reply_selection_error
                     return None, None
                 proxy_value = _account_proxy_value(candidate)
@@ -2936,6 +3038,7 @@ async def execute_engagement_only_replies_via_full_flow(
                     and active_reply_proxy_counts.get(proxy_value, 0) >= max_active_browsers_per_proxy
                 ):
                     capacity_blocked_proxies.add(proxy_value)
+                    scheduler_stats["capacity_skips"] += 1
                     logger.info(
                         "Task %s: engagement_only reply account %s skipped because proxy already has %s/%s active browser(s)",
                         task_id,
@@ -2955,6 +3058,7 @@ async def execute_engagement_only_replies_via_full_flow(
                 active_reply_proxy_counts
                 or capacity_blocked_proxies
             ):
+                scheduler_stats["selection_deferred"] += 1
                 return None, temporary_reply_selection_error
             return None, None
 
@@ -3246,6 +3350,7 @@ async def execute_engagement_only_replies_via_full_flow(
             active_reply_tasks: Dict[asyncio.Task, Tuple[int, str]] = {}
             inflight_reply_variants: set[int] = set()
             stop_after_dynamic = False
+            next_reply_selection_retry_at = 0.0
             consecutive_surface_unavailable_attempts = 0
             max_surface_unavailable_attempts = (
                 max_surface_unavailable_batches * max(1, parallel_worker_target)
@@ -3293,6 +3398,8 @@ async def execute_engagement_only_replies_via_full_flow(
                         and len(active_reply_tasks) < parallel_worker_target
                         and not _is_stop_requested()
                     ):
+                        if next_reply_selection_retry_at > time.monotonic():
+                            break
                         variant_idx, reply_text = pending_reply_variants.pop(0)
                         if variant_idx in inflight_reply_variants:
                             pending_reply_variants.append((variant_idx, reply_text))
@@ -3317,6 +3424,14 @@ async def execute_engagement_only_replies_via_full_flow(
                         )
 
                     if not active_reply_tasks:
+                        if (
+                            pending_reply_variants
+                            and not stop_after_dynamic
+                            and next_reply_selection_retry_at > time.monotonic()
+                        ):
+                            if await _sleep_or_stop(next_reply_selection_retry_at - time.monotonic()):
+                                break
+                            continue
                         break
 
                     done, _pending = await asyncio.wait(
@@ -3391,12 +3506,19 @@ async def execute_engagement_only_replies_via_full_flow(
                         if raw_result.get("error") == temporary_reply_selection_error:
                             reply_rounds[variant_idx] = max(0, reply_rounds.get(variant_idx, 0) - 1)
                             pending_reply_variants.append((variant_idx, reply_text))
+                            next_reply_selection_retry_at = max(
+                                next_reply_selection_retry_at,
+                                time.monotonic() + reply_selection_capacity_backoff_seconds,
+                            )
                             logger.info(
-                                "Task %s: engagement_only dynamic reply variant %s deferred until a proxy/browser slot frees up",
+                                "Task %s: engagement_only dynamic reply variant %s deferred until a proxy/browser slot frees up "
+                                "(backoff=%.1fs active=%s)",
                                 task_id,
                                 variant_idx,
+                                reply_selection_capacity_backoff_seconds,
+                                dict(active_reply_proxy_counts),
                             )
-                            if await _sleep_or_stop(0.5):
+                            if not active_reply_tasks and await _sleep_or_stop(reply_selection_capacity_backoff_seconds):
                                 results.append(
                                     _stopped_reply_row(
                                         reply_text,
@@ -3407,6 +3529,8 @@ async def execute_engagement_only_replies_via_full_flow(
                                 )
                                 return results, resolved_parent_id, resolved_author
                             continue
+
+                        next_reply_selection_retry_at = 0.0
 
                         surface_unavailable = (
                             raw_result.get("error") == "comment_list_not_open"
@@ -3432,6 +3556,7 @@ async def execute_engagement_only_replies_via_full_flow(
                             continue
 
                         if raw_result.get("stopped"):
+                            _record_attempt_reason(raw_result.get("error"))
                             results.append(
                                 _stopped_reply_row(
                                     reply_text,
@@ -3485,6 +3610,7 @@ async def execute_engagement_only_replies_via_full_flow(
                             and reply_rounds.get(variant_idx, 0) < max_attempts
                         )
                         if can_retry:
+                            _record_attempt_reason(raw_result.get("error"))
                             pending_reply_variants.append((variant_idx, reply_text))
                             continue
 
@@ -3498,6 +3624,7 @@ async def execute_engagement_only_replies_via_full_flow(
                                 for outcome in last_outcomes
                             )
                         else:
+                            _record_attempt_reason(raw_result.get("error"))
                             results.append(
                                 _failure_reply_row(
                                     reply_text,
@@ -3658,6 +3785,7 @@ async def execute_engagement_only_replies_via_full_flow(
                 continue
 
             if raw_result.get("stopped"):
+                _record_attempt_reason(raw_result.get("error"))
                 results.append(
                     _stopped_reply_row(
                         reply_text,
@@ -3675,6 +3803,7 @@ async def execute_engagement_only_replies_via_full_flow(
                 and reply_rounds.get(variant_idx, 0) < max_attempts
             )
             if can_retry:
+                _record_attempt_reason(raw_result.get("error"))
                 retry_variants.append((variant_idx, reply_text))
                 continue
 
@@ -3688,6 +3817,7 @@ async def execute_engagement_only_replies_via_full_flow(
                     for outcome in last_outcomes
                 )
             else:
+                _record_attempt_reason(raw_result.get("error"))
                 results.append(
                     _failure_reply_row(
                         reply_text,
@@ -3754,6 +3884,7 @@ async def execute_engagement_only_replies_via_full_flow(
                 break
 
     results.sort(key=lambda item: int(item.get("variant_index") or 0))
+    _log_engagement_only_reply_summary()
 
     return results, resolved_parent_id, resolved_author
 
