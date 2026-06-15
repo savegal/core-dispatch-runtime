@@ -2117,6 +2117,55 @@ async def test_engagement_only_dynamic_pool_marks_active_and_pending_replies_sto
 
 @pytest.mark.unit
 @pytest.mark.asyncio
+async def test_engagement_only_unexpected_reply_cancellation_reports_failure(db_session, monkeypatch):
+    import db.database as db_database
+    import executor.browser_pool as browser_pool
+    import executor.user_schema as user_schema
+
+    account = Account(id=431, label="reply-cancelled", status="active", cookies='{"sessionid":"x"}')
+
+    @contextmanager
+    def _fake_db_context():
+        yield db_session
+
+    def _fake_get_free_account_for_reply(*_args, **_kwargs):
+        return account
+
+    async def _fake_reply_with_variant_on_all_mains(*_args, **_kwargs):
+        raise asyncio.CancelledError()
+
+    async def _fake_close_browser_pool():
+        return None
+
+    monkeypatch.setattr(engagement_engine.settings, "MAX_RETRY_ACCOUNTS", 1, raising=False)
+    monkeypatch.setattr(engagement_engine.settings, "PARALLEL_COMMENTING_TARGET_BROWSERS", 1, raising=False)
+    monkeypatch.setattr(engagement_engine.settings, "PARALLEL_COMMENTING_MAX_BROWSERS", 1, raising=False)
+    monkeypatch.setattr(db_database, "get_sync_db_context", _fake_db_context)
+    monkeypatch.setattr(engagement_engine, "get_free_account_for_reply", _fake_get_free_account_for_reply)
+    monkeypatch.setattr(user_schema, "_reply_with_variant_on_all_mains", _fake_reply_with_variant_on_all_mains)
+    monkeypatch.setattr(browser_pool, "ensure_thread_browser_pool_capacity", lambda _value: None)
+    monkeypatch.setattr(browser_pool, "close_browser_pool", _fake_close_browser_pool)
+
+    results, resolved_parent_id, resolved_author = await engagement_engine.execute_engagement_only_replies_via_full_flow(
+        db=db_session,
+        video_url="https://www.tiktok.com/@demo/video/1234567890123456789",
+        comment_text="target comment",
+        comment_id="parent_123",
+        comment_author="main_author",
+        replies=["reply one"],
+        task_id=206,
+    )
+
+    assert resolved_parent_id == "parent_123"
+    assert resolved_author == "main_author"
+    assert len(results) == 1
+    assert results[0]["variant_index"] == 1
+    assert results[0]["account_id"] == 431
+    assert results[0]["error"] == "parallel_reply_cancelled"
+
+
+@pytest.mark.unit
+@pytest.mark.asyncio
 async def test_engagement_only_terminal_surface_failure_reports_active_and_pending_rows(db_session, monkeypatch):
     import db.database as db_database
     import executor.browser_pool as browser_pool

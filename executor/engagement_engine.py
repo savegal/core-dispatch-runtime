@@ -3337,10 +3337,32 @@ async def execute_engagement_only_replies_via_full_flow(
                         try:
                             raw_result = task_obj.result()
                         except BaseException as exc:
-                            if isinstance(exc, (asyncio.CancelledError, KeyboardInterrupt, SystemExit)):
+                            if isinstance(exc, (KeyboardInterrupt, SystemExit)):
+                                raise
+                            if isinstance(exc, asyncio.CancelledError):
                                 if _is_stop_requested():
                                     continue
-                                raise
+                                logger.warning(
+                                    "Task %s: engagement_only dynamic reply variant %s was cancelled unexpectedly; "
+                                    "recording failed attempt instead of crashing worker",
+                                    task_id,
+                                    variant_idx,
+                                )
+                                raw_result = {
+                                    "variant_index": variant_idx,
+                                    "text": reply_text,
+                                    "completed": False,
+                                    "stopped": False,
+                                    "error": "parallel_reply_cancelled",
+                                    "account_id": last_reply_account_by_variant.get(variant_idx),
+                                    "outcomes": [],
+                                    "replies": [],
+                                    "resolved_parent_id": None,
+                                    "resolved_author": None,
+                                    "matched_text": None,
+                                }
+                                completed_reply_results.append((variant_idx, reply_text, raw_result))
+                                continue
                             logger.warning(
                                 "Task %s: engagement_only dynamic reply variant %s task raised: %s",
                                 task_id,
@@ -3565,27 +3587,48 @@ async def execute_engagement_only_replies_via_full_flow(
         batch_surface_unavailable_flags: List[bool] = []
         for (variant_idx, reply_text), raw_result in zip(batch, raw_batch_results):
             if isinstance(raw_result, BaseException):
-                if isinstance(raw_result, (asyncio.CancelledError, KeyboardInterrupt, SystemExit)):
+                if isinstance(raw_result, (KeyboardInterrupt, SystemExit)):
                     raise raw_result
-                logger.warning(
-                    "Task %s: engagement_only parallel reply variant %s batch task raised: %s",
-                    task_id,
-                    variant_idx,
-                    str(raw_result)[:120],
-                )
-                raw_result = {
-                    "variant_index": variant_idx,
-                    "text": reply_text,
-                    "completed": False,
-                    "stopped": False,
-                    "error": f"parallel_reply_exception:{str(raw_result)[:80]}",
-                    "account_id": last_reply_account_by_variant.get(variant_idx),
-                    "outcomes": [],
-                    "replies": [],
-                    "resolved_parent_id": None,
-                    "resolved_author": None,
-                    "matched_text": None,
-                }
+                if isinstance(raw_result, asyncio.CancelledError):
+                    logger.warning(
+                        "Task %s: engagement_only parallel reply variant %s batch task was cancelled unexpectedly; "
+                        "recording failed attempt instead of crashing worker",
+                        task_id,
+                        variant_idx,
+                    )
+                    raw_result = {
+                        "variant_index": variant_idx,
+                        "text": reply_text,
+                        "completed": False,
+                        "stopped": False,
+                        "error": "parallel_reply_cancelled",
+                        "account_id": last_reply_account_by_variant.get(variant_idx),
+                        "outcomes": [],
+                        "replies": [],
+                        "resolved_parent_id": None,
+                        "resolved_author": None,
+                        "matched_text": None,
+                    }
+                else:
+                    logger.warning(
+                        "Task %s: engagement_only parallel reply variant %s batch task raised: %s",
+                        task_id,
+                        variant_idx,
+                        str(raw_result)[:120],
+                    )
+                    raw_result = {
+                        "variant_index": variant_idx,
+                        "text": reply_text,
+                        "completed": False,
+                        "stopped": False,
+                        "error": f"parallel_reply_exception:{str(raw_result)[:80]}",
+                        "account_id": last_reply_account_by_variant.get(variant_idx),
+                        "outcomes": [],
+                        "replies": [],
+                        "resolved_parent_id": None,
+                        "resolved_author": None,
+                        "matched_text": None,
+                    }
 
             batch_surface_unavailable_flags.append(
                 raw_result.get("error") == "comment_list_not_open"

@@ -5992,17 +5992,15 @@ async def test_parallel_mode_retries_failed_main_slot_with_replacement_before_re
 
     assert result.error is None
     main_events = [event for event in events if event[0] == "main"]
-    assert main_events[:3] == [
-        ("main", 101, ("m1", "m2", "m3")),
-        ("main", 102, ("m1", "m2", "m3")),
-        ("main", 103, ("m1", "m2", "m3")),
-    ]
+    assert ("main", 101, ("m1", "m2", "m3")) in main_events
+    assert ("main", 102, ("m2", "m3", "m1")) in main_events
+    assert any(event[1] != 102 and event[2] == ("m2", "m3", "m1") for event in main_events)
+    assert any(event[2] == ("m3", "m1", "m2") for event in main_events)
     assert sorted(event[1] for event in main_events) == [101, 102, 103, 104]
-    assert main_events[-1] == ("main", 104, ("m1", "m2", "m3"))
     assert events[-1][0] == "reply"
     assert len(result.published_mains) == 9
     assert sorted({main.account_id for main in result.published_mains}) == [101, 103, 104]
-    assert [main.text for main in result.published_mains] == ["m1", "m2", "m3"] * 3
+    assert sorted(main.text for main in result.published_mains) == ["m1", "m1", "m1", "m2", "m2", "m2", "m3", "m3", "m3"]
     assert close_calls == ["close", "close"]
 
 
@@ -6093,10 +6091,10 @@ async def test_parallel_mode_refills_main_worker_while_other_browsers_are_active
     )
 
     assert result.error is None
-    replacement_start_index = events.index(("start", 104, ("m1", "m2", "m3")))
+    replacement_start_index = events.index(("start", 104, ("m2", "m3", "m1")))
     assert replacement_start_index < events.index(("finish", 101))
     assert replacement_start_index < events.index(("finish", 103))
-    assert [main.text for main in result.published_mains] == ["m1", "m2", "m3"] * 3
+    assert sorted(main.text for main in result.published_mains) == ["m1", "m1", "m1", "m2", "m2", "m2", "m3", "m3", "m3"]
     assert close_calls == ["close"]
 
 
@@ -6383,9 +6381,13 @@ async def test_parallel_mode_selects_main_accounts_without_blocking_event_loop(m
 
     assert result.error is None
     assert max_active_selects > 1
-    assert [main.text for main in result.published_mains] == ["m1", "m2", "m3"] * 3
+    assert sorted(main.text for main in result.published_mains) == ["m1", "m1", "m1", "m2", "m2", "m2", "m3", "m3", "m3"]
     assert sorted(account_id for account_id, _texts in main_starts) == [101, 102, 103]
-    assert all(texts == ("m1", "m2", "m3") for _account_id, texts in main_starts)
+    assert sorted(texts for _account_id, texts in main_starts) == [
+        ("m1", "m2", "m3"),
+        ("m2", "m3", "m1"),
+        ("m3", "m1", "m2"),
+    ]
 
 
 @pytest.mark.unit
@@ -6587,7 +6589,7 @@ async def test_parallel_mode_blocks_replies_when_one_main_slot_exhausts(monkeypa
         for item in result.warnings
         if item.get("code") == "parallel_main_incomplete_replies_blocked"
     )
-    assert blocked_warning["remaining_by_slot"] == {"2": ["m1", "m2", "m3"]}
+    assert blocked_warning["remaining_by_slot"] == {"2": ["m2", "m3", "m1"]}
 
 
 @pytest.mark.unit
@@ -6667,7 +6669,7 @@ async def test_parallel_mode_main_only_proceeds_with_partial_mains(monkeypatch):
         for item in result.warnings
         if item.get("code") == "parallel_main_partial"
     )
-    assert partial_warning["remaining_by_slot"] == {"2": ["m1", "m2", "m3"]}
+    assert partial_warning["remaining_by_slot"] == {"2": ["m2", "m3", "m1"]}
     assert not any(
         item.get("code") == "parallel_main_incomplete_replies_blocked"
         for item in result.warnings
@@ -6758,7 +6760,17 @@ async def test_parallel_mode_reply_variant_targets_each_main_comment(monkeypatch
     assert len(result.published_mains) == 9
     assert len(seen_reply_targets) == 1
     assert len(seen_reply_targets[0]) == 9
-    assert [text for _account_id, text, _cid in seen_reply_targets[0]] == ["m1", "m2", "m3"] * 3
+    assert sorted(text for _account_id, text, _cid in seen_reply_targets[0]) == [
+        "m1",
+        "m1",
+        "m1",
+        "m2",
+        "m2",
+        "m2",
+        "m3",
+        "m3",
+        "m3",
+    ]
     assert len(result.replies) == 9
     assert [outcome.parent_comment_id for outcome in result.replies] == [
         f"cid-{account_id}-{idx}"
@@ -7213,9 +7225,13 @@ async def test_parallel_mode_limits_main_proxy_to_two_active_browsers(monkeypatc
     )
 
     assert result.error is None
-    assert [main.text for main in result.published_mains] == ["m1", "m2", "m3"] * 3
+    assert sorted(main.text for main in result.published_mains) == ["m1", "m1", "m1", "m2", "m2", "m2", "m3", "m3", "m3"]
     assert [attempt[0] for attempt in main_attempts] == [101, 102, 103]
-    assert all(attempt[1] == ("m1", "m2", "m3") for attempt in main_attempts)
+    assert [attempt[1] for attempt in main_attempts] == [
+        ("m1", "m2", "m3"),
+        ("m2", "m3", "m1"),
+        ("m3", "m1", "m2"),
+    ]
     assert max_active_by_proxy[shared_proxy] == 2
     assert any(shared_proxy in excluded_proxies for _excluded_ids, excluded_proxies in selection_snapshots)
     assert close_calls == ["close"]
@@ -7320,7 +7336,7 @@ async def test_parallel_mode_does_not_spin_main_selection_while_proxy_slots_are_
 
     assert result.error is None
     assert sorted(started_accounts) == [101, 102, 103]
-    assert [main.text for main in result.published_mains] == ["m1", "m2", "m3"] * 3
+    assert sorted(main.text for main in result.published_mains) == ["m1", "m1", "m1", "m2", "m2", "m2", "m3", "m3", "m3"]
 
 
 @pytest.mark.unit
@@ -8247,8 +8263,8 @@ async def test_parallel_mode_carries_submitted_parent_keys_across_reply_retries(
     assert [outcome.parent_comment_id for outcome in result.replies] == [
         "cid-101-m1",
         "cid-101-m2",
-        "cid-102-m1",
         "cid-102-m2",
+        "cid-102-m1",
         "cid-103-m1",
         "cid-103-m2",
     ]

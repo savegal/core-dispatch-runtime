@@ -402,59 +402,6 @@ async def _clear_main_comment_composer_best_effort(
     )
     return cleared
 
-
-async def _enter_submit_fast_path(
-    page: Page,
-    input_handle: Any,
-    *,
-    reply_scoped: bool,
-) -> bool:
-    """Try submitting via a real Enter keystroke after ensuring the editor is focused.
-
-    Returns True only when the composer actually CLEARED (submit accepted). If
-    Enter instead inserted a newline (composer not cleared, text grew), the
-    newline is removed with Backspace and False is returned so the caller falls
-    back to the existing Post-button click path. Usable for both main and reply;
-    for replies focus is placed on the reply editor first.
-    """
-    before = await _composer_cleared_state(page, reply_scoped=reply_scoped)
-    if not before.get("exists") or before.get("empty"):
-        # Nothing meaningful to submit via Enter; let the button path handle it.
-        return False
-    before_text = str(before.get("text") or "")
-
-    try:
-        if input_handle is not None:
-            try:
-                await input_handle.focus()
-            except Exception:
-                try:
-                    await input_handle.click(timeout=1500)
-                except Exception:
-                    pass
-        await page.keyboard.press("Enter")
-    except Exception as exc:
-        logger.debug("[PUBLISH] Enter submit fast-path keystroke failed: %s", str(exc)[:120])
-        return False
-
-    await asyncio.sleep(0.2)
-    after = await _composer_cleared_state(page, reply_scoped=reply_scoped)
-    if after.get("exists") and after.get("empty"):
-        logger.info("[PUBLISH] Enter submit fast-path cleared the composer (reply=%s)", reply_scoped)
-        return True
-
-    # Enter was treated as a newline (or did nothing). Undo any inserted newline
-    # so the text stays clean for the button-click fallback.
-    after_text = str(after.get("text") or "")
-    if after_text != before_text:
-        try:
-            await page.keyboard.press("Backspace")
-        except Exception:
-            pass
-    logger.debug("[PUBLISH] Enter submit fast-path did not clear composer; falling back to button click")
-    return False
-
-
 def _looks_like_driver_closed_error(text: Optional[str]) -> bool:
     safe = (text or "").lower()
     return any(
@@ -2565,6 +2512,40 @@ async def _publish_main_comment_direct_dom(
                     dom_strategy=combined_strategy,
                     post_was_enabled_at_click=post_was_enabled,
                 )
+            if post_was_enabled:
+                cleared: Dict[str, Any] = {}
+                try:
+                    cleared = await _asyncio_wait_for(
+                        _composer_cleared_state(page, reply_scoped=False),
+                        timeout=min(1.5, max(_remaining(), 0.2)),
+                    )
+                except asyncio.TimeoutError:
+                    cleared = {}
+                except Exception:
+                    cleared = {}
+                if cleared.get("exists") and cleared.get("empty"):
+                    _log_publish_trace(
+                        "publish_result",
+                        page=page,
+                        expected_video_url=expected_video_url,
+                        correlation_id=correlation_id,
+                        status="success",
+                        reason="main_direct_ambiguous_response_composer_cleared",
+                        network_status=captured.get("status"),
+                        post_was_enabled=post_was_enabled,
+                        elapsed=round(elapsed, 2),
+                    )
+                    return PublishResult(
+                        status="success",
+                        network_captured=True,
+                        network_request_attempted=True,
+                        network_status_code=captured.get("status"),
+                        network_body_preview=body_preview,
+                        network_response_json=response_json,
+                        elapsed_seconds=elapsed,
+                        dom_strategy=combined_strategy,
+                        post_was_enabled_at_click=post_was_enabled,
+                    )
             return PublishResult(
                 status="failed",
                 error_reason="main_direct_api_response_without_comment_id",
@@ -2583,7 +2564,7 @@ async def _publish_main_comment_direct_dom(
             try:
                 cleared = await _asyncio_wait_for(
                     _composer_cleared_state(page, reply_scoped=False),
-                    timeout=min(0.9, max(_remaining(), 0.2)),
+                    timeout=min(1.5, max(_remaining(), 0.2)),
                 )
             except asyncio.TimeoutError:
                 cleared = {}
@@ -3993,35 +3974,10 @@ async def _publish_via_current_input(
             "[PUBLISH] elementFromPoint=BODY; button has pointer-events:none. Will use synthetic dispatchEvent."
         )
 
-    # Enter-submit fast-path: when the Post button is enabled (text committed
-    # and ready) and we are not in the pointer-events:none synthetic case, a
-    # real Enter keystroke on the focused editor submits faster and more
-    # reliably than chasing the button center. Guarded: only treated as
-    # submitted when the composer actually clears (see _enter_submit_fast_path).
-    enter_submitted = False
-    if post_was_enabled and not _use_synthetic_click:
-        enter_submitted = await _enter_submit_fast_path(
-            page,
-            input_handle,
-            reply_scoped=reply_scoped,
-        )
-        if enter_submitted:
-            enter_wait_remaining = max_total_seconds - (time.monotonic() - started)
-            if enter_wait_remaining > 0 and not event.is_set():
-                try:
-                    await asyncio.wait_for(
-                        event.wait(),
-                        timeout=min(2.0, max(enter_wait_remaining, 0.3)),
-                    )
-                except asyncio.TimeoutError:
-                    pass
-
     synthetic_dispatch_attempted = False
     try:
-        box = None if enter_submitted else await post_button.bounding_box()
-        if enter_submitted:
-            logger.info("[PUBLISH] Enter submit fast-path used; skipping Post button click")
-        elif box:
+        box = await post_button.bounding_box()
+        if box:
             x = box["x"] + box["width"] / 2
             y = box["y"] + box["height"] / 2
 
@@ -4224,6 +4180,50 @@ async def _publish_via_current_input(
 
     elapsed = time.monotonic() - started
     request_attempted = bool(captured.get("request_url"))
+
+    async def _ambiguous_network_success_if_composer_cleared(
+        *,
+        reason: str,
+        body_preview: str,
+        response_json: Optional[Dict[str, Any]],
+    ) -> Optional[PublishResult]:
+        if not post_was_enabled:
+            return None
+        try:
+            cleared = await _asyncio_wait_for(
+                _composer_cleared_state(page, reply_scoped=reply_scoped),
+                timeout=min(1.5, max(_remaining(), 0.2)),
+            )
+        except asyncio.TimeoutError:
+            cleared = {}
+        except Exception:
+            cleared = {}
+        if not (cleared.get("exists") and cleared.get("empty")):
+            return None
+        _log_publish_trace(
+            "publish_result",
+            page=page,
+            expected_video_url=expected_video_url,
+            correlation_id=correlation_id,
+            status="success",
+            reason=reason,
+            network_status=captured.get("status"),
+            post_was_enabled=post_was_enabled,
+            request_attempted=request_attempted,
+            elapsed=round(elapsed, 2),
+        )
+        return PublishResult(
+            status="success",
+            network_captured=True,
+            network_request_attempted=True,
+            network_status_code=captured.get("status"),
+            network_body_preview=body_preview,
+            network_response_json=response_json,
+            elapsed_seconds=elapsed,
+            dom_strategy=input_info.strategy or post_info.strategy,
+            post_was_enabled_at_click=post_was_enabled,
+        )
+
     if captured.get("url"):
         body_preview = (captured.get("body") or "")[:200].replace("\n", " ")
         response_json = captured.get("json") if isinstance(captured.get("json"), dict) else None
@@ -4265,6 +4265,13 @@ async def _publish_via_current_input(
                     post_was_enabled_at_click=post_was_enabled,
                 )
             if not response_json:
+                cleared_success = await _ambiguous_network_success_if_composer_cleared(
+                    reason="ambiguous_empty_json_composer_cleared",
+                    body_preview=body_preview,
+                    response_json=response_json,
+                )
+                if cleared_success is not None:
+                    return cleared_success
                 _log_publish_trace(
                     "publish_result",
                     page=page,
@@ -4310,9 +4317,16 @@ async def _publish_via_current_input(
                 elapsed_seconds=elapsed,
                 dom_strategy=input_info.strategy or post_info.strategy,
                 post_was_enabled_at_click=post_was_enabled,
-            )
+                )
 
         if not (captured.get("body") or "").strip():
+            cleared_success = await _ambiguous_network_success_if_composer_cleared(
+                reason="ambiguous_empty_body_composer_cleared",
+                body_preview=body_preview,
+                response_json=response_json,
+            )
+            if cleared_success is not None:
+                return cleared_success
             _log_publish_trace(
                 "publish_result",
                 page=page,
@@ -4382,10 +4396,9 @@ async def _publish_via_current_input(
     # Confirmation robustness: TikTok very frequently returns an empty/late
     # response body even on a successful publish. The composer clearing is a
     # strong local "submit accepted" signal. Trust it ONLY when submission went
-    # through a trusted path (Post button was enabled, or the Enter fast-path
-    # cleared the composer) so the disabled synthetic-dispatch path stays
-    # classified as unverified.
-    if post_was_enabled or enter_submitted:
+    # through a trusted path (Post button was enabled) so the disabled
+    # synthetic-dispatch path stays classified as unverified.
+    if post_was_enabled:
         cleared = await _composer_cleared_state(page, reply_scoped=reply_scoped)
         if cleared.get("exists") and cleared.get("empty"):
             _log_publish_trace(
@@ -4395,15 +4408,13 @@ async def _publish_via_current_input(
                 correlation_id=correlation_id,
                 status="success",
                 reason="composer_cleared_after_submit",
-                enter_submitted=enter_submitted,
                 post_was_enabled=post_was_enabled,
                 request_attempted=request_attempted,
                 elapsed=round(elapsed, 2),
             )
             logger.info(
-                "[PUBLISH] No network body but composer cleared after submit "
-                "(enter=%s, post_enabled=%s); treating as success.",
-                enter_submitted,
+                "[PUBLISH] No network body but composer cleared after Post submit "
+                "(post_enabled=%s); treating as success.",
                 post_was_enabled,
             )
             return PublishResult(

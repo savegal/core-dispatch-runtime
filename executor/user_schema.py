@@ -1442,6 +1442,7 @@ class PublishedMain:
     method: str                   # "hybrid_dom" / etc.
     account_id: int
     tiktok_username: Optional[str]  # реальный username автора (для лайков)
+    variant_index: Optional[int] = None
 
 
 @dataclass
@@ -1720,6 +1721,7 @@ class UserSchemaResult:
                         {
                             "text": p.text,
                             "comment_id": p.comment_id,
+                            "variant_index": p.variant_index,
                             "method": p.method,
                             "account_id": p.account_id,
                             "tiktok_username": p.tiktok_username,
@@ -3231,6 +3233,23 @@ def _dedup_variants(text_variants: List[str]) -> List[str]:
     return result
 
 
+def _variant_index_by_text(text_variants: List[str]) -> Dict[str, int]:
+    return {
+        _dedup_key(text): index
+        for index, text in enumerate(_dedup_variants(text_variants), start=1)
+        if _dedup_key(text)
+    }
+
+
+def _rotate_main_texts_for_slot(main_texts: List[str], slot_index: int) -> List[str]:
+    """Start each parallel main slot with a different template variant."""
+    texts = _dedup_variants(main_texts)
+    if not texts:
+        return []
+    offset = (max(1, int(slot_index or 1)) - 1) % len(texts)
+    return texts[offset:] + texts[:offset]
+
+
 def _next_inter_publish_delay(idx_published_so_far: int) -> float:
     """Пауза между публикациями main-вариантов на одном аккаунте."""
     return random.uniform(*_INTER_MAIN_VARIANT_DELAY_RANGE)
@@ -3516,6 +3535,7 @@ async def _publish_all_variants_on_account(
     correlation_id: str,
     expected_video_url: Optional[str] = None,
     on_published: Optional[Callable[[PublishedMain], None]] = None,
+    variant_index_by_text: Optional[Dict[str, int]] = None,
 ) -> Tuple[List[PublishedMain], Optional[str]]:
     """Пишет все variants подряд. Возвращает только успешные публикации.
 
@@ -3553,7 +3573,9 @@ async def _publish_all_variants_on_account(
             correlation_id=f"{correlation_id}_http_main",
         )
 
-    for idx, text in enumerate(text_variants, start=1):
+    local_variant_index_by_text = variant_index_by_text or _variant_index_by_text(text_variants)
+    for local_idx, text in enumerate(text_variants, start=1):
+        idx = int(local_variant_index_by_text.get(_dedup_key(text), local_idx) or local_idx)
         sub_corr = f"{correlation_id}_v{idx}"
         logger.info(
             "[USER_SCHEMA] main publish %s on account=%s text=%r",
@@ -3816,6 +3838,7 @@ async def _publish_all_variants_on_account(
             method=result.dom_strategy or ("hybrid_http" if network_confirmed else "hybrid_dom"),
             account_id=account.id,
             tiktok_username=tiktok_username,
+            variant_index=idx,
         )
         published.append(published_main)
         if on_published is not None:
@@ -3873,7 +3896,7 @@ async def _publish_all_variants_on_account(
             )
             break
 
-        if idx < len(text_variants):
+        if local_idx < len(text_variants):
             delay = _next_inter_publish_delay(len(published))
             logger.debug("[USER_SCHEMA] inter-variant delay %.1fs (already published %d)", delay, len(published))
             await asyncio.sleep(delay)
@@ -3919,6 +3942,7 @@ async def _try_main_account(
     correlation_id: str,
     resolved_video_url_holder: Optional[Dict[str, str]] = None,
     on_published: Optional[Callable[[PublishedMain], None]] = None,
+    variant_index_by_text: Optional[Dict[str, int]] = None,
 ) -> Tuple[List[PublishedMain], Optional[str]]:
     """Полный цикл одной попытки на main-аккаунте.
 
@@ -4171,6 +4195,7 @@ async def _try_main_account(
             correlation_id=correlation_id,
             expected_video_url=target_media_url,
             on_published=on_published,
+            variant_index_by_text=variant_index_by_text,
         )
         if published:
             close_reason = (
@@ -4268,6 +4293,7 @@ def _normalize_main_candidates(main_candidates: List[Any]) -> List[PublishedMain
                 method=str(getattr(item, "method", "legacy_text")),
                 account_id=int(getattr(item, "account_id", 0) or 0),
                 tiktok_username=getattr(item, "tiktok_username", None),
+                variant_index=getattr(item, "variant_index", None),
             )
         )
     return normalized
@@ -4408,6 +4434,7 @@ def _published_main_with_cached_parent(main: PublishedMain, cached: PublishedMai
         method=main.method or cached.method,
         account_id=main.account_id,
         tiktok_username=main.tiktok_username or cached.tiktok_username,
+        variant_index=main.variant_index or cached.variant_index,
     )
 
 
@@ -4797,6 +4824,7 @@ def _main_from_anchor(main: PublishedMain, anchor: MainAnchor) -> PublishedMain:
         method=main.method,
         account_id=main.account_id,
         tiktok_username=anchor.matched_author or main.tiktok_username,
+        variant_index=main.variant_index,
     )
 
 
@@ -8198,8 +8226,9 @@ async def execute_user_schema_parallel(
         result.error = "no_text_variants"
         result.elapsed_seconds = time.monotonic() - started
         return result
+    main_variant_index_by_text = _variant_index_by_text(main_texts)
     main_texts_by_slot: Dict[int, List[str]] = {
-        slot_index: list(main_texts)
+        slot_index: _rotate_main_texts_for_slot(main_texts, slot_index)
         for slot_index in range(1, parallel_main_account_slots + 1)
     }
     result.expected_main_publications = len(main_texts) * parallel_main_account_slots
@@ -8922,6 +8951,7 @@ async def execute_user_schema_parallel(
                             )
                             if dynamic_worker_pool_enabled
                             else None,
+                            variant_index_by_text=main_variant_index_by_text,
                         ),
                         timeout=main_worker_attempt_timeout_seconds,
                     )
@@ -9141,10 +9171,26 @@ async def execute_user_schema_parallel(
                     try:
                         raw_result = task_obj.result()
                     except BaseException as exc:
-                        if isinstance(exc, (asyncio.CancelledError, KeyboardInterrupt, SystemExit)):
+                        if isinstance(exc, (KeyboardInterrupt, SystemExit)):
+                            raise
+                        if isinstance(exc, asyncio.CancelledError):
                             if _is_stop_requested():
                                 continue
-                            raise
+                            logger.warning(
+                                "Task %s: dynamic parallel main slot %s was cancelled unexpectedly; "
+                                "recording failed attempt instead of crashing worker",
+                                task_id,
+                                slot_index,
+                            )
+                            slot_result = _ParallelMainSlotResult(
+                                slot_index=slot_index,
+                                text=" | ".join(slot_texts),
+                                remaining_texts=list(slot_texts),
+                                attempts=main_attempts_by_slot.get(slot_index, 0),
+                                error="parallel_main_cancelled",
+                            )
+                            completed_main_results.append((slot_index, slot_texts, slot_result))
+                            continue
                         logger.warning(
                             "Task %s: dynamic parallel main slot %s raised outside attempt wrapper: %s",
                             task_id,
@@ -9397,8 +9443,25 @@ async def execute_user_schema_parallel(
         batch_results: List[_ParallelMainSlotResult] = []
         for (slot_index, slot_texts), raw_result in zip(batch, raw_batch_results):
             if isinstance(raw_result, BaseException):
-                if isinstance(raw_result, (asyncio.CancelledError, KeyboardInterrupt, SystemExit)):
+                if isinstance(raw_result, (KeyboardInterrupt, SystemExit)):
                     raise raw_result
+                if isinstance(raw_result, asyncio.CancelledError):
+                    logger.warning(
+                        "Task %s: parallel main slot %s batch task was cancelled unexpectedly; "
+                        "recording failed attempt instead of crashing worker",
+                        task_id,
+                        slot_index,
+                    )
+                    batch_results.append(
+                        _ParallelMainSlotResult(
+                            slot_index=slot_index,
+                            text=" | ".join(slot_texts),
+                            remaining_texts=list(slot_texts),
+                            attempts=main_attempts_by_slot.get(slot_index, 0),
+                            error="parallel_main_cancelled",
+                        )
+                    )
+                    continue
                 logger.warning(
                     "Task %s: parallel main slot %s batch task raised outside attempt wrapper: %s",
                     task_id,
@@ -10179,10 +10242,32 @@ async def execute_user_schema_parallel(
                         try:
                             raw_result = task_obj.result()
                         except BaseException as exc:
-                            if isinstance(exc, (asyncio.CancelledError, KeyboardInterrupt, SystemExit)):
+                            if isinstance(exc, (KeyboardInterrupt, SystemExit)):
+                                raise
+                            if isinstance(exc, asyncio.CancelledError):
                                 if _is_stop_requested():
                                     continue
-                                raise
+                                logger.warning(
+                                    "Task %s: dynamic parallel reply variant %s was cancelled unexpectedly; "
+                                    "recording failed attempt instead of crashing worker",
+                                    task_id,
+                                    variant_index,
+                                )
+                                item = _ParallelReplyVariantResult(
+                                    variant_index=variant_index,
+                                    text=reply_text,
+                                    error="parallel_reply_cancelled",
+                                    replies=[
+                                        _reply_failure_outcome(
+                                            reply_text=reply_text,
+                                            variant_index=variant_index,
+                                            account_id=None,
+                                            error="parallel_reply_cancelled",
+                                        )
+                                    ],
+                                )
+                                completed_reply_results.append((variant_index, reply_text, item))
+                                continue
                             logger.warning(
                                 "Task %s: dynamic parallel reply variant %s raised outside attempt wrapper: %s",
                                 task_id,
@@ -10422,8 +10507,31 @@ async def execute_user_schema_parallel(
         batch_results: List[_ParallelReplyVariantResult] = []
         for (variant_index, reply_text), raw_result in zip(batch, raw_batch_results):
             if isinstance(raw_result, BaseException):
-                if isinstance(raw_result, (asyncio.CancelledError, KeyboardInterrupt, SystemExit)):
+                if isinstance(raw_result, (KeyboardInterrupt, SystemExit)):
                     raise raw_result
+                if isinstance(raw_result, asyncio.CancelledError):
+                    logger.warning(
+                        "Task %s: parallel reply variant %s batch task was cancelled unexpectedly; "
+                        "recording failed attempt instead of crashing worker",
+                        task_id,
+                        variant_index,
+                    )
+                    batch_results.append(
+                        _ParallelReplyVariantResult(
+                            variant_index=variant_index,
+                            text=reply_text,
+                            error="parallel_reply_cancelled",
+                            replies=[
+                                _reply_failure_outcome(
+                                    reply_text=reply_text,
+                                    variant_index=variant_index,
+                                    account_id=None,
+                                    error="parallel_reply_cancelled",
+                                )
+                            ],
+                        )
+                    )
+                    continue
                 logger.warning(
                     "Task %s: parallel reply variant %s batch task raised outside attempt wrapper: %s",
                     task_id,
