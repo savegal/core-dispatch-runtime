@@ -1258,6 +1258,7 @@ def test_reply_input_finder_requires_live_parent_anchor_scope():
     assert "anchorMissing" in script
     assert "selected.score < 8000" in script
     assert "parent_anchor_not_found" in script
+    assert "data-smart-reply-anchor-token" in script
 
 
 @pytest.mark.unit
@@ -1429,7 +1430,7 @@ async def test_type_into_comment_reply_uses_trusted_full_insert_first(monkeypatc
     monkeypatch.setattr(dom_actions.asyncio, "sleep", _fake_sleep)
 
     page = _Page()
-    ok = await dom_actions.type_into_comment(
+    result = await dom_actions.type_into_comment(
         page,
         object(),
         "hello",
@@ -1438,14 +1439,19 @@ async def test_type_into_comment_reply_uses_trusted_full_insert_first(monkeypatc
         anchor_token="pa-123",
     )
 
-    assert ok is True
+    assert result["ok"] is True
+    assert result["strategy"] == "atomic-focus-insert-text"
+    assert result["anchor_bound"] is True
     assert dom_actions._JS_ATOMIC_SET_COMMENT_TEXT in page.scripts
+    # Reply path: scoped focus (atomic focus_only), then a TRUSTED Ctrl+A+Delete to
+    # reset React/Lexical EditorState (no DOM-only clear_only round-trip), then the
+    # trusted insert. The trusted clear mirrors the main-composer fix but stays
+    # scoped because focus is already confirmed inside the reply editor.
     assert page.atomic_calls == [
         ["", "hello", "pa-123", True, True, False],
-        ["", "", "pa-123", True, False, True],
     ]
     assert keyboard_calls["insert_text"] == ["hello"]
-    assert keyboard_calls["press"] == []
+    assert keyboard_calls["press"] == ["Control+A", "Delete"]
     assert keyboard_calls["type"] == []
 
 
@@ -1487,9 +1493,10 @@ async def test_type_into_comment_main_prefers_focus_insert_over_prefix_tail(monk
     monkeypatch.setattr(dom_actions.asyncio, "sleep", _fake_sleep)
 
     page = _Page()
-    ok = await dom_actions.type_into_comment(page, object(), "hello", fast=True)
+    result = await dom_actions.type_into_comment(page, object(), "hello", fast=True)
 
-    assert ok is True
+    assert result["ok"] is True
+    assert result["strategy"] == "atomic-focus-insert-text"
     # MAIN composer now clears via a TRUSTED select-all+delete (resets React/Lexical
     # EditorState) instead of an atomic clear_only that only wipes the DOM.
     assert page.atomic_calls == [
@@ -1545,9 +1552,10 @@ async def test_type_into_comment_main_uses_atomic_prefix_tail_after_keyboard_mis
     monkeypatch.setattr(dom_actions, "suppress_keyboard_shortcuts_overlay", _fake_suppress)
     monkeypatch.setattr(dom_actions.asyncio, "sleep", _fake_sleep)
 
-    ok = await dom_actions.type_into_comment(_Page(), object(), "hello", fast=True)
+    result = await dom_actions.type_into_comment(_Page(), object(), "hello", fast=True)
 
-    assert ok is True
+    assert result["ok"] is True
+    assert result["strategy"] == "atomic-prefix-trusted-tail"
     # MAIN composer clears via trusted Ctrl+A+Delete (no atomic clear_only call).
     assert [kwargs for _text, kwargs in atomic_calls] == [
         {"reply_scoped": False, "anchor_token": None, "focus_only": True},
@@ -1601,9 +1609,10 @@ async def test_type_into_comment_main_keeps_typing_when_clear_verify_is_uncertai
     monkeypatch.setattr(dom_actions, "suppress_keyboard_shortcuts_overlay", _fake_suppress)
     monkeypatch.setattr(dom_actions.asyncio, "sleep", _fake_sleep)
 
-    ok = await dom_actions.type_into_comment(_Page(), object(), "hello", fast=True)
+    result = await dom_actions.type_into_comment(_Page(), object(), "hello", fast=True)
 
-    assert ok is True
+    assert result["ok"] is True
+    assert result["strategy"] == "atomic-focus-insert-text"
     # MAIN composer always resets EditorState with a trusted Ctrl+A+Delete before
     # the trusted insert, so no atomic clear_only round-trip is used.
     assert [kwargs for _text, kwargs in atomic_calls] == [
@@ -1666,9 +1675,10 @@ async def test_type_into_comment_main_uses_contenteditable_js_fallback_after_key
     monkeypatch.setattr(dom_actions, "suppress_keyboard_shortcuts_overlay", _fake_suppress)
     monkeypatch.setattr(dom_actions.asyncio, "sleep", _fake_sleep)
 
-    ok = await dom_actions.type_into_comment(_Page(), _Element(), "hello", fast=True)
+    result = await dom_actions.type_into_comment(_Page(), _Element(), "hello", fast=True)
 
-    assert ok is True
+    assert result["ok"] is True
+    assert result["strategy"].startswith("js-fallback:")
     assert keyboard_calls["insert_text"] == ["hello"]
     assert keyboard_calls["type"] == []
     assert any("const pickEditor" in call and "document.execCommand('insertText'" in call for call in evaluate_calls)
@@ -1676,7 +1686,7 @@ async def test_type_into_comment_main_uses_contenteditable_js_fallback_after_key
 
 @pytest.mark.unit
 @pytest.mark.asyncio
-async def test_type_into_comment_reply_uses_scoped_full_insert_after_keyboard_miss(monkeypatch):
+async def test_type_into_comment_reply_skips_raw_dom_atomic_fallback_after_keyboard_miss(monkeypatch):
     keyboard_calls = {"insert_text": [], "press": []}
     atomic_calls = []
 
@@ -1721,7 +1731,7 @@ async def test_type_into_comment_reply_uses_scoped_full_insert_after_keyboard_mi
     monkeypatch.setattr(dom_actions, "suppress_keyboard_shortcuts_overlay", _fake_suppress)
     monkeypatch.setattr(dom_actions.asyncio, "sleep", _fake_sleep)
 
-    ok = await dom_actions.type_into_comment(
+    result = await dom_actions.type_into_comment(
         _Page(),
         None,
         "hello",
@@ -1730,14 +1740,18 @@ async def test_type_into_comment_reply_uses_scoped_full_insert_after_keyboard_mi
         anchor_token="pa-777",
     )
 
-    assert ok is True
+    assert result["ok"] is False
+    assert result["reason"] == "editor_missing_after_atomic_attempts"
+    assert result["strategy"] == "resolve-editor"
+    assert result["anchor_bound"] is True
+    # Reply primary now resets EditorState with a trusted Ctrl+A+Delete (no atomic
+    # clear_only round-trip). If the trusted insert does not verify, reply mode
+    # must NOT fall through to raw-DOM atomic prefix/full insert because that is
+    # the path that can desync React/Lexical state.
     assert [kwargs for _text, kwargs in atomic_calls] == [
         {"reply_scoped": True, "anchor_token": "pa-777", "focus_only": True},
-        {"reply_scoped": True, "anchor_token": "pa-777", "clear_only": True},
-        {"reply_scoped": True, "anchor_token": "pa-777", "insert_text": "hell"},
-        {"reply_scoped": True, "anchor_token": "pa-777"},
     ]
-    assert keyboard_calls["press"] == []
+    assert keyboard_calls["press"] == ["Control+A", "Delete"]
     assert keyboard_calls["insert_text"] == ["hello"]
 
 
@@ -1776,7 +1790,7 @@ async def test_type_into_comment_reply_scoped_forwards_anchor_to_atomic(monkeypa
     monkeypatch.setattr(dom_actions, "suppress_keyboard_shortcuts_overlay", _fake_suppress)
     monkeypatch.setattr(dom_actions.asyncio, "sleep", _fake_sleep)
 
-    ok = await dom_actions.type_into_comment(
+    result = await dom_actions.type_into_comment(
         _Page(),
         object(),
         "hi there",
@@ -1785,14 +1799,16 @@ async def test_type_into_comment_reply_scoped_forwards_anchor_to_atomic(monkeypa
         anchor_token="pa-xyz",
     )
 
-    assert ok is True
-    # replyScoped True and the anchor token are forwarded into the atomic JS.
+    assert result["ok"] is True
+    assert result["strategy"] == "atomic-focus-insert-text"
+    assert result["anchor_bound"] is True
+    # replyScoped True and the anchor token are forwarded into the atomic JS for
+    # the scoped focus. The clear before typing is now a TRUSTED Ctrl+A+Delete
+    # (keyboard), not an atomic clear_only round-trip, so when the trusted insert
+    # verifies on the first try there is only the single scoped focus atomic call.
     assert captured["atomic_args"][0][2] == "pa-xyz"
     assert captured["atomic_args"][0][3] is True
-    assert captured["atomic_args"][0][4] is True  # scoped focus before trusted full insert
-    assert captured["atomic_args"][1][2] == "pa-xyz"
-    assert captured["atomic_args"][1][3] is True
-    assert captured["atomic_args"][1][5] is True  # verified clear before trusted text
+    assert captured["atomic_args"][0][4] is True  # scoped focus before trusted clear + insert
 
 
 @pytest.mark.unit

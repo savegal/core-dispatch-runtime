@@ -671,10 +671,11 @@ _JS_FIND_POST_BUTTON = r"""
 _JS_FIND_REPLY_INPUT = r"""
 ([parentAnchorToken]) => {
     document
-        .querySelectorAll('[data-smart-reply-input], [data-smart-reply-composer]')
+        .querySelectorAll('[data-smart-reply-input], [data-smart-reply-composer], [data-smart-reply-anchor-token]')
         .forEach(el => {
             el.removeAttribute('data-smart-reply-input');
             el.removeAttribute('data-smart-reply-composer');
+            el.removeAttribute('data-smart-reply-anchor-token');
         });
 
     const targetAnchorToken = String(parentAnchorToken || '').trim();
@@ -796,6 +797,10 @@ _JS_FIND_REPLY_INPUT = r"""
     try { editor.setAttribute('data-smart-reply-input', '1'); } catch (_) {}
     try { editor.setAttribute('data-smart-id', 'comment-input'); } catch (_) {}
     try { composer.setAttribute('data-smart-reply-composer', '1'); } catch (_) {}
+    if (targetAnchorToken) {
+        try { editor.setAttribute('data-smart-reply-anchor-token', targetAnchorToken); } catch (_) {}
+        try { composer.setAttribute('data-smart-reply-anchor-token', targetAnchorToken); } catch (_) {}
+    }
     return {
         found: true,
         strategy: selected.score >= 8000 ? 'reply-scoped-anchor-input' : 'reply-scoped-input',
@@ -1123,10 +1128,22 @@ _JS_ATOMIC_SET_COMMENT_TEXT = r"""
     const txtLower = txt.toLowerCase();
     const startsWithPlaceholder = verifyPlaceholderMarkers.some(m => txtLower.startsWith(m));
     const normalizeText = (value) => String(value || '').replace(/\s+/g, ' ').trim();
+    // Mention-aware match for anchored replies only: TikTok may inject a single
+    // leading "@handle " into the reply composer. Only strip it when this editor
+    // was marked by the current parent-anchor probe; unanchored/stale reply inputs
+    // keep strict equality so a wrong composer cannot pass by having any @handle.
+    const expectedNorm = normalizeText(expected);
+    const actualNorm = normalizeText(txt);
+    const mentionMatch = actualNorm.match(/^@[A-Za-z0-9._\-]{1,30}\s+/);
+    const anchorBound = replyScoped && Boolean(
+        real.getAttribute && String(real.getAttribute('data-smart-reply-anchor-token') || '').trim()
+    );
+    const matches = actualNorm === expectedNorm ||
+        (anchorBound && mentionMatch && normalizeText(actualNorm.slice(mentionMatch[0].length)) === expectedNorm);
     const ok = Boolean(
         txt &&
         !startsWithPlaceholder &&
-        normalizeText(txt) === normalizeText(expected)
+        matches
     );
     return {
         ok: ok,
@@ -6390,16 +6407,16 @@ async def type_into_comment(
     fast: bool = False,
     reply_scoped: bool = False,
     anchor_token: Optional[str] = None,
-) -> bool:
+) -> Dict[str, Any]:
     """
     Type text into TikTok's comment input.
 
     Final robust strategy:
     0) PRIMARY: atomically locate/focus the real editor, then insert the full
        text with trusted keyboard input and verify it landed in the scoped editor.
-    1) If trusted full insertion misses, use a latency-friendly atomic prefix +
-       trusted tail fallback.
-    2) Last-resort exact DOM insert for already anchored/scoped editors.
+    1) For main comments only, if trusted full insertion misses, use a
+       latency-friendly atomic prefix + trusted tail fallback.
+    2) For main comments only, use a last-resort exact DOM insert.
     3) Resolve the real editable node (data-e2e can be just a wrapper).
     4) Try human-like focus + keyboard typing.
     5) Verify globally, not only on the original ElementHandle, because TikTok may re-render input.
@@ -6408,6 +6425,46 @@ async def type_into_comment(
     selects the editor INSIDE the reply container only (never the global
     composer), preserving the "reply must not post as a main comment" guard.
     """
+
+    last_reason = "not_started"
+    last_strategy = "not_started"
+    last_text = ""
+    last_focused: Optional[bool] = None
+
+    def _record_typing_state(
+        reason: str,
+        strategy: str,
+        *,
+        found_text: str = "",
+        focused: Optional[bool] = None,
+    ) -> None:
+        nonlocal last_reason, last_strategy, last_text, last_focused
+        last_reason = str(reason or "unknown")
+        last_strategy = str(strategy or "unknown")
+        last_text = str(found_text or "")[:160]
+        if focused is not None:
+            last_focused = bool(focused)
+
+    def _typing_result(
+        ok: bool,
+        *,
+        reason: Optional[str] = None,
+        strategy: Optional[str] = None,
+        found_text: Optional[str] = None,
+        focused: Optional[bool] = None,
+    ) -> Dict[str, Any]:
+        result: Dict[str, Any] = {
+            "ok": bool(ok),
+            "reason": str(reason or last_reason or ("ok" if ok else "unknown")),
+            "last_text": str(last_text if found_text is None else found_text or "")[:160],
+            "strategy": str(strategy or last_strategy or "unknown"),
+            "anchor_bound": bool(anchor_token),
+            "reply_scoped": bool(reply_scoped),
+        }
+        focus_value = last_focused if focused is None else focused
+        if focus_value is not None:
+            result["focused"] = bool(focus_value)
+        return result
 
     def _deadline_exceeded() -> bool:
         return deadline is not None and time.monotonic() >= deadline
@@ -6418,7 +6475,7 @@ async def type_into_comment(
         return max(0.0, deadline - time.monotonic())
 
     if _deadline_exceeded():
-        return False
+        return _typing_result(False, reason="deadline_exceeded_before_start", strategy="deadline")
 
     await suppress_keyboard_shortcuts_overlay(page)
 
@@ -6433,7 +6490,8 @@ async def type_into_comment(
             if element is not None:
                 try:
                     await element.evaluate(
-                        "el => { try { el.setAttribute('data-smart-reply-input', '1'); el.setAttribute('data-smart-id', 'comment-input'); } catch (_) {} }"
+                        "(el, anchorToken) => { try { el.setAttribute('data-smart-reply-input', '1'); el.setAttribute('data-smart-id', 'comment-input'); if (anchorToken) el.setAttribute('data-smart-reply-anchor-token', anchorToken); } catch (_) {} }",
+                        anchor_token or "",
                     )
                 except Exception:
                     pass
@@ -6690,8 +6748,18 @@ async def type_into_comment(
                     const txt = normalizeText(raw);
                     const lower = txt.toLowerCase();
                     const placeholderLeak = placeholderMarkers.some(marker => lower.startsWith(marker));
+                    // Mention-aware match for anchored replies only. If the current
+                    // input was not marked by the parent-anchor probe, keep strict
+                    // equality and reject "@other_user expected".
+                    const mentionMatch = txt.match(/^@[A-Za-z0-9._\-]{1,30}\s+/);
+                    const anchorBound = Boolean(
+                        input.getAttribute && String(input.getAttribute('data-smart-reply-anchor-token') || '').trim()
+                    );
+                    const expectedNorm = normalizeText(expected);
+                    const matches = txt === expectedNorm ||
+                        (anchorBound && mentionMatch && normalizeText(txt.slice(mentionMatch[0].length)) === expectedNorm);
                     return {
-                        ok: Boolean(txt && !placeholderLeak && txt === normalizeText(expected)),
+                        ok: Boolean(txt && !placeholderLeak && matches),
                         text: txt.slice(0, 120),
                         reason: placeholderLeak ? 'placeholder_leak' : 'checked',
                     };
@@ -6990,6 +7058,12 @@ async def type_into_comment(
 
             if isinstance(result, dict):
                 if result.get("ok"):
+                    _record_typing_state(
+                        "verified",
+                        f"js-fallback:{reason}",
+                        found_text=str(result.get("text") or ""),
+                        focused=True,
+                    )
                     logger.info(
                         "[DOM] Text inserted by JS fallback (%s): '%s'",
                         reason,
@@ -6997,6 +7071,11 @@ async def type_into_comment(
                     )
                     return True
                 if result.get("placeholder_leak"):
+                    _record_typing_state(
+                        "js_fallback_placeholder_leak",
+                        f"js-fallback:{reason}",
+                        found_text=str(result.get("text") or ""),
+                    )
                     # We wrote into the wrapper instead of the inner editor;
                     # placeholder remained in the read-back text. React state
                     # was not updated → Post will stay disabled.
@@ -7005,10 +7084,20 @@ async def type_into_comment(
                         result.get("text", "")[:60],
                     )
                 else:
+                    _record_typing_state(
+                        f"js_fallback_failed:{result.get('reason') or 'verify_failed'}",
+                        f"js-fallback:{reason}",
+                        found_text=str(result.get("text") or ""),
+                    )
                     logger.warning("[DOM] JS fallback failed (%s): %s", reason, result)
             else:
+                _record_typing_state("js_fallback_non_dict_result", f"js-fallback:{reason}")
                 logger.warning("[DOM] JS fallback returned non-dict (%s): %s", reason, result)
         except Exception as exc:
+            _record_typing_state(
+                f"js_fallback_exception:{str(exc)[:80]}",
+                f"js-fallback:{reason}",
+            )
             logger.warning("[DOM] JS fallback exception (%s): %s", reason, str(exc)[:160])
 
         return False
@@ -7023,7 +7112,12 @@ async def type_into_comment(
         windows are busy. Setting all but the last character in-page keeps the
         operation cheap, while the final trusted insert wakes TikTok/React state.
         """
+        if reply_scoped:
+            _record_typing_state("atomic_prefix_skipped_reply_scoped", "atomic-prefix-trusted-tail")
+            logger.debug("[DOM] Skipping atomic-prefix reply fallback to avoid raw-DOM editor desync")
+            return False
         if not text:
+            _record_typing_state("empty_text", "atomic-prefix-trusted-tail")
             return False
 
         prefix = text[:-1]
@@ -7036,15 +7130,26 @@ async def type_into_comment(
             insert_text=prefix,
         )
         if not isinstance(result, dict):
+            _record_typing_state("atomic_prefix_non_dict_result", "atomic-prefix-trusted-tail")
             return False
 
         reason = str(result.get("reason") or "")
         if reason in {"no_editor", "reply_marked_input_missing", "reply_input_not_scoped_to_parent"}:
+            _record_typing_state(
+                f"atomic_prefix_failed:{reason}",
+                "atomic-prefix-trusted-tail",
+                found_text=str(result.get("textFull") or result.get("text") or ""),
+            )
             logger.debug("[DOM] Atomic prefix primary failed (%s); falling back", reason)
             return False
 
         landed = str(result.get("textFull") or result.get("text") or "")
         if prefix and _normalize_local(landed) != _normalize_local(prefix):
+            _record_typing_state(
+                "atomic_prefix_text_mismatch",
+                "atomic-prefix-trusted-tail",
+                found_text=landed,
+            )
             logger.debug(
                 "[DOM] Atomic prefix primary did not land prefix cleanly (%s); falling back",
                 reason,
@@ -7062,34 +7167,52 @@ async def type_into_comment(
                     focus_only=True,
                 )
                 if not isinstance(focus_result, dict) or not focus_result.get("ok"):
+                    _record_typing_state(
+                        f"atomic_prefix_refocus_failed:{focus_result.get('reason') if isinstance(focus_result, dict) else 'no_result'}",
+                        "atomic-prefix-trusted-tail",
+                        found_text=str(focus_result.get("text") if isinstance(focus_result, dict) else ""),
+                        focused=False,
+                    )
                     logger.debug(
                         "[DOM] Atomic prefix primary could not refocus editor (%s); falling back",
                         focus_result.get("reason") if isinstance(focus_result, dict) else "no_result",
                     )
                     return False
                 if not await _focus_ok():
+                    _record_typing_state(
+                        "atomic_prefix_focus_check_failed",
+                        "atomic-prefix-trusted-tail",
+                        focused=False,
+                    )
                     logger.debug("[DOM] Atomic prefix primary focus check failed; falling back")
                     return False
             await page.keyboard.insert_text(tail)
             await asyncio.sleep(0.10 if fast else 0.18)
         except Exception as exc:
+            _record_typing_state(
+                f"atomic_prefix_trusted_tail_exception:{str(exc)[:80]}",
+                "atomic-prefix-trusted-tail",
+            )
             logger.debug("[DOM] Atomic prefix primary trusted tail failed (%s); falling back", str(exc)[:120])
             return False
 
         ok, found_text = await _scoped_text_contains_expected()
         if ok:
+            _record_typing_state("verified", "atomic-prefix-trusted-tail", found_text=found_text, focused=True)
             logger.info(
                 "[DOM] Text set via atomic-prefix+trusted-tail primary: '%s'",
                 found_text[:30],
             )
             return True
 
+        _record_typing_state("atomic_prefix_verify_failed", "atomic-prefix-trusted-tail", found_text=found_text)
         logger.debug("[DOM] Atomic prefix primary failed global re-verify; falling back")
         return False
 
     async def _atomic_primary() -> bool:
         """Primary path: atomic scoped focus + trusted full keyboard.insert_text."""
         if not text:
+            _record_typing_state("empty_text", "atomic-focus-insert-text")
             return False
 
         focus_result = await atomic_set_comment_text(
@@ -7101,31 +7224,53 @@ async def type_into_comment(
         )
         if not isinstance(focus_result, dict) or not focus_result.get("ok"):
             reason = focus_result.get("reason") if isinstance(focus_result, dict) else "no_result"
+            _record_typing_state(
+                f"atomic_focus_failed:{reason}",
+                "atomic-focus-insert-text",
+                found_text=str(focus_result.get("text") if isinstance(focus_result, dict) else ""),
+                focused=False,
+            )
             logger.debug("[DOM] Atomic focus primary failed (%s); falling back", reason)
             return False
 
         try:
             await suppress_keyboard_shortcuts_overlay(page)
             if not await _focus_ok():
+                _record_typing_state(
+                    "atomic_focus_not_in_comment_input",
+                    "atomic-focus-insert-text",
+                    focused=False,
+                )
                 logger.debug("[DOM] Atomic focus primary did not leave focus in comment input; falling back")
                 return False
             if reply_scoped:
-                clear_result = await atomic_set_comment_text(
-                    page,
-                    "",
-                    reply_scoped=reply_scoped,
-                    anchor_token=anchor_token,
-                    clear_only=True,
-                )
-                if not isinstance(clear_result, dict) or not clear_result.get("ok"):
-                    logger.debug(
-                        "[DOM] Atomic focus primary could not verify an empty editor before typing (%s); falling back",
-                        clear_result.get("reason") if isinstance(clear_result, dict) else "no_result",
+                # REPLY composer: focus is confirmed INSIDE the scoped reply editor
+                # (see _focus_ok above), so a TRUSTED select-all + delete is safe
+                # here and, unlike a raw-DOM clear (textContent='' / deleteContents),
+                # actually resets TikTok's React/Lexical EditorState. A DOM-only
+                # clear would empty the DOM while React keeps the old content, so the
+                # following trusted insert would APPEND onto retained state -> the
+                # same desync that doubled main comments. We mirror the main fix here
+                # but keep it scoped: Ctrl+A only selects within the focused reply
+                # editor, never the global composer.
+                await page.keyboard.press("Control+A")
+                await page.keyboard.press("Delete")
+                if not await _focus_ok():
+                    await atomic_set_comment_text(
+                        page,
+                        text,
+                        reply_scoped=True,
+                        anchor_token=anchor_token,
+                        focus_only=True,
                     )
-                    return False
                 if not await _focus_ok():
                     logger.debug(
-                        "[DOM] Atomic focus primary lost focus after clear; falling back",
+                        "[DOM] Atomic focus primary lost focus after reply clear; falling back",
+                    )
+                    _record_typing_state(
+                        "atomic_focus_lost_after_reply_clear",
+                        "atomic-focus-insert-text",
+                        focused=False,
                     )
                     return False
             else:
@@ -7146,16 +7291,26 @@ async def type_into_comment(
                         focus_only=True,
                     )
                 if not await _focus_ok():
+                    _record_typing_state(
+                        "atomic_focus_lost_before_main_insert",
+                        "atomic-focus-insert-text",
+                        focused=False,
+                    )
                     logger.debug("[DOM] Atomic focus primary could not keep focus before insert; falling back")
                     return False
             await page.keyboard.insert_text(text)
             await asyncio.sleep(0.12 if fast else 0.22)
         except Exception as exc:
+            _record_typing_state(
+                f"trusted_insert_exception:{str(exc)[:80]}",
+                "atomic-focus-insert-text",
+            )
             logger.debug("[DOM] Trusted insert_text primary failed (%s); falling back", str(exc)[:120])
             return False
 
         ok, found_text = await _scoped_text_contains_expected()
         if ok:
+            _record_typing_state("verified", "atomic-focus-insert-text", found_text=found_text, focused=True)
             logger.info(
                 "[DOM] Text set via focus+insert_text primary (%s): '%s'",
                 focus_result.get("scoped"),
@@ -7163,6 +7318,7 @@ async def type_into_comment(
             )
             return True
 
+        _record_typing_state("atomic_primary_verify_failed", "atomic-focus-insert-text", found_text=found_text, focused=True)
         logger.debug("[DOM] Focus+insert_text primary failed global re-verify; falling back")
         return False
 
@@ -7174,7 +7330,12 @@ async def type_into_comment(
         chance to receive input events when trusted keyboard insertion does not
         commit into contenteditable.
         """
+        if reply_scoped:
+            _record_typing_state("atomic_full_skipped_reply_scoped", "atomic-full-insert")
+            logger.debug("[DOM] Skipping atomic-full reply fallback to avoid raw-DOM editor desync")
+            return False
         if not text:
+            _record_typing_state("empty_text", "atomic-full-insert")
             return False
         result = await atomic_set_comment_text(
             page,
@@ -7183,6 +7344,11 @@ async def type_into_comment(
             anchor_token=anchor_token if reply_scoped else None,
         )
         if not isinstance(result, dict) or not result.get("ok"):
+            _record_typing_state(
+                f"atomic_full_failed:{result.get('reason') if isinstance(result, dict) else 'no_result'}",
+                "atomic-full-insert",
+                found_text=str(result.get("text") if isinstance(result, dict) else ""),
+            )
             logger.debug(
                 "[DOM] Atomic full %s insert failed (%s); falling back",
                 "reply" if reply_scoped else "main",
@@ -7194,24 +7360,26 @@ async def type_into_comment(
             "reply" if reply_scoped else "main",
             str(result.get("text") or text)[:30],
         )
+        _record_typing_state("verified", "atomic-full-insert", found_text=str(result.get("text") or text), focused=True)
         return True
 
     if not _deadline_exceeded():
         if await _atomic_primary():
-            return True
+            return _typing_result(True)
 
     if not _deadline_exceeded():
         if await _atomic_prefix_then_trusted_tail():
-            return True
+            return _typing_result(True)
 
     if not _deadline_exceeded():
         if await _atomic_full_insert_fallback():
-            return True
+            return _typing_result(True)
 
     editor = await _resolve_editor_handle()
     if editor is None:
         logger.debug("[DOM] No scoped comment editor handle available after atomic attempts")
-        return False
+        _record_typing_state("editor_missing_after_atomic_attempts", "resolve-editor", focused=False)
+        return _typing_result(False)
 
     # Placeholder before typing. Used only for sanity check, not as hard gate.
     placeholder_text = ""
@@ -7224,7 +7392,8 @@ async def type_into_comment(
     focused = False
     for attempt in range(6):
         if _deadline_exceeded():
-            return False
+            _record_typing_state("deadline_exceeded_during_focus", "keyboard-focus", focused=focused)
+            return _typing_result(False)
         await suppress_keyboard_shortcuts_overlay(page)
         editor = await _resolve_editor_handle()
 
@@ -7266,9 +7435,15 @@ async def type_into_comment(
             await asyncio.sleep(0.22)
             if await _focus_ok():
                 focused = True
+                _record_typing_state("focused", "keyboard-focus", focused=True)
                 logger.debug("[DOM] Focus confirmed in comment input (attempt %d)", attempt + 1)
                 break
         except Exception as exc:
+            _record_typing_state(
+                f"focus_attempt_exception:{str(exc)[:80]}",
+                "keyboard-focus",
+                focused=False,
+            )
             logger.debug("[DOM] Focus attempt %d failed: %s", attempt + 1, str(exc)[:100])
 
     if focused:
@@ -7276,6 +7451,7 @@ async def type_into_comment(
             await suppress_keyboard_shortcuts_overlay(page)
             if not await _focus_ok():
                 logger.warning("[DOM] Focus was lost before keyboard typing; skipping blind keyboard input")
+                _record_typing_state("keyboard_focus_lost_before_typing", "keyboard-type", focused=False)
                 focused = False
             else:
                 await page.keyboard.press("Control+a")
@@ -7303,9 +7479,12 @@ async def type_into_comment(
 
                 ok, found_text = await _scoped_text_contains_expected()
                 if ok:
+                    _record_typing_state("verified", "keyboard-type", found_text=found_text, focused=True)
                     logger.info("[DOM] Text typed and verified: '%s' (%d chars)", found_text[:30], len(found_text))
-                    return True
+                    return _typing_result(True)
+                _record_typing_state("keyboard_verify_failed", "keyboard-type", found_text=found_text, focused=True)
         except Exception as exc:
+            _record_typing_state(f"keyboard_typing_exception:{str(exc)[:80]}", "keyboard-type", focused=focused)
             logger.warning("[DOM] keyboard typing path failed: %s", str(exc)[:120])
 
     if focused:
@@ -7314,14 +7493,19 @@ async def type_into_comment(
             placeholder_text[:30],
         )
     else:
+        if last_strategy == "not_started" or last_strategy == "keyboard-focus":
+            _record_typing_state("focus_not_confirmed", "keyboard-focus", focused=False)
         logger.warning("[DOM] Could not focus comment input normally; trying JS input fallback")
 
     if _deadline_exceeded():
-        return False
+        _record_typing_state("deadline_exceeded_before_fallback", last_strategy)
+        return _typing_result(False)
 
     if reply_scoped:
         logger.warning("[DOM] Scoped reply typing did not verify; skipping unscoped JS fallback")
-        return False
+        if last_reason in {"atomic_full_skipped_reply_scoped", "focus_not_confirmed"}:
+            _record_typing_state("scoped_reply_unverified", last_strategy, found_text=last_text, focused=focused)
+        return _typing_result(False)
 
     # MAIN comment fallback: insert via the on-page execCommand path. This is the
     # workhorse that actually lands text into TikTok's DraftEditor when the
@@ -7331,13 +7515,16 @@ async def type_into_comment(
     # accumulation-across-variants bug is prevented upstream (no dirty composer
     # reuse + per-variant confirmation), not by crippling input here.
     if await _js_insert_text("focus_failed_or_keyboard_unverified"):
-        return True
+        return _typing_result(True)
 
     # One last check: maybe text is already there but handle was stale.
     ok, found_text = await _scoped_text_contains_expected()
     if ok:
+        _record_typing_state("verified", "final-global-check", found_text=found_text, focused=focused)
         logger.info("[DOM] Text verified after final global check: '%s'", found_text[:30])
-        return True
+        return _typing_result(True)
 
     logger.warning("[DOM] Could not type/insert comment text after all attempts")
-    return False
+    if last_reason == "verified":
+        _record_typing_state("all_typing_strategies_failed", "final-global-check", focused=focused)
+    return _typing_result(False)

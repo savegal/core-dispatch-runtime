@@ -2513,6 +2513,74 @@ async def test_type_reply_comment_without_handle_uses_scoped_smart_typing_first(
 
 @pytest.mark.unit
 @pytest.mark.asyncio
+async def test_type_reply_comment_without_handle_does_not_use_raw_dom_atomic_insert(monkeypatch):
+    keyboard_calls = {"press": [], "insert_text": []}
+    atomic_calls = []
+
+    class _Keyboard:
+        async def press(self, key):
+            keyboard_calls["press"].append(key)
+
+        async def insert_text(self, text):
+            keyboard_calls["insert_text"].append(text)
+
+    class _Page:
+        keyboard = _Keyboard()
+
+    async def _fake_type_into_comment(*args, **kwargs):
+        return {
+            "ok": False,
+            "reason": "atomic_primary_verify_failed",
+            "last_text": "@wrong_user reply text",
+            "strategy": "atomic-focus-insert-text",
+            "anchor_bound": True,
+        }
+
+    async def _fake_atomic(_page, text, **kwargs):
+        atomic_calls.append((text, kwargs))
+        if kwargs.get("focus_only"):
+            return {"ok": True, "reason": "focused", "text": "", "scoped": "reply"}
+        raise AssertionError("reply fallback must not use raw-DOM atomic insert")
+
+    async def _fake_reply_contains(*args, **kwargs):
+        return False, "@wrong_user reply text"
+
+    async def _fake_suppress(_page):
+        return 0
+
+    async def _fake_sleep(_seconds):
+        return None
+
+    monkeypatch.setattr(publish_action, "type_into_comment", _fake_type_into_comment)
+    monkeypatch.setattr(publish_action, "atomic_set_comment_text", _fake_atomic)
+    monkeypatch.setattr(publish_action, "_reply_scoped_input_contains_expected_text", _fake_reply_contains)
+    monkeypatch.setattr(publish_action, "suppress_keyboard_shortcuts_overlay", _fake_suppress)
+    monkeypatch.setattr(publish_action.asyncio, "sleep", _fake_sleep)
+
+    result = await publish_action._type_reply_comment_without_handle(
+        _Page(),
+        "reply text",
+        parent_anchor_token="pa-1",
+        fast=True,
+        deadline=123.0,
+    )
+
+    assert result == {
+        "ok": False,
+        "reason": "reply_verify_failed_after_trusted_insert",
+        "last_text": "@wrong_user reply text",
+    }
+    assert [kwargs for _text, kwargs in atomic_calls] == [
+        {"reply_scoped": True, "anchor_token": "pa-1", "focus_only": True},
+    ]
+    assert keyboard_calls == {
+        "press": ["Control+A", "Delete"],
+        "insert_text": ["reply text"],
+    }
+
+
+@pytest.mark.unit
+@pytest.mark.asyncio
 async def test_main_direct_dom_fallback_reports_no_response_after_publish_request(monkeypatch):
     class _RequestOnlyDirectPage(_FakePage):
         async def evaluate(self, script, *args):

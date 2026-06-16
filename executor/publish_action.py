@@ -2001,8 +2001,18 @@ _JS_REPLY_SCOPED_TEXT_MATCH = r"""
     const text = normalizeText(raw);
     const lower = text.toLowerCase();
     const placeholderLeak = placeholderMarkers.some(marker => lower.startsWith(marker));
+    // Mention-aware match for anchored replies only. A stale/wrong reply input
+    // must not pass merely because it has some leading @handle.
+    const mentionMatch = text.match(/^@[A-Za-z0-9._\-]{1,30}\s+/);
+    const composer = document.querySelector('[data-smart-reply-composer="1"]');
+    const anchorBound = Boolean(
+        (input.getAttribute && String(input.getAttribute('data-smart-reply-anchor-token') || '').trim()) ||
+        (composer && composer.getAttribute && String(composer.getAttribute('data-smart-reply-anchor-token') || '').trim())
+    );
+    const matches = text === expectedText ||
+        (anchorBound && mentionMatch && normalizeText(text.slice(mentionMatch[0].length)) === expectedText);
     return {
-        ok: Boolean(text && !placeholderLeak && text === expectedText),
+        ok: Boolean(text && !placeholderLeak && matches),
         reason: placeholderLeak ? 'placeholder_leak' : 'checked',
         text: text.slice(0, 160),
     };
@@ -2048,7 +2058,17 @@ _JS_REPLY_DIRECT_POST_CLICK = r"""
     const inputText = normalizeText(rawText);
     const lowerInput = inputText.toLowerCase();
     const placeholderLeak = placeholderMarkers.some(marker => lowerInput.startsWith(marker));
-    if (!inputText || placeholderLeak || inputText !== expectedText) {
+    // Mention-aware exact gate for anchored replies only. Without a fresh
+    // parent-anchor marker, keep strict equality so a wrong composer cannot pass
+    // by carrying any leading @handle.
+    const mentionMatch = inputText.match(/^@[A-Za-z0-9._\-]{1,30}\s+/);
+    const anchorBound = Boolean(
+        (input.getAttribute && String(input.getAttribute('data-smart-reply-anchor-token') || '').trim()) ||
+        (composer && composer.getAttribute && String(composer.getAttribute('data-smart-reply-anchor-token') || '').trim())
+    );
+    const textMatches = inputText === expectedText ||
+        (anchorBound && mentionMatch && normalizeText(inputText.slice(mentionMatch[0].length)) === expectedText);
+    if (!inputText || placeholderLeak || !textMatches) {
         return {
             clicked: false,
             reason: placeholderLeak ? 'reply_input_placeholder_leak' : 'reply_input_text_not_committed',
@@ -2149,6 +2169,31 @@ _JS_REPLY_DIRECT_POST_CLICK = r"""
 
 def _normalize_publish_text(value: str) -> str:
     return " ".join(str(value or "").split()).strip()
+
+
+def _typing_result_ok(result: Any) -> bool:
+    if isinstance(result, dict):
+        return bool(result.get("ok"))
+    return bool(result)
+
+
+def _typing_result_reason(result: Any) -> str:
+    if isinstance(result, dict):
+        fallback = "ok" if result.get("ok") else "typing_failed"
+        return str(result.get("reason") or fallback)
+    return "ok" if result else "typing_failed"
+
+
+def _typing_result_text(result: Any) -> str:
+    if isinstance(result, dict):
+        return str(result.get("last_text") or result.get("text") or "")[:160]
+    return ""
+
+
+def _typing_result_strategy(result: Any) -> str:
+    if isinstance(result, dict):
+        return str(result.get("strategy") or "")
+    return ""
 
 
 async def _reply_scoped_input_contains_expected_text(page: Page, text: str) -> tuple[bool, str]:
@@ -2480,8 +2525,9 @@ async def _type_main_comment_without_handle(
     if not text:
         return {"ok": False, "reason": "empty_text"}
 
+    typed_result: Any = None
     try:
-        typed_ok = await type_into_comment(
+        typed_result = await type_into_comment(
             page,
             None,
             text,
@@ -2489,6 +2535,7 @@ async def _type_main_comment_without_handle(
             fast=fast,
             reply_scoped=False,
         )
+        typed_ok = _typing_result_ok(typed_result)
         if typed_ok:
             ok, found_text = await comment_input_contains_expected_text(page, text)
             return {
@@ -2496,6 +2543,12 @@ async def _type_main_comment_without_handle(
                 "strategy": "main-direct-smart-type",
                 "text": found_text if ok else text,
             }
+        logger.debug(
+            "[PUBLISH] Direct main smart typing did not verify: reason=%s strategy=%s last_text='%s'",
+            _typing_result_reason(typed_result)[:120],
+            _typing_result_strategy(typed_result)[:80],
+            _typing_result_text(typed_result)[:80],
+        )
     except Exception as exc:
         logger.debug("[PUBLISH] Direct main smart typing failed: %s", str(exc)[:120])
 
@@ -2531,14 +2584,15 @@ async def _type_main_comment_without_handle(
     return {
         "ok": False,
         "reason": str(
-            (focus_result or {}).get("reason")
-            if isinstance(focus_result, dict)
-            else keyboard_reason or "typing_failed"
+            ((focus_result or {}).get("reason") if isinstance(focus_result, dict) else "")
+            or keyboard_reason
+            or _typing_result_reason(typed_result)
+            or "typing_failed"
         ),
         "last_text": str(
-            (focus_result or {}).get("text")
-            if isinstance(focus_result, dict)
-            else keyboard_result.get("last_text", "") if isinstance(keyboard_result, dict) else ""
+            ((focus_result or {}).get("text") if isinstance(focus_result, dict) else "")
+            or (keyboard_result.get("last_text", "") if isinstance(keyboard_result, dict) else "")
+            or _typing_result_text(typed_result)
         )[:120],
     }
 
@@ -2561,8 +2615,9 @@ async def _type_reply_comment_without_handle(
     if not parent_anchor_token:
         return {"ok": False, "reason": "missing_parent_anchor"}
 
+    typed_result: Any = None
     try:
-        typed_ok = await type_into_comment(
+        typed_result = await type_into_comment(
             page,
             None,
             text,
@@ -2571,6 +2626,7 @@ async def _type_reply_comment_without_handle(
             reply_scoped=True,
             anchor_token=parent_anchor_token,
         )
+        typed_ok = _typing_result_ok(typed_result)
         if typed_ok:
             ok, found_text = await _reply_scoped_input_contains_expected_text(page, text)
             if ok:
@@ -2579,47 +2635,15 @@ async def _type_reply_comment_without_handle(
                     "strategy": "reply-direct-smart-type",
                     "text": found_text,
                 }
+        logger.debug(
+            "[PUBLISH] Direct reply smart typing did not verify: reason=%s strategy=%s anchor_bound=%s last_text='%s'",
+            _typing_result_reason(typed_result)[:120],
+            _typing_result_strategy(typed_result)[:80],
+            bool(typed_result.get("anchor_bound")) if isinstance(typed_result, dict) else False,
+            _typing_result_text(typed_result)[:80],
+        )
     except Exception as exc:
         logger.debug("[PUBLISH] Direct reply smart typing failed: %s", str(exc)[:120])
-
-    prefix = text[:-1]
-    tail = text[-1:]
-    result = await atomic_set_comment_text(
-        page,
-        text,
-        reply_scoped=True,
-        anchor_token=parent_anchor_token,
-        insert_text=prefix,
-    )
-    if isinstance(result, dict) and result.get("reason") in {
-        "no_editor",
-        "reply_marked_input_missing",
-        "reply_input_not_scoped_to_parent",
-        "parent_anchor_not_found",
-    }:
-        return {"ok": False, "reason": str(result.get("reason") or "no_editor")}
-
-    landed = str(result.get("text") or "") if isinstance(result, dict) else ""
-    if prefix and len(prefix) <= 120 and _normalize_publish_text(landed) != _normalize_publish_text(prefix):
-        logger.debug(
-            "[PUBLISH] Direct reply prefix did not land cleanly: reason=%s text='%s'",
-            result.get("reason") if isinstance(result, dict) else "non_dict_result",
-            landed[:60],
-        )
-    else:
-        try:
-            await suppress_keyboard_shortcuts_overlay(page)
-            await page.keyboard.insert_text(tail)
-            await asyncio.sleep(0.10 if fast else 0.18)
-            ok, found_text = await _reply_scoped_input_contains_expected_text(page, text)
-            if ok:
-                return {
-                    "ok": True,
-                    "strategy": "reply-direct-atomic-prefix-tail",
-                    "text": found_text,
-                }
-        except Exception as exc:
-            logger.debug("[PUBLISH] Direct reply trusted tail failed: %s", str(exc)[:120])
 
     focus_result = await atomic_set_comment_text(
         page,
@@ -2632,7 +2656,7 @@ async def _type_reply_comment_without_handle(
         try:
             await suppress_keyboard_shortcuts_overlay(page)
             await page.keyboard.press("Control+A")
-            await page.keyboard.press("Backspace")
+            await page.keyboard.press("Delete")
             await page.keyboard.insert_text(text)
             await asyncio.sleep(0.12 if fast else 0.22)
             ok, found_text = await _reply_scoped_input_contains_expected_text(page, text)
@@ -2644,25 +2668,21 @@ async def _type_reply_comment_without_handle(
                 }
         except Exception as exc:
             logger.debug("[PUBLISH] Direct reply focus+insert_text failed: %s", str(exc)[:120])
+            ok, found_text = False, ""
+    else:
+        found_text = str(focus_result.get("text") if isinstance(focus_result, dict) else "")
 
-    full_result = await atomic_set_comment_text(
-        page,
-        text,
-        reply_scoped=True,
-        anchor_token=parent_anchor_token,
+    reason = str(
+        ((focus_result or {}).get("reason") if isinstance(focus_result, dict) else "")
+        or _typing_result_reason(typed_result)
+        or "typing_failed"
     )
-    if isinstance(full_result, dict) and full_result.get("ok"):
-        ok, found_text = await _reply_scoped_input_contains_expected_text(page, text)
-        if ok:
-            return {
-                "ok": True,
-                "strategy": "reply-direct-atomic-full",
-                "text": found_text,
-            }
+    if isinstance(focus_result, dict) and focus_result.get("ok"):
+        reason = "reply_verify_failed_after_trusted_insert"
     return {
         "ok": False,
-        "reason": str((full_result or {}).get("reason") if isinstance(full_result, dict) else "typing_failed"),
-        "last_text": str((full_result or {}).get("text") if isinstance(full_result, dict) else "")[:120],
+        "reason": reason,
+        "last_text": str(found_text or "")[:120],
     }
 
 
@@ -3213,12 +3233,15 @@ async def _publish_reply_comment_direct_dom(
         return None
     if not isinstance(type_result, dict) or not type_result.get("ok"):
         reason = str(type_result.get("reason") if isinstance(type_result, dict) else "typing_failed")
+        last_text = str(type_result.get("last_text") if isinstance(type_result, dict) else "")
         _log_publish_trace(
             "reply_direct_dom_fallback_typing_failed",
             page=page,
             expected_video_url=expected_video_url,
             correlation_id=correlation_id,
             reason=reason,
+            input_preview=last_text[:80],
+            input_text_len=len(last_text),
             level=logging.WARNING,
         )
         return None
@@ -3972,8 +3995,9 @@ async def _publish_via_current_input(
     typing_timeout = _typing_phase_timeout()
     if typing_timeout <= 0:
         return _deadline_result("before_typing", input_info.strategy)
+    typed_result: Any = None
     try:
-        typed_ok = await _asyncio_wait_for(
+        typed_result = await _asyncio_wait_for(
             type_into_comment(
                 page,
                 input_handle,
@@ -3985,6 +4009,7 @@ async def _publish_via_current_input(
             ),
             timeout=typing_timeout,
         )
+        typed_ok = _typing_result_ok(typed_result)
     except asyncio.TimeoutError:
         if await _text_visible_after_typing_timeout("typing", input_info.strategy):
             typed_ok = True
@@ -4003,7 +4028,26 @@ async def _publish_via_current_input(
             typed_ok = True
 
     if not typed_ok:
-        logger.warning("[PUBLISH] type_into_comment failed on first attempt; retrying with fresh input handle")
+        logger.warning(
+            "[PUBLISH] type_into_comment failed on first attempt; retrying with fresh input handle "
+            "(reason=%s strategy=%s last_text='%s')",
+            _typing_result_reason(typed_result)[:120],
+            _typing_result_strategy(typed_result)[:80],
+            _typing_result_text(typed_result)[:80],
+        )
+        _log_publish_trace(
+            "typing_first_attempt_failed",
+            page=page,
+            expected_video_url=expected_video_url,
+            correlation_id=correlation_id,
+            strategy=input_info.strategy,
+            typing_reason=_typing_result_reason(typed_result),
+            typing_strategy=_typing_result_strategy(typed_result),
+            typing_last_text=_typing_result_text(typed_result),
+            typing_anchor_bound=bool(typed_result.get("anchor_bound")) if isinstance(typed_result, dict) else False,
+            reply_scoped=reply_scoped,
+            level=logging.WARNING,
+        )
         if main_comment_aggressive:
             await _clear_main_comment_composer_best_effort(
                 page,
@@ -4048,8 +4092,9 @@ async def _publish_via_current_input(
         retry_typing_timeout = _typing_phase_timeout(retry=True)
         if retry_typing_timeout <= 0:
             return _deadline_result("before_typing_retry", input_info.strategy)
+        retry_typed_result: Any = None
         try:
-            retry_typed_ok = await _asyncio_wait_for(
+            retry_typed_result = await _asyncio_wait_for(
                 type_into_comment(
                     page,
                     retry_handle,
@@ -4061,6 +4106,7 @@ async def _publish_via_current_input(
                 ),
                 timeout=retry_typing_timeout,
             )
+            retry_typed_ok = _typing_result_ok(retry_typed_result)
         except asyncio.TimeoutError:
             if await _text_visible_after_typing_timeout("typing_retry", input_info.strategy):
                 retry_typed_ok = True
@@ -4084,6 +4130,21 @@ async def _publish_via_current_input(
                         expected_video_url=expected_video_url,
                         correlation_id=correlation_id,
                     )
+                _log_publish_trace(
+                    "typing_retry_failed",
+                    page=page,
+                    expected_video_url=expected_video_url,
+                    correlation_id=correlation_id,
+                    strategy=input_info.strategy,
+                    typing_reason=_typing_result_reason(retry_typed_result),
+                    typing_strategy=_typing_result_strategy(retry_typed_result),
+                    typing_last_text=_typing_result_text(retry_typed_result),
+                    typing_anchor_bound=bool(retry_typed_result.get("anchor_bound")) if isinstance(retry_typed_result, dict) else False,
+                    first_typing_reason=_typing_result_reason(typed_result),
+                    first_typing_strategy=_typing_result_strategy(typed_result),
+                    reply_scoped=reply_scoped,
+                    level=logging.WARNING,
+                )
                 return PublishResult(
                     status="dom_error",
                     error_reason="typing_failed",
