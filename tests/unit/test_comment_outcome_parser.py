@@ -87,21 +87,37 @@ def test_parent_search_marks_rows_with_dom_anchor_tokens():
 
 
 @pytest.mark.unit
-def test_batch_search_partial_return_waits_for_all_targets():
+def test_parent_search_scans_bounded_comment_containers_before_broad_roots():
     joined = inspect.getsource(comment_outcome.find_comments_in_list_batch)
 
-    # The premature partial-return shortcut (which abandoned mains further down the
-    # list after only ~2 extra scrolls) must be gone, so repliers no longer skip
-    # main comments.
+    assert "const primaryRootSelector = [" in joined
+    assert "const primaryRoots = [...scope.querySelectorAll(primaryRootSelector)].filter(visible);" in joined
+    assert ").slice(0, 250);" in joined
+
+
+@pytest.mark.unit
+def test_batch_search_trace_reports_top_level_only_mode():
+    joined = inspect.getsource(comment_outcome.find_comments_in_list_batch)
+
+    assert '"top_level_only": top_level_only' in joined
+
+
+@pytest.mark.unit
+def test_batch_search_partial_return_is_enabled_for_reply_attempts():
+    joined = inspect.getsource(comment_outcome.find_comments_in_list_batch)
+
+    # Reply attempts should act on parents already visible/found instead of
+    # scrolling through the full list before publishing anything. Remaining
+    # parents stay pending in the reply matrix and are retried by the scheduler.
     assert "partial_extra_scrolls" not in joined
     assert "partial_found_at_scroll" not in joined
-    # The batch search now terminates early only once EVERY target has been found.
     assert "if len(found) >= len(targets):" in joined
+    assert "partial_found_return" in joined
 
 
 @pytest.mark.unit
 @pytest.mark.asyncio
-async def test_batch_search_partial_return_keeps_found_anchor_after_extra_scans(monkeypatch):
+async def test_batch_search_partial_return_keeps_found_anchor_without_extra_scans(monkeypatch):
     async def fake_detect_captcha(_page, wait_ms=0):
         return False, None
 
@@ -179,9 +195,78 @@ async def test_batch_search_partial_return_keeps_found_anchor_after_extra_scans(
     assert info["matched_indexes"] == [0]
     assert info["missing_indexes"] == [1]
     assert info["missing_previews"][0]["text_preview"] == "main two"
-    # No early partial-return: the search now scans the full budget looking for the
-    # still-missing target instead of bailing out after a couple of extra scrolls.
-    assert info["scrolls"] == 5
+    assert info["partial_returned"] is True
+    assert info["scrolls"] == 1
+
+
+@pytest.mark.unit
+@pytest.mark.asyncio
+async def test_batch_search_accepts_expected_author_from_author_candidates(monkeypatch):
+    async def fake_detect_captcha(_page, wait_ms=0):
+        return False, None
+
+    class _Scope:
+        async def evaluate(self, script, *_args):
+            if "=> ({top:" in script:
+                return {"top": 0, "height": 1000, "client": 500}
+            return None
+
+    class _Page:
+        url = "https://www.tiktok.com/@u/video/123"
+
+        async def evaluate(self, script, *_args, **_kwargs):
+            if "({selectors, strictScope})" in script:
+                return {
+                    "selector": '[data-smart-comment-surface-opened="1"]',
+                    "scroll_container_tag": "DIV",
+                    "scroll_container_scrollable": True,
+                    "items": 3,
+                    "strong_items": 3,
+                    "score": 3000,
+                }
+            return {
+                "rows": [
+                    {
+                        "position": 0,
+                        "text": "main parent text",
+                        "selector": '[data-e2e="comment-level-1"]',
+                        "cid": None,
+                        "author": "display_name",
+                        "authorCandidates": ["display_name", "real_parent_author"],
+                        "scrollTop": 0,
+                        "anchorToken": "anchor-author-candidate",
+                    }
+                ],
+                "scrollTop": 0,
+                "scopeMissing": False,
+            }
+
+        async def query_selector(self, selector):
+            if selector in {
+                '[data-smart-comment-list-batch-scope="1"]',
+                '[data-smart-comment-list-batch-scroll="1"]',
+            }:
+                return _Scope()
+            return None
+
+    monkeypatch.setattr(comment_outcome, "detect_captcha", fake_detect_captcha)
+
+    found, info = await comment_outcome.find_comments_in_list_batch(
+        _Page(),
+        ["main parent text"],
+        expected_authors=["real_parent_author"],
+        require_author_match=True,
+        max_scrolls=1,
+        scroll_delay_ms=0,
+        ensure_open=False,
+        strict_scope=True,
+        top_level_only=True,
+    )
+
+    assert set(found) == {0}
+    assert found[0]["matched_by"] == "text_author"
+    assert found[0]["author_candidates"] == ["display_name", "real_parent_author"]
+    assert info["found_count"] == 1
 
 
 @pytest.mark.unit
@@ -271,9 +356,8 @@ async def test_batch_search_returns_partial_for_mid_sized_missing_set(monkeypatc
     assert info["matched_indexes"] == [0, 1]
     assert info["missing_indexes"] == [2]
     assert info["missing_previews"][0]["text_preview"] == "main three"
-    # No early partial-return: the search scans the full budget for the missing
-    # target instead of returning a partial set prematurely.
-    assert info["scrolls"] == 5
+    assert info["partial_returned"] is True
+    assert info["scrolls"] == 1
 
 
 @pytest.mark.unit

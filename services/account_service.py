@@ -77,6 +77,42 @@ def release_main_account_reservation(account_id: int) -> None:
         _MAIN_ACCOUNT_RESERVED_UNTIL.pop(account_id, None)
 
 
+_REPLY_ACCOUNT_RESERVATION_LOCK = threading.Lock()
+_REPLY_ACCOUNT_RESERVED_UNTIL: dict[int, float] = {}
+_REPLY_ACCOUNT_RESERVATION_TTL_SECONDS = 180.0
+
+
+def _cleanup_reply_account_reservations_locked() -> None:
+    now_monotonic = time.monotonic()
+    expired = [
+        account_id
+        for account_id, reserved_until in _REPLY_ACCOUNT_RESERVED_UNTIL.items()
+        if reserved_until <= now_monotonic
+    ]
+    for account_id in expired:
+        _REPLY_ACCOUNT_RESERVED_UNTIL.pop(account_id, None)
+
+
+def get_reserved_reply_account_ids() -> set[int]:
+    with _REPLY_ACCOUNT_RESERVATION_LOCK:
+        _cleanup_reply_account_reservations_locked()
+        return set(_REPLY_ACCOUNT_RESERVED_UNTIL.keys())
+
+
+def reserve_reply_account(account_id: int, ttl_seconds: float = _REPLY_ACCOUNT_RESERVATION_TTL_SECONDS) -> bool:
+    with _REPLY_ACCOUNT_RESERVATION_LOCK:
+        _cleanup_reply_account_reservations_locked()
+        if account_id in _REPLY_ACCOUNT_RESERVED_UNTIL:
+            return False
+        _REPLY_ACCOUNT_RESERVED_UNTIL[account_id] = time.monotonic() + ttl_seconds
+        return True
+
+
+def release_reply_account_reservation(account_id: int) -> None:
+    with _REPLY_ACCOUNT_RESERVATION_LOCK:
+        _REPLY_ACCOUNT_RESERVED_UNTIL.pop(account_id, None)
+
+
 MONITOR_SCOPE = "monitor"
 RUNTIME_SCOPE = "runtime"
 MAIN_SCOPE = "main_comment"
@@ -815,6 +851,22 @@ def _is_publish_session_last_resort(session_quality: dict[str, Any]) -> bool:
 def _allow_publish_session_last_resort() -> bool:
     """Allow sid_guard-only sessions only after stronger browser-auth sessions are exhausted."""
     return bool(getattr(settings, "ALLOW_SID_GUARD_ONLY_PUBLISH_LAST_RESORT", False))
+
+
+def _main_account_selection_scan_limit(
+    candidate_limit: int,
+    total_matching: int | None,
+) -> int:
+    """Scan the real main pool before falling back to degraded runtime sessions."""
+    default_cap = 10000
+    try:
+        configured_cap = int(getattr(settings, "ACCOUNT_SELECTION_MAX_MAIN_SCAN", default_cap) or default_cap)
+    except (TypeError, ValueError):
+        configured_cap = default_cap
+    configured_cap = max(2000, configured_cap)
+    if total_matching and total_matching > 0:
+        return max(candidate_limit, min(int(total_matching), configured_cap))
+    return max(candidate_limit, configured_cap)
 
 
 def _infer_monitor_category(reason: str | None) -> str:
@@ -1761,6 +1813,8 @@ def get_free_account_for_main_comment(
         Account.id.asc()  # Для детерминированности при одинаковых значениях
     ])
 
+    total_matching_for_scan: int | None = None
+
     # Логирование для отладки
     try:
         logger.info(f"[ACCOUNT_SERVICE] proxy_type_filter={proxy_type_filter}, proxy_prefer_mobile={proxy_prefer_mobile}, has_proxy_join={has_proxy_join}, PROXY_GEO_MATCHING={settings.PROXY_GEO_MATCHING}")
@@ -1771,6 +1825,7 @@ def get_free_account_for_main_comment(
             total_matching = account_ids_query.count()
         else:
             total_matching = query.count()
+        total_matching_for_scan = int(total_matching or 0)
         logger.info(f"[ACCOUNT_SERVICE] Found {total_matching} raw accounts matching query for main comment")
         
         if total_matching == 0:
@@ -1831,7 +1886,10 @@ def get_free_account_for_main_comment(
     dialect_name = getattr(getattr(bind, "dialect", None), "name", "") or ""
     supports_skip_locked = dialect_name not in {"", "sqlite"}
     candidate_limit = max(20, min(80, getattr(settings, "MAX_CONCURRENT_BROWSERS", 10) * 4))
-    max_candidate_scan = max(candidate_limit, min(2000, candidate_limit * 100))
+    max_candidate_scan = _main_account_selection_scan_limit(
+        candidate_limit,
+        total_matching_for_scan,
+    )
 
     ranked_candidates: list[tuple[tuple[Any, ...], Account, dict[str, Any], int]] = []
     runtime_last_resort_candidates: list[tuple[tuple[Any, ...], Account, dict[str, Any], int]] = []
@@ -2072,6 +2130,7 @@ def get_free_account_for_reply(
     exclude_proxy_source_hosts: bool | None = None,
     exclude_degraded_categories: set[str] | list[str] | tuple[str, ...] | None = None,
     pool_owner_user_id: int | None = None,
+    reserve: bool = False,
 ) -> Account | None:
     """
     Picks a reply account in small batches so we do not lock and load the
@@ -2116,8 +2175,11 @@ def get_free_account_for_reply(
             )
         )
 
-    if exclude_ids:
-        query = query.filter(~Account.id.in_(exclude_ids))
+    excluded_account_ids: set[int] = set(exclude_ids or [])
+    if reserve:
+        excluded_account_ids.update(get_reserved_reply_account_ids())
+    if excluded_account_ids:
+        query = query.filter(~Account.id.in_(list(excluded_account_ids)))
 
     normalized_exclude_proxies = {
         str(proxy).strip()
@@ -2162,7 +2224,7 @@ def get_free_account_for_reply(
     locking_enabled = True
     supports_skip_locked = dialect_name not in {"", "sqlite"}
     batch_size = max(20, min(100, getattr(settings, "MAX_CONCURRENT_BROWSERS", 10) * 4))
-    seen_ids: set[int] = set(exclude_ids or [])
+    seen_ids: set[int] = set(excluded_account_ids)
     runtime_last_resort_accounts: list[tuple[Account, dict[str, Any], int]] = []
     last_resort_accounts: list[tuple[Account, dict[str, Any], int]] = []
     scanned_count = 0
@@ -2401,9 +2463,25 @@ def get_free_account_for_reply(
                 )
 
             ranked_available.sort(key=lambda item: item[0])
-            account = ranked_available[0][1]
-            account_state = ranked_available[0][2]
-            account_score = ranked_available[0][3]
+            account = None
+            account_state = None
+            account_score = None
+            for _, candidate_account, candidate_state, candidate_score in ranked_available:
+                if reserve and not reserve_reply_account(candidate_account.id):
+                    seen_ids.add(candidate_account.id)
+                    logger.debug(
+                        "[ACCOUNT_SERVICE] Candidate reply account %s was already reserved by another worker; skipping",
+                        candidate_account.id,
+                    )
+                    continue
+                account = candidate_account
+                account_state = candidate_state
+                account_score = candidate_score
+                break
+            if account is None:
+                if len(accounts) >= batch_size:
+                    continue
+                return None
             account_proxy_obj = proxy_map.get(account.proxy) if account.proxy else None
             if settings.PROXY_GEO_MATCHING:
                 try:
@@ -2784,6 +2862,24 @@ def record_reply_success(db: Session, account_id: int) -> None:
         raise
 
 
+def record_reply_attempt(db: Session, account_id: int) -> None:
+    """Marks a reply submit attempt without counting it as a confirmed reply."""
+    account = db.query(Account).filter(Account.id == account_id).with_for_update().first()
+    if not account:
+        return
+
+    now = datetime.now(timezone.utc)
+    account.last_used_at = now
+    account.last_checked_at = now
+
+    try:
+        db.commit()
+    except Exception as e:
+        db.rollback()
+        logger.error(f"Error recording reply attempt for account {account_id}: {e}", exc_info=True)
+        raise
+
+
 def mark_monitor_use(db: Session, account_id: int) -> None:
     """Records that the account was used for monitor work."""
     account = db.query(Account).filter(Account.id == account_id).with_for_update().first()
@@ -2900,7 +2996,12 @@ def _build_scope_runtime_stats(
     now: datetime | None = None,
 ) -> dict[str, Any]:
     now = now or datetime.now(timezone.utc)
-    reserved_ids = get_reserved_main_account_ids()
+    if scope == MAIN_SCOPE:
+        reserved_ids = get_reserved_main_account_ids()
+    elif scope == REPLY_SCOPE:
+        reserved_ids = get_reserved_reply_account_ids()
+    else:
+        reserved_ids = set()
     summary = {
         "total_candidates": len(accounts),
         "eligible_now": 0,

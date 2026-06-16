@@ -50,8 +50,51 @@ def test_parallel_commenting_mode_uses_dynamic_reply_worker_pool():
 
     assert "asyncio.FIRST_COMPLETED" in src
     assert "inflight_reply_variants" in src
-    assert "pending_reply_variants.append((item.variant_index, item.text))" in src
-    assert "retry_variants + pending_reply_variants" not in src
+    assert "pending_reply_variants.insert(0, (item.variant_index, item.text))" in src
+    assert "pending_reply_variants = retry_variants + pending_reply_variants" in src
+
+
+@pytest.mark.unit
+def test_parallel_commenting_uses_phase_specific_worker_and_proxy_limits():
+    from executor import user_schema
+    src = inspect.getsource(user_schema.execute_user_schema_parallel)
+
+    assert "PARALLEL_MAIN_WORKERS" in src
+    assert "PARALLEL_MAIN_MAX_ACTIVE_BROWSERS_PER_PROXY" in src
+    assert "PARALLEL_REPLY_MAX_ACTIVE_BROWSERS_PER_PROXY" in src
+    assert "max_active_main_browsers_per_proxy" in src
+    assert "max_active_reply_browsers_per_proxy" in src
+    assert "len(active_main_tasks) < main_worker_target" in src
+
+
+@pytest.mark.unit
+def test_parallel_reply_default_starts_two_variant_workers():
+    from config.settings import Settings
+    from executor import user_schema
+    src = inspect.getsource(user_schema.execute_user_schema_parallel)
+
+    assert Settings().PARALLEL_REPLY_VARIANT_WORKERS == 2
+    assert '_positive_int_setting("PARALLEL_REPLY_VARIANT_WORKERS", 2)' in src
+
+
+@pytest.mark.unit
+def test_parallel_commenting_continues_replies_after_partial_mains():
+    from executor import user_schema
+    src = inspect.getsource(user_schema.execute_user_schema_parallel)
+
+    assert "parallel_main_incomplete_replies_continuing" in src
+    assert "parallel_main_incomplete_replies_blocked" not in src
+    assert "main_partial_replies_blocked" not in src
+
+
+@pytest.mark.unit
+def test_parallel_main_no_free_account_is_temporary_while_browser_active():
+    from executor import user_schema
+    src = inspect.getsource(user_schema.execute_user_schema_parallel)
+
+    assert "if candidate is None:" in src
+    assert "active_main_proxy_counts" in src
+    assert "temporary_main_selection_error" in src
 
 
 @pytest.mark.unit

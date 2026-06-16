@@ -213,6 +213,47 @@ _TIKTOK_SHORTCUTS_SUPPRESS_INIT_SCRIPT = r"""
 settings = get_settings()
 
 
+async def _install_resource_blocking_routes(context: BrowserContext, account_id: int | None = None) -> None:
+    if (
+        settings.BLOCK_IMAGES
+        or settings.BLOCK_MEDIA
+        or settings.BLOCK_FONTS
+        or settings.BLOCK_STYLESHEETS
+    ):
+        logger.info(
+            "[BROWSER_RESOURCE_BLOCK] account=%s images=%s media=%s fonts=%s stylesheets=%s service_workers=%s",
+            account_id,
+            bool(settings.BLOCK_IMAGES),
+            bool(settings.BLOCK_MEDIA),
+            bool(settings.BLOCK_FONTS),
+            bool(settings.BLOCK_STYLESHEETS),
+            "block" if settings.BLOCK_MEDIA else "default",
+        )
+
+    async def route_handler(route):
+        try:
+            request = route.request
+            resource_type = request.resource_type
+            request_url = request.url
+            if _should_abort_resource(resource_type, request_url):
+                await route.abort()
+                return
+            try:
+                await route.continue_()
+            except Exception as continue_error:
+                if "target" in str(continue_error).lower() or "closed" in str(continue_error).lower():
+                    logger.debug(f"Route handler: page/context closed, ignoring: {continue_error}")
+                    return
+                raise
+        except Exception as route_error:
+            if "target" in str(route_error).lower() or "closed" in str(route_error).lower():
+                logger.debug(f"Route handler: context closed, ignoring: {route_error}")
+                return
+            logger.debug(f"Route handler error: {route_error}")
+
+    await context.route("**/*", route_handler)
+
+
 def _positive_int_setting(name: str, default: int, *, minimum: int = 1, maximum: int = 10000) -> int:
     try:
         value = int(getattr(settings, name, default) or default)
@@ -1565,7 +1606,8 @@ class BrowserPool:
                 # КРИТИЧНО: Проверяем, что context был успешно создан перед использованием
                 if context is None:
                     raise TikTokClientError(f"Failed to create browser context for account {account.id}")
-                
+
+                await _install_resource_blocking_routes(context, account.id)
                 context.set_default_timeout(settings.PLAYWRIGHT_TIMEOUT)
 
                 # Install early TikTok UI popup suppression before any real page is created.
@@ -1629,51 +1671,7 @@ class BrowserPool:
                             )
                         finally:
                             await temp_page.close()
-                
-                # Применяем блокировку ресурсов
-                if (
-                    settings.BLOCK_IMAGES
-                    or settings.BLOCK_MEDIA
-                    or settings.BLOCK_FONTS
-                    or settings.BLOCK_STYLESHEETS
-                ):
-                    logger.info(
-                        "[BROWSER_RESOURCE_BLOCK] account=%s images=%s media=%s fonts=%s stylesheets=%s service_workers=%s",
-                        account.id,
-                        bool(settings.BLOCK_IMAGES),
-                        bool(settings.BLOCK_MEDIA),
-                        bool(settings.BLOCK_FONTS),
-                        bool(settings.BLOCK_STYLESHEETS),
-                        "block" if settings.BLOCK_MEDIA else "default",
-                    )
 
-                async def route_handler(route):
-                    try:
-                        request = route.request
-                        resource_type = request.resource_type
-                        request_url = request.url
-                        if _should_abort_resource(resource_type, request_url):
-                            await route.abort()
-                            return
-                        # ИСПРАВЛЕНО: Обрабатываем TargetClosedError при continue_()
-                        try:
-                            await route.continue_()
-                        except Exception as continue_error:
-                            # Игнорируем ошибки если страница/контекст закрыт
-                            if "target" in str(continue_error).lower() or "closed" in str(continue_error).lower():
-                                logger.debug(f"Route handler: page/context closed, ignoring: {continue_error}")
-                                return
-                            raise
-                    except Exception as route_error:
-                        # Игнорируем ошибки маршрутизации если контекст закрыт
-                        if "target" in str(route_error).lower() or "closed" in str(route_error).lower():
-                            logger.debug(f"Route handler: context closed, ignoring: {route_error}")
-                            return
-                        # Для других ошибок логируем, но не падаем
-                        logger.debug(f"Route handler error: {route_error}")
-                
-                await context.route("**/*", route_handler)
-                
                 # ИСПРАВЛЕНО: Добавляем скрипты для маскировки НА КОНТЕКСТ, а не на временную страницу
                 # КРИТИЧНО: context.add_init_script применяется ко ВСЕМ страницам контекста
                 if settings.HUMAN_LIKE_BEHAVIOR:

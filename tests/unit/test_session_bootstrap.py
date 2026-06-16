@@ -226,6 +226,14 @@ async def test_extract_tiktok_username_strips_leading_at_sign():
 
 
 @pytest.mark.unit
+def test_extract_tiktok_username_does_not_use_broad_profile_link_fallback():
+    source = inspect.getsource(extract_tiktok_username)
+
+    assert 'a[href*="/@"][role="link"]' not in source
+    assert 'nav a[href*="/@"][aria-label*="profile" i]' in source
+
+
+@pytest.mark.unit
 def test_bootstrap_result_carries_tiktok_username_field():
     res = BootstrapResult(status="ready", tiktok_username="erjowkaaa")
     assert res.tiktok_username == "erjowkaaa"

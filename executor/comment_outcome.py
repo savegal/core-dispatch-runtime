@@ -631,6 +631,7 @@ async def find_comment_in_list(
     strict_scope: bool = False,
     min_match_ratio: float = 0.7,
     top_level_only: bool = False,
+    expected_author: Optional[str] = None,
 ) -> Tuple[bool, Dict[str, Any]]:
     """
     Find a comment by text inside the TikTok comment list.
@@ -1197,6 +1198,25 @@ async def find_comment_in_list(
                             author = (author or "").strip() or None
                         except Exception:
                             author = None
+                        # Author-scoped match (parallel safety): when an
+                        # expected_author is supplied, identical comment text
+                        # posted by a DIFFERENT account must not count. We only
+                        # reject when the row exposes a non-empty author that
+                        # clearly differs; if the row author cannot be read we
+                        # fall back to the legacy text-only match so replies can
+                        # still recover a comment_id.
+                        if expected_author:
+                            exp_author_norm = normalize_author(expected_author)
+                            row_author_norm = normalize_author(author) if author else ""
+                            if exp_author_norm and row_author_norm and row_author_norm != exp_author_norm:
+                                _log_parent_search_trace(
+                                    "author_mismatch_skip",
+                                    scroll=scroll_i,
+                                    position=idx,
+                                    requested_author=exp_author_norm,
+                                    row_author=row_author_norm,
+                                )
+                                continue
                         logger.info(
                             f"[FIND_COMMENT] Comment found: scroll={scroll_i}, position={idx}, "
                             f"text_normalized={normalize_text(txt)[:50]}"
@@ -1452,6 +1472,7 @@ async def find_comments_in_list_batch(
             "max_scrolls": max_scrolls,
             "min_match_ratio": min_match_ratio,
             "require_author_match": require_author_match,
+            "top_level_only": top_level_only,
             "return_partial_on_found": return_partial_on_found,
             "partial_sink": partial_found_sink is not None,
             "url": getattr(page, "url", None),
@@ -1796,15 +1817,17 @@ async def find_comments_in_list_batch(
     scope_selector = None
     if scroll_target is None and comment_list is not None:
         scroll_target = comment_list
+    defer_initial_scroll_reset = bool(return_partial_on_found and comment_list is not None)
     if comment_list is not None:
         scope_selector = '[data-smart-comment-list-batch-scope="1"]'
-        try:
-            if scroll_target is not None:
-                await scroll_target.evaluate("(el) => { el.scrollTop = 0; }")
-            await asyncio.sleep(0.2)
-            _log_batch_trace("scope_scroll_reset")
-        except Exception as exc:
-            logger.debug("[FIND_COMMENT_BATCH] failed to reset scoped comment-list scroll: %s", exc)
+        if not defer_initial_scroll_reset:
+            try:
+                if scroll_target is not None:
+                    await scroll_target.evaluate("(el) => { el.scrollTop = 0; }")
+                await asyncio.sleep(0.2)
+                _log_batch_trace("scope_scroll_reset")
+            except Exception as exc:
+                logger.debug("[FIND_COMMENT_BATCH] failed to reset scoped comment-list scroll: %s", exc)
 
     found: Dict[int, Dict[str, Any]] = {}
     used_comment_keys: set[str] = set()
@@ -1972,7 +1995,21 @@ async def find_comments_in_list_batch(
                         if (!raw) return null;
                         return String(raw).replace(/^comment-/, '') || null;
                     };
-                    const roots = [...scope.querySelectorAll(rootSelector)].filter(visible);
+                    const primaryRootSelector = [
+                        '[data-cid]:not([data-cid^="one-column-item"])',
+                        '[data-comment-id]',
+                        '[data-e2e="comment-item"]',
+                        '[class*="DivCommentObject"]',
+                        '[class*="CommentItem"]',
+                        '[role="listitem"]',
+                        'article',
+                        'li'
+                    ].join(', ');
+                    const primaryRoots = [...scope.querySelectorAll(primaryRootSelector)].filter(visible);
+                    const roots = (primaryRoots.length
+                        ? primaryRoots
+                        : [...scope.querySelectorAll(rootSelector)].filter(visible)
+                    ).slice(0, 250);
                     const rows = [];
                     const seenContainers = new Set();
                     for (let i = 0; i < roots.length; i++) {
@@ -2011,11 +2048,31 @@ async def find_comments_in_list_batch(
                             }
                         }
                         if (!text) continue;
-                        const authorEl = container.querySelector(
-                            'a[href*="/@"], [data-e2e*="username"], [class*="UserName"], [class*="username"], [class*="author"]'
-                        );
-                        const href = authorEl ? (authorEl.getAttribute('href') || '') : '';
-                        const m = href.match(/\\/@([^/?]+)/);
+                        const authorCandidates = [];
+                        const pushAuthor = (value) => {
+                            const raw = String(value || '').trim().replace(/^@/, '');
+                            if (!raw) return;
+                            const key = raw.toLowerCase();
+                            if (!authorCandidates.some((item) => String(item || '').toLowerCase() === key)) {
+                                authorCandidates.push(raw);
+                            }
+                        };
+                        const authorNodes = (() => {
+                            try {
+                                return [...container.querySelectorAll(
+                                    'a[href*="/@"], [data-e2e*="username"], [class*="UserName"], ' +
+                                    '[class*="username"], [class*="author"]'
+                                )].filter(visible).slice(0, 10);
+                            } catch (_) {
+                                return [];
+                            }
+                        })();
+                        for (const authorEl of authorNodes) {
+                            const href = authorEl.getAttribute ? (authorEl.getAttribute('href') || '') : '';
+                            const m = href.match(/\\/@([^/?]+)/);
+                            if (m && m[1]) pushAuthor(m[1]);
+                            pushAuthor((authorEl.innerText || authorEl.textContent || '').trim());
+                        }
                         const idHost = (() => {
                             try {
                                 const selfOrAncestor = container.matches(cidSelector) ? container : container.closest(cidSelector);
@@ -2036,7 +2093,8 @@ async def find_comments_in_list_batch(
                             text,
                             selector,
                             cid: readCid(idHost),
-                            author: m ? m[1] : (authorEl ? (authorEl.innerText || authorEl.textContent || '').trim().replace(/^@/, '') : null),
+                            author: authorCandidates.length ? authorCandidates[0] : null,
+                            authorCandidates,
                             scrollTop: scrollNode && typeof scrollNode.scrollTop === 'number' ? scrollNode.scrollTop : null,
                             anchorToken,
                         });
@@ -2099,6 +2157,7 @@ async def find_comments_in_list_batch(
                 "selector": row.get("selector"),
                 "cid": row.get("cid"),
                 "author": row.get("author"),
+                "author_candidates": row.get("authorCandidates") or row.get("author_candidates"),
             }
             for row in rows[:5]
         ]
@@ -2134,8 +2193,21 @@ async def find_comments_in_list_batch(
                         continue
                     expected_author = str(target.get("author") or "").strip()
                     row_author = normalize_author(row.get("author"))
+                    raw_author_candidates = row.get("authorCandidates") or row.get("author_candidates") or []
+                    if isinstance(raw_author_candidates, str):
+                        raw_author_candidates = [raw_author_candidates]
+                    row_author_candidates = {
+                        normalized
+                        for normalized in (
+                            normalize_author(candidate)
+                            for candidate in raw_author_candidates
+                        )
+                        if normalized
+                    }
+                    if row_author:
+                        row_author_candidates.add(row_author)
                     if require_author_match and expected_author:
-                        if row_author and row_author == expected_author:
+                        if expected_author in row_author_candidates:
                             matched_target = target
                             matched_by = "text_author"
                             break
@@ -2153,9 +2225,10 @@ async def find_comments_in_list_batch(
                                     "comment_id": row_cid,
                                     "text_selector": row.get("selector"),
                                     "author": row.get("author"),
+                                    "author_candidates": sorted(row_author_candidates),
                                     "anchor_token": row.get("anchorToken"),
                                     "matched_by": "text_author_fallback",
-                                    "fallback_reason": "author_missing" if not row_author else "author_mismatch",
+                                    "fallback_reason": "author_missing" if not row_author_candidates else "author_mismatch",
                                 })
                         continue
                     matched_target = target
@@ -2175,6 +2248,7 @@ async def find_comments_in_list_batch(
                 "comment_id": row_cid,
                 "text_selector": row.get("selector"),
                 "author": row.get("author"),
+                "author_candidates": row.get("authorCandidates") or row.get("author_candidates"),
                 "anchor_token": row.get("anchorToken"),
                 "matched_by": matched_by,
             }
@@ -2192,11 +2266,26 @@ async def find_comments_in_list_batch(
             if len(found) >= len(targets):
                 break
 
-        # Ранний выход только когда найдены ВСЕ цели. Прежний «partial return»
-        # (выход через ~2 лишних скролла после первого совпадения) бросал
-        # main-комментарии ниже по списку, и реплаеры их пропускали.
         if len(found) >= len(targets):
             break
+        if return_partial_on_found and found:
+            partial_returned = True
+            _log_batch_trace(
+                "partial_found_return",
+                scroll=scroll_i,
+                found_count=len(found),
+                target_count=len(targets),
+                missing_indexes=_missing_target_indexes(),
+            )
+            break
+        if defer_initial_scroll_reset and scroll_i == 0 and not found and scroll_target is not None:
+            try:
+                await scroll_target.evaluate("(el) => { el.scrollTop = 0; }")
+                await asyncio.sleep(0.2)
+                _log_batch_trace("scope_scroll_reset_after_current_viewport_miss")
+                continue
+            except Exception as exc:
+                logger.debug("[FIND_COMMENT_BATCH] deferred scoped reset failed: %s", exc)
 
         try:
             if scroll_target:

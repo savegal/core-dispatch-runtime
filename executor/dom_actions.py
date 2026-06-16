@@ -762,14 +762,10 @@ _JS_FIND_REPLY_INPUT = r"""
     if (!selected || selected.score <= 0) {
         return { found: false, reason: 'reply_input_not_found' };
     }
-    // Anti "reply-as-main" guard: in a reply flow we always pass a parent anchor
-    // token. Only accept an input that is actually associated with the reply —
-    // i.e. near/inside the parent row (+8000/+12000), labelled as a reply
-    // (+5000) or pre-filled with the "@mention" reply indicator (+3000). A bare
-    // global comment composer scores ~1250; accepting it would type the reply
-    // into the main comment box and publish it as a top-level comment. Rejecting
-    // here is safe: the caller retries instead of posting to the wrong place.
-    if (targetAnchorToken && selected.score < 3000) {
+    // Anti "reply-as-main" guard: in a reply flow a parent anchor must still be
+    // present, and the editor must be near/inside that parent row. A bare
+    // @mention or generic reply label can belong to another comment.
+    if (targetAnchorToken && (anchorMissing || selected.score < 8000)) {
         return {
             found: false,
             reason: anchorMissing ? 'parent_anchor_not_found' : 'reply_input_not_scoped_to_parent',
@@ -846,7 +842,7 @@ _JS_FIND_REPLY_INPUT_HANDLE = (
 # a main comment" protection. When replyScoped is false the global composer
 # picker is used.
 _JS_ATOMIC_SET_COMMENT_TEXT = r"""
-([insertText, expected, anchorToken, replyScoped, focusOnly]) => {
+([insertText, expected, anchorToken, replyScoped, focusOnly, clearOnly]) => {
     const visible = (el) => {
         if (!el || !el.getBoundingClientRect) return false;
         const r = el.getBoundingClientRect();
@@ -893,6 +889,17 @@ _JS_ATOMIC_SET_COMMENT_TEXT = r"""
             try { el.dispatchEvent(ev); } catch (_) {}
         }
     };
+    const fireClearEvents = (el) => {
+        const evs = [
+            new InputEvent('beforeinput', {bubbles:true, cancelable:true, inputType:'deleteContentBackward', data:null}),
+            new InputEvent('input', {bubbles:true, cancelable:true, inputType:'deleteContentBackward', data:null}),
+            new Event('change', {bubbles:true, cancelable:true}),
+            new KeyboardEvent('keyup', {bubbles:true, cancelable:true, key:'Backspace'})
+        ];
+        for (const ev of evs) {
+            try { el.dispatchEvent(ev); } catch (_) {}
+        }
+    };
     const setNativeValue = (el, val) => {
         const proto =
             el.tagName === 'TEXTAREA' ? window.HTMLTextAreaElement.prototype :
@@ -903,6 +910,63 @@ _JS_ATOMIC_SET_COMMENT_TEXT = r"""
         if (desc && desc.set) desc.set.call(el, val);
         else el.value = val;
         return true;
+    };
+    const readEditorText = (el) => {
+        const rawText = (el.value !== undefined && el.value !== null && el.value !== '')
+            ? el.value
+            : (el.textContent || el.innerText || '');
+        return String(rawText || '');
+    };
+    const placeholderMarkers = [
+        'add comment',
+        'add a comment',
+        'say something',
+        'leave a comment',
+        'write a comment',
+        'write something',
+        'comment...',
+        '\u0434\u043e\u0431\u0430\u0432\u044c\u0442\u0435 \u043a\u043e\u043c\u043c\u0435\u043d\u0442\u0430\u0440',
+        '\u043d\u0430\u043f\u0438\u0448\u0438\u0442\u0435 \u043a\u043e\u043c\u043c\u0435\u043d\u0442\u0430\u0440',
+        '\u0434\u043e\u0434\u0430\u0442\u0438 \u043a\u043e\u043c\u0435\u043d\u0442\u0430\u0440',
+        '\u0434\u043e\u0434\u0430\u0442\u0438 \u0432\u0456\u0434\u043f\u043e\u0432\u0456\u0434\u044c',
+        'Ð´Ð¾Ð±Ð°Ð²ÑŒÑ‚Ðµ ÐºÐ¾Ð¼Ð¼ÐµÐ½Ñ‚Ð°Ñ€',
+        'ÐÐ°Ð¿Ð¸ÑˆÐ¸Ñ‚Ðµ ÐºÐ¾Ð¼Ð¼ÐµÐ½Ñ‚Ð°Ñ€',
+        'ÐºÐ¾Ð¼Ð¼ÐµÐ½Ñ‚Ð°Ñ€Ð¸Ð¹...'
+    ];
+    const isPlaceholderText = (value) => {
+        const lower = String(value || '').replace(/\s+/g, ' ').trim().toLowerCase();
+        if (!lower) return false;
+        return placeholderMarkers.some(m => lower.startsWith(String(m || '').toLowerCase()));
+    };
+    const clearEditor = (target) => {
+        try { target.focus(); } catch (_) {}
+        try {
+            if (target.tagName === 'TEXTAREA' || target.tagName === 'INPUT') {
+                setNativeValue(target, '');
+            } else {
+                const sel = window.getSelection && window.getSelection();
+                if (sel) {
+                    const range = document.createRange();
+                    range.selectNodeContents(target);
+                    sel.removeAllRanges();
+                    sel.addRange(range);
+                    range.deleteContents();
+                    sel.removeAllRanges();
+                }
+                target.textContent = '';
+            }
+            fireClearEvents(target);
+        } catch (exc) {
+            return { ok: false, reason: 'clear_exception:' + String(exc).slice(0, 80), text: readEditorText(target) };
+        }
+        const after = readEditorText(target);
+        const afterTrimmed = after.trim();
+        const emptyLike = afterTrimmed.length === 0 || isPlaceholderText(afterTrimmed);
+        return {
+            ok: emptyLike,
+            reason: emptyLike ? (afterTrimmed.length ? 'cleared_placeholder' : 'cleared') : 'clear_verify_failed',
+            text: after
+        };
     };
     const globalPick = () => {
         const commentSelectors = [
@@ -991,20 +1055,39 @@ _JS_ATOMIC_SET_COMMENT_TEXT = r"""
         };
     }
 
+    if (clearOnly) {
+        const cleared = clearEditor(real);
+        const clearText = String((cleared && cleared.text) || '');
+        return {
+            ok: Boolean(cleared && cleared.ok),
+            reason: (cleared && cleared.reason) || 'clear_verify_failed',
+            text: clearText.slice(0, 120),
+            textFull: clearText,
+            textLen: clearText.length,
+            placeholder_leak: false,
+            scoped: replyScoped ? 'reply' : 'global'
+        };
+    }
+
+    const cleared = clearEditor(real);
+    if (!cleared || !cleared.ok) {
+        const clearText = String((cleared && cleared.text) || '');
+        return {
+            ok: false,
+            reason: (cleared && cleared.reason) || 'clear_verify_failed',
+            text: clearText.slice(0, 120),
+            textFull: clearText,
+            textLen: clearText.length,
+            placeholder_leak: false,
+            scoped: replyScoped ? 'reply' : 'global'
+        };
+    }
+
     if (real.tagName === 'TEXTAREA' || real.tagName === 'INPUT') {
         setNativeValue(real, insertText);
         fireInputEvents(real, insertText);
     } else {
         try { real.focus(); } catch (_) {}
-        try {
-            real.textContent = '';
-            const range = document.createRange();
-            range.selectNodeContents(real);
-            range.collapse(false);
-            const sel = window.getSelection();
-            sel.removeAllRanges();
-            sel.addRange(range);
-        } catch (_) {}
 
         let execOk = false;
         try { execOk = document.execCommand('insertText', false, insertText); } catch (_) {}
@@ -1022,7 +1105,7 @@ _JS_ATOMIC_SET_COMMENT_TEXT = r"""
         } catch (_) {}
     }
 
-    const placeholderMarkers = [
+    const verifyPlaceholderMarkers = [
         'add comment',
         'add a comment',
         'say something',
@@ -1035,12 +1118,10 @@ _JS_ATOMIC_SET_COMMENT_TEXT = r"""
         'Напишите комментар',
         'комментарий...'
     ];
-    const rawText = (real.value !== undefined && real.value !== null && real.value !== '')
-        ? real.value
-        : (real.textContent || real.innerText || '');
+    const rawText = readEditorText(real);
     const txt = rawText.trim();
     const txtLower = txt.toLowerCase();
-    const startsWithPlaceholder = placeholderMarkers.some(m => txtLower.startsWith(m));
+    const startsWithPlaceholder = verifyPlaceholderMarkers.some(m => txtLower.startsWith(m));
     const normalizeText = (value) => String(value || '').replace(/\s+/g, ' ').trim();
     const ok = Boolean(
         txt &&
@@ -1051,6 +1132,8 @@ _JS_ATOMIC_SET_COMMENT_TEXT = r"""
         ok: ok,
         reason: ok ? 'inserted' : 'verify_failed',
         text: txt.slice(0, 120),
+        textFull: txt,
+        textLen: txt.length,
         placeholder_leak: startsWithPlaceholder,
         scoped: replyScoped ? 'reply' : 'global'
     };
@@ -1066,6 +1149,7 @@ async def atomic_set_comment_text(
     anchor_token: Optional[str] = None,
     insert_text: Optional[str] = None,
     focus_only: bool = False,
+    clear_only: bool = False,
 ) -> dict[str, Any]:
     """Atomically focus, clear and insert text into the comment/reply editor.
 
@@ -1079,11 +1163,18 @@ async def atomic_set_comment_text(
     When ``insert_text`` is provided it is what actually gets inserted in-page,
     while ``text`` remains the full expected string used for verification.
     """
-    payload_insert = "" if focus_only else (text if insert_text is None else insert_text)
+    payload_insert = "" if (focus_only or clear_only) else (text if insert_text is None else insert_text)
     try:
         result = await page.evaluate(
             _JS_ATOMIC_SET_COMMENT_TEXT,
-            [payload_insert, text, anchor_token or "", bool(reply_scoped), bool(focus_only)],
+            [
+                payload_insert,
+                text,
+                anchor_token or "",
+                bool(reply_scoped),
+                bool(focus_only),
+                bool(clear_only),
+            ],
         )
         if isinstance(result, dict):
             return result
@@ -1116,7 +1207,7 @@ _JS_FIND_REPLY_POST_BUTTON = r"""
             el.classList.contains('disabled') ||
             parseFloat(st.opacity || '1') < 0.5;
     };
-    const clickTargetFor = (raw) => {
+    const clickTargetFor = (raw, allowDisabled = false) => {
         if (!raw) return null;
         const candidates = [
             raw,
@@ -1134,7 +1225,7 @@ _JS_FIND_REPLY_POST_BUTTON = r"""
             const r = el.getBoundingClientRect();
             if (r.width > 360 || r.height > 140) continue;
             if (getComputedStyle(el).pointerEvents === 'none') continue;
-            if (disabled(el)) continue;
+            if (!allowDisabled && disabled(el)) continue;
             return el;
         }
         return null;
@@ -1152,8 +1243,7 @@ _JS_FIND_REPLY_POST_BUTTON = r"""
             r.height <= Math.max(420, window.innerHeight * 0.50);
     };
 
-    const input = document.querySelector('[data-smart-reply-input="1"]') ||
-        document.querySelector('[data-smart-id="comment-input"]');
+    const input = document.querySelector('[data-smart-reply-input="1"]');
     const roots = [];
     const composer = document.querySelector('[data-smart-reply-composer="1"]');
     if (composer && usableComposerRoot(composer)) roots.push({ root: composer, strategy: 'reply-composer' });
@@ -1184,8 +1274,11 @@ _JS_FIND_REPLY_POST_BUTTON = r"""
                 label.includes('отправ');
             if (!looksPost) continue;
             if (label.includes('reply') && !label.includes('post')) continue;
-            const target = clickTargetFor(raw);
-            if (!target) continue;
+            let target = clickTargetFor(raw);
+            if (!target) {
+                target = clickTargetFor(raw, true);
+                if (!target || !disabled(target)) continue;
+            }
             target.setAttribute('data-smart-reply-post', '1');
             target.setAttribute('data-smart-id', 'comment-post');
             return {
@@ -1213,7 +1306,7 @@ _JS_FIND_REPLY_POST_BUTTON_HANDLE = (
     "    }\n"
     "    try { window.__smartReplyPostProbeState = result || null; } catch (_) {}\n"
     "    if (!result || !result.found) return null;\n"
-    "    const marked = document.querySelector('[data-smart-reply-post=\"1\"], [data-smart-id=\"comment-post\"]');\n"
+    "    const marked = document.querySelector('[data-smart-reply-post=\"1\"]');\n"
     "    if (!marked) {\n"
     "        try { window.__smartReplyPostProbeState = { ...result, found: false, reason: 'reply_marked_post_missing_after_probe' }; } catch (_) {}\n"
     "        return null;\n"
@@ -2412,6 +2505,9 @@ _JS_OPEN_REPLY = r"""
                 if (parentResult) return parentResult;
             }
             break;
+        }
+        if (!targetId && !normalizedNeedle) {
+            return { clicked: false, reason: 'parent_anchor_not_found' };
         }
     }
 
@@ -4033,7 +4129,7 @@ async def open_reply_box(
     max_attempts: Optional[int] = None,
 ) -> DomActionResult:
     started = time.monotonic()
-    has_anchor = bool(parent_comment_id or parent_comment_text)
+    has_anchor = bool(parent_comment_id or parent_comment_text or parent_anchor_token)
     # When anchor is provided, retry with scroll to handle freshly posted comments.
     default_attempts = 4 if has_anchor else 1
     try:
@@ -4041,7 +4137,7 @@ async def open_reply_box(
     except Exception:
         max_attempts = default_attempts
     max_attempts = max(1, min(max_attempts, default_attempts))
-    fast_mode = max_attempts <= 2
+    fast_mode = max_attempts <= 3
 
     for attempt in range(max_attempts):
         if attempt > 0:
@@ -4113,11 +4209,11 @@ async def open_reply_box(
                 await page.wait_for_selector(
                     '[data-e2e="comment-input"], [data-e2e*="reply"] [contenteditable="true"], div[contenteditable="true"]',
                     state="attached",
-                    timeout=1200 if fast_mode else 2500,
+                    timeout=1800 if fast_mode else 2500,
                 )
             except Exception:
                 # Fallback: give TikTok at least 0.7s even if selector never appears
-                await asyncio.sleep(0.25 if fast_mode else 0.7)
+                await asyncio.sleep(0.45 if fast_mode else 0.7)
             try:
                 activation = await page.evaluate(_JS_REPLY_INPUT_ACTIVE)
             except Exception as exc:
@@ -5966,7 +6062,6 @@ async def wait_for_post_button_enabled(
                         replyScoped
                             ? [
                                 document.querySelector('[data-smart-reply-post="1"]'),
-                                document.querySelector('[data-smart-id="comment-post"]'),
                             ]
                             : [
                                 document.querySelector('[data-smart-id="comment-post-ready"]'),
@@ -6032,10 +6127,7 @@ async def wait_for_post_button_enabled(
                     };
 
                     const inputWrapper = replyScoped
-                        ? (
-                            document.querySelector('[data-smart-reply-input="1"]') ||
-                            document.querySelector('[data-smart-id="comment-input"]')
-                        )
+                        ? document.querySelector('[data-smart-reply-input="1"]')
                         : (
                             document.querySelector('[data-smart-id="comment-input"]') ||
                             document.querySelector('[data-e2e="comment-input"]')
@@ -6303,13 +6395,14 @@ async def type_into_comment(
     Type text into TikTok's comment input.
 
     Final robust strategy:
-    0) PRIMARY: one atomic page.evaluate that focuses + clears + inserts the
-       text and verifies it landed (atomic_set_comment_text). ~1 round-trip,
-       survives latency. For replies it is scoped to the reply editor only.
-    1) Resolve the real editable node (data-e2e can be just a wrapper).
-    2) Try human-like focus + keyboard typing.
-    3) If focus fails, use a direct DOM/React event fallback on the real editor.
-    4) Verify globally, not only on the original ElementHandle, because TikTok may re-render input.
+    0) PRIMARY: atomically locate/focus the real editor, then insert the full
+       text with trusted keyboard input and verify it landed in the scoped editor.
+    1) If trusted full insertion misses, use a latency-friendly atomic prefix +
+       trusted tail fallback.
+    2) Last-resort exact DOM insert for already anchored/scoped editors.
+    3) Resolve the real editable node (data-e2e can be just a wrapper).
+    4) Try human-like focus + keyboard typing.
+    5) Verify globally, not only on the original ElementHandle, because TikTok may re-render input.
 
     reply_scoped/anchor_token: when reply_scoped is True the atomic primitive
     selects the editor INSIDE the reply container only (never the global
@@ -6668,6 +6761,28 @@ async def type_into_comment(
     async def _js_insert_text(reason: str) -> bool:
         """Insert text using DOM + React-like events. This is still on-page UI, not API spoofing."""
         try:
+            # MAIN-only last resort (reply path returns before reaching here).
+            # The on-page execCommand insert below appends to whatever the editor
+            # currently holds. If TikTok's React/Lexical EditorState still carries
+            # stale/duplicated text, that would produce a doubled comment. Reset it
+            # with a TRUSTED select-all+delete first, but only when focus is
+            # confirmed inside the composer (otherwise a stray Ctrl+A could hit the
+            # page). If focus can't be confirmed we skip and rely on the strict
+            # pre-Post exact gate to refuse any corrupted publish.
+            if not reply_scoped:
+                try:
+                    await atomic_set_comment_text(
+                        page,
+                        text,
+                        reply_scoped=False,
+                        anchor_token=None,
+                        focus_only=True,
+                    )
+                    if await _focus_ok():
+                        await page.keyboard.press("Control+A")
+                        await page.keyboard.press("Delete")
+                except Exception:
+                    pass
             result = await page.evaluate(
                 r"""
                 (expected) => {
@@ -6789,21 +6904,42 @@ async def type_into_comment(
                         setNativeValue(real, expected);
                         fireInputEvents(real, expected);
                     } else {
-                        return {
-                            ok: false,
-                            reason: 'contenteditable_js_fallback_disabled',
-                            text: (real.textContent || real.innerText || '').trim().slice(0, 120),
-                            placeholder_leak: false,
-                            diag: {
-                                tag: real.tagName,
-                                e2e: real.getAttribute && real.getAttribute('data-e2e'),
-                                smart: real.getAttribute && real.getAttribute('data-smart-id'),
-                                role: real.getAttribute && real.getAttribute('role'),
-                                contenteditable: real.getAttribute && real.getAttribute('contenteditable'),
-                                isContentEditable: Boolean(real.isContentEditable),
-                                html: (real.outerHTML || '').slice(0, 400)
+                        try {
+                            const sel = window.getSelection && window.getSelection();
+                            if (sel) {
+                                const clearRange = document.createRange();
+                                clearRange.selectNodeContents(real);
+                                sel.removeAllRanges();
+                                sel.addRange(clearRange);
+                                try { document.execCommand('delete', false, null); } catch (_) {}
+                                try { clearRange.deleteContents(); } catch (_) {}
+                                sel.removeAllRanges();
                             }
-                        };
+                            real.textContent = '';
+                            fireInputEvents(real, '');
+                        } catch (_) {}
+
+                        try {
+                            const range = document.createRange();
+                            range.selectNodeContents(real);
+                            range.collapse(false);
+                            const sel = window.getSelection();
+                            sel.removeAllRanges();
+                            sel.addRange(range);
+                        } catch (_) {}
+
+                        let execOk = false;
+                        try { execOk = document.execCommand('insertText', false, expected); } catch (_) {}
+                        fireInputEvents(real, expected);
+
+                        try {
+                            const range = document.createRange();
+                            range.selectNodeContents(real);
+                            range.collapse(false);
+                            const sel = window.getSelection();
+                            sel.removeAllRanges();
+                            sel.addRange(range);
+                        } catch (_) {}
                     }
 
                     // STRICT verification against the actual editor, NOT the wrapper.
@@ -6834,7 +6970,7 @@ async def type_into_comment(
 
                     return {
                         ok: ok,
-                        reason: 'inserted',
+                        reason: ok ? 'inserted' : 'verify_failed',
                         text: txt.slice(0, 120),
                         placeholder_leak: startsWithPlaceholder,
                         diag: {
@@ -6881,7 +7017,7 @@ async def type_into_comment(
         return " ".join(str(value or "").split()).strip()
 
     async def _atomic_prefix_then_trusted_tail() -> bool:
-        """Fast path: DOM-set the prefix, then use one trusted keyboard insert.
+        """Latency fallback: DOM-set the prefix, then use one trusted keyboard insert.
 
         A full keyboard.insert_text can stall badly when several Chromium
         windows are busy. Setting all but the last character in-page keeps the
@@ -6907,8 +7043,8 @@ async def type_into_comment(
             logger.debug("[DOM] Atomic prefix primary failed (%s); falling back", reason)
             return False
 
-        landed = str(result.get("text") or "")
-        if prefix and len(prefix) <= 120 and _normalize_local(landed) != _normalize_local(prefix):
+        landed = str(result.get("textFull") or result.get("text") or "")
+        if prefix and _normalize_local(landed) != _normalize_local(prefix):
             logger.debug(
                 "[DOM] Atomic prefix primary did not land prefix cleanly (%s); falling back",
                 reason,
@@ -6952,7 +7088,7 @@ async def type_into_comment(
         return False
 
     async def _atomic_primary() -> bool:
-        """Fallback path: atomic focus + trusted keyboard.insert_text."""
+        """Primary path: atomic scoped focus + trusted full keyboard.insert_text."""
         if not text:
             return False
 
@@ -6973,8 +7109,45 @@ async def type_into_comment(
             if not await _focus_ok():
                 logger.debug("[DOM] Atomic focus primary did not leave focus in comment input; falling back")
                 return False
-            await page.keyboard.press("Control+A")
-            await page.keyboard.press("Backspace")
+            if reply_scoped:
+                clear_result = await atomic_set_comment_text(
+                    page,
+                    "",
+                    reply_scoped=reply_scoped,
+                    anchor_token=anchor_token,
+                    clear_only=True,
+                )
+                if not isinstance(clear_result, dict) or not clear_result.get("ok"):
+                    logger.debug(
+                        "[DOM] Atomic focus primary could not verify an empty editor before typing (%s); falling back",
+                        clear_result.get("reason") if isinstance(clear_result, dict) else "no_result",
+                    )
+                    return False
+                if not await _focus_ok():
+                    logger.debug(
+                        "[DOM] Atomic focus primary lost focus after clear; falling back",
+                    )
+                    return False
+            else:
+                # MAIN composer: a raw-DOM clear (textContent='' / deleteContents)
+                # empties the DOM but NOT TikTok's React/Lexical EditorState, so a
+                # following trusted insert APPENDS onto retained state -> duplicated
+                # text and the "147 chars / empty field" desync. Only a TRUSTED
+                # select-all + delete actually resets EditorState and keeps DOM and
+                # React in sync. This is the difference that prevents accumulation.
+                await page.keyboard.press("Control+A")
+                await page.keyboard.press("Delete")
+                if not await _focus_ok():
+                    await atomic_set_comment_text(
+                        page,
+                        text,
+                        reply_scoped=False,
+                        anchor_token=None,
+                        focus_only=True,
+                    )
+                if not await _focus_ok():
+                    logger.debug("[DOM] Atomic focus primary could not keep focus before insert; falling back")
+                    return False
             await page.keyboard.insert_text(text)
             await asyncio.sleep(0.12 if fast else 0.22)
         except Exception as exc:
@@ -7023,15 +7196,11 @@ async def type_into_comment(
         )
         return True
 
-    if reply_scoped and not _deadline_exceeded():
-        if await _atomic_prefix_then_trusted_tail():
-            return True
-
     if not _deadline_exceeded():
         if await _atomic_primary():
             return True
 
-    if not reply_scoped and not _deadline_exceeded():
+    if not _deadline_exceeded():
         if await _atomic_prefix_then_trusted_tail():
             return True
 
@@ -7154,6 +7323,13 @@ async def type_into_comment(
         logger.warning("[DOM] Scoped reply typing did not verify; skipping unscoped JS fallback")
         return False
 
+    # MAIN comment fallback: insert via the on-page execCommand path. This is the
+    # workhorse that actually lands text into TikTok's DraftEditor when the
+    # keyboard/atomic paths don't (the old, reliable behaviour). It can only
+    # RETURN success when verification confirms the editor holds EXACTLY the
+    # expected text, so it cannot post stacked/garbage text; the
+    # accumulation-across-variants bug is prevented upstream (no dirty composer
+    # reuse + per-variant confirmation), not by crippling input here.
     if await _js_insert_text("focus_failed_or_keyboard_unverified"):
         return True
 

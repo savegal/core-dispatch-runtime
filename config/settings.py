@@ -40,6 +40,7 @@ class Settings(BaseSettings):
     # accounts as a last resort. They still must pass browser action-ready and
     # enrichment gates before any DOM publish/search is attempted.
     ALLOW_SID_GUARD_ONLY_PUBLISH_LAST_RESORT: bool = True
+    ACCOUNT_SELECTION_MAX_MAIN_SCAN: int = 10000
     # Жизненный цикл по дате создания записи в БД (created_at):
     # True — режим «сжигаемых» аккаунтов: старше ~72ч без свежей валидации → hard_expired, аккаунт
     #   исключается из main/reply/monitor (как на ферме одноразовых логинов).
@@ -448,9 +449,14 @@ class Settings(BaseSettings):
     PARALLEL_COMMENTING_MAX_MAIN_ATTEMPTS: int = 6
     PARALLEL_COMMENTING_MAX_REPLY_ATTEMPTS: int = 6
     PARALLEL_DYNAMIC_WORKER_POOL_ENABLED: bool = True
-    PARALLEL_COMMENTING_TARGET_BROWSERS: int = 4
-    PARALLEL_COMMENTING_MAX_BROWSERS: int = 4
-    PARALLEL_MAX_ACTIVE_BROWSERS_PER_PROXY: int = 2
+    PARALLEL_COMMENTING_TARGET_BROWSERS: int = 3
+    PARALLEL_COMMENTING_MAX_BROWSERS: int = 3
+    PARALLEL_MAX_ACTIVE_BROWSERS_PER_PROXY: int = 3
+    PARALLEL_MAIN_WORKERS: int = 3
+    PARALLEL_MAIN_ACCOUNT_SLOTS: int = 3
+    PARALLEL_MAIN_MAX_ACTIVE_BROWSERS_PER_PROXY: int = 3
+    PARALLEL_REPLY_MAX_ACTIVE_BROWSERS_PER_PROXY: int = 2
+    PARALLEL_REPLY_VARIANT_WORKERS: int = 2
     PARALLEL_MAIN_WORKER_ATTEMPT_TIMEOUT_SECONDS: float = 300.0
     PARALLEL_MAIN_REFILL_POLL_SECONDS: float = 0.15
     PARALLEL_REPLY_WORKER_ATTEMPT_TIMEOUT_SECONDS: float = 240.0
@@ -460,7 +466,7 @@ class Settings(BaseSettings):
     PARALLEL_MAIN_INPUT_RETRY_MAX_SECONDS: float = 35.0
     PARALLEL_MAIN_OPEN_COMMENTS_MAX_SECONDS: float = 18.0
     PARALLEL_MAIN_INPUT_SEARCH_MAX_SECONDS: float = 10.0
-    PARALLEL_REPLY_PUBLISH_MAX_SECONDS: float = 30.0
+    PARALLEL_REPLY_PUBLISH_MAX_SECONDS: float = 45.0
     PARALLEL_REPLY_START_DELAY_MIN_SECONDS: float = 2.0
     PARALLEL_REPLY_START_DELAY_MAX_SECONDS: float = 5.0
     PARALLEL_MAIN_READY_IDLE_MIN_SECONDS: float = 0.2

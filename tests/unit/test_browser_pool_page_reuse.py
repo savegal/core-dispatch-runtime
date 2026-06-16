@@ -100,6 +100,34 @@ class LaunchProbeBrowser:
         self.closed = True
 
 
+class WarmupProbeContext(LaunchProbeContext):
+    def __init__(self):
+        super().__init__()
+        self.events = []
+        self.add_cookie_calls = 0
+
+    async def route(self, _pattern, _handler):
+        self.events.append("route")
+
+    async def add_cookies(self, _cookies):
+        self.add_cookie_calls += 1
+        self.events.append("add_cookies")
+        if self.add_cookie_calls == 1:
+            raise RuntimeError("domain warmup required")
+
+    async def new_page(self):
+        self.events.append("new_page")
+        return await super().new_page()
+
+
+class WarmupProbeBrowser(LaunchProbeBrowser):
+    async def new_context(self, **_options):
+        self.new_context_options.append(dict(_options))
+        context = WarmupProbeContext()
+        self.contexts.append(context)
+        return context
+
+
 @pytest.mark.unit
 def test_browser_pool_honors_single_browser_limit():
     pool = BrowserPool(max_browsers=1)
@@ -182,6 +210,50 @@ async def test_get_page_for_account_blocks_service_workers_when_media_blocked(mo
         )
 
         assert launched_browsers[0].new_context_options[0]["service_workers"] == "block"
+    finally:
+        await pool.close_all()
+
+
+@pytest.mark.unit
+@pytest.mark.asyncio
+async def test_resource_routes_install_before_cookie_domain_warmup(monkeypatch):
+    from executor import tiktok_client
+
+    pool = BrowserPool(max_browsers=1)
+    launched_browsers = []
+
+    class FakeChromium:
+        async def launch(self, **_launch_options):
+            browser = WarmupProbeBrowser()
+            launched_browsers.append(browser)
+            return browser
+
+    async def noop_initialize():
+        return None
+
+    monkeypatch.setattr(pool, "initialize", noop_initialize)
+    monkeypatch.setattr(pool, "_playwright", SimpleNamespace(chromium=FakeChromium()))
+    monkeypatch.setattr(tiktok_client, "_get_cookies_for_account", lambda _account: "cookie-json")
+    monkeypatch.setattr(
+        tiktok_client,
+        "parse_cookies",
+        lambda _raw: [{"name": "sessionid", "value": "x", "domain": ".tiktok.com", "path": "/"}],
+    )
+    monkeypatch.setattr(
+        tiktok_client,
+        "_normalize_proxy_for_playwright",
+        lambda proxy: {"server": proxy} if proxy else None,
+    )
+    monkeypatch.setattr(browser_pool.settings, "BLOCK_MEDIA", True, raising=False)
+    monkeypatch.setattr(browser_pool.settings, "HUMAN_LIKE_BEHAVIOR", False, raising=False)
+
+    try:
+        await pool.get_page_for_account(
+            SimpleNamespace(id=1, label="a1", proxy="http://proxy-a:8000", user_agent=None, country_code="US")
+        )
+
+        events = launched_browsers[0].contexts[0].events
+        assert events.index("route") < events.index("new_page")
     finally:
         await pool.close_all()
 

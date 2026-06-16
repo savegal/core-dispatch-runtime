@@ -34,9 +34,11 @@ settings = get_settings()
 @pytest.fixture(autouse=True)
 def reset_account_service_runtime_state(monkeypatch: pytest.MonkeyPatch):
     account_service_module._MAIN_ACCOUNT_RESERVED_UNTIL.clear()
+    account_service_module._REPLY_ACCOUNT_RESERVED_UNTIL.clear()
     monkeypatch.setattr(account_service_module.settings, "USE_PROXY", False, raising=False)
     yield
     account_service_module._MAIN_ACCOUNT_RESERVED_UNTIL.clear()
+    account_service_module._REPLY_ACCOUNT_RESERVED_UNTIL.clear()
 
 
 @pytest.mark.unit
@@ -1559,6 +1561,67 @@ class TestAccountService:
         assert selected is not None
         assert selected.id == strong.id
 
+    def test_main_selector_scans_past_legacy_degraded_scan_cap(
+        self,
+        db_session: Session,
+        monkeypatch: pytest.MonkeyPatch,
+    ):
+        """A large degraded prefix should not trigger runtime last-resort before the full main pool is scanned."""
+        monkeypatch.setattr(account_service_module.settings, "MAX_CONCURRENT_BROWSERS", 1, raising=False)
+        monkeypatch.setattr(account_service_module.settings, "ACCOUNT_SELECTION_MAX_MAIN_SCAN", 10000, raising=False)
+        now = datetime.now(timezone.utc)
+        degraded_accounts = [
+            Account(
+                label=f"main_degraded_large_prefix_{idx}",
+                status="active",
+                cookies=json.dumps(
+                    {
+                        "sessionid": f"degraded-session-{idx}",
+                        "sid_tt": f"degraded-sid-{idx}",
+                        "s_v_web_id": f"degraded-verify-{idx}",
+                        "ttwid": f"degraded-wid-{idx}",
+                        "msToken": f"degraded-ms-{idx}",
+                    }
+                ),
+                proxy=f"http://main-degraded-prefix-proxy-{idx}",
+                last_error=json.dumps(
+                    {
+                        "scope": "runtime",
+                        "category": account_service_module.MONITOR_CATEGORY_CAPTCHA,
+                        "reason": "captcha_challenge:slider",
+                    }
+                ),
+                created_at=now - timedelta(hours=5),
+                last_validation_ok=now - timedelta(minutes=20),
+            )
+            for idx in range(2000)
+        ]
+        strong = Account(
+            label="main_healthy_after_degraded_legacy_cap",
+            status="active",
+            cookies=json.dumps(
+                {
+                    "sessionid": "main-healthy-after-degraded-session",
+                    "sid_tt": "main-healthy-after-degraded-sid",
+                    "sid_guard": "main-healthy-after-degraded-guard",
+                    "s_v_web_id": "main-healthy-after-degraded-verify",
+                    "ttwid": "main-healthy-after-degraded-wid",
+                    "msToken": "main-healthy-after-degraded-ms",
+                    "tt_chain_token": "main-healthy-after-degraded-chain",
+                }
+            ),
+            proxy="http://main-healthy-after-degraded-proxy",
+            created_at=now - timedelta(hours=5),
+            last_validation_ok=now - timedelta(minutes=20),
+        )
+        db_session.add_all([*degraded_accounts, strong])
+        db_session.commit()
+
+        selected = get_free_account_for_main_comment(db_session)
+
+        assert selected is not None
+        assert selected.id == strong.id
+
     def test_main_selector_uses_sid_guard_only_as_last_resort_by_default(self, db_session: Session):
         """Main selection may use sid_guard-only accounts only when no stronger browser-auth accounts exist."""
         account = Account(
@@ -1666,6 +1729,42 @@ class TestAccountService:
 
         assert selected is not None
         assert selected.id == account.id
+
+    def test_reply_selector_reserve_skips_process_reserved_account(self, db_session: Session):
+        """Reply reservation prevents parallel workers from selecting the same account."""
+        owner_id = 99001
+        now = datetime.now(timezone.utc)
+        accounts = [
+            Account(
+                label=f"reply_reserved_{idx}",
+                status="active",
+                cookies=json.dumps(
+                    {
+                        "sessionid": f"reply-session-{idx}",
+                        "sid_tt": f"reply-sid-{idx}",
+                        "sid_guard": f"reply-guard-{idx}",
+                        "s_v_web_id": f"reply-verify-{idx}",
+                        "ttwid": f"reply-wid-{idx}",
+                        "msToken": f"reply-ms-{idx}",
+                    }
+                ),
+                owner_user_id=owner_id,
+                created_at=now - timedelta(hours=5),
+                last_validation_ok=now - timedelta(minutes=20),
+            )
+            for idx in range(2)
+        ]
+        db_session.add_all(accounts)
+        db_session.commit()
+
+        first = get_free_account_for_reply(db_session, pool_owner_user_id=owner_id, reserve=True)
+        second = get_free_account_for_reply(db_session, pool_owner_user_id=owner_id, reserve=True)
+
+        assert first is not None
+        assert second is not None
+        assert second.id != first.id
+        account_service_module.release_reply_account_reservation(first.id)
+        account_service_module.release_reply_account_reservation(second.id)
 
     def test_reply_selector_can_disable_sid_guard_only_last_resort(
         self,

@@ -127,7 +127,8 @@ async def extract_tiktok_username(page: Page) -> Optional[str]:
                         'a[data-e2e="nav-profile"][href*="/@"]',
                         'a[data-e2e="profile-icon"][href*="/@"]',
                         'a[href*="/@"][data-e2e*="profile"]',
-                        'a[href*="/@"][role="link"]'
+                        'nav a[href*="/@"][aria-label*="profile" i]',
+                        'header a[href*="/@"][aria-label*="profile" i]'
                     ];
                     for (const sel of selectors) {
                         const el = document.querySelector(sel);

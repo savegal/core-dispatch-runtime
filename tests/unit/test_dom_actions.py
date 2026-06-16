@@ -1239,6 +1239,7 @@ def test_open_reply_box_exact_anchor_does_not_require_full_parent_text_match():
     assert "rootMatchesNeedle(el)" not in anchor_block
     assert "depth < 8" in anchor_block
     assert "parent-anchor-parent" in anchor_block
+    assert "parent_anchor_not_found" in anchor_block
 
 
 @pytest.mark.unit
@@ -1251,12 +1252,25 @@ def test_open_reply_box_prefers_parent_dom_anchor_before_text_search():
 
 
 @pytest.mark.unit
-def test_reply_input_finder_allows_strong_reply_signal_if_anchor_marker_rerenders():
+def test_reply_input_finder_requires_live_parent_anchor_scope():
     script = dom_actions._JS_FIND_REPLY_INPUT
 
     assert "anchorMissing" in script
-    assert "selected.score < 3000" in script
+    assert "selected.score < 8000" in script
     assert "parent_anchor_not_found" in script
+
+
+@pytest.mark.unit
+def test_reply_post_finder_does_not_fallback_to_global_comment_markers():
+    script = dom_actions._JS_FIND_REPLY_POST_BUTTON
+    handle_script = "".join(dom_actions._JS_FIND_REPLY_POST_BUTTON_HANDLE)
+    enabled_source = inspect.getsource(dom_actions.wait_for_post_button_enabled)
+
+    assert 'document.querySelector(\'[data-smart-reply-input="1"]\')' in script
+    assert 'document.querySelector(\'[data-smart-id="comment-input"]\')' not in script
+    assert '[data-smart-reply-post="1"]' in handle_script
+    assert '[data-smart-id=\\"comment-post\\"]' not in handle_script
+    assert "document.querySelector('[data-smart-reply-post=\"1\"]')" in enabled_source
 
 
 # ---------------------------------------------------------------------------
@@ -1293,7 +1307,8 @@ def test_comment_typing_verification_rejects_partial_and_fake_dom_text():
     assert "expected.includes(txt)" not in dom_actions._JS_ATOMIC_SET_COMMENT_TEXT
     assert "expected.includes(txt)" not in source
     assert "real.textContent = expected" not in source
-    assert "contenteditable_js_fallback_disabled" in source
+    assert "contenteditable_js_fallback_disabled" not in source
+    assert "document.execCommand('insertText'" in source
     assert 'page.keyboard.press("Tab")' not in source
     assert 'page.keyboard.press("Shift+Tab")' not in source
 
@@ -1317,8 +1332,8 @@ async def test_atomic_set_comment_text_forwards_reply_flags():
     )
 
     assert captured["script"] == dom_actions._JS_ATOMIC_SET_COMMENT_TEXT
-    # [insertText, expected, anchorToken, replyScoped, focusOnly]
-    assert captured["args"] == ["hello world", "hello world", "pa-123", True, False]
+    # [insertText, expected, anchorToken, replyScoped, focusOnly, clearOnly]
+    assert captured["args"] == ["hello world", "hello world", "pa-123", True, False, False]
     assert result == {"ok": False, "reason": "reply_input_not_scoped_to_parent", "scoped": "reply"}
 
 
@@ -1339,25 +1354,48 @@ async def test_atomic_set_comment_text_holds_back_last_char_when_requested():
     )
 
     # insert_text is what lands in-page; expected stays the full string.
-    assert captured["args"] == ["hell", "hello", "", False, False]
+    assert captured["args"] == ["hell", "hello", "", False, False, False]
     assert result["ok"] is True
 
 
 @pytest.mark.unit
 @pytest.mark.asyncio
-async def test_type_into_comment_reply_uses_atomic_prefix_tail_first(monkeypatch):
-    """Reply path keeps the scoped atomic prefix + one trusted tail insert."""
-    keyboard_calls = {"type": 0, "insert_text": 0, "press": 0}
+async def test_atomic_set_comment_text_can_verify_clear_only():
+    captured = {}
+
+    class _Page:
+        async def evaluate(self, script, *args):
+            captured["script"] = script
+            captured["args"] = args[0] if args else None
+            return {"ok": True, "reason": "cleared", "text": "", "scoped": "global"}
+
+    result = await dom_actions.atomic_set_comment_text(
+        _Page(),
+        "",
+        clear_only=True,
+    )
+
+    assert captured["script"] == dom_actions._JS_ATOMIC_SET_COMMENT_TEXT
+    assert captured["args"] == ["", "", "", False, False, True]
+    assert result["ok"] is True
+    assert result["reason"] == "cleared"
+
+
+@pytest.mark.unit
+@pytest.mark.asyncio
+async def test_type_into_comment_reply_uses_trusted_full_insert_first(monkeypatch):
+    """Reply path starts with scoped focus + trusted full text insertion."""
+    keyboard_calls = {"type": [], "insert_text": [], "press": []}
 
     class _Keyboard:
-        async def type(self, *_args, **_kwargs):
-            keyboard_calls["type"] += 1
+        async def type(self, *args, **_kwargs):
+            keyboard_calls["type"].append(args[0] if args else "")
 
-        async def insert_text(self, *_args, **_kwargs):
-            keyboard_calls["insert_text"] += 1
+        async def insert_text(self, text):
+            keyboard_calls["insert_text"].append(text)
 
-        async def press(self, *_args, **_kwargs):
-            keyboard_calls["press"] += 1
+        async def press(self, key):
+            keyboard_calls["press"].append(key)
 
     class _Page:
         keyboard = _Keyboard()
@@ -1372,12 +1410,13 @@ async def test_type_into_comment_reply_uses_atomic_prefix_tail_first(monkeypatch
                 payload = args[0] if args else None
                 self.atomic_calls.append(payload)
                 return {
-                    "ok": False,
-                    "reason": "verify_failed",
+                    "ok": True,
+                    "reason": "focused",
                     "text": payload[0],
                     "scoped": "reply",
                 }
-            # _page_text_contains_expected verification
+            if "document.activeElement" in str(script):
+                return True
             return {"ok": True, "text": "hello"}
 
     async def _fake_suppress(_page):
@@ -1401,10 +1440,13 @@ async def test_type_into_comment_reply_uses_atomic_prefix_tail_first(monkeypatch
 
     assert ok is True
     assert dom_actions._JS_ATOMIC_SET_COMMENT_TEXT in page.scripts
-    assert page.atomic_calls == [["hell", "hello", "pa-123", True, False]]
-    assert keyboard_calls["insert_text"] == 1
-    assert keyboard_calls["press"] == 0
-    assert keyboard_calls["type"] == 0
+    assert page.atomic_calls == [
+        ["", "hello", "pa-123", True, True, False],
+        ["", "", "pa-123", True, False, True],
+    ]
+    assert keyboard_calls["insert_text"] == ["hello"]
+    assert keyboard_calls["press"] == []
+    assert keyboard_calls["type"] == []
 
 
 @pytest.mark.unit
@@ -1448,8 +1490,12 @@ async def test_type_into_comment_main_prefers_focus_insert_over_prefix_tail(monk
     ok = await dom_actions.type_into_comment(page, object(), "hello", fast=True)
 
     assert ok is True
-    assert page.atomic_calls == [["", "hello", "", False, True]]
-    assert keyboard_calls["press"] == ["Control+A", "Backspace"]
+    # MAIN composer now clears via a TRUSTED select-all+delete (resets React/Lexical
+    # EditorState) instead of an atomic clear_only that only wipes the DOM.
+    assert page.atomic_calls == [
+        ["", "hello", "", False, True, False],
+    ]
+    assert keyboard_calls["press"] == ["Control+A", "Delete"]
     assert keyboard_calls["insert_text"] == ["hello"]
 
 
@@ -1483,6 +1529,8 @@ async def test_type_into_comment_main_uses_atomic_prefix_tail_after_keyboard_mis
         atomic_calls.append((text, kwargs))
         if kwargs.get("focus_only"):
             return {"ok": True, "reason": "focused", "scoped": "global"}
+        if kwargs.get("clear_only"):
+            return {"ok": True, "reason": "cleared", "text": "", "scoped": "global"}
         if kwargs.get("insert_text") == "hell":
             return {"ok": False, "reason": "verify_failed", "text": "hell", "scoped": "global"}
         return {"ok": False, "reason": "unexpected_atomic_call", "text": "", "scoped": "global"}
@@ -1500,12 +1548,130 @@ async def test_type_into_comment_main_uses_atomic_prefix_tail_after_keyboard_mis
     ok = await dom_actions.type_into_comment(_Page(), object(), "hello", fast=True)
 
     assert ok is True
+    # MAIN composer clears via trusted Ctrl+A+Delete (no atomic clear_only call).
     assert [kwargs for _text, kwargs in atomic_calls] == [
         {"reply_scoped": False, "anchor_token": None, "focus_only": True},
         {"reply_scoped": False, "anchor_token": None, "insert_text": "hell"},
     ]
-    assert keyboard_calls["press"] == ["Control+A", "Backspace"]
+    assert keyboard_calls["press"] == ["Control+A", "Delete"]
     assert keyboard_calls["insert_text"] == ["hello", "o"]
+
+
+@pytest.mark.unit
+@pytest.mark.asyncio
+async def test_type_into_comment_main_keeps_typing_when_clear_verify_is_uncertain(monkeypatch):
+    keyboard_calls = {"insert_text": [], "press": []}
+    atomic_calls = []
+
+    class _Keyboard:
+        async def insert_text(self, text):
+            keyboard_calls["insert_text"].append(text)
+
+        async def press(self, key):
+            keyboard_calls["press"].append(key)
+
+        async def type(self, *_args, **_kwargs):
+            raise AssertionError("main path should use insert_text, not slow keyboard.type")
+
+    class _Page:
+        keyboard = _Keyboard()
+
+        async def evaluate(self, script, *args):
+            if "document.activeElement" in str(script):
+                return True
+            if keyboard_calls["insert_text"] == ["hello"]:
+                return {"ok": True, "text": "hello"}
+            return {"ok": False, "text": ""}
+
+    async def _fake_atomic(_page, text, **kwargs):
+        atomic_calls.append((text, kwargs))
+        if kwargs.get("focus_only"):
+            return {"ok": True, "reason": "focused", "scoped": "global"}
+        if kwargs.get("clear_only"):
+            return {"ok": False, "reason": "clear_verify_failed", "text": "Add comment...", "scoped": "global"}
+        return {"ok": False, "reason": "unexpected_atomic_call", "text": "", "scoped": "global"}
+
+    async def _fake_suppress(_page):
+        return 0
+
+    async def _fake_sleep(_seconds):
+        return None
+
+    monkeypatch.setattr(dom_actions, "atomic_set_comment_text", _fake_atomic)
+    monkeypatch.setattr(dom_actions, "suppress_keyboard_shortcuts_overlay", _fake_suppress)
+    monkeypatch.setattr(dom_actions.asyncio, "sleep", _fake_sleep)
+
+    ok = await dom_actions.type_into_comment(_Page(), object(), "hello", fast=True)
+
+    assert ok is True
+    # MAIN composer always resets EditorState with a trusted Ctrl+A+Delete before
+    # the trusted insert, so no atomic clear_only round-trip is used.
+    assert [kwargs for _text, kwargs in atomic_calls] == [
+        {"reply_scoped": False, "anchor_token": None, "focus_only": True},
+    ]
+    assert keyboard_calls["press"] == ["Control+A", "Delete"]
+    assert keyboard_calls["insert_text"] == ["hello"]
+
+
+@pytest.mark.unit
+@pytest.mark.asyncio
+async def test_type_into_comment_main_uses_contenteditable_js_fallback_after_keyboard_miss(monkeypatch):
+    keyboard_calls = {"insert_text": [], "press": [], "type": []}
+    evaluate_calls = []
+
+    class _Keyboard:
+        async def insert_text(self, text):
+            keyboard_calls["insert_text"].append(text)
+
+        async def press(self, key):
+            keyboard_calls["press"].append(key)
+
+        async def type(self, text, **_kwargs):
+            keyboard_calls["type"].append(text)
+
+    class _Element:
+        async def evaluate(self, script, *args):
+            if "textContent || el.innerText" in str(script):
+                return ""
+            return None
+
+        async def click(self, **_kwargs):
+            return None
+
+    class _Page:
+        keyboard = _Keyboard()
+
+        async def query_selector(self, _selector):
+            return None
+
+        async def evaluate(self, script, *args):
+            script_text = str(script)
+            evaluate_calls.append(script_text)
+            if "document.activeElement" in script_text:
+                return True
+            if "const pickEditor" in script_text and "fireInputEvents" in script_text:
+                return {"ok": True, "reason": "inserted", "text": args[0], "placeholder_leak": False}
+            return {"ok": False, "text": ""}
+
+    async def _fake_atomic(_page, text, **kwargs):
+        return {"ok": False, "reason": "no_editor", "text": "", "scoped": "global"}
+
+    async def _fake_suppress(_page):
+        return 0
+
+    async def _fake_sleep(_seconds):
+        return None
+
+    monkeypatch.setattr(dom_actions, "atomic_set_comment_text", _fake_atomic)
+    monkeypatch.setattr(dom_actions, "suppress_keyboard_shortcuts_overlay", _fake_suppress)
+    monkeypatch.setattr(dom_actions.asyncio, "sleep", _fake_sleep)
+
+    ok = await dom_actions.type_into_comment(_Page(), _Element(), "hello", fast=True)
+
+    assert ok is True
+    assert keyboard_calls["insert_text"] == ["hello"]
+    assert keyboard_calls["type"] == []
+    assert any("const pickEditor" in call and "document.execCommand('insertText'" in call for call in evaluate_calls)
 
 
 @pytest.mark.unit
@@ -1541,6 +1707,8 @@ async def test_type_into_comment_reply_uses_scoped_full_insert_after_keyboard_mi
             return {"ok": False, "reason": "verify_failed", "text": "he", "scoped": "reply"}
         if kwargs.get("focus_only"):
             return {"ok": True, "reason": "focused", "scoped": "reply"}
+        if kwargs.get("clear_only"):
+            return {"ok": True, "reason": "cleared", "text": "", "scoped": "reply"}
         return {"ok": True, "reason": "inserted", "text": text, "scoped": "reply"}
 
     async def _fake_suppress(_page):
@@ -1564,18 +1732,19 @@ async def test_type_into_comment_reply_uses_scoped_full_insert_after_keyboard_mi
 
     assert ok is True
     assert [kwargs for _text, kwargs in atomic_calls] == [
-        {"reply_scoped": True, "anchor_token": "pa-777", "insert_text": "hell"},
         {"reply_scoped": True, "anchor_token": "pa-777", "focus_only": True},
+        {"reply_scoped": True, "anchor_token": "pa-777", "clear_only": True},
+        {"reply_scoped": True, "anchor_token": "pa-777", "insert_text": "hell"},
         {"reply_scoped": True, "anchor_token": "pa-777"},
     ]
-    assert keyboard_calls["press"] == ["Control+A", "Backspace"]
+    assert keyboard_calls["press"] == []
     assert keyboard_calls["insert_text"] == ["hello"]
 
 
 @pytest.mark.unit
 @pytest.mark.asyncio
 async def test_type_into_comment_reply_scoped_forwards_anchor_to_atomic(monkeypatch):
-    captured = {}
+    captured = {"atomic_args": []}
 
     class _Keyboard:
         async def insert_text(self, *_args, **_kwargs):
@@ -1589,7 +1758,7 @@ async def test_type_into_comment_reply_scoped_forwards_anchor_to_atomic(monkeypa
 
         async def evaluate(self, script, *args):
             if script == dom_actions._JS_ATOMIC_SET_COMMENT_TEXT:
-                captured["atomic_args"] = args[0]
+                captured["atomic_args"].append(args[0])
                 return {
                     "ok": True,
                     "reason": "focused",
@@ -1618,9 +1787,12 @@ async def test_type_into_comment_reply_scoped_forwards_anchor_to_atomic(monkeypa
 
     assert ok is True
     # replyScoped True and the anchor token are forwarded into the atomic JS.
-    assert captured["atomic_args"][2] == "pa-xyz"
-    assert captured["atomic_args"][3] is True
-    assert captured["atomic_args"][4] is False  # prefix path, not focusOnly
+    assert captured["atomic_args"][0][2] == "pa-xyz"
+    assert captured["atomic_args"][0][3] is True
+    assert captured["atomic_args"][0][4] is True  # scoped focus before trusted full insert
+    assert captured["atomic_args"][1][2] == "pa-xyz"
+    assert captured["atomic_args"][1][3] is True
+    assert captured["atomic_args"][1][5] is True  # verified clear before trusted text
 
 
 @pytest.mark.unit
