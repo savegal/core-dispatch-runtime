@@ -6,6 +6,7 @@ import logging
 import os
 import re
 import time
+from asyncio import sleep as _asyncio_sleep
 from asyncio import wait_for as _asyncio_wait_for
 from dataclasses import dataclass
 from typing import Any, Dict, Optional, Tuple
@@ -98,6 +99,89 @@ def _post_click_fallback_selector(*, reply_scoped: bool) -> str:
     )
 
 
+def _request_attr(request: Any, name: str) -> Optional[Any]:
+    try:
+        return getattr(request, name)
+    except Exception:
+        return None
+
+
+def _request_post_data_preview(request: Any) -> str:
+    try:
+        value = getattr(request, "post_data", None)
+        if callable(value):
+            value = value()
+    except Exception:
+        value = None
+    if value is None:
+        return ""
+    if isinstance(value, bytes):
+        try:
+            value = value.decode("utf-8", "replace")
+        except Exception:
+            value = repr(value)
+    return str(value)[:1000]
+
+
+def _record_publish_request(captured: Dict[str, Any], request: Any) -> bool:
+    try:
+        url = request.url
+    except Exception:
+        return False
+    if "/api/comment/publish/" not in str(url):
+        return False
+    captured["request_url"] = str(url)
+    captured["request_obj"] = request
+    method = _request_attr(request, "method")
+    if method is not None:
+        captured["request_method"] = str(method)
+    post_data = _request_post_data_preview(request)
+    if post_data:
+        captured["request_post_data_preview"] = post_data
+    captured["request_seen_at_monotonic"] = time.monotonic()
+    return True
+
+
+def _publish_response_matches_current_request(captured: Dict[str, Any], response: Response) -> bool:
+    expected_request = captured.get("request_obj")
+    if expected_request is None:
+        captured["ignored_response_without_request"] = int(captured.get("ignored_response_without_request") or 0) + 1
+        return False
+    try:
+        response_request = response.request
+    except Exception:
+        response_request = None
+    if response_request is None:
+        return True
+    if response_request is expected_request:
+        return True
+    response_url = str(_request_attr(response_request, "url") or "")
+    expected_url = str(captured.get("request_url") or "")
+    if response_url and expected_url and response_url != expected_url:
+        captured["ignored_response_url_mismatch"] = response_url[:200]
+        return False
+    response_method = str(_request_attr(response_request, "method") or "")
+    expected_method = str(captured.get("request_method") or "")
+    if response_method and expected_method and response_method != expected_method:
+        captured["ignored_response_method_mismatch"] = response_method[:40]
+        return False
+    response_post_data = _request_post_data_preview(response_request)
+    expected_post_data = str(captured.get("request_post_data_preview") or "")
+    if response_post_data and expected_post_data and response_post_data != expected_post_data:
+        captured["ignored_response_post_data_mismatch"] = True
+        return False
+    return True
+
+
+async def _yield_to_publish_listener_tasks(listener_tasks: set) -> None:
+    if not listener_tasks:
+        return
+    try:
+        await _asyncio_sleep(0)
+    except Exception:
+        pass
+
+
 _COMMENT_PLACEHOLDER_MARKERS = (
     "add comment",
     "add a comment",
@@ -143,6 +227,7 @@ _JS_COMPOSER_CLEARED = r"""
             if (r) return r;
         }
         const sels = [
+            '[data-smart-main-input="1"]',
             '[data-smart-id="comment-input"]',
             '[data-e2e="comment-input"] div[contenteditable="true"]',
             '[data-e2e="comment-input"] [contenteditable="true"]',
@@ -207,10 +292,19 @@ _JS_COMPOSER_CLEARED_V2 = r"""
     ].join(' ').toLowerCase();
     const rejectScope = (el) => {
         for (let cur = el, depth = 0; cur && cur !== document.body && depth < 9; cur = cur.parentElement, depth++) {
+            if (!replyScoped && cur.getAttribute && (
+                cur.getAttribute('data-smart-reply-input') ||
+                cur.getAttribute('data-smart-reply-composer') ||
+                cur.getAttribute('data-smart-reply-anchor-token')
+            )) return true;
             const label = labelOf(cur);
             if (label.includes('search') || label.includes('captcha') || label.includes('challenge')) return true;
             if (label.includes('login') || label.includes('sign in') || label.includes('signup')) return true;
-            if (!replyScoped && (label.includes('data-smart-reply') || label.includes('smart-reply'))) return true;
+            if (!replyScoped && (
+                label.includes('data-smart-reply') ||
+                label.includes('smart-reply') ||
+                label.includes('reply')
+            )) return true;
         }
         return false;
     };
@@ -232,6 +326,7 @@ _JS_COMPOSER_CLEARED_V2 = r"""
         addEditor(editors, document.querySelector('[data-smart-reply-input="1"]'));
     } else {
         for (const selector of [
+            '[data-smart-main-input="1"]',
             '[data-smart-id="comment-input"]',
             '[data-e2e="comment-input"]',
             '[data-e2e*="comment-input"]',
@@ -361,7 +456,14 @@ _JS_CLEAR_MAIN_COMMENT_COMPOSER = r"""
             const label = labelOf(cur);
             if (label.includes('search') || label.includes('captcha') || label.includes('challenge')) return true;
             if (label.includes('login') || label.includes('sign in') || label.includes('signup')) return true;
-            if (label.includes('data-smart-reply') || label.includes('smart-reply')) return true;
+            if (
+                label.includes('data-smart-reply') ||
+                label.includes('smart-reply') ||
+                label.includes('replycommenteditor') ||
+                label.includes('reply-comment') ||
+                label.includes('comment-reply') ||
+                label.includes('reply')
+            ) return true;
         }
         return false;
     };
@@ -380,6 +482,7 @@ _JS_CLEAR_MAIN_COMMENT_COMPOSER = r"""
         }
     };
     for (const selector of [
+        '[data-smart-main-input="1"]',
         '[data-smart-id="comment-input"]',
         '[data-e2e="comment-input"]',
         '[data-e2e*="comment-input"]',
@@ -453,9 +556,15 @@ async def _clear_main_comment_composer_best_effort(
     correlation_id: Optional[str] = None,
     timeout_seconds: float = 1.2,
 ) -> bool:
-    """Clear dirty main composer state before retrying another variant/account."""
+    """Clear dirty main composer state before retrying another variant/account.
+
+    Returns True only when a trusted keyboard clear is proven. A raw DOM cleanup
+    may still be attempted as visual best-effort, but it is not treated as safe
+    editor-state cleanup for reusing the main composer.
+    """
     deadline = time.monotonic() + max(0.2, timeout_seconds)
-    cleared = False
+    trusted_cleared = False
+    dom_visible_cleared = False
     try:
         target = await _asyncio_wait_for(
             page.evaluate(_JS_MAIN_COMMENT_KEYBOARD_FOCUS_TARGET),
@@ -476,25 +585,25 @@ async def _clear_main_comment_composer_best_effort(
                 _composer_cleared_state(page, reply_scoped=False),
                 timeout=max(0.1, min(0.35, deadline - time.monotonic())),
             )
-            cleared = bool(
+            trusted_cleared = bool(
                 state.get("exists")
                 and (state.get("empty") or _looks_like_comment_placeholder_text(state.get("text")))
             )
         except Exception:
-            cleared = False
+            trusted_cleared = False
 
-    if not cleared and deadline - time.monotonic() > 0.1:
+    if not trusted_cleared and deadline - time.monotonic() > 0.1:
         try:
             result = await _asyncio_wait_for(
                 page.evaluate(_JS_CLEAR_MAIN_COMMENT_COMPOSER),
                 timeout=max(0.1, min(0.75, deadline - time.monotonic())),
             )
-            cleared = bool(
+            dom_visible_cleared = bool(
                 isinstance(result, dict)
                 and (result.get("ok") or _looks_like_comment_placeholder_text(result.get("text")))
             )
         except Exception:
-            cleared = False
+            dom_visible_cleared = False
 
     _log_publish_trace(
         "main_composer_clear_after_failure",
@@ -502,10 +611,12 @@ async def _clear_main_comment_composer_best_effort(
         expected_video_url=expected_video_url,
         correlation_id=correlation_id,
         reason=reason,
-        cleared=cleared,
-        level=logging.INFO if cleared else logging.WARNING,
+        cleared=trusted_cleared,
+        trusted_cleared=trusted_cleared,
+        dom_visible_cleared=dom_visible_cleared,
+        level=logging.INFO if trusted_cleared else logging.WARNING,
     )
-    return cleared
+    return trusted_cleared
 
 
 async def _ensure_main_comment_composer_clean_before_typing(
@@ -533,31 +644,30 @@ async def _ensure_main_comment_composer_clean_before_typing(
     if not isinstance(state, dict):
         state = {}
 
-    cleared = await _clear_main_comment_composer_best_effort(
+    trusted_cleared = await _clear_main_comment_composer_best_effort(
         page,
         reason=reason,
         expected_video_url=expected_video_url,
         correlation_id=correlation_id,
         timeout_seconds=timeout_seconds,
     )
-    if cleared:
+    if trusted_cleared:
         return True
 
     state_text = str(state.get("text") or "")
     state_empty = bool(state.get("empty") or _looks_like_comment_placeholder_text(state_text))
-    if state.get("exists") and not state_empty:
-        _log_publish_trace(
-            "main_pre_type_composer_clean_failed",
-            page=page,
-            expected_video_url=expected_video_url,
-            correlation_id=correlation_id,
-            reason=reason,
-            text_len=len(str(state.get("text") or "")),
-            level=logging.WARNING,
-        )
-        return False
-
-    return True
+    _log_publish_trace(
+        "main_pre_type_composer_clean_failed",
+        page=page,
+        expected_video_url=expected_video_url,
+        correlation_id=correlation_id,
+        reason=reason,
+        text_len=len(state_text),
+        state_exists=bool(state.get("exists")),
+        state_empty=state_empty,
+        level=logging.WARNING,
+    )
+    return False
 
 
 async def _clear_reply_comment_composer_best_effort(
@@ -624,6 +734,47 @@ async def _clear_dirty_composer_after_submit_timeout(
         expected_video_url=expected_video_url,
         correlation_id=correlation_id,
         timeout_seconds=0.9,
+    )
+
+
+async def _cleanup_composer_after_ambiguous_submit(
+    page: Page,
+    *,
+    reply_scoped: bool,
+    reason: str,
+    expected_video_url: Optional[str] = None,
+    correlation_id: Optional[str] = None,
+    probe_timeout: float = 0.7,
+) -> Optional[bool]:
+    """Return whether composer cleanup is proven after an ambiguous submit."""
+    try:
+        state = await _asyncio_wait_for(
+            _composer_cleared_state(page, reply_scoped=reply_scoped),
+            timeout=max(0.1, probe_timeout),
+        )
+    except Exception:
+        state = {}
+    if not isinstance(state, dict):
+        state = {}
+    if not state.get("exists"):
+        return None
+    if state.get("empty"):
+        return True
+    _log_publish_trace(
+        "composer_preserved_after_unconfirmed_submit",
+        page=page,
+        expected_video_url=expected_video_url,
+        correlation_id=correlation_id,
+        reason=reason,
+        reply_scoped=reply_scoped,
+        text_len=len(str(state.get("text") or "")),
+    )
+    return await _clear_dirty_composer_after_submit_timeout(
+        page,
+        reply_scoped=reply_scoped,
+        reason=reason,
+        expected_video_url=expected_video_url,
+        correlation_id=correlation_id,
     )
 
 
@@ -1637,16 +1788,48 @@ _JS_MAIN_COMMENT_DIRECT_POST_CLICK = r"""
             : (editor.textContent || editor.innerText || '');
         return normalizeText(raw);
     };
+    const labelOf = (el) => [
+        el && el.getAttribute && (el.getAttribute('data-e2e') || ''),
+        el && el.getAttribute && (el.getAttribute('data-smart-id') || ''),
+        el && el.getAttribute && (el.getAttribute('aria-label') || ''),
+        el && el.getAttribute && (el.getAttribute('placeholder') || ''),
+        el && el.getAttribute && (el.getAttribute('data-placeholder') || ''),
+        el && String(el.className || ''),
+        el && (el.id || ''),
+        el && (el.tagName || ''),
+    ].join(' ').toLowerCase();
+    const replyScoped = (el) => {
+        for (let cur = el, depth = 0; cur && cur !== document.body && depth < 8; cur = cur.parentElement, depth++) {
+            if (cur.getAttribute && (
+                cur.getAttribute('data-smart-reply-input') ||
+                cur.getAttribute('data-smart-reply-composer') ||
+                cur.getAttribute('data-smart-reply-anchor-token')
+            )) return true;
+            const label = labelOf(cur);
+            if (
+                label.includes('data-smart-reply') ||
+                label.includes('smart-reply') ||
+                label.includes('replycommenteditor') ||
+                label.includes('reply-comment') ||
+                label.includes('comment-reply') ||
+                label.includes('reply')
+            ) return true;
+        }
+        return false;
+    };
     const inputWrappers = [
-        document.querySelector('[data-smart-id="comment-input"]'),
+        document.querySelector('[data-smart-main-input="1"]'),
+        document.querySelector('[data-smart-id="comment-input"]:not([data-smart-reply-input="1"]):not([data-smart-reply-anchor-token])'),
         document.querySelector('[data-e2e="comment-input"]'),
         document.querySelector('[data-e2e*="comment-input"]'),
         document.querySelector('[data-e2e*="CommentInput"]'),
     ].filter(Boolean);
     let editor = null;
     for (const raw of inputWrappers) {
+        if (replyScoped(raw)) continue;
         const inner = resolveInnerEditor(raw);
         if (!inner) continue;
+        if (replyScoped(inner)) continue;
         if (!visible(inner) && !visible(raw) && !(inner.parentElement && visible(inner.parentElement))) continue;
         editor = inner;
         break;
@@ -1656,6 +1839,7 @@ _JS_MAIN_COMMENT_DIRECT_POST_CLICK = r"""
             '[role="textbox"], div[contenteditable="true"], [contenteditable="true"], textarea, input'
         )) {
             if (!isRealEditor(raw) || !visible(raw)) continue;
+            if (replyScoped(raw)) continue;
             let scoped = false;
             let bad = false;
             for (let cur = raw, depth = 0; cur && cur !== document.body && depth < 8; cur = cur.parentElement, depth++) {
@@ -1877,13 +2061,21 @@ _JS_MAIN_COMMENT_KEYBOARD_FOCUS_TARGET = r"""
     const badSurface = (el) => {
         const authTokenLike = (value) => /(^|[^a-z])auth([^a-z]|$)/.test(String(value || ''));
         for (let cur = el, depth = 0; cur && cur !== document.body && depth < 8; cur = cur.parentElement, depth++) {
+            if (cur.getAttribute && (
+                cur.getAttribute('data-smart-reply-input') ||
+                cur.getAttribute('data-smart-reply-composer') ||
+                cur.getAttribute('data-smart-reply-anchor-token')
+            )) return true;
             const label = labelOf(cur);
             const text = (cur.innerText || cur.textContent || '').toLowerCase();
             if (
                 label.includes('data-smart-reply') ||
                 label.includes('smart-reply') ||
                 label.includes('replycommenteditor') ||
-                label.includes('reply-comment-editor')
+                label.includes('reply-comment-editor') ||
+                label.includes('reply-comment') ||
+                label.includes('comment-reply') ||
+                label.includes('reply')
             ) return true;
             if (authTokenLike(label) || authTokenLike(text)) return true;
             if (badMarkers.some(marker => label.includes(marker) || text.includes(marker))) return true;
@@ -1908,7 +2100,7 @@ _JS_MAIN_COMMENT_KEYBOARD_FOCUS_TARGET = r"""
     };
     const rawCandidates = [
         ...document.querySelectorAll(
-            '[data-smart-id="comment-input"], [data-e2e="comment-input"], ' +
+            '[data-smart-main-input="1"], [data-smart-id="comment-input"], [data-e2e="comment-input"], ' +
             '[data-e2e*="comment-input"], [data-e2e*="CommentInput"], ' +
             '[class*="comment-panel-input"], [class*="DivTextInputContainer"], ' +
             'div[contenteditable="true"], [contenteditable="true"], [role="textbox"], textarea'
@@ -1948,6 +2140,7 @@ _JS_MAIN_COMMENT_KEYBOARD_FOCUS_TARGET = r"""
     if (!chosen) return {ok: false, reason: 'no_main_comment_input_target'};
     const {editor, clickRect} = chosen;
     try { editor.setAttribute('data-smart-id', 'comment-input'); } catch (_) {}
+    try { editor.setAttribute('data-smart-main-input', '1'); } catch (_) {}
     try { editor.scrollIntoView({block: 'center', inline: 'nearest'}); } catch (_) {}
     try { editor.focus({preventScroll: true}); } catch (_) { try { editor.focus(); } catch (_) {} }
     try {
@@ -2299,6 +2492,7 @@ async def _main_comment_input_committed_text_state(
                 };
                 const editors = [];
                 const wrappers = [
+                    ...document.querySelectorAll('[data-smart-main-input="1"]'),
                     ...document.querySelectorAll('[data-smart-id="comment-input"]'),
                     ...document.querySelectorAll('[data-e2e="comment-input"]'),
                     ...document.querySelectorAll('[data-e2e*="comment-input"]'),
@@ -2519,8 +2713,8 @@ async def _type_main_comment_without_handle(
     """Type a top-level comment without first resolving an ElementHandle.
 
     This is intentionally main-comment only. Prefer a human-like click/focus
-    and keyboard insert; fall back to DOM-assisted input only if that cannot
-    resolve the visible composer.
+    and keyboard insert; fall back only to alternate trusted keyboard paths
+    when the first smart path cannot verify the committed text.
     """
     if not text:
         return {"ok": False, "reason": "empty_text"}
@@ -2534,15 +2728,21 @@ async def _type_main_comment_without_handle(
             deadline=deadline,
             fast=fast,
             reply_scoped=False,
+            allow_main_dom_fallback=False,
         )
         typed_ok = _typing_result_ok(typed_result)
         if typed_ok:
             ok, found_text = await comment_input_contains_expected_text(page, text)
-            return {
-                "ok": True,
-                "strategy": "main-direct-smart-type",
-                "text": found_text if ok else text,
-            }
+            if ok:
+                return {
+                    "ok": True,
+                    "strategy": "main-direct-smart-type",
+                    "text": found_text,
+                }
+            logger.debug(
+                "[PUBLISH] Direct main smart typing reported ok but committed-text probe disagreed; "
+                "falling back to trusted mouse/keyboard path"
+            )
         logger.debug(
             "[PUBLISH] Direct main smart typing did not verify: reason=%s strategy=%s last_text='%s'",
             _typing_result_reason(typed_result)[:120],
@@ -2714,13 +2914,30 @@ async def _publish_main_comment_direct_dom(
 
     preclean_timeout = min(1.2, max(0.2, _remaining() - 3.0))
     if preclean_timeout > 0:
-        await _ensure_main_comment_composer_clean_before_typing(
+        preclean_ok = await _ensure_main_comment_composer_clean_before_typing(
             page,
             reason="main_direct_pre_type_clean",
             expected_video_url=expected_video_url,
             correlation_id=correlation_id,
             timeout_seconds=preclean_timeout,
         )
+        if not preclean_ok:
+            _log_publish_trace(
+                "main_direct_pre_type_composer_not_clean",
+                page=page,
+                expected_video_url=expected_video_url,
+                correlation_id=correlation_id,
+                previous_reason=previous_reason,
+                level=logging.WARNING,
+            )
+            return PublishResult(
+                status="dom_error",
+                error_reason="main_direct_pre_type_composer_not_clean",
+                dom_strategy="main-direct-preclean",
+                elapsed_seconds=time.monotonic() - started,
+                post_was_enabled_at_click=False,
+                network_request_attempted=False,
+            )
 
     type_timeout = min(7.0, max(1.2, _remaining() - 3.0))
     try:
@@ -2802,6 +3019,8 @@ async def _publish_main_comment_direct_dom(
             return
         if "/api/comment/publish/" not in url:
             return
+        if not _publish_response_matches_current_request(captured, response):
+            return
         try:
             captured["url"] = url
             captured["status"] = response.status
@@ -2828,17 +3047,8 @@ async def _publish_main_comment_direct_dom(
         task.add_done_callback(_consume_listener_task)
 
     def on_request(request):
-        try:
-            url = request.url
-        except Exception:
+        if not _record_publish_request(captured, request):
             return
-        if "/api/comment/publish/" not in url:
-            return
-        captured["request_url"] = url
-        try:
-            captured["request_method"] = request.method
-        except Exception:
-            pass
         event.set()
 
     page.on("request", on_request)
@@ -2886,6 +3096,13 @@ async def _publish_main_comment_direct_dom(
                 comment_id = _extract_comment_id(response_json)
                 body_preview = (captured.get("body") or "")[:200].replace("\n", " ")
                 if comment_id:
+                    composer_clean_after_submit = await _cleanup_composer_after_ambiguous_submit(
+                        page,
+                        reply_scoped=False,
+                        reason="main_direct_success_comment_id",
+                        expected_video_url=expected_video_url,
+                        correlation_id=correlation_id,
+                    )
                     _log_publish_trace(
                         "publish_result",
                         page=page,
@@ -2908,6 +3125,7 @@ async def _publish_main_comment_direct_dom(
                         elapsed_seconds=elapsed,
                         dom_strategy=strategy,
                         post_was_enabled_at_click=True,
+                        composer_clean_after_submit=composer_clean_after_submit,
                     )
                 _log_publish_trace(
                     "publish_result",
@@ -3005,10 +3223,12 @@ async def _publish_main_comment_direct_dom(
                 )
             except asyncio.TimeoutError:
                 pass
+        await _yield_to_publish_listener_tasks(listener_tasks)
         if captured.get("request_url") and not captured.get("url"):
             grace = min(_PARALLEL_POST_RESPONSE_GRACE_SECONDS, max(_remaining(), 0.0))
             if grace > 0:
                 await asyncio.sleep(grace)
+                await _yield_to_publish_listener_tasks(listener_tasks)
 
         if captured.get("url"):
             elapsed = time.monotonic() - started
@@ -3016,6 +3236,13 @@ async def _publish_main_comment_direct_dom(
             response_json = captured.get("json") if isinstance(captured.get("json"), dict) else None
             comment_id = _extract_comment_id(response_json)
             if comment_id:
+                composer_clean_after_submit = await _cleanup_composer_after_ambiguous_submit(
+                    page,
+                    reply_scoped=False,
+                    reason="main_direct_success_comment_id",
+                    expected_video_url=expected_video_url,
+                    correlation_id=correlation_id,
+                )
                 _log_publish_trace(
                     "publish_result",
                     page=page,
@@ -3038,6 +3265,7 @@ async def _publish_main_comment_direct_dom(
                     elapsed_seconds=elapsed,
                     dom_strategy=combined_strategy,
                     post_was_enabled_at_click=post_was_enabled,
+                    composer_clean_after_submit=composer_clean_after_submit,
                 )
             if post_was_enabled:
                 cleared: Dict[str, Any] = {}
@@ -3073,7 +3301,15 @@ async def _publish_main_comment_direct_dom(
                         elapsed_seconds=elapsed,
                         dom_strategy=combined_strategy,
                         post_was_enabled_at_click=post_was_enabled,
+                        composer_clean_after_submit=True,
                     )
+            composer_clean_after_submit = await _cleanup_composer_after_ambiguous_submit(
+                page,
+                reply_scoped=False,
+                reason="main_direct_api_response_without_comment_id",
+                expected_video_url=expected_video_url,
+                correlation_id=correlation_id,
+            )
             return PublishResult(
                 status="failed",
                 error_reason="main_direct_api_response_without_comment_id",
@@ -3085,6 +3321,7 @@ async def _publish_main_comment_direct_dom(
                 elapsed_seconds=elapsed,
                 dom_strategy=combined_strategy,
                 post_was_enabled_at_click=post_was_enabled,
+                composer_clean_after_submit=composer_clean_after_submit,
             )
 
         cleared: Dict[str, Any] = {}
@@ -3281,6 +3518,8 @@ async def _publish_reply_comment_direct_dom(
             return
         if "/api/comment/publish/" not in url:
             return
+        if not _publish_response_matches_current_request(captured, response):
+            return
         try:
             captured["url"] = url
             captured["status"] = response.status
@@ -3307,17 +3546,8 @@ async def _publish_reply_comment_direct_dom(
         task.add_done_callback(_consume_listener_task)
 
     def on_request(request):
-        try:
-            url = request.url
-        except Exception:
+        if not _record_publish_request(captured, request):
             return
-        if "/api/comment/publish/" not in url:
-            return
-        captured["request_url"] = url
-        try:
-            captured["request_method"] = request.method
-        except Exception:
-            pass
         event.set()
 
     page.on("request", on_request)
@@ -3415,10 +3645,12 @@ async def _publish_reply_comment_direct_dom(
                 )
             except asyncio.TimeoutError:
                 pass
+        await _yield_to_publish_listener_tasks(listener_tasks)
         if captured.get("request_url") and not captured.get("url"):
             grace = min(_PARALLEL_POST_RESPONSE_GRACE_SECONDS, max(_remaining(), 0.0))
             if grace > 0:
                 await asyncio.sleep(grace)
+                await _yield_to_publish_listener_tasks(listener_tasks)
 
         if captured.get("url"):
             elapsed = time.monotonic() - started
@@ -3426,6 +3658,13 @@ async def _publish_reply_comment_direct_dom(
             response_json = captured.get("json") if isinstance(captured.get("json"), dict) else None
             comment_id = _extract_comment_id(response_json)
             if comment_id:
+                composer_clean_after_submit = await _cleanup_composer_after_ambiguous_submit(
+                    page,
+                    reply_scoped=True,
+                    reason="reply_direct_success_comment_id",
+                    expected_video_url=expected_video_url,
+                    correlation_id=correlation_id,
+                )
                 _log_publish_trace(
                     "publish_result",
                     page=page,
@@ -3448,9 +3687,17 @@ async def _publish_reply_comment_direct_dom(
                     elapsed_seconds=elapsed,
                     dom_strategy=combined_strategy,
                     post_was_enabled_at_click=post_was_enabled,
+                    composer_clean_after_submit=composer_clean_after_submit,
                 )
             status_code = _extract_tiktok_status_code(response_json)
             if status_code is not None and status_code != 0:
+                composer_clean_after_submit = await _cleanup_composer_after_ambiguous_submit(
+                    page,
+                    reply_scoped=True,
+                    reason=f"api_error_status_code={status_code}",
+                    expected_video_url=expected_video_url,
+                    correlation_id=correlation_id,
+                )
                 return PublishResult(
                     status="failed",
                     error_reason=f"api_error_status_code={status_code}",
@@ -3462,7 +3709,15 @@ async def _publish_reply_comment_direct_dom(
                     elapsed_seconds=elapsed,
                     dom_strategy=combined_strategy,
                     post_was_enabled_at_click=post_was_enabled,
+                    composer_clean_after_submit=composer_clean_after_submit,
                 )
+            composer_clean_after_submit = await _cleanup_composer_after_ambiguous_submit(
+                page,
+                reply_scoped=True,
+                reason="reply_direct_api_response_without_comment_id",
+                expected_video_url=expected_video_url,
+                correlation_id=correlation_id,
+            )
             return PublishResult(
                 status="failed",
                 error_reason="reply_direct_api_response_without_comment_id",
@@ -3474,6 +3729,7 @@ async def _publish_reply_comment_direct_dom(
                 elapsed_seconds=elapsed,
                 dom_strategy=combined_strategy,
                 post_was_enabled_at_click=post_was_enabled,
+                composer_clean_after_submit=composer_clean_after_submit,
             )
 
         cleared: Dict[str, Any] = {}
@@ -3981,14 +4237,31 @@ async def _publish_via_current_input(
     if captcha_result:
         return captcha_result
 
-    if main_comment_aggressive:
-        await _ensure_main_comment_composer_clean_before_typing(
+    if not reply_scoped:
+        composer_clean_before_typing = await _ensure_main_comment_composer_clean_before_typing(
             page,
             reason="main_current_input_pre_type_clean",
             expected_video_url=expected_video_url,
             correlation_id=correlation_id,
             timeout_seconds=min(1.2, max(0.2, _remaining())),
         )
+        if not composer_clean_before_typing:
+            _log_publish_trace(
+                "main_pre_type_composer_not_clean",
+                page=page,
+                expected_video_url=expected_video_url,
+                correlation_id=correlation_id,
+                strategy=input_info.strategy,
+                level=logging.WARNING,
+            )
+            return PublishResult(
+                status="dom_error",
+                error_reason="main_pre_type_composer_not_clean",
+                dom_strategy=input_info.strategy,
+                elapsed_seconds=time.monotonic() - started,
+                post_was_enabled_at_click=False,
+                network_request_attempted=False,
+            )
 
     if _remaining() <= 0:
         return _deadline_result("before_typing", input_info.strategy)
@@ -4006,6 +4279,7 @@ async def _publish_via_current_input(
                 fast=aggressive,
                 reply_scoped=reply_scoped,
                 anchor_token=parent_anchor_token,
+                allow_main_dom_fallback=False,
             ),
             timeout=typing_timeout,
         )
@@ -4103,6 +4377,7 @@ async def _publish_via_current_input(
                     fast=True,
                     reply_scoped=reply_scoped,
                     anchor_token=parent_anchor_token,
+                    allow_main_dom_fallback=False,
                 ),
                 timeout=retry_typing_timeout,
             )
@@ -4215,8 +4490,9 @@ async def _publish_via_current_input(
         )
         if captcha_result:
             return captcha_result
-        if main_comment_aggressive:
-            await _clear_main_comment_composer_best_effort(
+        composer_clean_after_submit: Optional[bool] = None
+        if not reply_scoped:
+            composer_clean_after_submit = await _clear_main_comment_composer_best_effort(
                 page,
                 reason="post_button_not_found",
                 expected_video_url=expected_video_url,
@@ -4227,6 +4503,9 @@ async def _publish_via_current_input(
             error_reason="post_button_not_found",
             dom_strategy=input_info.strategy,
             elapsed_seconds=time.monotonic() - started,
+            network_request_attempted=False,
+            post_was_enabled_at_click=False,
+            composer_clean_after_submit=composer_clean_after_submit,
         )
     _log_publish_trace(
         "post_button_found",
@@ -4440,9 +4719,9 @@ async def _publish_via_current_input(
     # React/Lexical EditorState keeps stale/duplicated text that DOM-based
     # verification cannot see. Right before clicking Post we re-read the live
     # composer and refuse to publish unless it is EXACTLY the expected variant.
-    # On mismatch we clear and return a dom_error so the orchestration re-types
-    # on a fresh handle instead of posting corrupted text.
-    if main_comment_aggressive and not reply_scoped and _remaining() > 0.5:
+    # If exact text cannot be proven we clear and return a dom_error so the
+    # orchestration moves to a safe composer instead of posting corrupted text.
+    if not reply_scoped and _remaining() > 0.5:
         exact_ok, gate_state = await _main_composer_exact_text_ok_before_post(page, text)
         gate_reason = str(gate_state.get("reason") or "unknown")
         # Block ONLY when the composer concretely holds the WRONG text
@@ -4450,7 +4729,7 @@ async def _publish_via_current_input(
         # bug. Empty/placeholder/probe-failure are NOT blocked here: upstream
         # typing verification already ran, and the trusted-clear typing path keeps
         # DOM and React/Lexical state in sync, so an empty read is a true empty.
-        if not exact_ok and gate_reason == "text_mismatch":
+        if not exact_ok:
             gate_text = str(gate_state.get("text") or "")
             _log_publish_trace(
                 "main_pre_post_exact_guard_block",
@@ -4478,11 +4757,12 @@ async def _publish_via_current_input(
             )
             return PublishResult(
                 status="dom_error",
-                error_reason=f"post_text_mismatch_guard:{gate_reason}"[:80],
+                error_reason=f"post_text_not_exact_guard:{gate_reason}"[:80],
                 dom_strategy=input_info.strategy or post_info.strategy,
                 elapsed_seconds=time.monotonic() - started,
                 post_was_enabled_at_click=False,
                 network_request_attempted=False,
+                composer_clean_after_submit=False,
             )
 
     captured: Dict[str, Any] = {}
@@ -4504,6 +4784,8 @@ async def _publish_via_current_input(
         except Exception:
             return
         if "/api/comment/publish/" not in url:
+            return
+        if not _publish_response_matches_current_request(captured, response):
             return
         try:
             captured["url"] = url
@@ -4531,17 +4813,8 @@ async def _publish_via_current_input(
         task.add_done_callback(_consume_listener_task)
 
     def on_request(request):
-        try:
-            url = request.url
-        except Exception:
+        if not _record_publish_request(captured, request):
             return
-        if "/api/comment/publish/" not in url:
-            return
-        captured["request_url"] = url
-        try:
-            captured["request_method"] = request.method
-        except Exception:
-            pass
         if fast_publish:
             event.set()
 
@@ -4802,11 +5075,13 @@ async def _publish_via_current_input(
         await asyncio.wait_for(event.wait(), timeout=min(publish_wait, max(wait_remaining, 0.5)))
     except asyncio.TimeoutError:
         pass
+    await _yield_to_publish_listener_tasks(listener_tasks)
 
     if fast_publish and captured.get("request_url") and not captured.get("url"):
         grace = min(_PARALLEL_POST_RESPONSE_GRACE_SECONDS, max(_remaining(), 0.0))
         if grace > 0:
             await asyncio.sleep(grace)
+            await _yield_to_publish_listener_tasks(listener_tasks)
 
     if not captured and synthetic_dispatch_attempted:
         logger.warning(
@@ -4895,6 +5170,7 @@ async def _publish_via_current_input(
                             await asyncio.wait_for(event.wait(), timeout=min(4.0, max(retry_wait_remaining, 0.5)))
                     except asyncio.TimeoutError:
                         pass
+                    await _yield_to_publish_listener_tasks(listener_tasks)
         except Exception as retry_exc:
             logger.warning("[PUBLISH] Retry Post click failed: %s", retry_exc)
 
@@ -4959,6 +5235,13 @@ async def _publish_via_current_input(
             # Accept it regardless of whether status_code is 0 to handle A/B response variants
             # where status_code may be absent but the comment was clearly created.
             if comment_id:
+                composer_clean_after_submit = await _cleanup_composer_after_ambiguous_submit(
+                    page,
+                    reply_scoped=reply_scoped,
+                    reason="success_comment_id",
+                    expected_video_url=expected_video_url,
+                    correlation_id=correlation_id,
+                )
                 _log_publish_trace(
                     "publish_result",
                     page=page,
@@ -4987,6 +5270,7 @@ async def _publish_via_current_input(
                     elapsed_seconds=elapsed,
                     dom_strategy=input_info.strategy or post_info.strategy,
                     post_was_enabled_at_click=post_was_enabled,
+                    composer_clean_after_submit=composer_clean_after_submit,
                 )
             if not response_json:
                 cleared_success = await _ambiguous_network_success_if_composer_cleared(
@@ -4996,6 +5280,13 @@ async def _publish_via_current_input(
                 )
                 if cleared_success is not None:
                     return cleared_success
+                composer_clean_after_submit = await _cleanup_composer_after_ambiguous_submit(
+                    page,
+                    reply_scoped=reply_scoped,
+                    reason="stealth_reject_empty_body",
+                    expected_video_url=expected_video_url,
+                    correlation_id=correlation_id,
+                )
                 _log_publish_trace(
                     "publish_result",
                     page=page,
@@ -5018,7 +5309,15 @@ async def _publish_via_current_input(
                     elapsed_seconds=elapsed,
                     dom_strategy=input_info.strategy or post_info.strategy,
                     post_was_enabled_at_click=post_was_enabled,
+                    composer_clean_after_submit=composer_clean_after_submit,
                 )
+            composer_clean_after_submit = await _cleanup_composer_after_ambiguous_submit(
+                page,
+                reply_scoped=reply_scoped,
+                reason=f"api_error_status_code={status_code}",
+                expected_video_url=expected_video_url,
+                correlation_id=correlation_id,
+            )
             _log_publish_trace(
                 "publish_result",
                 page=page,
@@ -5041,7 +5340,8 @@ async def _publish_via_current_input(
                 elapsed_seconds=elapsed,
                 dom_strategy=input_info.strategy or post_info.strategy,
                 post_was_enabled_at_click=post_was_enabled,
-                )
+                composer_clean_after_submit=composer_clean_after_submit,
+            )
 
         if not (captured.get("body") or "").strip():
             cleared_success = await _ambiguous_network_success_if_composer_cleared(
@@ -5051,6 +5351,13 @@ async def _publish_via_current_input(
             )
             if cleared_success is not None:
                 return cleared_success
+            composer_clean_after_submit = await _cleanup_composer_after_ambiguous_submit(
+                page,
+                reply_scoped=reply_scoped,
+                reason="stealth_reject_empty_body",
+                expected_video_url=expected_video_url,
+                correlation_id=correlation_id,
+            )
             _log_publish_trace(
                 "publish_result",
                 page=page,
@@ -5072,7 +5379,15 @@ async def _publish_via_current_input(
                 elapsed_seconds=elapsed,
                 dom_strategy=input_info.strategy or post_info.strategy,
                 post_was_enabled_at_click=post_was_enabled,
+                composer_clean_after_submit=composer_clean_after_submit,
             )
+        composer_clean_after_submit = await _cleanup_composer_after_ambiguous_submit(
+            page,
+            reply_scoped=reply_scoped,
+            reason="non_json_response",
+            expected_video_url=expected_video_url,
+            correlation_id=correlation_id,
+        )
         _log_publish_trace(
             "publish_result",
             page=page,
@@ -5094,6 +5409,7 @@ async def _publish_via_current_input(
             elapsed_seconds=elapsed,
             dom_strategy=input_info.strategy or post_info.strategy,
             post_was_enabled_at_click=post_was_enabled,
+            composer_clean_after_submit=composer_clean_after_submit,
         )
 
     try:
@@ -5192,7 +5508,7 @@ async def _publish_via_current_input(
                 );
             };
             const inputWrapper = document.querySelector(
-                '[data-smart-reply-input="1"], [data-smart-id="comment-input"], [data-e2e="comment-input"], [data-e2e*="comment-input"], div[contenteditable="true"], textarea'
+                '[data-smart-reply-input="1"], [data-smart-main-input="1"], [data-smart-id="comment-input"], [data-e2e="comment-input"], [data-e2e*="comment-input"], div[contenteditable="true"], textarea'
             );
             const input = resolveInnerEditor(inputWrapper);
             const inputText = input ? (input.value || input.textContent || input.innerText || '').trim() : '';
@@ -5231,8 +5547,9 @@ async def _publish_via_current_input(
     #      AMBIGUOUS_POST_SUBMIT_ERRORS) so downstream logic does NOT consider
     #      a local DOM match alone as proof of publication.
     if not post_was_enabled and not request_attempted:
-        if main_comment_aggressive:
-            await _clear_main_comment_composer_best_effort(
+        composer_clean_after_submit: Optional[bool] = None
+        if not reply_scoped:
+            composer_clean_after_submit = await _clear_main_comment_composer_best_effort(
                 page,
                 reason="submitted_unverified_disabled_post",
                 expected_video_url=expected_video_url,
@@ -5258,6 +5575,7 @@ async def _publish_via_current_input(
             dom_strategy=input_info.strategy or post_info.strategy,
             post_was_enabled_at_click=False,
             network_request_attempted=False,
+            composer_clean_after_submit=composer_clean_after_submit,
         )
 
     if request_attempted:
@@ -5311,8 +5629,9 @@ async def _publish_via_current_input(
             composer_clean_after_submit=composer_clean_after_submit,
         )
 
-    if main_comment_aggressive:
-        await _clear_main_comment_composer_best_effort(
+    composer_clean_after_submit: Optional[bool] = None
+    if not reply_scoped:
+        composer_clean_after_submit = await _clear_main_comment_composer_best_effort(
             page,
             reason="no_network_request_after_post_click",
             expected_video_url=expected_video_url,
@@ -5338,6 +5657,7 @@ async def _publish_via_current_input(
         dom_strategy=input_info.strategy or post_info.strategy,
         post_was_enabled_at_click=post_was_enabled,
         network_request_attempted=False,
+        composer_clean_after_submit=composer_clean_after_submit,
     )
 
 

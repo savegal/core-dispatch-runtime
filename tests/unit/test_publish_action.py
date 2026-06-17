@@ -9,6 +9,21 @@ import pytest
 import executor.publish_action as publish_action
 
 
+class _FakePublishRequest:
+    def __init__(self, *, url="https://www.tiktok.com/api/comment/publish/?aid=1988", method="POST", post_data="text=hello"):
+        self.url = url
+        self.method = method
+        self.post_data = post_data
+
+
+class _FakePublishResponseForRequest:
+    url = "https://www.tiktok.com/api/comment/publish/?aid=1988"
+    status = 200
+
+    def __init__(self, request):
+        self.request = request
+
+
 class _FakeInput:
     async def evaluate(self, _script):
         return "hello"
@@ -32,13 +47,61 @@ class _FakeResponse:
     url = "https://www.tiktok.com/api/comment/publish/?aid=1988"
     status = 200
 
+    def __init__(self, request=None):
+        if request is not None:
+            self.request = request
+
     async def text(self):
         return json.dumps({"status_code": 0, "comment": {"cid": "cid_retry_123"}})
+
+
+class _EmptyBodyResponse:
+    url = "https://www.tiktok.com/api/comment/publish/?aid=1988"
+    status = 200
+
+    def __init__(self, request=None):
+        if request is not None:
+            self.request = request
+
+    async def text(self):
+        return ""
+
+
+def _emit_publish_response(page, response_factory=_FakeResponse):
+    request = _FakePublishRequest()
+    request_handler = page.listeners.get("request")
+    response_handler = page.listeners.get("response")
+    assert request_handler is not None, "request listener was removed before fake response"
+    assert response_handler is not None, "response listener was removed before fake response"
+    request_handler(request)
+    response_handler(response_factory(request))
+
+
+@pytest.mark.unit
+def test_publish_response_must_match_current_publish_request():
+    captured = {}
+    request = _FakePublishRequest(post_data="text=current")
+    late_request = _FakePublishRequest(post_data="text=old")
+
+    late_response = _FakePublishResponseForRequest(late_request)
+    assert publish_action._publish_response_matches_current_request(captured, late_response) is False
+    assert captured["ignored_response_without_request"] == 1
+
+    assert publish_action._record_publish_request(captured, request) is True
+    current_response = _FakePublishResponseForRequest(request)
+    assert publish_action._publish_response_matches_current_request(captured, current_response) is True
+
+    other_response = _FakePublishResponseForRequest(late_request)
+    assert publish_action._publish_response_matches_current_request(captured, other_response) is False
+    assert captured["ignored_response_post_data_mismatch"] is True
 
 
 class _FakeMouse:
     def __init__(self, page):
         self.page = page
+
+    async def click(self, *_args, **_kwargs):
+        return None
 
     async def move(self, *_args, **_kwargs):
         return None
@@ -49,14 +112,15 @@ class _FakeMouse:
     async def up(self, *_args, **_kwargs):
         self.page.click_count += 1
         if self.page.click_count == 2:
-            handler = self.page.listeners.get("response")
-            assert handler is not None, "response listener was removed before retry click"
-            handler(_FakeResponse())
+            _emit_publish_response(self.page)
 
 
 class _RequestOnlyMouse:
     def __init__(self, page):
         self.page = page
+
+    async def click(self, *_args, **_kwargs):
+        return None
 
     async def move(self, *_args, **_kwargs):
         return None
@@ -74,6 +138,17 @@ class _RequestOnlyMouse:
             ))
 
 
+class _FakeKeyboard:
+    async def press(self, *_args, **_kwargs):
+        return None
+
+    async def insert_text(self, *_args, **_kwargs):
+        return None
+
+    async def type(self, *_args, **_kwargs):
+        return None
+
+
 class _FakePage:
     def __init__(self):
         self.listeners = {}
@@ -81,6 +156,7 @@ class _FakePage:
         self.click_count = 0
         self.synthetic_dispatch_count = 0
         self.mouse = _FakeMouse(self)
+        self.keyboard = _FakeKeyboard()
         self.url = "https://www.tiktok.com/@demo/video/7635267329407913230"
 
     def on(self, event, handler):
@@ -99,6 +175,26 @@ class _FakePage:
         if "dispatchEvent(new MouseEvent" in script:
             self.synthetic_dispatch_count += 1
             return "dispatched"
+        if "no_main_comment_input_target" in script:
+            return {
+                "ok": True,
+                "found": True,
+                "x": 100,
+                "y": 200,
+                "rect": {"left": 80, "top": 184, "width": 160, "height": 32},
+            }
+        if "([replyScoped])" in script and "placeholderMarkers" in script:
+            return {"exists": True, "empty": True, "text": ""}
+        if "textMatchesExpected" in script and "postDisabled" in script:
+            expected_arg = _args[1] if len(_args) > 1 else [""]
+            expected = expected_arg[0] if isinstance(expected_arg, list) and expected_arg else ""
+            return {
+                "ok": True,
+                "text": expected,
+                "textLen": len(str(expected)),
+                "postVisible": True,
+                "postDisabled": False,
+            }
         return {}
 
 
@@ -694,6 +790,9 @@ async def test_parallel_main_publish_soft_continues_after_input_clear_timeout(mo
         def __init__(self, page):
             self.page = page
 
+        async def click(self, *_args, **_kwargs):
+            return None
+
         async def move(self, *_args, **_kwargs):
             return None
 
@@ -702,9 +801,7 @@ async def test_parallel_main_publish_soft_continues_after_input_clear_timeout(mo
 
         async def up(self, *_args, **_kwargs):
             self.page.click_count += 1
-            handler = self.page.listeners.get("response")
-            assert handler is not None
-            handler(_FakeResponse())
+            _emit_publish_response(self.page)
 
     page.mouse = _ImmediateResponseMouse(page)
 
@@ -1010,10 +1107,11 @@ async def test_parallel_publish_returns_after_request_without_slow_retry(monkeyp
         correlation_id="task_1_parallel_reply_v1_a1_acc10",
     )
 
-    assert result.status == "timeout"
-    assert result.error_reason == "no_network_response_after_publish_request"
+    assert result.status == "failed"
+    assert result.error_reason == "composer_cleared_after_submit"
     assert result.network_request_attempted is True
     assert result.post_was_enabled_at_click is True
+    assert result.composer_clean_after_submit is True
     assert page.click_count == 1
     assert page.removed == ["request", "response"]
 
@@ -1099,7 +1197,99 @@ async def test_parallel_main_request_timeout_clears_dirty_composer_after_request
 
 @pytest.mark.unit
 @pytest.mark.asyncio
-async def test_parallel_main_pre_type_clean_allows_placeholder_state(monkeypatch):
+async def test_parallel_main_empty_body_cleans_dirty_composer_and_reports_state(monkeypatch):
+    page = _FakePage()
+    button = _FakeButton()
+    events = []
+
+    class _EmptyBodyMouse:
+        async def move(self, *_args, **_kwargs):
+            return None
+
+        async def down(self, *_args, **_kwargs):
+            return None
+
+        async def up(self, *_args, **_kwargs):
+            page.click_count += 1
+            _emit_publish_response(page, _EmptyBodyResponse)
+
+    page.mouse = _EmptyBodyMouse()
+
+    async def _fake_sleep(_seconds):
+        return None
+
+    async def _fake_detect_captcha(*args, **kwargs):
+        return False, None
+
+    async def _fake_find_comment_input_smart(*args, **kwargs):
+        return _FakeInput(), SimpleNamespace(strategy="input", elapsed_seconds=0.1, reason=None)
+
+    async def _fake_find_post_button_smart(*args, **kwargs):
+        return button, SimpleNamespace(strategy="post")
+
+    async def _fake_wait_for_post_button_enabled(*args, **kwargs):
+        return button, SimpleNamespace(strategy="post", reason=None)
+
+    async def _fake_clear_post_click_blockers(*args, **kwargs):
+        return button, {"tag": "BUTTON", "e2e": "comment-post"}, True
+
+    async def _fake_suppress_keyboard_shortcuts_overlay(*args, **kwargs):
+        return 0
+
+    async def _fake_ensure_click_target_clear(*args, **kwargs):
+        return None
+
+    async def _fake_type_into_comment(*args, **kwargs):
+        events.append(("type", kwargs.get("fast")))
+        return True
+
+    dirty_probe_count = {"count": 0}
+
+    async def _fake_composer_cleared_state(*args, **kwargs):
+        dirty_probe_count["count"] += 1
+        return {"exists": True, "empty": False, "text": "hello"}
+
+    async def _fake_clear_main_comment_composer_best_effort(*args, **kwargs):
+        events.append(("clear", kwargs.get("reason")))
+        return True
+
+    monkeypatch.setattr(publish_action.asyncio, "sleep", _fake_sleep)
+    monkeypatch.setattr(publish_action, "detect_captcha", _fake_detect_captcha)
+    monkeypatch.setattr(publish_action, "suppress_keyboard_shortcuts_overlay", _fake_suppress_keyboard_shortcuts_overlay)
+    monkeypatch.setattr(publish_action, "find_comment_input_smart", _fake_find_comment_input_smart)
+    monkeypatch.setattr(publish_action, "find_post_button_smart", _fake_find_post_button_smart)
+    monkeypatch.setattr(publish_action, "wait_for_post_button_enabled", _fake_wait_for_post_button_enabled)
+    monkeypatch.setattr(publish_action, "_clear_post_click_blockers", _fake_clear_post_click_blockers)
+    monkeypatch.setattr(publish_action, "ensure_click_target_clear", _fake_ensure_click_target_clear)
+    monkeypatch.setattr(publish_action, "type_into_comment", _fake_type_into_comment)
+    monkeypatch.setattr(publish_action, "_composer_cleared_state", _fake_composer_cleared_state)
+    monkeypatch.setattr(
+        publish_action,
+        "_clear_main_comment_composer_best_effort",
+        _fake_clear_main_comment_composer_best_effort,
+    )
+
+    result = await publish_action._publish_via_current_input(
+        page,
+        "hello",
+        max_total_seconds=30.0,
+        correlation_id="task_1_parallel_main_v1_a1_acc10",
+    )
+
+    assert result.status == "failed"
+    assert result.error_reason == "stealth_reject_empty_body"
+    assert result.network_captured is True
+    assert result.network_request_attempted is True
+    assert result.composer_clean_after_submit is True
+    assert page.click_count == 1
+    assert dirty_probe_count["count"] >= 1
+    assert ("clear", "stealth_reject_empty_body") in events
+    assert page.removed == ["request", "response"]
+
+
+@pytest.mark.unit
+@pytest.mark.asyncio
+async def test_parallel_main_pre_type_clean_blocks_placeholder_without_trusted_clear(monkeypatch):
     page = _FakePage()
     page.mouse = _RequestOnlyMouse(page)
     button = _FakeButton()
@@ -1163,13 +1353,67 @@ async def test_parallel_main_pre_type_clean_allows_placeholder_state(monkeypatch
         correlation_id="task_1_parallel_main_v1_a1_acc10",
     )
 
-    assert result.status == "timeout"
-    assert result.error_reason == "no_network_response_after_publish_request"
-    assert events[:2] == [
-        ("clear", "main_current_input_pre_type_clean"),
-        ("type", True),
-    ]
-    assert page.click_count == 1
+    assert result.status == "dom_error"
+    assert result.error_reason == "main_pre_type_composer_not_clean"
+    assert result.network_request_attempted is False
+    assert result.post_was_enabled_at_click is False
+    assert events == [("clear", "main_current_input_pre_type_clean")]
+    assert page.click_count == 0
+
+
+@pytest.mark.unit
+@pytest.mark.asyncio
+async def test_parallel_main_pre_type_dirty_composer_blocks_typing(monkeypatch):
+    page = _FakePage()
+    events = []
+
+    async def _fake_sleep(_seconds):
+        return None
+
+    async def _fake_detect_captcha(*args, **kwargs):
+        return False, None
+
+    async def _fake_find_comment_input_smart(*args, **kwargs):
+        return _FakeInput(), SimpleNamespace(strategy="input", elapsed_seconds=0.1, reason=None)
+
+    async def _fake_suppress_keyboard_shortcuts_overlay(*args, **kwargs):
+        return 0
+
+    async def _unexpected_type_into_comment(*args, **kwargs):
+        raise AssertionError("typing must not run when main composer is still dirty")
+
+    async def _fake_composer_cleared_state(*args, **kwargs):
+        return {"exists": True, "empty": False, "text": "old draft"}
+
+    async def _fake_clear_main_comment_composer_best_effort(*args, **kwargs):
+        events.append(("clear", kwargs.get("reason")))
+        return False
+
+    monkeypatch.setattr(publish_action.asyncio, "sleep", _fake_sleep)
+    monkeypatch.setattr(publish_action, "detect_captcha", _fake_detect_captcha)
+    monkeypatch.setattr(publish_action, "suppress_keyboard_shortcuts_overlay", _fake_suppress_keyboard_shortcuts_overlay)
+    monkeypatch.setattr(publish_action, "find_comment_input_smart", _fake_find_comment_input_smart)
+    monkeypatch.setattr(publish_action, "type_into_comment", _unexpected_type_into_comment)
+    monkeypatch.setattr(publish_action, "_composer_cleared_state", _fake_composer_cleared_state)
+    monkeypatch.setattr(
+        publish_action,
+        "_clear_main_comment_composer_best_effort",
+        _fake_clear_main_comment_composer_best_effort,
+    )
+
+    result = await publish_action._publish_via_current_input(
+        page,
+        "hello",
+        max_total_seconds=30.0,
+        correlation_id="task_1_parallel_main_v1_a1_acc10",
+    )
+
+    assert result.status == "dom_error"
+    assert result.error_reason == "main_pre_type_composer_not_clean"
+    assert result.network_request_attempted is False
+    assert result.post_was_enabled_at_click is False
+    assert events == [("clear", "main_current_input_pre_type_clean")]
+    assert page.click_count == 0
 
 
 @pytest.mark.unit
@@ -1183,6 +1427,9 @@ async def test_publish_continues_when_typing_times_out_but_text_is_visible(monke
         def __init__(self, page):
             self.page = page
 
+        async def click(self, *_args, **_kwargs):
+            return None
+
         async def move(self, *_args, **_kwargs):
             return None
 
@@ -1191,9 +1438,7 @@ async def test_publish_continues_when_typing_times_out_but_text_is_visible(monke
 
         async def up(self, *_args, **_kwargs):
             self.page.click_count += 1
-            handler = self.page.listeners.get("response")
-            assert handler is not None
-            handler(_FakeResponse())
+            _emit_publish_response(self.page)
 
     page.mouse = _ImmediateResponseMouse(page)
 
@@ -1267,6 +1512,9 @@ async def test_parallel_main_publish_continues_when_typing_timeout_has_committed
         def __init__(self, page):
             self.page = page
 
+        async def click(self, *_args, **_kwargs):
+            return None
+
         async def move(self, *_args, **_kwargs):
             return None
 
@@ -1275,9 +1523,7 @@ async def test_parallel_main_publish_continues_when_typing_timeout_has_committed
 
         async def up(self, *_args, **_kwargs):
             self.page.click_count += 1
-            handler = self.page.listeners.get("response")
-            assert handler is not None
-            handler(_FakeResponse())
+            _emit_publish_response(self.page)
 
     page.mouse = _ImmediateResponseMouse(page)
 
@@ -1540,6 +1786,9 @@ async def test_publish_surface_ready_still_resolves_real_input_handle(monkeypatc
         def __init__(self, page):
             self.page = page
 
+        async def click(self, *_args, **_kwargs):
+            return None
+
         async def move(self, *_args, **_kwargs):
             return None
 
@@ -1548,9 +1797,7 @@ async def test_publish_surface_ready_still_resolves_real_input_handle(monkeypatc
 
         async def up(self, *_args, **_kwargs):
             self.page.click_count += 1
-            handler = self.page.listeners.get("response")
-            assert handler is not None
-            handler(_FakeResponse())
+            _emit_publish_response(self.page)
 
     page.mouse = _ImmediateResponseMouse(page)
 
@@ -1624,6 +1871,9 @@ async def test_parallel_main_fast_path_skips_redundant_post_enabled_rechecks(mon
         def __init__(self, page):
             self.page = page
 
+        async def click(self, *_args, **_kwargs):
+            return None
+
         async def move(self, *_args, **_kwargs):
             return None
 
@@ -1632,9 +1882,7 @@ async def test_parallel_main_fast_path_skips_redundant_post_enabled_rechecks(mon
 
         async def up(self, *_args, **_kwargs):
             self.page.click_count += 1
-            handler = self.page.listeners.get("response")
-            assert handler is not None
-            handler(_FakeResponse())
+            _emit_publish_response(self.page)
 
     page.mouse = _ImmediateResponseMouse(page)
 
@@ -1753,12 +2001,13 @@ async def test_publish_does_not_retry_click_after_synthetic_dispatch_without_net
 
     # Mock returns the Post button as enabled on every wait_for_post_button_enabled
     # call, so post_was_enabled stays True. The synthetic-dispatch branch fires
-    # because point_diag.tag == "BODY" forces it; with Post enabled the result
-    # is the legitimate timeout (no_network_request_after_post_click), not the
-    # unverified-disabled-post variant introduced for the disabled case.
-    assert result.status == "timeout"
-    assert result.error_reason == "no_network_request_after_post_click"
+    # because point_diag.tag == "BODY" forces it; when the composer is proven
+    # cleared afterwards, the result is an ambiguous submitted state instead of
+    # a retryable timeout.
+    assert result.status == "failed"
+    assert result.error_reason == "composer_cleared_after_submit"
     assert result.post_was_enabled_at_click is True
+    assert result.composer_clean_after_submit is True
     assert page.synthetic_dispatch_count == 1
     # Two probes: (1) main wait before click, (2) short pre-click re-probe after
     # blocker clearance — both legitimate.
@@ -2390,14 +2639,58 @@ async def test_publish_current_input_uses_main_direct_dom_fallback_after_input_s
 
 
 @pytest.mark.unit
+def test_main_direct_post_click_rejects_reply_scoped_inputs():
+    script = publish_action._JS_MAIN_COMMENT_DIRECT_POST_CLICK
+
+    assert 'data-smart-reply-input' in script
+    assert 'data-smart-reply-composer' in script
+    assert 'data-smart-reply-anchor-token' in script
+    assert '[data-smart-id="comment-input"]:not([data-smart-reply-input="1"]):not([data-smart-reply-anchor-token])' in script
+    assert "if (replyScoped(raw)) continue;" in script
+    assert "if (replyScoped(inner)) continue;" in script
+
+
+@pytest.mark.unit
+@pytest.mark.asyncio
+async def test_main_direct_dom_fallback_refuses_dirty_pre_type_composer(monkeypatch):
+    type_calls = {"count": 0}
+
+    async def _fake_preclean(*args, **kwargs):
+        assert kwargs["reason"] == "main_direct_pre_type_clean"
+        return False
+
+    async def _unexpected_type(*args, **kwargs):
+        type_calls["count"] += 1
+        raise AssertionError("direct main fallback must not type into a dirty composer")
+
+    monkeypatch.setattr(publish_action, "_ensure_main_comment_composer_clean_before_typing", _fake_preclean)
+    monkeypatch.setattr(publish_action, "_type_main_comment_without_handle", _unexpected_type)
+
+    page = _FakePage()
+    result = await publish_action._publish_main_comment_direct_dom(
+        page,
+        "hello",
+        started=time.monotonic(),
+        max_total_seconds=10.0,
+        expected_video_url=page.url,
+        correlation_id="task_1_parallel_main_v1_a1_acc2",
+        previous_reason="timeout",
+    )
+
+    assert result is not None
+    assert result.status == "dom_error"
+    assert result.error_reason == "main_direct_pre_type_composer_not_clean"
+    assert result.network_request_attempted is False
+    assert type_calls["count"] == 0
+
+
+@pytest.mark.unit
 @pytest.mark.asyncio
 async def test_main_direct_dom_fallback_returns_success_from_publish_response(monkeypatch):
     class _DirectPage(_FakePage):
         async def evaluate(self, script, *args):
             if script == publish_action._JS_MAIN_COMMENT_DIRECT_POST_CLICK:
-                handler = self.listeners.get("response")
-                assert handler is not None
-                handler(_FakeResponse())
+                _emit_publish_response(self)
                 return {
                     "clicked": True,
                     "postWasEnabled": True,
@@ -2469,6 +2762,46 @@ async def test_type_main_comment_without_handle_uses_smart_typing_before_legacy_
         "text": "hello",
     }
     assert calls == {"smart": 1, "legacy": 0}
+
+
+@pytest.mark.unit
+@pytest.mark.asyncio
+async def test_type_main_comment_without_handle_rechecks_smart_typing_before_success(monkeypatch):
+    calls = {"smart": 0, "probe": 0, "legacy": 0}
+
+    async def _fake_type_into_comment(*args, **kwargs):
+        calls["smart"] += 1
+        return {"ok": True, "strategy": "atomic-focus-insert-text", "last_text": "hello"}
+
+    async def _fake_contains_expected(*args, **kwargs):
+        calls["probe"] += 1
+        return False, "hellohello"
+
+    async def _fake_legacy_keyboard(*args, **kwargs):
+        calls["legacy"] += 1
+        return {
+            "ok": True,
+            "strategy": "main-direct-mouse-keyboard",
+            "text": "hello",
+        }
+
+    monkeypatch.setattr(publish_action, "type_into_comment", _fake_type_into_comment)
+    monkeypatch.setattr(publish_action, "comment_input_contains_expected_text", _fake_contains_expected)
+    monkeypatch.setattr(publish_action, "_type_main_comment_by_mouse_keyboard", _fake_legacy_keyboard)
+
+    result = await publish_action._type_main_comment_without_handle(
+        _FakePage(),
+        "hello",
+        fast=True,
+        deadline=123.0,
+    )
+
+    assert result == {
+        "ok": True,
+        "strategy": "main-direct-mouse-keyboard",
+        "text": "hello",
+    }
+    assert calls == {"smart": 1, "probe": 1, "legacy": 1}
 
 
 @pytest.mark.unit
@@ -2807,15 +3140,17 @@ async def test_reply_direct_dom_fallback_no_id_with_api_error_is_not_unconfirmed
         url = "https://www.tiktok.com/api/comment/publish/?aid=1988"
         status = 200
 
+        def __init__(self, request=None):
+            if request is not None:
+                self.request = request
+
         async def text(self):
             return json.dumps({"status_code": 1001, "status_msg": "blocked"})
 
     class _ErrorNoIdReplyPage(_FakePage):
         async def evaluate(self, script, *args):
             if script == publish_action._JS_REPLY_DIRECT_POST_CLICK:
-                handler = self.listeners.get("response")
-                assert handler is not None
-                handler(_ErrorNoIdResponse())
+                _emit_publish_response(self, _ErrorNoIdResponse)
                 return {
                     "clicked": True,
                     "postWasEnabled": True,
@@ -2982,9 +3317,7 @@ async def test_reply_direct_dom_fallback_returns_success_from_publish_response(m
     class _ReplyDirectPage(_FakePage):
         async def evaluate(self, script, *args):
             if script == publish_action._JS_REPLY_DIRECT_POST_CLICK:
-                handler = self.listeners.get("response")
-                assert handler is not None
-                handler(_FakeResponse())
+                _emit_publish_response(self)
                 return {
                     "clicked": True,
                     "postWasEnabled": True,
@@ -3111,9 +3444,7 @@ async def test_publish_retries_input_search_after_manual_captcha_clear(monkeypat
     async def _fake_wait_for(awaitable, timeout):
         wait_calls["count"] += 1
         if wait_calls["count"] == 1:
-            handler = page.listeners.get("response")
-            assert handler is not None
-            handler(_FakeResponse())
+            _emit_publish_response(page)
         return await awaitable
 
     monkeypatch.setattr(publish_action.asyncio, "sleep", _fake_sleep)

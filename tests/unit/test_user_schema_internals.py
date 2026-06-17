@@ -623,6 +623,34 @@ def test_main_composer_cleared_without_network_counts_as_submitted_unconfirmed()
 
 
 @pytest.mark.unit
+def test_dom_publish_requires_proven_clean_composer_for_same_page_reuse():
+    from executor import user_schema
+    from executor.publish_action import PublishResult
+
+    http_result = PublishResult(
+        status="success",
+        comment_id="cid-http",
+        dom_strategy="http_user_schema",
+    )
+    dom_clean = PublishResult(
+        status="success",
+        comment_id="cid-dom",
+        dom_strategy="main-dom",
+        composer_clean_after_submit=True,
+    )
+    dom_unknown = PublishResult(
+        status="success",
+        comment_id="cid-dom",
+        dom_strategy="main-dom",
+        composer_clean_after_submit=None,
+    )
+
+    assert user_schema._publish_result_allows_same_page_reuse(http_result) is True
+    assert user_schema._publish_result_allows_same_page_reuse(dom_clean) is True
+    assert user_schema._publish_result_allows_same_page_reuse(dom_unknown) is False
+
+
+@pytest.mark.unit
 def test_user_schema_result_persists_main_tiktok_username_in_payload():
     from executor import user_schema
 
@@ -1174,9 +1202,10 @@ async def test_publish_all_variants_retries_input_not_found_on_same_account(monk
             dom_strategy="data-e2e",
         )
 
-    async def fake_recover(_page, *, correlation_id):
+    async def fake_recover(_page, *, correlation_id, require_clean_composer=False):
         recovered["count"] += 1
         assert correlation_id == "task_1_v1"
+        assert require_clean_composer is True
         return True
 
     async def fake_username(_page):
@@ -1219,8 +1248,9 @@ async def test_publish_all_variants_stops_after_composer_retry_failure(monkeypat
         calls.append((text, kwargs.get("correlation_id"), kwargs.get("comments_already_open")))
         return PublishResult(status="timeout", error_reason="publish_deadline_exceeded:open_comments")
 
-    async def fake_recover(_page, *, correlation_id):
+    async def fake_recover(_page, *, correlation_id, require_clean_composer=False):
         assert correlation_id == "task_1_v1"
+        assert require_clean_composer is True
         return False
 
     async def fake_username(_page):
@@ -1243,7 +1273,6 @@ async def test_publish_all_variants_stops_after_composer_retry_failure(monkeypat
     assert failure_reason == "publish_deadline_exceeded:open_comments"
     assert calls == [
         ("hello", "task_1_v1", None),
-        ("hello", "task_1_v1_input_retry", False),
     ]
 
 
@@ -1544,8 +1573,13 @@ async def test_publish_all_variants_does_not_dom_fallback_after_attempted_http_f
         expected_video_url="https://www.tiktok.com/@demo/video/1234567890123456789",
     )
 
-    assert published == []
-    assert failure_reason == "stealth_reject_empty_body"
+    assert failure_reason is None
+    assert len(published) == 1
+    assert published[0].text == "hello"
+    assert published[0].comment_id is None
+    assert published[0].network_confirmed is False
+    assert published[0].local_confirmed is False
+    assert published[0].method == "http_user_schema"
 
 
 @pytest.mark.unit
@@ -1642,7 +1676,7 @@ async def test_parallel_main_direct_response_without_comment_id_counts_as_submit
 
 @pytest.mark.unit
 @pytest.mark.asyncio
-async def test_parallel_main_submit_without_response_continues_after_composer_recovery(monkeypatch):
+async def test_parallel_main_submit_without_response_stops_after_unconfirmed_even_when_composer_clean(monkeypatch):
     from executor import user_schema
     from executor.publish_action import PublishResult
 
@@ -1682,23 +1716,20 @@ async def test_parallel_main_submit_without_response_continues_after_composer_re
         expected_video_url="https://www.tiktok.com/@demo/video/1234567890123456789",
     )
 
-    assert calls == [
-        ("first", "task_1_parallel_main_v1_a1_acc44_v1"),
-        ("second", "task_1_parallel_main_v1_a1_acc44_v2"),
-    ]
-    assert failure_reason is None
-    assert len(published) == 2
+    assert calls == [("first", "task_1_parallel_main_v1_a1_acc44_v1")]
+    assert failure_reason == (
+        "main_partial:published=1/2;remaining=1;"
+        "reason=account_series_stopped_after_unconfirmed"
+    )
+    assert len(published) == 1
     assert published[0].text == "first"
     assert published[0].comment_id is None
     assert published[0].local_confirmed is False
-    assert published[1].text == "second"
-    assert published[1].comment_id is None
-    assert published[1].local_confirmed is False
 
 
 @pytest.mark.unit
 @pytest.mark.asyncio
-async def test_parallel_main_submit_without_response_stops_when_composer_recovery_fails(monkeypatch):
+async def test_parallel_main_submit_without_response_stops_after_unconfirmed_without_recovery(monkeypatch):
     from executor import user_schema
     from executor.publish_action import PublishResult
 
@@ -1739,7 +1770,7 @@ async def test_parallel_main_submit_without_response_stops_when_composer_recover
     assert calls == [("first", "task_1_parallel_main_v1_a1_acc44_v1")]
     assert failure_reason == (
         "main_partial:published=1/2;remaining=1;"
-        "reason=account_series_stopped_after_unconfirmed_dirty_composer"
+        "reason=account_series_stopped_after_unconfirmed"
     )
     assert len(published) == 1
     assert published[0].text == "first"
@@ -1747,7 +1778,7 @@ async def test_parallel_main_submit_without_response_stops_when_composer_recover
 
 @pytest.mark.unit
 @pytest.mark.asyncio
-async def test_parallel_main_submit_without_clean_composer_continues_after_clean_recovery(monkeypatch):
+async def test_parallel_main_submit_without_clean_composer_stops_after_unconfirmed(monkeypatch):
     from executor import user_schema
     from executor.publish_action import PublishResult
 
@@ -1787,20 +1818,19 @@ async def test_parallel_main_submit_without_clean_composer_continues_after_clean
         expected_video_url="https://www.tiktok.com/@demo/video/1234567890123456789",
     )
 
-    assert calls == [
-        ("first", "task_1_parallel_main_v1_a1_acc44_v1"),
-        ("second", "task_1_parallel_main_v1_a1_acc44_v2"),
-    ]
-    assert recovered["count"] == 1
-    assert failure_reason is None
-    assert len(published) == 2
+    assert calls == [("first", "task_1_parallel_main_v1_a1_acc44_v1")]
+    assert recovered["count"] == 0
+    assert failure_reason == (
+        "main_partial:published=1/2;remaining=1;"
+        "reason=account_series_stopped_after_unconfirmed"
+    )
+    assert len(published) == 1
     assert published[0].text == "first"
-    assert published[1].text == "second"
 
 
 @pytest.mark.unit
 @pytest.mark.asyncio
-async def test_parallel_main_submit_without_clean_composer_stops_when_clean_recovery_fails(monkeypatch):
+async def test_parallel_main_submit_without_clean_composer_does_not_recover_same_browser(monkeypatch):
     from executor import user_schema
     from executor.publish_action import PublishResult
 
@@ -1841,10 +1871,10 @@ async def test_parallel_main_submit_without_clean_composer_stops_when_clean_reco
     )
 
     assert calls == [("first", "task_1_parallel_main_v1_a1_acc44_v1")]
-    assert recovered["count"] == 1
+    assert recovered["count"] == 0
     assert failure_reason == (
         "main_partial:published=1/2;remaining=1;"
-        "reason=account_series_stopped_after_unconfirmed_dirty_composer"
+        "reason=account_series_stopped_after_unconfirmed"
     )
     assert len(published) == 1
     assert published[0].text == "first"
@@ -1852,7 +1882,7 @@ async def test_parallel_main_submit_without_clean_composer_stops_when_clean_reco
 
 @pytest.mark.unit
 @pytest.mark.asyncio
-async def test_parallel_main_direct_no_response_ignores_text_only_local_match(monkeypatch):
+async def test_parallel_main_direct_no_response_accepts_author_scoped_local_match(monkeypatch):
     from executor import user_schema
     from executor.publish_action import PublishResult
 
@@ -1874,7 +1904,7 @@ async def test_parallel_main_direct_no_response_ignores_text_only_local_match(mo
     async def fake_recover(_page, **_kwargs):
         return True
 
-    finder = AsyncMock(return_value=(True, {"comment_id": "stale-or-other-account-cid"}))
+    finder = AsyncMock(return_value=(True, {"comment_id": "author-scoped-cid"}))
 
     monkeypatch.setattr(user_schema, "publish_comment_hybrid", fake_publish)
     monkeypatch.setattr(user_schema, "extract_tiktok_username", fake_username)
@@ -1891,20 +1921,70 @@ async def test_parallel_main_direct_no_response_ignores_text_only_local_match(mo
         expected_video_url="https://www.tiktok.com/@demo/video/1234567890123456789",
     )
 
-    finder.assert_not_awaited()
+    assert finder.await_count == 2
+    assert all(call.kwargs.get("expected_author") == "main_user" for call in finder.await_args_list)
     assert failure_reason is None
     assert len(published) == 2
     assert published[0].text == "first"
-    assert published[0].comment_id is None
-    assert published[0].local_confirmed is False
+    assert published[0].comment_id == "author-scoped-cid"
+    assert published[0].local_confirmed is True
     assert published[1].text == "second"
-    assert published[1].comment_id is None
-    assert published[1].local_confirmed is False
+    assert published[1].comment_id == "author-scoped-cid"
+    assert published[1].local_confirmed is True
 
 
 @pytest.mark.unit
 @pytest.mark.asyncio
-async def test_parallel_main_local_confirmation_timeout_records_unconfirmed(monkeypatch):
+async def test_parallel_main_local_only_dirty_composer_stops_account_series(monkeypatch):
+    from executor import user_schema
+    from executor.publish_action import PublishResult
+
+    calls = []
+
+    async def fake_publish(_page, text, **kwargs):
+        calls.append((text, kwargs["correlation_id"]))
+        return PublishResult(
+            status="timeout",
+            error_reason="no_network_response_after_publish_request",
+            network_request_attempted=True,
+            dom_strategy="data-e2e-inner-editable",
+            post_was_enabled_at_click=True,
+            composer_clean_after_submit=False,
+        )
+
+    async def fake_username(_page):
+        return "main_user"
+
+    finder = AsyncMock(return_value=(True, {"comment_id": "cid-first"}))
+
+    monkeypatch.setattr(user_schema, "publish_comment_hybrid", fake_publish)
+    monkeypatch.setattr(user_schema, "extract_tiktok_username", fake_username)
+    monkeypatch.setattr(user_schema, "find_comment_in_list", finder)
+    monkeypatch.setattr(user_schema, "_deny_if_visible_logged_out", AsyncMock(return_value=None))
+
+    published, failure_reason = await user_schema._publish_all_variants_on_account(
+        SimpleNamespace(),
+        SimpleNamespace(url="https://www.tiktok.com/@demo/video/1234567890123456789"),
+        SimpleNamespace(id=44),
+        ["first", "second"],
+        correlation_id="task_1_parallel_main_v1_a1_acc44",
+        expected_video_url="https://www.tiktok.com/@demo/video/1234567890123456789",
+    )
+
+    assert calls == [("first", "task_1_parallel_main_v1_a1_acc44_v1")]
+    assert failure_reason == (
+        "main_partial:published=1/2;remaining=1;"
+        "reason=account_series_stopped_after_local_unsafe_composer"
+    )
+    assert len(published) == 1
+    assert published[0].text == "first"
+    assert published[0].comment_id == "cid-first"
+    assert published[0].local_confirmed is True
+
+
+@pytest.mark.unit
+@pytest.mark.asyncio
+async def test_parallel_main_local_confirmation_timeout_stops_after_unconfirmed(monkeypatch):
     from executor import user_schema
     from executor.publish_action import PublishResult
 
@@ -1946,14 +2026,14 @@ async def test_parallel_main_local_confirmation_timeout_records_unconfirmed(monk
         expected_video_url="https://www.tiktok.com/@demo/video/1234567890123456789",
     )
 
-    assert failure_reason is None
-    assert len(published) == 2
+    assert failure_reason == (
+        "main_partial:published=1/2;remaining=1;"
+        "reason=account_series_stopped_after_unconfirmed"
+    )
+    assert len(published) == 1
     assert published[0].text == "first"
     assert published[0].comment_id is None
     assert published[0].local_confirmed is False
-    assert published[1].text == "second"
-    assert published[1].comment_id is None
-    assert published[1].local_confirmed is False
 
 
 @pytest.mark.unit
@@ -1998,8 +2078,10 @@ async def test_publish_all_variants_returns_comment_ui_failure_reason(monkeypatc
     async def fake_publish(_page, _text, **_kwargs):
         return PublishResult(status="dom_error", error_reason="input_not_found: comment_ui_not_found")
 
-    async def fake_recover(_page, *, correlation_id):
+    async def fake_recover(_page, *, correlation_id, require_clean_composer=False):
         assert correlation_id == "task_2_v1"
+        assert require_clean_composer is True
+        return False
 
     async def fake_username(_page):
         return "main_user"
@@ -2043,6 +2125,7 @@ async def test_publish_all_variants_records_local_only_and_continues(monkeypatch
             status="failed",
             error_reason="stealth_reject_empty_body",
             network_captured=True,  # real stealth reject = we saw the response
+            composer_clean_after_submit=True,
         )
 
     async def fake_username(_page):
@@ -2138,6 +2221,7 @@ async def test_publish_all_variants_cooldowns_account_after_partial_success_then
                 comment_id="cid-1",
                 network_captured=True,
                 dom_strategy="data-e2e",
+                composer_clean_after_submit=True,
             )
         return PublishResult(status="failed", error_reason="captcha_challenge:slider")
 
@@ -3931,6 +4015,7 @@ async def test_reply_uses_batch_parent_search_for_multiple_mains(monkeypatch):
             comment_id=f"reply-{len(publish_calls)}",
             network_captured=True,
             dom_strategy="reply-dom",
+            composer_clean_after_submit=True,
         )
 
     async def fake_sleep(_seconds):
@@ -4052,6 +4137,7 @@ async def test_reply_batch_prioritizes_visible_screen_order_over_template_order(
             comment_id=f"reply-{len(publish_calls)}",
             network_captured=True,
             dom_strategy="reply-dom",
+            composer_clean_after_submit=True,
         )
 
     async def fake_sleep(_seconds):
@@ -4262,6 +4348,7 @@ async def test_reply_publishes_cached_batch_anchors_after_search_deadline(monkey
             comment_id=f"reply-{len(publish_calls)}",
             network_captured=True,
             dom_strategy="reply-dom",
+            composer_clean_after_submit=True,
         )
 
     async def fake_sleep(seconds):
@@ -4512,6 +4599,7 @@ async def test_reply_batch_partial_result_falls_back_to_single_search(monkeypatc
             comment_id=f"reply-{len(publish_calls)}",
             network_captured=True,
             dom_strategy="reply-dom",
+            composer_clean_after_submit=True,
         )
 
     async def fake_sleep(_seconds):

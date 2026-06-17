@@ -3386,7 +3386,13 @@ def _is_comment_composer_publish_failure(result: "PublishResult") -> bool:
     reason = result.error_reason or ""
     if _is_input_not_found_publish_failure(result):
         return True
-    if result.status == "dom_error" and reason.startswith("post_button_input_not_ready:"):
+    if result.status == "dom_error" and (
+        reason.startswith("post_button_input_not_ready:")
+        or reason in {
+            "main_pre_type_composer_not_clean",
+            "main_direct_pre_type_composer_not_clean",
+        }
+    ):
         return True
     if result.status != "timeout":
         return False
@@ -3413,9 +3419,13 @@ def _main_publish_failure_may_leave_dirty_composer(
         (
             "publish_deadline_exceeded:typing",
             "publish_deadline_exceeded:main_direct_post_click",
+            "main_pre_type_composer_not_clean",
+            "main_direct_pre_type_composer_not_clean",
+            "post_button_not_found",
             "main_direct_post_click_failed:",
             "no_network_request_after_main_direct_post_click",
             "no_network_response_after_main_direct_post_click",
+            "post_text_not_exact_guard:",
             "typing_failed",
         )
     )
@@ -3663,23 +3673,33 @@ async def _publish_all_variants_on_account(
             break
 
         if _is_comment_composer_publish_failure(result):
-            comments_already_open = await _recover_page_before_input_retry(page, correlation_id=sub_corr)
+            comments_already_open = await _recover_page_before_input_retry(
+                page,
+                correlation_id=sub_corr,
+                require_clean_composer=True,
+            )
             if comments_already_open:
                 _remember_action_ready_proof(page, expected_video_url, phase=f"{sub_corr}_composer_recover")
-            try:
-                result = await publish_comment_hybrid(
-                    page,
-                    text,
-                    max_total_seconds=_parallel_main_input_retry_max_seconds(),
-                    correlation_id=f"{sub_corr}_input_retry",
-                    expected_video_url=expected_video_url,
-                    comments_already_open=comments_already_open,
-                )
-            except Exception as exc:
+                try:
+                    result = await publish_comment_hybrid(
+                        page,
+                        text,
+                        max_total_seconds=_parallel_main_input_retry_max_seconds(),
+                        correlation_id=f"{sub_corr}_input_retry",
+                        expected_video_url=expected_video_url,
+                        comments_already_open=True,
+                    )
+                except Exception as exc:
+                    logger.warning(
+                        "[USER_SCHEMA] main publish %s input retry raised: %s",
+                        sub_corr,
+                        str(exc)[:120],
+                    )
+            else:
                 logger.warning(
-                    "[USER_SCHEMA] main publish %s input retry raised: %s",
+                    "[USER_SCHEMA] main publish %s input retry skipped because composer/input recovery "
+                    "could not prove a clean editor",
                     sub_corr,
-                    str(exc)[:120],
                 )
 
         success_status = result.status == "success"
@@ -3918,11 +3938,31 @@ async def _publish_all_variants_on_account(
         )
         if network_confirmed:
             _register_runtime_success(db, account, scope="main")
+            if local_idx < len(text_variants) and not _publish_result_allows_same_page_reuse(result):
+                last_failure_reason = "account_series_stopped_after_network_unknown_composer"
+                logger.info(
+                    "[USER_SCHEMA] main publish %s network-confirmed through DOM, but composer cleanup "
+                    "was not strictly proven; stopping this account series so the next variant starts "
+                    "in a fresh browser",
+                    sub_corr,
+                )
+                break
         elif local_confirmed:
             logger.info(
                 "[USER_SCHEMA] main publish %s is local-only; not resetting account health counters yet",
                 sub_corr,
             )
+            if (
+                local_idx < len(text_variants)
+                and getattr(result, "composer_clean_after_submit", None) is not True
+            ):
+                last_failure_reason = "account_series_stopped_after_local_unsafe_composer"
+                logger.info(
+                    "[USER_SCHEMA] main publish %s is local-only and composer cleanup was not strictly proven; "
+                    "stopping this account series so the next variant starts in a fresh browser",
+                    sub_corr,
+                )
+                break
         elif submitted_unconfirmed:
             logger.info(
                 "[USER_SCHEMA] main publish %s is submitted-unconfirmed; not resetting account health counters yet",
@@ -4885,6 +4925,19 @@ def _main_publish_submitted_unconfirmed(correlation_id: Optional[str], result: P
 
 def _main_unconfirmed_safe_to_continue_same_browser(result: PublishResult) -> bool:
     return bool(getattr(result, "composer_clean_after_submit", False) is True)
+
+
+def _publish_result_used_dom_composer(result: PublishResult) -> bool:
+    strategy = str(getattr(result, "dom_strategy", "") or "").lower()
+    if not strategy:
+        return True
+    return not strategy.startswith(_USER_SCHEMA_HTTP_METHOD)
+
+
+def _publish_result_allows_same_page_reuse(result: PublishResult) -> bool:
+    if not _publish_result_used_dom_composer(result):
+        return True
+    return bool(getattr(result, "composer_clean_after_submit", None) is True)
 
 
 def _coerce_main_anchor(value: Any, source_main: Optional[PublishedMain] = None) -> MainAnchor:
@@ -7753,6 +7806,35 @@ async def _reply_with_variant_on_all_mains(
                                 searched=True,
                             )
                         )
+
+                if submitted and not _publish_result_allows_same_page_reuse(publish_result):
+                    logger.info(
+                        "[USER_SCHEMA] %s reply submit used DOM composer but cleanup was not strictly proven; "
+                        "stopping this reply account/page before the next parent",
+                        sub_corr,
+                    )
+                    _log_user_trace(
+                        "reply_account_stopped_after_unsafe_composer",
+                        page=page,
+                        expected_video_url=target_media_url,
+                        correlation_id=sub_corr,
+                        account_id=account.id,
+                        variant_index=variant_index,
+                        status=publish_result.status,
+                        reason=publish_result.error_reason,
+                        composer_clean_after_submit=getattr(publish_result, "composer_clean_after_submit", None),
+                        dom_strategy=publish_result.dom_strategy,
+                        submitted_unconfirmed=submitted_unconfirmed,
+                        level=logging.INFO,
+                    )
+                    return await _finish_reply_attempt(
+                        ReplyAttemptResult(
+                            replies=results,
+                            found_mains=list(found_mains_by_key.values()),
+                            attempted_parent_keys=attempted_parent_keys,
+                            searched=True,
+                        )
+                    )
 
                 if submitted:
                     try:

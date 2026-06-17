@@ -2818,7 +2818,15 @@ async def execute_engagement_only_replies_via_full_flow(
         "selection_deferred": 0,
         "capacity_skips": 0,
         "least_used_fallbacks": 0,
+        "selection_scan_skipped": 0,
     }
+    # P0 scheduler: short-lived cooldown so we do not re-run the expensive
+    # get_free_account_for_reply SQL candidate scan on every backoff tick while
+    # every active proxy is still at capacity. "capacity_cooldown_until" is a
+    # time.monotonic() deadline; it is set when a selection concludes that no slot
+    # is available and cleared the moment a reply task frees a proxy slot, so a
+    # freed slot is picked up on the very next tick instead of after a full rescan.
+    reply_selection_state: Dict[str, float] = {"capacity_cooldown_until": 0.0}
     attempt_reason_counts: Dict[str, int] = {}
     reply_selection_capacity_backoff_seconds = 1.5
     try:
@@ -2943,7 +2951,7 @@ async def execute_engagement_only_replies_via_full_flow(
             "Task %s: engagement_only reply summary submitted=%s/%s "
             "submitted_unconfirmed=%s failed=%s remaining=%s "
             "close_reasons=%s selection_deferred=%s capacity_skips=%s "
-            "least_used_fallbacks=%s",
+            "least_used_fallbacks=%s selection_scan_skipped=%s",
             task_id,
             submitted,
             expected,
@@ -2954,10 +2962,23 @@ async def execute_engagement_only_replies_via_full_flow(
             scheduler_stats.get("selection_deferred", 0),
             scheduler_stats.get("capacity_skips", 0),
             scheduler_stats.get("least_used_fallbacks", 0),
+            scheduler_stats.get("selection_scan_skipped", 0),
         )
 
     async def _select_reply_account(attempt_db: Session) -> Tuple[Optional[Account], Optional[str]]:
         async with reply_selection_lock:
+            # P0 scheduler: while a recent selection already concluded that every
+            # active proxy is at capacity, short-circuit instead of re-scanning
+            # thousands of candidate rows on each backoff tick. The cooldown is
+            # cleared the instant a reply task frees a proxy slot, so this never
+            # delays picking up a genuinely freed slot beyond the freeing event.
+            if (
+                dynamic_worker_pool_enabled
+                and active_reply_proxy_counts
+                and time.monotonic() < reply_selection_state["capacity_cooldown_until"]
+            ):
+                scheduler_stats["selection_scan_skipped"] += 1
+                return None, temporary_reply_selection_error
             strict_degraded_categories = {"captcha", "page_blocked"}
             capacity_blocked_proxies: set[str] = set()
             for _ in range(max(1, parallel_browser_capacity + 2)):
@@ -3029,6 +3050,9 @@ async def execute_engagement_only_replies_via_full_flow(
                             list(capacity_blocked_proxies),
                         )
                         scheduler_stats["selection_deferred"] += 1
+                        reply_selection_state["capacity_cooldown_until"] = (
+                            time.monotonic() + reply_selection_capacity_backoff_seconds
+                        )
                         return None, temporary_reply_selection_error
                     return None, None
                 proxy_value = _account_proxy_value(candidate)
@@ -3059,6 +3083,9 @@ async def execute_engagement_only_replies_via_full_flow(
                 or capacity_blocked_proxies
             ):
                 scheduler_stats["selection_deferred"] += 1
+                reply_selection_state["capacity_cooldown_until"] = (
+                    time.monotonic() + reply_selection_capacity_backoff_seconds
+                )
                 return None, temporary_reply_selection_error
             return None, None
 
@@ -3281,6 +3308,10 @@ async def execute_engagement_only_replies_via_full_flow(
                 if dynamic_worker_pool_enabled:
                     async with reply_selection_lock:
                         _dec_proxy_count(active_reply_proxy_counts, attempt_info.get("proxy_value"))
+                        # A proxy slot just freed: clear the capacity cooldown so the
+                        # next selection tick runs a real scan and can claim it
+                        # immediately instead of waiting out the backoff window.
+                        reply_selection_state["capacity_cooldown_until"] = 0.0
 
         outcomes = list(attempt_result.replies or [])
         attempt_info["outcomes"] = outcomes

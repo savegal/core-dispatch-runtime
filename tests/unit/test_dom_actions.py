@@ -1259,6 +1259,9 @@ def test_reply_input_finder_requires_live_parent_anchor_scope():
     assert "selected.score < 8000" in script
     assert "parent_anchor_not_found" in script
     assert "data-smart-reply-anchor-token" in script
+    assert "editor.setAttribute('data-smart-id', 'comment-input')" not in script
+    assert "editor.removeAttribute('data-smart-id')" in script
+    assert "editor.removeAttribute('data-smart-main-input')" in script
 
 
 @pytest.mark.unit
@@ -1292,6 +1295,12 @@ def test_atomic_set_comment_text_js_preserves_reply_scoping():
     # The embedded reply finder keeps its anti "reply-as-main" guard reasons.
     assert "reply_input_not_scoped_to_parent" in script
     assert "parent_anchor_not_found" in script
+    assert "real.removeAttribute('data-smart-id')" in script
+    assert "real.removeAttribute('data-smart-main-input')" in script
+    assert script.index("real.removeAttribute('data-smart-id')") < script.index(
+        "real.setAttribute('data-smart-id', 'comment-input')"
+    )
+    assert "real.setAttribute('data-smart-main-input', '1')" in script
     # globalPick is only reachable in the non-reply branch (after replyProbe).
     assert "el = globalPick();" in script
     assert script.index("const replyProbe =") < script.index("el = globalPick();")
@@ -1312,6 +1321,38 @@ def test_comment_typing_verification_rejects_partial_and_fake_dom_text():
     assert "document.execCommand('insertText'" in source
     assert 'page.keyboard.press("Tab")' not in source
     assert 'page.keyboard.press("Shift+Tab")' not in source
+
+
+@pytest.mark.unit
+def test_main_comment_input_paths_prefer_main_marker():
+    wait_source = inspect.getsource(dom_actions.wait_for_post_button_enabled)
+    typing_source = inspect.getsource(dom_actions.type_into_comment)
+
+    assert "data-smart-main-input" in dom_actions._JS_FIND_COMMENT_INPUT
+    assert "data-smart-main-input" in dom_actions._JS_COMMENT_INPUT_TEXT_MATCH
+    assert "document.querySelector('[data-smart-main-input=\"1\"]')" in wait_source
+    assert "'[data-smart-main-input=\"1\"]'" in typing_source
+
+
+@pytest.mark.unit
+def test_raw_dom_comment_insert_does_not_dispatch_second_insert_text_event():
+    script = dom_actions._JS_ATOMIC_SET_COMMENT_TEXT
+    atomic_after_exec = script.split(
+        "document.execCommand('insertText', false, insertText);",
+        1,
+    )[1].split("// Leave caret", 1)[0]
+
+    assert "fireInputEvents(real, insertText)" not in atomic_after_exec
+    assert "fireCommitEvents(real)" in atomic_after_exec
+
+    source = inspect.getsource(dom_actions.type_into_comment)
+    fallback_after_exec = source.split(
+        "document.execCommand('insertText', false, expected);",
+        1,
+    )[1].split("const range = document.createRange();", 1)[0]
+
+    assert "fireInputEvents(real, expected)" not in fallback_after_exec
+    assert "fireCommitEvents(real)" in fallback_after_exec
 
 
 @pytest.mark.unit
@@ -1552,7 +1593,13 @@ async def test_type_into_comment_main_uses_atomic_prefix_tail_after_keyboard_mis
     monkeypatch.setattr(dom_actions, "suppress_keyboard_shortcuts_overlay", _fake_suppress)
     monkeypatch.setattr(dom_actions.asyncio, "sleep", _fake_sleep)
 
-    result = await dom_actions.type_into_comment(_Page(), object(), "hello", fast=True)
+    result = await dom_actions.type_into_comment(
+        _Page(),
+        object(),
+        "hello",
+        fast=True,
+        allow_main_dom_fallback=True,
+    )
 
     assert result["ok"] is True
     assert result["strategy"] == "atomic-prefix-trusted-tail"
@@ -1675,13 +1722,82 @@ async def test_type_into_comment_main_uses_contenteditable_js_fallback_after_key
     monkeypatch.setattr(dom_actions, "suppress_keyboard_shortcuts_overlay", _fake_suppress)
     monkeypatch.setattr(dom_actions.asyncio, "sleep", _fake_sleep)
 
-    result = await dom_actions.type_into_comment(_Page(), _Element(), "hello", fast=True)
+    result = await dom_actions.type_into_comment(
+        _Page(),
+        _Element(),
+        "hello",
+        fast=True,
+        allow_main_dom_fallback=True,
+    )
 
     assert result["ok"] is True
     assert result["strategy"].startswith("js-fallback:")
     assert keyboard_calls["insert_text"] == ["hello"]
     assert keyboard_calls["type"] == []
     assert any("const pickEditor" in call and "document.execCommand('insertText'" in call for call in evaluate_calls)
+
+
+@pytest.mark.unit
+@pytest.mark.asyncio
+async def test_type_into_comment_main_skips_raw_dom_fallback_by_default(monkeypatch):
+    keyboard_calls = {"insert_text": [], "press": [], "type": []}
+    evaluate_calls = []
+
+    class _Keyboard:
+        async def insert_text(self, text):
+            keyboard_calls["insert_text"].append(text)
+
+        async def press(self, key):
+            keyboard_calls["press"].append(key)
+
+        async def type(self, text, **_kwargs):
+            keyboard_calls["type"].append(text)
+
+    class _Element:
+        async def evaluate(self, script, *args):
+            if "textContent || el.innerText" in str(script):
+                return ""
+            return None
+
+        async def click(self, **_kwargs):
+            return None
+
+    class _Page:
+        keyboard = _Keyboard()
+
+        async def query_selector(self, _selector):
+            return None
+
+        async def evaluate(self, script, *args):
+            script_text = str(script)
+            evaluate_calls.append(script_text)
+            if "document.activeElement" in script_text:
+                return True
+            if "const pickEditor" in script_text and "document.execCommand('insertText'" in script_text:
+                raise AssertionError("raw JS fallback must stay disabled for main publish by default")
+            return {"ok": False, "text": ""}
+
+    async def _fake_atomic(_page, text, **kwargs):
+        return {"ok": False, "reason": "no_editor", "text": "", "scoped": "global"}
+
+    async def _fake_suppress(_page):
+        return 0
+
+    async def _fake_sleep(_seconds):
+        return None
+
+    monkeypatch.setattr(dom_actions, "atomic_set_comment_text", _fake_atomic)
+    monkeypatch.setattr(dom_actions, "suppress_keyboard_shortcuts_overlay", _fake_suppress)
+    monkeypatch.setattr(dom_actions.asyncio, "sleep", _fake_sleep)
+
+    result = await dom_actions.type_into_comment(_Page(), _Element(), "hello", fast=True)
+
+    assert result["ok"] is False
+    assert result["reason"] == "main_raw_dom_fallback_disabled"
+    assert result["strategy"] in {"keyboard-type", "keyboard-focus"}
+    assert keyboard_calls["insert_text"] == ["hello"]
+    assert keyboard_calls["type"] == []
+    assert not any("const pickEditor" in call and "document.execCommand('insertText'" in call for call in evaluate_calls)
 
 
 @pytest.mark.unit

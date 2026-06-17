@@ -219,6 +219,7 @@ _JS_FIND_COMMENT_INPUT = r"""
         const panelInput = pickEditable(panelInputRaw);
         if (safeCommentCandidate(panelInput, panelInputRaw) && visibleEnoughOrParent(panelInput, panelInputRaw)) {
             panelInput.setAttribute('data-smart-id', 'comment-input');
+            panelInput.setAttribute('data-smart-main-input', '1');
             return { found: true, strategy: 'side-panel' };
         }
     }
@@ -230,6 +231,7 @@ _JS_FIND_COMMENT_INPUT = r"""
     // Check wrapper visibility (dataE2eRaw) because inner contenteditable may have h=0 when unfocused
     if (safeCommentCandidate(dataE2e, dataE2eRaw) && visibleEnoughOrParent(dataE2e, dataE2eRaw)) {
         dataE2e.setAttribute('data-smart-id', 'comment-input');
+        dataE2e.setAttribute('data-smart-main-input', '1');
         return { found: true, strategy: dataE2e === dataE2eRaw ? 'data-e2e' : 'data-e2e-inner-editable' };
     }
 
@@ -243,6 +245,7 @@ _JS_FIND_COMMENT_INPUT = r"""
         if (combined.match(/comment|комментарий|коммент|say something|add a comment|написать/)) {
             if (safeCommentCandidate(el, el.parentElement) && visibleEnoughOrParent(el, el.parentElement)) {
                 el.setAttribute('data-smart-id', 'comment-input');
+                el.setAttribute('data-smart-main-input', '1');
                 return { found: true, strategy: 'placeholder-text' };
             }
         }
@@ -256,6 +259,7 @@ _JS_FIND_COMMENT_INPUT = r"""
         const inner = pickEditable(rawInner);
         if (safeCommentCandidate(inner, rawInner) && visibleEnoughOrParent(inner, rawInner)) {
             inner.setAttribute('data-smart-id', 'comment-input');
+            inner.setAttribute('data-smart-main-input', '1');
             return { found: true, strategy: 'inside-comment-section' };
         }
     }
@@ -278,6 +282,7 @@ _JS_FIND_COMMENT_INPUT = r"""
         if (st.display === 'none' || st.visibility === 'hidden') continue;
         if (r.width > 100 && r.height > 15 && r.top > window.innerHeight * 0.35) {
             el.setAttribute('data-smart-id', 'comment-input');
+            el.setAttribute('data-smart-main-input', '1');
             return { found: true, strategy: 'position-heuristic' };
         }
     }
@@ -297,6 +302,7 @@ _JS_FIND_COMMENT_INPUT = r"""
         if (st.display === 'none' || st.visibility === 'hidden') continue;
         if (r.width > 50 && r.height > 5 && r.top > window.innerHeight * 0.3) {
             el.setAttribute('data-smart-id', 'comment-input');
+            el.setAttribute('data-smart-main-input', '1');
             return { found: true, strategy: 'any-visible-editable' };
         }
     }
@@ -310,6 +316,7 @@ _JS_FIND_COMMENT_INPUT = r"""
         const r = el.getBoundingClientRect();
         if (r.width > 50 && r.height > 5) {
             el.setAttribute('data-smart-id', 'comment-input');
+            el.setAttribute('data-smart-main-input', '1');
             return { found: true, strategy: 'any-editable-last-resort' };
         }
     }
@@ -329,7 +336,7 @@ _JS_FIND_COMMENT_INPUT_HANDLE = (
     "    }\n"
     "    try { window.__smartCommentInputProbeState = result || null; } catch (_) {}\n"
     "    if (!result || !result.found) return null;\n"
-    "    const marked = document.querySelector('[data-smart-id=\"comment-input\"]');\n"
+    "    const marked = document.querySelector('[data-smart-main-input=\"1\"]') || document.querySelector('[data-smart-id=\"comment-input\"]');\n"
     "    if (!marked) {\n"
     "        try { window.__smartCommentInputProbeState = { ...result, found: false, reason: 'marked_input_missing_after_probe' }; } catch (_) {}\n"
     "        return null;\n"
@@ -484,6 +491,7 @@ _JS_RESOLVE_COMMENT_INPUT_HANDLE = r"""
     const addCandidates = (selector) => {
         try { rawCandidates.push(...document.querySelectorAll(selector)); } catch (_) {}
     };
+    addCandidates('[data-smart-main-input="1"]');
     addCandidates('[data-smart-id="comment-input"]');
     addCandidates('[data-e2e="comment-input"], [data-e2e*="comment-input"], [data-e2e*="CommentInput"]');
     addCandidates('[data-e2e*="comment" i] div[contenteditable="true"], [data-e2e*="comment" i] [contenteditable="true"], [data-e2e*="comment" i] textarea, [data-e2e*="comment" i] [role="textbox"]');
@@ -515,7 +523,7 @@ _JS_RESOLVE_COMMENT_INPUT_HANDLE = r"""
         const lowerScreen = rect.top >= window.innerHeight * 0.25;
 
         let score = 0;
-        if (labels.includes('data-smart-id comment-input') || rawLabel.includes('comment-input')) score += 9000;
+        if (labels.includes('data-smart-main-input') || labels.includes('data-smart-id comment-input') || rawLabel.includes('comment-input')) score += 9000;
         if (rawLabel.includes('data-e2e comment-input') || rawLabel.includes('comment-input')) score += 7000;
         if (editorLabel.includes('comment') || parentLabel.includes('comment')) score += 3500;
         if (placeholderLike) score += 2500;
@@ -544,6 +552,7 @@ _JS_RESOLVE_COMMENT_INPUT_HANDLE = r"""
     }
 
     try { selected.editor.setAttribute('data-smart-id', 'comment-input'); } catch (_) {}
+    try { selected.editor.setAttribute('data-smart-main-input', '1'); } catch (_) {}
     try { selected.editor.setAttribute('data-smart-input-resolver', 'comment'); } catch (_) {}
     try { selected.editor.setAttribute('data-smart-input-resolver-strategy', selected.strategy); } catch (_) {}
     try { selected.editor.setAttribute('data-smart-input-resolver-score', String(selected.score || 0)); } catch (_) {}
@@ -676,6 +685,12 @@ _JS_FIND_REPLY_INPUT = r"""
             el.removeAttribute('data-smart-reply-input');
             el.removeAttribute('data-smart-reply-composer');
             el.removeAttribute('data-smart-reply-anchor-token');
+            if (el.getAttribute && el.getAttribute('data-smart-id') === 'comment-input') {
+                el.removeAttribute('data-smart-id');
+            }
+            if (el.getAttribute && el.getAttribute('data-smart-main-input') === '1') {
+                el.removeAttribute('data-smart-main-input');
+            }
         });
 
     const targetAnchorToken = String(parentAnchorToken || '').trim();
@@ -795,7 +810,14 @@ _JS_FIND_REPLY_INPUT = r"""
         return editor.parentElement || editor;
     })();
     try { editor.setAttribute('data-smart-reply-input', '1'); } catch (_) {}
-    try { editor.setAttribute('data-smart-id', 'comment-input'); } catch (_) {}
+    try {
+        if (editor.getAttribute && editor.getAttribute('data-smart-id') === 'comment-input') {
+            editor.removeAttribute('data-smart-id');
+        }
+        if (editor.getAttribute && editor.getAttribute('data-smart-main-input') === '1') {
+            editor.removeAttribute('data-smart-main-input');
+        }
+    } catch (_) {}
     try { composer.setAttribute('data-smart-reply-composer', '1'); } catch (_) {}
     if (targetAnchorToken) {
         try { editor.setAttribute('data-smart-reply-anchor-token', targetAnchorToken); } catch (_) {}
@@ -833,7 +855,7 @@ _JS_FIND_REPLY_INPUT_HANDLE = (
 
 # Atomic "set comment text" primitive. ONE page.evaluate round-trip:
 #   pick editor (global composer OR reply-scoped editor) -> focus -> clear ->
-#   insert via execCommand('insertText') with beforeinput/input fallback ->
+#   insert via execCommand('insertText') + non-mutating input/change notification ->
 #   place caret at end -> verify the text actually landed (reject placeholder
 #   leak) -> tag editor with data-smart-id="comment-input" -> return
 #   {ok, text, reason, placeholder_leak, scoped}.
@@ -889,6 +911,16 @@ _JS_ATOMIC_SET_COMMENT_TEXT = r"""
             new Event('change', {bubbles:true, cancelable:true}),
             new KeyboardEvent('keydown', {bubbles:true, cancelable:true, key:data.slice(-1) || 'a'}),
             new KeyboardEvent('keyup', {bubbles:true, cancelable:true, key:data.slice(-1) || 'a'})
+        ];
+        for (const ev of evs) {
+            try { el.dispatchEvent(ev); } catch (_) {}
+        }
+    };
+    const fireCommitEvents = (el) => {
+        const evs = [
+            new Event('input', {bubbles:true, cancelable:true}),
+            new Event('change', {bubbles:true, cancelable:true}),
+            new KeyboardEvent('keyup', {bubbles:true, cancelable:true, key:'Unidentified'})
         ];
         for (const ev of evs) {
             try { el.dispatchEvent(ev); } catch (_) {}
@@ -1040,7 +1072,20 @@ _JS_ATOMIC_SET_COMMENT_TEXT = r"""
         ? el
         : (el.querySelector && el.querySelector('div[contenteditable="true"], [contenteditable="true"], [role="textbox"], textarea, input')) || el;
 
-    try { real.setAttribute('data-smart-id', 'comment-input'); } catch (_) {}
+    if (replyScoped) {
+        try { real.setAttribute('data-smart-reply-input', '1'); } catch (_) {}
+        try {
+            if (real.getAttribute && real.getAttribute('data-smart-id') === 'comment-input') {
+                real.removeAttribute('data-smart-id');
+            }
+            if (real.getAttribute && real.getAttribute('data-smart-main-input') === '1') {
+                real.removeAttribute('data-smart-main-input');
+            }
+        } catch (_) {}
+    } else {
+        try { real.setAttribute('data-smart-id', 'comment-input'); } catch (_) {}
+        try { real.setAttribute('data-smart-main-input', '1'); } catch (_) {}
+    }
 
     if (focusOnly) {
         try {
@@ -1096,8 +1141,12 @@ _JS_ATOMIC_SET_COMMENT_TEXT = r"""
 
         let execOk = false;
         try { execOk = document.execCommand('insertText', false, insertText); } catch (_) {}
-
-        fireInputEvents(real, insertText);
+        if (!execOk) {
+            // Do not synthesize a second DOM insertion here. A fake DOM write can
+            // pass read-back while TikTok's editor state still differs; let the
+            // strict verification below fail instead.
+        }
+        fireCommitEvents(real);
 
         // Leave caret at the end so a trusted trailing keystroke (if any) appends.
         try {
@@ -6146,7 +6195,8 @@ async def wait_for_post_button_enabled(
                     const inputWrapper = replyScoped
                         ? document.querySelector('[data-smart-reply-input="1"]')
                         : (
-                            document.querySelector('[data-smart-id="comment-input"]') ||
+                            document.querySelector('[data-smart-main-input="1"]') ||
+                            document.querySelector('[data-smart-id="comment-input"]:not([data-smart-reply-input="1"]):not([data-smart-reply-anchor-token])') ||
                             document.querySelector('[data-e2e="comment-input"]')
                         );
                     const inputEditor = resolveInnerEditor(inputWrapper);
@@ -6324,7 +6374,31 @@ _JS_COMMENT_INPUT_TEXT_MATCH = r"""
         ];
         return parts.join(' ').toLowerCase();
     };
-    const isCommentOrReplyScoped = (el) => {
+    const isReplyScoped = (el) => {
+        if (!el) return false;
+        if (el.getAttribute && (
+            el.getAttribute('data-smart-reply-input') ||
+            el.getAttribute('data-smart-reply-composer') ||
+            el.getAttribute('data-smart-reply-anchor-token')
+        )) return true;
+        let cur = el;
+        for (let depth = 0; depth < 8 && cur && cur !== document.body; depth++, cur = cur.parentElement) {
+            const label = labelOf(cur);
+            if (
+                label.includes('reply') ||
+                label.includes('reply-input') ||
+                label.includes('replycomposer') ||
+                label.includes('comment-reply') ||
+                (cur.getAttribute && (
+                    cur.getAttribute('data-smart-reply-input') ||
+                    cur.getAttribute('data-smart-reply-composer') ||
+                    cur.getAttribute('data-smart-reply-anchor-token')
+                ))
+            ) return true;
+        }
+        return false;
+    };
+    const isTopLevelCommentScoped = (el) => {
         let cur = el;
         for (let depth = 0; depth < 8 && cur && cur !== document.body; depth++, cur = cur.parentElement) {
             const label = labelOf(cur);
@@ -6336,27 +6410,29 @@ _JS_COMMENT_INPUT_TEXT_MATCH = r"""
                 label.includes('login') ||
                 label.includes('password')
             ) return false;
-            if (label.includes('comment') || label.includes('reply')) return true;
+            if (label.includes('reply')) return false;
+            if (label.includes('comment')) return true;
         }
         return false;
     };
     const addEditor = (set, raw) => {
         if (!raw) return;
+        if (isReplyScoped(raw)) return;
         if (isRealEditor(raw)) {
-            set.add(raw);
+            if (!isReplyScoped(raw)) set.add(raw);
             return;
         }
         if (!raw.querySelector) return;
         const inner = raw.querySelector(
             'div[contenteditable="true"], [contenteditable="true"], textarea, input, [role="textbox"]'
         );
-        if (isRealEditor(inner)) set.add(inner);
+        if (isRealEditor(inner) && !isReplyScoped(inner)) set.add(inner);
     };
 
     const editors = new Set();
     const wrappers = [
+        ...document.querySelectorAll('[data-smart-main-input="1"]'),
         ...document.querySelectorAll('[data-smart-id="comment-input"]'),
-        ...document.querySelectorAll('[data-smart-reply-input]'),
         ...document.querySelectorAll('[data-e2e="comment-input"]'),
         ...document.querySelectorAll('[data-e2e*="comment-input"]'),
         ...document.querySelectorAll('[data-e2e*="CommentInput"]'),
@@ -6365,7 +6441,7 @@ _JS_COMMENT_INPUT_TEXT_MATCH = r"""
     for (const el of document.querySelectorAll(
         'div[contenteditable="true"], [contenteditable="true"], [role="textbox"], textarea, input'
     )) {
-        if (isRealEditor(el) && isCommentOrReplyScoped(el)) editors.add(el);
+        if (isRealEditor(el) && !isReplyScoped(el) && isTopLevelCommentScoped(el)) editors.add(el);
     }
 
     for (const el of editors) {
@@ -6388,7 +6464,7 @@ _JS_COMMENT_INPUT_TEXT_MATCH = r"""
 
 
 async def comment_input_contains_expected_text(page: Page, text: str) -> tuple[bool, str]:
-    """Return whether the real comment/reply editor already contains text."""
+    """Return whether the top-level main comment editor contains expected text."""
     try:
         result = await page.evaluate(_JS_COMMENT_INPUT_TEXT_MATCH, text)
         if isinstance(result, dict):
@@ -6407,6 +6483,7 @@ async def type_into_comment(
     fast: bool = False,
     reply_scoped: bool = False,
     anchor_token: Optional[str] = None,
+    allow_main_dom_fallback: bool = False,
 ) -> Dict[str, Any]:
     """
     Type text into TikTok's comment input.
@@ -6414,9 +6491,9 @@ async def type_into_comment(
     Final robust strategy:
     0) PRIMARY: atomically locate/focus the real editor, then insert the full
        text with trusted keyboard input and verify it landed in the scoped editor.
-    1) For main comments only, if trusted full insertion misses, use a
-       latency-friendly atomic prefix + trusted tail fallback.
-    2) For main comments only, use a last-resort exact DOM insert.
+    1) For main comments, keep production publishing on trusted keyboard/CDP
+       input only. Raw DOM fallbacks are opt-in diagnostics because TikTok can
+       keep React/Lexical state that differs from visible textContent.
     3) Resolve the real editable node (data-e2e can be just a wrapper).
     4) Try human-like focus + keyboard typing.
     5) Verify globally, not only on the original ElementHandle, because TikTok may re-render input.
@@ -6490,7 +6567,20 @@ async def type_into_comment(
             if element is not None:
                 try:
                     await element.evaluate(
-                        "(el, anchorToken) => { try { el.setAttribute('data-smart-reply-input', '1'); el.setAttribute('data-smart-id', 'comment-input'); if (anchorToken) el.setAttribute('data-smart-reply-anchor-token', anchorToken); } catch (_) {} }",
+                        """
+                        (el, anchorToken) => {
+                            try {
+                                el.setAttribute('data-smart-reply-input', '1');
+                                if (el.getAttribute && el.getAttribute('data-smart-id') === 'comment-input') {
+                                    el.removeAttribute('data-smart-id');
+                                }
+                                if (el.getAttribute && el.getAttribute('data-smart-main-input') === '1') {
+                                    el.removeAttribute('data-smart-main-input');
+                                }
+                                if (anchorToken) el.setAttribute('data-smart-reply-anchor-token', anchorToken);
+                            } catch (_) {}
+                        }
+                        """,
                         anchor_token or "",
                     )
                 except Exception:
@@ -6506,7 +6596,8 @@ async def type_into_comment(
 
         # Comment-specific selectors FIRST to avoid picking an unrelated input (e.g. search box)
         selectors = [
-            '[data-smart-id="comment-input"]',
+            '[data-smart-main-input="1"]',
+            '[data-smart-id="comment-input"]:not([data-smart-reply-input="1"]):not([data-smart-reply-anchor-token])',
             '[data-e2e="comment-input"]',
             '[data-e2e*="comment-input"]',
             '[data-e2e*="CommentInput"]',
@@ -6532,6 +6623,32 @@ async def type_into_comment(
                     pass
 
                 real = inner or candidate
+
+                is_reply_scoped_candidate = await real.evaluate(
+                    r"""
+                    el => {
+                        const labelOf = (node) => [
+                            node && node.getAttribute && (node.getAttribute('data-e2e') || ''),
+                            node && node.getAttribute && (node.getAttribute('aria-label') || ''),
+                            node && String(node.className || ''),
+                            node && (node.id || ''),
+                            node && (node.tagName || ''),
+                        ].join(' ').toLowerCase();
+                        for (let cur = el, depth = 0; cur && cur !== document.body && depth < 8; cur = cur.parentElement, depth++) {
+                            if (cur.getAttribute && (
+                                cur.getAttribute('data-smart-reply-input') ||
+                                cur.getAttribute('data-smart-reply-composer') ||
+                                cur.getAttribute('data-smart-reply-anchor-token')
+                            )) return true;
+                            const label = labelOf(cur);
+                            if (label.includes('reply')) return true;
+                        }
+                        return false;
+                    }
+                    """
+                )
+                if is_reply_scoped_candidate:
+                    continue
 
                 # `real` = inner if inner exists, else candidate. We check that
                 # it's actually editable (real editor element, not wrapper).
@@ -6566,6 +6683,10 @@ async def type_into_comment(
                         await real.evaluate("el => el.setAttribute('data-smart-id', 'comment-input')")
                     except Exception:
                         pass
+                    try:
+                        await real.evaluate("el => el.setAttribute('data-smart-main-input', '1')")
+                    except Exception:
+                        pass
                     return real
 
                 # Inner is a real editor but currently has h=0 (TikTok unfocused
@@ -6596,6 +6717,10 @@ async def type_into_comment(
                     if visible_after:
                         try:
                             await real.evaluate("el => el.setAttribute('data-smart-id', 'comment-input')")
+                        except Exception:
+                            pass
+                        try:
+                            await real.evaluate("el => el.setAttribute('data-smart-main-input', '1')")
                         except Exception:
                             pass
                         logger.debug("[DOM] Inner editable activated via wrapper focus: %s", sel)
@@ -6786,7 +6911,7 @@ async def type_into_comment(
                     }
                     const scopedEditor = () => {
                         const wrapper = document.querySelector(
-                            '[data-smart-id="comment-input"]:not([data-smart-reply-input="1"]), [data-e2e="comment-input"], [data-e2e*="comment-input"], [data-e2e*="CommentInput"]'
+                            '[data-smart-main-input="1"], [data-smart-id="comment-input"]:not([data-smart-reply-input="1"]), [data-e2e="comment-input"], [data-e2e*="comment-input"], [data-e2e*="CommentInput"]'
                         );
                         if (wrapper) {
                             return wrapper.querySelector(
@@ -6936,6 +7061,16 @@ async def type_into_comment(
                             try { el.dispatchEvent(ev); } catch (_) {}
                         }
                     };
+                    const fireCommitEvents = (el) => {
+                        const evs = [
+                            new Event('input', {bubbles:true, cancelable:true}),
+                            new Event('change', {bubbles:true, cancelable:true}),
+                            new KeyboardEvent('keyup', {bubbles:true, cancelable:true, key:'Unidentified'})
+                        ];
+                        for (const ev of evs) {
+                            try { el.dispatchEvent(ev); } catch (_) {}
+                        }
+                    };
 
                     const setNativeValue = (el, val) => {
                         const proto =
@@ -6984,7 +7119,7 @@ async def type_into_comment(
                                 sel.removeAllRanges();
                             }
                             real.textContent = '';
-                            fireInputEvents(real, '');
+                            fireCommitEvents(real);
                         } catch (_) {}
 
                         try {
@@ -6998,7 +7133,12 @@ async def type_into_comment(
 
                         let execOk = false;
                         try { execOk = document.execCommand('insertText', false, expected); } catch (_) {}
-                        fireInputEvents(real, expected);
+                        if (!execOk) {
+                            // Do not synthesize a second DOM insertion here. A fake DOM write can
+                            // pass read-back while TikTok's editor state still differs; let the
+                            // strict verification below fail instead.
+                        }
+                        fireCommitEvents(real);
 
                         try {
                             const range = document.createRange();
@@ -7367,11 +7507,11 @@ async def type_into_comment(
         if await _atomic_primary():
             return _typing_result(True)
 
-    if not _deadline_exceeded():
+    if not _deadline_exceeded() and not reply_scoped and allow_main_dom_fallback:
         if await _atomic_prefix_then_trusted_tail():
             return _typing_result(True)
 
-    if not _deadline_exceeded():
+    if not _deadline_exceeded() and not reply_scoped and allow_main_dom_fallback:
         if await _atomic_full_insert_fallback():
             return _typing_result(True)
 
@@ -7488,14 +7628,23 @@ async def type_into_comment(
             logger.warning("[DOM] keyboard typing path failed: %s", str(exc)[:120])
 
     if focused:
-        logger.warning(
-            "[DOM] Keyboard typing did not verify. placeholder='%s'. Trying JS fallback.",
-            placeholder_text[:30],
-        )
+        if reply_scoped or allow_main_dom_fallback:
+            logger.warning(
+                "[DOM] Keyboard typing did not verify. placeholder='%s'. Trying JS fallback.",
+                placeholder_text[:30],
+            )
+        else:
+            logger.warning(
+                "[DOM] Main trusted typing did not verify. placeholder='%s'. Skipping raw JS fallback.",
+                placeholder_text[:30],
+            )
     else:
         if last_strategy == "not_started" or last_strategy == "keyboard-focus":
             _record_typing_state("focus_not_confirmed", "keyboard-focus", focused=False)
-        logger.warning("[DOM] Could not focus comment input normally; trying JS input fallback")
+        if reply_scoped or allow_main_dom_fallback:
+            logger.warning("[DOM] Could not focus comment input normally; trying JS input fallback")
+        else:
+            logger.warning("[DOM] Could not focus main comment input normally; skipping raw JS fallback")
 
     if _deadline_exceeded():
         _record_typing_state("deadline_exceeded_before_fallback", last_strategy)
@@ -7507,13 +7656,23 @@ async def type_into_comment(
             _record_typing_state("scoped_reply_unverified", last_strategy, found_text=last_text, focused=focused)
         return _typing_result(False)
 
-    # MAIN comment fallback: insert via the on-page execCommand path. This is the
-    # workhorse that actually lands text into TikTok's DraftEditor when the
-    # keyboard/atomic paths don't (the old, reliable behaviour). It can only
-    # RETURN success when verification confirms the editor holds EXACTLY the
-    # expected text, so it cannot post stacked/garbage text; the
-    # accumulation-across-variants bug is prevented upstream (no dirty composer
-    # reuse + per-variant confirmation), not by crippling input here.
+    if not allow_main_dom_fallback:
+        ok, found_text = await _scoped_text_contains_expected()
+        if ok:
+            _record_typing_state("verified", "final-global-check", found_text=found_text, focused=focused)
+            logger.info("[DOM] Text verified after final global check: '%s'", found_text[:30])
+            return _typing_result(True)
+        _record_typing_state(
+            "main_raw_dom_fallback_disabled",
+            last_strategy,
+            found_text=found_text or last_text,
+            focused=focused,
+        )
+        return _typing_result(False)
+
+    # MAIN diagnostic fallback: insert via the on-page execCommand path only
+    # when explicitly enabled. Production publish calls keep this disabled
+    # because visible textContent can be cleaner than TikTok's editor state.
     if await _js_insert_text("focus_failed_or_keyboard_unverified"):
         return _typing_result(True)
 
