@@ -3264,8 +3264,12 @@ async def execute_engagement_only_replies_via_full_flow(
                 max_attempts,
                 reply_account.id,
             )
-            author_required = bool((main_candidate.tiktok_username or "").strip())
-            allow_author_fallback = author_required and attempt_num == max_attempts
+            author_hints_present = bool((main_candidate.tiktok_username or "").strip())
+            if author_hints_present:
+                logger.info(
+                    "Task %s: engagement_only reply parent search has author hints, but will use text-first matching",
+                    task_id,
+                )
 
             try:
                 attempt_result = await asyncio.wait_for(
@@ -3279,8 +3283,8 @@ async def execute_engagement_only_replies_via_full_flow(
                         correlation_id=correlation_id,
                         fallback_main_texts=None,
                         already_replied_parent_keys=submitted_parent_keys,
-                        require_parent_author_match=author_required,
-                        allow_parent_author_fallback=allow_author_fallback,
+                        require_parent_author_match=False,
+                        allow_parent_author_fallback=False,
                     ),
                     timeout=reply_worker_attempt_timeout_seconds,
                 )

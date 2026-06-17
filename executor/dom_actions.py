@@ -680,20 +680,27 @@ _JS_FIND_POST_BUTTON = r"""
 _JS_FIND_REPLY_INPUT = r"""
 ([parentAnchorToken]) => {
     document
-        .querySelectorAll('[data-smart-reply-input], [data-smart-reply-composer], [data-smart-reply-anchor-token]')
+        .querySelectorAll('[data-smart-reply-input], [data-smart-reply-composer], [data-smart-reply-post], [data-smart-reply-anchor-token]')
         .forEach(el => {
             el.removeAttribute('data-smart-reply-input');
             el.removeAttribute('data-smart-reply-composer');
+            el.removeAttribute('data-smart-reply-post');
             el.removeAttribute('data-smart-reply-anchor-token');
+            el.removeAttribute('data-smart-reply-strategy');
+            el.removeAttribute('data-smart-reply-score');
+            el.removeAttribute('data-smart-reply-post-strategy');
+            el.removeAttribute('data-smart-reply-post-target');
             if (el.getAttribute && el.getAttribute('data-smart-id') === 'comment-input') {
                 el.removeAttribute('data-smart-id');
-            }
-            if (el.getAttribute && el.getAttribute('data-smart-main-input') === '1') {
-                el.removeAttribute('data-smart-main-input');
             }
         });
 
     const targetAnchorToken = String(parentAnchorToken || '').trim();
+    const finish = (state) => {
+        try { window.__smartReplyInputProbeState = state || null; } catch (_) {}
+        try { window.__smartReplyComposerProbeState = state || null; } catch (_) {}
+        return state;
+    };
 
     const visible = (el) => {
         if (!el || !el.getBoundingClientRect) return false;
@@ -701,7 +708,14 @@ _JS_FIND_REPLY_INPUT = r"""
         const st = getComputedStyle(el);
         return r.width > 0 && r.height > 0 && st.display !== 'none' && st.visibility !== 'hidden';
     };
-
+    const disabled = (el) => {
+        if (!el) return true;
+        const st = getComputedStyle(el);
+        return el.hasAttribute('disabled') ||
+            el.getAttribute('aria-disabled') === 'true' ||
+            el.classList.contains('disabled') ||
+            parseFloat(st.opacity || '1') < 0.45;
+    };
     const pickEditable = (root) => {
         if (!root) return null;
         if (root.matches && root.matches('textarea, input, div[contenteditable="true"], [contenteditable="true"], [role="textbox"]')) {
@@ -711,32 +725,207 @@ _JS_FIND_REPLY_INPUT = r"""
             'textarea, input, div[contenteditable="true"], [contenteditable="true"], [role="textbox"]'
         );
     };
-
     const labelOf = (el) => [
         (el && (el.innerText || el.textContent)) || '',
         el && el.getAttribute && (el.getAttribute('placeholder') || ''),
         el && el.getAttribute && (el.getAttribute('aria-label') || ''),
+        el && el.getAttribute && (el.getAttribute('title') || ''),
         el && el.getAttribute && (el.getAttribute('data-placeholder') || ''),
         el && el.getAttribute && (el.getAttribute('data-e2e') || ''),
+        el && el.getAttribute && (el.getAttribute('data-smart-id') || ''),
+        el && el.getAttribute && (el.getAttribute('data-smart-main-input') || ''),
         el && String(el.className || ''),
+        el && (el.tagName || ''),
     ].join(' ').replace(/\s+/g, ' ').trim().toLowerCase();
-
-    const wrapperRect = (editor, raw) => {
-        const editorRect = editor && editor.getBoundingClientRect ? editor.getBoundingClientRect() : null;
-        const rawRect = raw && raw.getBoundingClientRect ? raw.getBoundingClientRect() : null;
-        const parentRect = editor && editor.parentElement && editor.parentElement.getBoundingClientRect
-            ? editor.parentElement.getBoundingClientRect()
-            : null;
-        const rects = [rawRect, parentRect, editorRect].filter(Boolean);
-        return rects.sort((a, b) => (b.width * b.height) - (a.width * a.height))[0] || editorRect || rawRect;
+    const rectObj = (rect) => rect ? ({
+        top: Math.round(rect.top),
+        bottom: Math.round(rect.bottom),
+        left: Math.round(rect.left),
+        right: Math.round(rect.right),
+        width: Math.round(rect.width),
+        height: Math.round(rect.height),
+    }) : null;
+    const normalizeText = (value) => String(value || '').replace(/\s+/g, ' ').trim().toLowerCase();
+    const readText = (el) => {
+        if (!el) return '';
+        if (el.value !== undefined && el.value !== null && el.value !== '') return String(el.value || '');
+        return String(el.textContent || el.innerText || '');
+    };
+    const editorRect = (editor, raw) => {
+        const rects = [];
+        for (const node of [raw, editor && editor.parentElement, editor]) {
+            if (node && node.getBoundingClientRect) {
+                const rect = node.getBoundingClientRect();
+                if (rect && rect.width > 0 && rect.height > 0) rects.push(rect);
+            }
+        }
+        rects.sort((a, b) => (b.width * b.height) - (a.width * a.height));
+        return rects[0] || null;
+    };
+    const isSearchOrAuth = (el) => {
+        let cur = el;
+        for (let depth = 0; depth < 8 && cur && cur !== document.body && cur !== document.documentElement; depth++, cur = cur.parentElement) {
+            const label = labelOf(cur);
+            if (
+                label.includes('search') ||
+                label.includes('captcha') ||
+                label.includes('challenge') ||
+                label.includes('verification') ||
+                label.includes('login') ||
+                label.includes('sign in') ||
+                label.includes('signup') ||
+                label.includes('password')
+            ) return true;
+        }
+        return false;
+    };
+    const looksMainComposer = (editor, raw, rect) => {
+        const labels = `${labelOf(editor)} ${labelOf(raw)} ${editor && editor.parentElement ? labelOf(editor.parentElement) : ''}`;
+        const text = normalizeText(readText(editor) || readText(raw));
+        const replyLike =
+            labels.includes('add a reply') ||
+            labels.includes('reply') ||
+            labels.includes('ответ') ||
+            labels.includes('відпов');
+        const placeholderMain =
+            labels.includes('add comment') ||
+            labels.includes('add a comment') ||
+            labels.includes('leave a comment') ||
+            labels.includes('say something') ||
+            labels.includes('write a comment') ||
+            (labels.includes('comment-input') && !replyLike);
+        const hasMainMarker = Boolean(
+            (editor && editor.closest && editor.closest('[data-smart-main-input="1"]')) ||
+            (raw && raw.closest && raw.closest('[data-smart-main-input="1"]'))
+        );
+        const bottomComposer = rect && rect.top > window.innerHeight - 180;
+        return !replyLike && (hasMainMarker || placeholderMain || (bottomComposer && text.length === 0));
+    };
+    const candidateRows = () => {
+        const rows = [];
+        const selectors = [
+            '[data-smart-parent-anchor]',
+            '[data-e2e*="comment-level" i]',
+            '[data-e2e*="comment-item" i]',
+            '[data-cid]:not([data-cid^="one-column-item"])',
+            '[data-comment-id]',
+            '[class*="CommentItem" i]',
+            '[class*="DivCommentItem" i]',
+            '[class*="CommentContent" i]',
+        ];
+        for (const sel of selectors) {
+            try { rows.push(...document.querySelectorAll(sel)); } catch (_) {}
+        }
+        return rows.filter(visible);
+    };
+    const nextTopLevelRowTop = (anchor, anchorRect) => {
+        let best = null;
+        for (const row of candidateRows()) {
+            if (!row || row === anchor || anchor.contains(row) || row.contains(anchor)) continue;
+            const r = row.getBoundingClientRect();
+            if (!r || r.width < 80 || r.height < 16) continue;
+            if (r.left > anchorRect.right + 120 || r.right < anchorRect.left - 120) continue;
+            if (r.top <= anchorRect.bottom + 8) continue;
+            if (best === null || r.top < best) best = r.top;
+        }
+        return best;
+    };
+    const clickTargetFor = (raw, composerRect, inputRect, options = {}) => {
+        const allowDisabled = Boolean(options && options.allowDisabled);
+        if (!raw) return null;
+        const candidates = [
+            raw,
+            raw.closest && raw.closest('button'),
+            raw.closest && raw.closest('[role="button"]'),
+            raw.closest && raw.closest('div[tabindex="0"]'),
+            raw.parentElement,
+            raw.parentElement && raw.parentElement.parentElement,
+        ].filter(Boolean);
+        const seen = new Set();
+        for (const el of candidates) {
+            if (!el || seen.has(el) || !visible(el)) continue;
+            seen.add(el);
+            const r = el.getBoundingClientRect();
+            if (!r || r.width > 360 || r.height > 160) continue;
+            if (composerRect && (r.top < composerRect.top - 4 || r.bottom > composerRect.bottom + 4)) continue;
+            const st = getComputedStyle(el);
+            if (!allowDisabled && st.pointerEvents === 'none') continue;
+            if (!allowDisabled && disabled(el)) continue;
+            const label = labelOf(el);
+            if (label.includes('emoji') || label.includes('emoticon')) continue;
+            if (label.trim() === '@') continue;
+            if (inputRect) {
+                const verticalOverlap = r.bottom >= inputRect.top - 20 && r.top <= inputRect.bottom + 20;
+                const rightSide = r.left >= inputRect.left + Math.max(40, inputRect.width * 0.45);
+                if (!verticalOverlap && !rightSide) continue;
+            }
+            return el;
+        }
+        return null;
+    };
+    const findPostInside = (root, inputRect, options = {}) => {
+        if (!root || !visible(root)) return null;
+        const composerRect = root.getBoundingClientRect();
+        const rawButtons = [
+            ...root.querySelectorAll('[data-e2e="comment-post"], [data-e2e*="comment-post"], [data-e2e="post-comment-button"]'),
+            ...root.querySelectorAll('button, [role="button"], div[tabindex="0"]'),
+            ...root.querySelectorAll('svg')
+        ];
+        for (const raw of rawButtons) {
+            const label = labelOf(raw);
+            const rawRect = raw.getBoundingClientRect ? raw.getBoundingClientRect() : null;
+            const iconNearInput = rawRect && inputRect &&
+                rawRect.bottom >= inputRect.top - 22 &&
+                rawRect.top <= inputRect.bottom + 22 &&
+                rawRect.left >= inputRect.left + Math.max(45, inputRect.width * 0.45);
+            const looksPost =
+                label.includes('comment-post') ||
+                label.includes('post') ||
+                label.includes('send') ||
+                label.includes('submit') ||
+                label.includes('\u043e\u043f\u0443\u0431\u043b') ||
+                label.includes('\u043e\u0442\u043f\u0440\u0430\u0432') ||
+                iconNearInput;
+            if (!looksPost) continue;
+            const target = clickTargetFor(raw, composerRect, inputRect, options);
+            if (target) return target;
+        }
+        return null;
+    };
+    const expandComposer = (editor, raw, anchorRect, bottomLimit) => {
+        const inputRect = editorRect(editor, raw);
+        let cur = editor;
+        for (let depth = 0; cur && cur !== document.body && cur !== document.documentElement && depth < 10; depth++, cur = cur.parentElement) {
+            if (!visible(cur)) continue;
+            const r = cur.getBoundingClientRect();
+            if (!r || r.width < 80 || r.height < 20) continue;
+            if (r.width > Math.max(760, window.innerWidth * 0.42)) continue;
+            if (r.height > Math.max(280, window.innerHeight * 0.36)) continue;
+            if (r.top < anchorRect.top - 60) continue;
+            if (r.bottom > bottomLimit + 170) continue;
+            const post = findPostInside(cur, inputRect, {allowDisabled: true});
+            if (post) return { composer: cur, post };
+        }
+        return null;
     };
 
-    const anchor = targetAnchorToken
-        ? [...document.querySelectorAll('[data-smart-parent-anchor]')]
-            .find(el => (el.getAttribute('data-smart-parent-anchor') || '') === targetAnchorToken)
-        : null;
-    const anchorMissing = Boolean(targetAnchorToken && !anchor);
-    const anchorRect = anchor && anchor.getBoundingClientRect ? anchor.getBoundingClientRect() : null;
+    if (!targetAnchorToken) {
+        return finish({ found: false, reason: 'parent_anchor_token_missing' });
+    }
+    const anchor = [...document.querySelectorAll('[data-smart-parent-anchor]')]
+        .find(el => (el.getAttribute('data-smart-parent-anchor') || '') === targetAnchorToken);
+    if (!anchor || !visible(anchor)) {
+        return finish({
+            found: false,
+            reason: anchor ? 'parent_anchor_not_visible' : 'parent_anchor_not_found',
+            anchorToken: targetAnchorToken,
+        });
+    }
+    const anchorRect = anchor.getBoundingClientRect();
+    const nextRowTop = nextTopLevelRowTop(anchor, anchorRect);
+    const bottomLimit = nextRowTop !== null
+        ? Math.max(anchorRect.bottom + 80, nextRowTop - 4)
+        : Math.min(window.innerHeight - 16, anchorRect.bottom + 430);
 
     const rawCandidates = [
         ...document.querySelectorAll('[data-e2e*="reply" i] [contenteditable="true"], [data-e2e*="reply" i] textarea, [data-e2e*="reply" i] [role="textbox"]'),
@@ -746,69 +935,91 @@ _JS_FIND_REPLY_INPUT = r"""
 
     const seen = new Set();
     const candidates = [];
+    const rejected = [];
     for (const raw of rawCandidates) {
         const editor = pickEditable(raw);
         if (!editor || seen.has(editor)) continue;
         seen.add(editor);
+        if (isSearchOrAuth(editor) || isSearchOrAuth(raw)) {
+            rejected.push({ reason: 'search_or_auth', label: labelOf(raw).slice(0, 80) });
+            continue;
+        }
         if (!visible(editor) && !(raw && visible(raw)) && !(editor.parentElement && visible(editor.parentElement))) continue;
-        const rect = wrapperRect(editor, raw);
+        const rect = editorRect(editor, raw);
         if (!rect || rect.width < 40 || rect.height < 4) continue;
+        const inParentSubtree = anchor.contains(editor) || anchor.contains(raw);
+        const boundedBelowParent =
+            rect.top >= anchorRect.bottom - 28 &&
+            rect.top <= bottomLimit;
+        const horizontalOverlap =
+            rect.right >= anchorRect.left - 80 &&
+            rect.left <= anchorRect.right + 520;
+        if (!inParentSubtree && (!boundedBelowParent || !horizontalOverlap)) {
+            rejected.push({ reason: 'outside_parent_bounds', rect: rectObj(rect) });
+            continue;
+        }
+        if (looksMainComposer(editor, raw, rect)) {
+            rejected.push({ reason: 'global_main_composer', rect: rectObj(rect) });
+            continue;
+        }
         const label = `${labelOf(editor)} ${labelOf(raw)} ${editor.parentElement ? labelOf(editor.parentElement) : ''}`;
-        let score = 0;
+        const text = normalizeText(readText(editor) || readText(raw));
+        const replyLike =
+            label.includes('reply') ||
+            label.includes('add a reply') ||
+            label.includes('ответ') ||
+            label.includes('відпов') ||
+            text.startsWith('@') ||
+            inParentSubtree ||
+            boundedBelowParent;
+        if (!replyLike) {
+            rejected.push({ reason: 'not_reply_like', rect: rectObj(rect) });
+            continue;
+        }
+        const expanded = expandComposer(editor, raw, anchorRect, bottomLimit);
+        if (!expanded || !expanded.composer || !expanded.post) {
+            rejected.push({ reason: 'input_without_post', rect: rectObj(rect) });
+            continue;
+        }
+        let score = 10000;
         if (label.includes('reply') || label.includes('replying') || label.includes('ответ') || label.includes('відпов')) score += 5000;
-        const text = ((editor.innerText || editor.textContent || '')).trim();
         if (text.startsWith('@') || (text.length <= 100 && text.includes('@'))) score += 3000;
         if (raw && raw.getAttribute && String(raw.getAttribute('data-e2e') || '').toLowerCase().includes('comment-input')) score += 1000;
-        if (anchorRect) {
-            const verticalNear =
-                rect.top >= anchorRect.top - 40 &&
-                rect.top <= Math.max(anchorRect.bottom + 520, anchorRect.top + 120);
-            const horizontalOverlap =
-                rect.right >= anchorRect.left - 60 &&
-                rect.left <= anchorRect.right + 500;
-            if (verticalNear && horizontalOverlap) score += 8000;
-            if (anchor && (anchor.contains(editor) || anchor.contains(raw))) score += 12000;
-        }
-        if (rect.top > window.innerHeight * 0.35) score += 250;
-        candidates.push({ editor, raw, score, rectTop: rect.top });
+        if (inParentSubtree) score += 12000;
+        if (boundedBelowParent) score += 8000;
+        const composerRect = expanded.composer.getBoundingClientRect();
+        const postRect = expanded.post.getBoundingClientRect();
+        candidates.push({
+            editor,
+            raw,
+            composer: expanded.composer,
+            post: expanded.post,
+            score,
+            rectTop: rect.top,
+            rect,
+            composerRect,
+            postRect,
+            foundBy: inParentSubtree ? 'inside_parent_subtree' : (nextRowTop !== null ? 'between_parent_and_next_row' : 'below_parent_bounded'),
+        });
     }
 
     candidates.sort((a, b) => b.score - a.score || b.rectTop - a.rectTop);
     const selected = candidates[0];
     if (!selected || selected.score <= 0) {
-        return { found: false, reason: 'reply_input_not_found' };
-    }
-    // Anti "reply-as-main" guard: in a reply flow a parent anchor must still be
-    // present, and the editor must be near/inside that parent row. A bare
-    // @mention or generic reply label can belong to another comment.
-    if (targetAnchorToken && (anchorMissing || selected.score < 8000)) {
-        return {
+        return finish({
             found: false,
-            reason: anchorMissing ? 'parent_anchor_not_found' : 'reply_input_not_scoped_to_parent',
-        };
+            reason: 'reply_composer_triple_not_found',
+            anchorToken: targetAnchorToken,
+            parentRect: rectObj(anchorRect),
+            nextRowTop: nextRowTop === null ? null : Math.round(nextRowTop),
+            candidateCount: candidates.length,
+            rejected: rejected.slice(-8),
+        });
     }
 
     const editor = selected.editor;
-    const composer = (() => {
-        const selectors = [
-            '[data-e2e*="reply" i]',
-            '[class*="reply" i]',
-            '[data-e2e*="comment" i]',
-            '[class*="Comment" i]',
-        ];
-        for (const sel of selectors) {
-            try {
-                const node = editor.closest(sel);
-                if (node && visible(node)) {
-                    const r = node.getBoundingClientRect();
-                    const panelLike = r.width > Math.max(620, window.innerWidth * 0.34) ||
-                        r.height > Math.max(360, window.innerHeight * 0.45);
-                    if (!panelLike) return node;
-                }
-            } catch (_) {}
-        }
-        return editor.parentElement || editor;
-    })();
+    const composer = selected.composer;
+    const post = selected.post;
     try { editor.setAttribute('data-smart-reply-input', '1'); } catch (_) {}
     try {
         if (editor.getAttribute && editor.getAttribute('data-smart-id') === 'comment-input') {
@@ -818,16 +1029,30 @@ _JS_FIND_REPLY_INPUT = r"""
             editor.removeAttribute('data-smart-main-input');
         }
     } catch (_) {}
+    const postInitiallyDisabled = disabled(post) || getComputedStyle(post).pointerEvents === 'none';
     try { composer.setAttribute('data-smart-reply-composer', '1'); } catch (_) {}
-    if (targetAnchorToken) {
-        try { editor.setAttribute('data-smart-reply-anchor-token', targetAnchorToken); } catch (_) {}
-        try { composer.setAttribute('data-smart-reply-anchor-token', targetAnchorToken); } catch (_) {}
-    }
-    return {
+    try { post.setAttribute('data-smart-reply-post', '1'); } catch (_) {}
+    try { post.setAttribute('data-smart-reply-post-strategy', selected.foundBy); } catch (_) {}
+    try { post.setAttribute('data-smart-reply-post-target', post.tagName || ''); } catch (_) {}
+    try { post.setAttribute('data-smart-reply-post-initial-disabled', postInitiallyDisabled ? '1' : '0'); } catch (_) {}
+    try { editor.setAttribute('data-smart-reply-anchor-token', targetAnchorToken); } catch (_) {}
+    try { composer.setAttribute('data-smart-reply-anchor-token', targetAnchorToken); } catch (_) {}
+    try { post.setAttribute('data-smart-reply-anchor-token', targetAnchorToken); } catch (_) {}
+    return finish({
         found: true,
-        strategy: selected.score >= 8000 ? 'reply-scoped-anchor-input' : 'reply-scoped-input',
+        strategy: `reply-composer-${selected.foundBy}`,
+        anchorToken: targetAnchorToken,
         score: selected.score,
-    };
+        parentRect: rectObj(anchorRect),
+        nextRowTop: nextRowTop === null ? null : Math.round(nextRowTop),
+        inputRect: rectObj(selected.rect),
+        composerRect: rectObj(selected.composerRect),
+        postRect: rectObj(selected.postRect),
+        postInitiallyDisabled,
+        inputTextBefore: readText(editor).slice(0, 160),
+        candidateCount: candidates.length,
+        rejected: rejected.slice(-8),
+    });
 }
 """
 
@@ -1253,9 +1478,8 @@ async def atomic_set_comment_text(
 _JS_FIND_REPLY_POST_BUTTON = r"""
 () => {
     document
-        .querySelectorAll('[data-smart-reply-post], [data-smart-id="comment-post"], [data-smart-id="comment-post-ready"]')
+        .querySelectorAll('[data-smart-id="comment-post"], [data-smart-id="comment-post-ready"]')
         .forEach(el => {
-            el.removeAttribute('data-smart-reply-post');
             el.removeAttribute('data-smart-id');
         });
 
@@ -1310,6 +1534,24 @@ _JS_FIND_REPLY_POST_BUTTON = r"""
     };
 
     const input = document.querySelector('[data-smart-reply-input="1"]');
+    const markedPost = document.querySelector('[data-smart-reply-post="1"]');
+    const markedComposer = document.querySelector('[data-smart-reply-composer="1"]');
+    if (
+        input &&
+        markedPost &&
+        visible(markedPost) &&
+        (!markedComposer || markedComposer.contains(markedPost)) &&
+        !disabled(markedPost)
+    ) {
+        markedPost.setAttribute('data-smart-id', 'comment-post');
+        return {
+            found: true,
+            strategy: markedPost.getAttribute('data-smart-reply-post-strategy') || 'reply-bonded-post',
+            targetTag: markedPost.tagName,
+            rawPointerEvents: getComputedStyle(markedPost).pointerEvents,
+            targetPointerEvents: getComputedStyle(markedPost).pointerEvents,
+        };
+    }
     const roots = [];
     const composer = document.querySelector('[data-smart-reply-composer="1"]');
     if (composer && usableComposerRoot(composer)) roots.push({ root: composer, strategy: 'reply-composer' });
@@ -3191,6 +3433,17 @@ class DomActionResult:
     anchor_token: Optional[str] = None
 
 
+@dataclass
+class ReplyComposerTarget:
+    input_handle: Any
+    composer_handle: Any
+    post_button_handle: Any
+    anchor_token: Optional[str] = None
+    strategy: Optional[str] = None
+    diagnostics: Optional[Dict[str, Any]] = None
+    post_initially_disabled: Optional[bool] = None
+
+
 async def _comment_surface_state(page: Page) -> dict[str, Any]:
     try:
         state = await page.evaluate(_JS_COMMENT_SURFACE_STATE)
@@ -4269,8 +4522,8 @@ async def open_reply_box(
             )
 
         if isinstance(result, dict) and result.get("clicked"):
-            # Wait for the reply input to actually appear rather than sleeping blindly.
-            # TikTok animates the reply box open; the contenteditable may take ~500-900ms.
+            # Wait for the bonded reply composer rather than any contenteditable.
+            # Success means parent anchor + reply input + send button are connected.
             try:
                 await page.wait_for_selector(
                     '[data-e2e="comment-input"], [data-e2e*="reply"] [contenteditable="true"], div[contenteditable="true"]',
@@ -4280,45 +4533,22 @@ async def open_reply_box(
             except Exception:
                 # Fallback: give TikTok at least 0.7s even if selector never appears
                 await asyncio.sleep(0.45 if fast_mode else 0.7)
+            anchor_token = parent_anchor_token or result.get("anchorToken") or ""
             try:
-                activation = await page.evaluate(_JS_REPLY_INPUT_ACTIVE)
+                scoped_input = await page.evaluate(_JS_FIND_REPLY_INPUT, [anchor_token])
             except Exception as exc:
-                activation = {"active": False, "reason": f"reply_input_activation_check_failed:{str(exc)[:80]}"}
-            if not (isinstance(activation, dict) and activation.get("active")):
-                # The old working flow did not require an extra "reply active" marker after
-                # clicking Reply. TikTok sometimes opens a perfectly usable scoped composer
-                # without exposing a reliable reply label/mention yet, so accept the click if
-                # the scoped reply-input finder can already see an editor near the parent
-                # anchor. Keep this anchor-gated so we do not publish a normal top-level
-                # comment as a reply.
-                try:
-                    scoped_input = await page.evaluate(
-                        _JS_FIND_REPLY_INPUT,
-                        [parent_anchor_token or result.get("anchorToken") or ""],
-                    )
-                except Exception:
-                    scoped_input = None
-                if (
-                    parent_anchor_token or result.get("anchorToken")
-                ) and isinstance(scoped_input, dict) and scoped_input.get("found") and (
-                    scoped_input.get("strategy") == "reply-scoped-anchor-input"
-                    or int(scoped_input.get("score") or 0) >= 8000
-                ):
-                    return DomActionResult(
-                        True,
-                        strategy=f"{result.get('strategy') or 'reply-click'}+scoped-input-visible",
-                        anchor_token=result.get("anchorToken") or parent_anchor_token,
-                        elapsed_seconds=time.monotonic() - started,
-                    )
+                scoped_input = {"found": False, "reason": f"reply_composer_probe_exception:{str(exc)[:80]}"}
+            if not (isinstance(scoped_input, dict) and scoped_input.get("found")):
                 return DomActionResult(
                     False,
-                    reason=(activation or {}).get("reason") or "reply_input_not_activated",
+                    reason=(scoped_input or {}).get("reason") or "reply_composer_not_resolved",
+                    anchor_token=anchor_token or None,
                     elapsed_seconds=time.monotonic() - started,
                 )
             return DomActionResult(
                 True,
-                strategy=result.get("strategy"),
-                anchor_token=result.get("anchorToken") or parent_anchor_token,
+                strategy=f"{result.get('strategy') or 'reply-click'}+{scoped_input.get('strategy') or 'reply-composer'}",
+                anchor_token=scoped_input.get("anchorToken") or anchor_token or None,
                 elapsed_seconds=time.monotonic() - started,
             )
 
@@ -5891,13 +6121,15 @@ async def find_comment_input_smart(
     return None, DomActionResult(False, reason=reason, elapsed_seconds=time.monotonic() - started)
 
 
-async def find_reply_input_smart(
+async def find_reply_composer_for_parent(
     page: Page,
     *,
     parent_anchor_token: Optional[str] = None,
-    max_total_seconds: float = 4.0,
-) -> tuple[Optional[Any], DomActionResult]:
-    """Find the editor opened by clicking Reply, scoped near the parent anchor."""
+    expected_parent_text: Optional[str] = None,
+    parent_comment_id: Optional[str] = None,
+    max_total_seconds: float = 8.0,
+) -> tuple[Optional[ReplyComposerTarget], DomActionResult]:
+    """Find the bonded reply composer for a parent: input + composer + post."""
     started = time.monotonic()
     last_reason: Optional[str] = None
 
@@ -5912,22 +6144,31 @@ async def find_reply_input_smart(
                 return None
         return handle
 
+    token = str(parent_anchor_token or "").strip()
+    if not token:
+        return None, DomActionResult(
+            False,
+            reason="parent_anchor_token_missing",
+            elapsed_seconds=time.monotonic() - started,
+        )
+
     while time.monotonic() - started < max_total_seconds:
         try:
-            handle = await page.evaluate_handle(
+            input_handle_raw = await page.evaluate_handle(
                 _JS_FIND_REPLY_INPUT_HANDLE,
-                [parent_anchor_token or ""],
+                [token],
             )
         except Exception as exc:
             await asyncio.sleep(0.2)
             last_reason = str(exc)[:120]
             continue
-        element = _as_element_handle(handle)
-        if element:
+        input_handle = _as_element_handle(input_handle_raw)
+        if input_handle:
             strategy = "reply-scoped-handle"
             score = None
+            diagnostics: Dict[str, Any] = {}
             try:
-                meta = await element.evaluate(
+                meta = await input_handle.evaluate(
                     """
                     el => ({
                         strategy: el.getAttribute('data-smart-reply-strategy') || 'reply-scoped-handle',
@@ -5940,16 +6181,55 @@ async def find_reply_input_smart(
                     score = meta.get("score")
             except Exception:
                 pass
+            try:
+                state = await page.evaluate("() => window.__smartReplyComposerProbeState || window.__smartReplyInputProbeState || null")
+                if isinstance(state, dict):
+                    diagnostics = state
+                    strategy = state.get("strategy") or strategy
+                    score = state.get("score") or score
+            except Exception:
+                diagnostics = {}
+            try:
+                composer_handle_raw = await page.evaluate_handle(
+                    "() => document.querySelector('[data-smart-reply-composer=\"1\"]')"
+                )
+                post_handle_raw = await page.evaluate_handle(
+                    "() => document.querySelector('[data-smart-reply-post=\"1\"]')"
+                )
+            except Exception as exc:
+                last_reason = f"reply_target_handle_exception:{str(exc)[:80]}"
+                await asyncio.sleep(0.2)
+                continue
+            composer_handle = _as_element_handle(composer_handle_raw)
+            post_handle = _as_element_handle(post_handle_raw)
+            if not composer_handle or not post_handle:
+                last_reason = "reply_target_incomplete_handles"
+                await asyncio.sleep(0.2)
+                continue
             logger.info(
-                "[DOM] Reply input found via %s in %.1fs score=%s",
+                "[DOM] Reply composer found via %s in %.1fs score=%s",
                 strategy,
                 time.monotonic() - started,
                 score,
             )
-            return element, DomActionResult(
+            target = ReplyComposerTarget(
+                input_handle=input_handle,
+                composer_handle=composer_handle,
+                post_button_handle=post_handle,
+                anchor_token=diagnostics.get("anchorToken") or token,
+                strategy=strategy,
+                diagnostics=diagnostics,
+                post_initially_disabled=(
+                    bool(diagnostics.get("postInitiallyDisabled"))
+                    if isinstance(diagnostics, dict) and "postInitiallyDisabled" in diagnostics
+                    else None
+                ),
+            )
+            return target, DomActionResult(
                 True,
                 strategy=strategy,
                 elapsed_seconds=time.monotonic() - started,
+                anchor_token=target.anchor_token,
             )
         try:
             js_result = await page.evaluate("() => window.__smartReplyInputProbeState || null")
@@ -5959,9 +6239,26 @@ async def find_reply_input_smart(
         await asyncio.sleep(0.2)
     return None, DomActionResult(
         False,
-        reason=last_reason or "reply_input_timeout",
+        reason=last_reason or "reply_composer_timeout",
         elapsed_seconds=time.monotonic() - started,
     )
+
+
+async def find_reply_input_smart(
+    page: Page,
+    *,
+    parent_anchor_token: Optional[str] = None,
+    max_total_seconds: float = 4.0,
+) -> tuple[Optional[Any], DomActionResult]:
+    """Find the editor opened by clicking Reply, scoped to a bonded target."""
+    target, result = await find_reply_composer_for_parent(
+        page,
+        parent_anchor_token=parent_anchor_token,
+        max_total_seconds=max_total_seconds,
+    )
+    if not target:
+        return None, result
+    return target.input_handle, result
 
 
 async def find_reply_post_button_smart(
@@ -6124,11 +6421,121 @@ async def wait_for_post_button_enabled(
                         return null;
                     };
 
+                    const buttonLabel = (raw) => {
+                        if (!raw) return '';
+                        const nodes = [
+                            raw,
+                            raw.closest && raw.closest('button'),
+                            raw.closest && raw.closest('[role="button"]'),
+                            raw.closest && raw.closest('div[tabindex="0"]'),
+                            raw.parentElement,
+                            raw.parentElement && raw.parentElement.parentElement,
+                        ].filter(Boolean);
+                        const seen = new Set();
+                        const parts = [];
+                        for (const node of nodes) {
+                            if (!node || seen.has(node)) continue;
+                            seen.add(node);
+                            const r = node.getBoundingClientRect ? node.getBoundingClientRect() : null;
+                            parts.push(
+                                node.getAttribute && (node.getAttribute('data-e2e') || ''),
+                                node.getAttribute && (node.getAttribute('data-smart-reply-post') || ''),
+                                node.getAttribute && (node.getAttribute('aria-label') || ''),
+                                node.getAttribute && (node.getAttribute('title') || ''),
+                                node.getAttribute && (node.getAttribute('data-testid') || ''),
+                                node.getAttribute && (node.getAttribute('class') || ''),
+                                r && r.width <= 360 && r.height <= 160 ? (node.innerText || node.textContent || '') : ''
+                            );
+                        }
+                        return parts.join(' ').replace(/\s+/g, ' ').trim().toLowerCase();
+                    };
+
+                    const isAccessoryReplyIcon = (raw) => {
+                        const label = buttonLabel(raw);
+                        const compact = label.replace(/\s+/g, '');
+                        return label.includes('emoji') ||
+                            label.includes('emoticon') ||
+                            label.includes('smile') ||
+                            label.includes('sticker') ||
+                            label.includes('mention') ||
+                            label.includes('tag people') ||
+                            label.includes('add mention') ||
+                            compact === '@';
+                    };
+
+                    const looksReplyPost = (raw, inputRect) => {
+                        if (!raw) return false;
+                        if (isAccessoryReplyIcon(raw)) return false;
+                        if (raw.getAttribute && raw.getAttribute('data-smart-reply-post') === '1') return true;
+                        const r = raw.getBoundingClientRect ? raw.getBoundingClientRect() : null;
+                        const label = buttonLabel(raw);
+                        const iconNearInput = r && inputRect &&
+                            r.bottom >= inputRect.top - 22 &&
+                            r.top <= inputRect.bottom + 22 &&
+                            r.left >= inputRect.left + Math.max(45, inputRect.width * 0.45);
+                        return label.includes('comment-post') ||
+                            label.includes('post') ||
+                            label.includes('send') ||
+                            label.includes('submit') ||
+                            label.includes('\u043e\u043f\u0443\u0431\u043b') ||
+                            label.includes('\u043e\u0442\u043f\u0440\u0430\u0432') ||
+                            Boolean(iconNearInput);
+                    };
+
+                    const usableInputRect = (input) => {
+                        const candidates = [
+                            input,
+                            input && input.parentElement,
+                            input && input.parentElement && input.parentElement.parentElement,
+                        ].filter(Boolean);
+                        for (const node of candidates) {
+                            if (!node || !node.getBoundingClientRect) continue;
+                            const r = node.getBoundingClientRect();
+                            if (!r || r.width <= 0) continue;
+                            if (visible(node) || r.height > 0) return r;
+                        }
+                        return null;
+                    };
+
+                    const replyPostCandidates = () => {
+                        const input = document.querySelector('[data-smart-reply-input="1"]');
+                        const composer = document.querySelector('[data-smart-reply-composer="1"]');
+                        const inputRect = usableInputRect(input);
+                        if (!input || !composer || !visible(composer) || !composer.contains(input) || !inputRect) {
+                            return [];
+                        }
+                        const rawButtons = [];
+                        const seen = new Set();
+                        const addRaw = (raw) => {
+                            if (!raw || seen.has(raw) || !visible(raw)) return;
+                            if (!composer.contains(raw)) return;
+                            if (!looksReplyPost(raw, inputRect)) return;
+                            seen.add(raw);
+                            rawButtons.push(raw);
+                        };
+                        addRaw(document.querySelector('[data-smart-reply-post="1"]'));
+                        const selectors = [
+                            '[data-e2e="comment-post"]',
+                            '[data-e2e*="comment-post"]',
+                            '[data-e2e="post-comment-button"]',
+                            'button',
+                            '[role="button"]',
+                            'div[tabindex="0"]',
+                            'svg',
+                        ];
+                        for (const selector of selectors) {
+                            for (const raw of composer.querySelectorAll(selector)) {
+                                addRaw(raw);
+                                if (rawButtons.length >= 24) break;
+                            }
+                            if (rawButtons.length >= 24) break;
+                        }
+                        return rawButtons;
+                    };
+
                     const rawCandidates = (
                         replyScoped
-                            ? [
-                                document.querySelector('[data-smart-reply-post="1"]'),
-                            ]
+                            ? replyPostCandidates()
                             : [
                                 document.querySelector('[data-smart-id="comment-post-ready"]'),
                                 document.querySelector('[data-smart-id="comment-post"]'),
@@ -6207,6 +6614,9 @@ async def wait_for_post_button_enabled(
                     const expectedNormalized = expectedProvided ? normalizeSubmitText(expectedText) : '';
                     const expectedMatches = !expectedProvided || actualNormalized === expectedNormalized;
 
+                    let sawDisabled = null;
+                    let sawMismatch = null;
+                    let sawInputNotReady = null;
                     for (const raw of rawCandidates) {
                         const el = clickTargetFor(raw);
                         if (!el) continue;
@@ -6221,6 +6631,11 @@ async def wait_for_post_button_enabled(
 
                         if (!disabled && !placeholderLeak && inputText.length > 0 && expectedMatches) {
                             el.setAttribute('data-smart-id', 'comment-post-ready');
+                            if (replyScoped) {
+                                el.setAttribute('data-smart-reply-post', '1');
+                                el.setAttribute('data-smart-reply-post-strategy', 'reply-enabled-refind');
+                                el.setAttribute('data-smart-reply-post-target', el.tagName || '');
+                            }
                             return {
                                 ready: true,
                                 tag: el.tagName,
@@ -6230,7 +6645,7 @@ async def wait_for_post_button_enabled(
                                 targetPointerEvents: getComputedStyle(el).pointerEvents,
                             };
                         } else if (!placeholderLeak && inputText.length > 0 && !expectedMatches) {
-                            return {
+                            sawMismatch = sawMismatch || {
                                 ready: false,
                                 reason: 'text_mismatch',
                                 inputText: inputText.substring(0, 80),
@@ -6239,14 +6654,14 @@ async def wait_for_post_button_enabled(
                                 expectedNormalized: expectedNormalized.substring(0, 80),
                             };
                         } else if (!disabled && (placeholderLeak || inputText.length === 0)) {
-                            return {
+                            sawInputNotReady = sawInputNotReady || {
                                 ready: false,
                                 reason: placeholderLeak ? 'placeholder_leak' : 'input_empty',
                                 inputText: inputText.substring(0, 80),
                                 placeholderLeak: placeholderLeak,
                             };
                         } else {
-                            return {
+                            sawDisabled = sawDisabled || {
                                 ready: false,
                                 reason: 'button_disabled',
                                 inputText: inputText.substring(0, 80),
@@ -6259,6 +6674,20 @@ async def wait_for_post_button_enabled(
                                 targetTag: el.tagName,
                             };
                         }
+                    }
+                    if (sawMismatch) return sawMismatch;
+                    if (sawInputNotReady) return sawInputNotReady;
+                    if (sawDisabled) return sawDisabled;
+                    if (placeholderLeak || inputText.length === 0) {
+                        return {
+                            ready: false,
+                            reason: placeholderLeak ? 'placeholder_leak' : 'input_empty',
+                            inputText: inputText.substring(0, 80),
+                            placeholderLeak: placeholderLeak,
+                        };
+                    }
+                    if (rawCandidates.length) {
+                        return { ready: false, reason: 'button_disabled', inputText: inputText.substring(0, 80) };
                     }
                     return { ready: false, reason: 'button_not_found', inputText: inputText.substring(0, 80) };
                 }

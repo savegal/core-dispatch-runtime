@@ -1516,6 +1516,79 @@ class TestAccountService:
         )
         assert weak_quality["quality_reason"] == "no_browser_auth_sid_guard_only"
 
+    def test_main_selector_scans_past_reserved_top_candidate_in_parallel_batch(
+        self,
+        db_session: Session,
+        monkeypatch: pytest.MonkeyPatch,
+    ):
+        """A reserved top candidate must not collapse parallel main selection to one browser."""
+        monkeypatch.setattr(account_service_module.settings, "MAX_CONCURRENT_BROWSERS", 1, raising=False)
+        monkeypatch.setattr(account_service_module.settings, "PARALLEL_COMMENTING_TARGET_BROWSERS", 3, raising=False)
+        monkeypatch.setattr(account_service_module.settings, "ALLOW_SID_GUARD_ONLY_PUBLISH_LAST_RESORT", False, raising=False)
+        now = datetime.now(timezone.utc)
+        first_strong = Account(
+            label="main_reserved_top_candidate",
+            status="active",
+            cookies=json.dumps(
+                {
+                    "sessionid": "reserved-top-session",
+                    "sid_tt": "reserved-top-sid",
+                    "sid_guard": "reserved-top-guard",
+                    "s_v_web_id": "reserved-top-verify",
+                    "ttwid": "reserved-top-wid",
+                    "msToken": "reserved-top-ms",
+                }
+            ),
+            proxy="http://main-reserved-top-proxy",
+            created_at=now - timedelta(hours=5),
+            last_validation_ok=now - timedelta(minutes=20),
+        )
+        weak_prefix = [
+            Account(
+                label=f"main_reserved_race_weak_{idx}",
+                status="active",
+                cookies=json.dumps({"sid_guard": f"race-weak-sg-{idx}", "msToken": f"race-weak-ms-{idx}"}),
+                proxy=f"http://main-reserved-race-weak-{idx}",
+                created_at=now - timedelta(hours=5),
+                last_validation_ok=now - timedelta(minutes=20),
+            )
+            for idx in range(19)
+        ]
+        second_strong = Account(
+            label="main_second_candidate_after_reserved_top",
+            status="active",
+            cookies=json.dumps(
+                {
+                    "sessionid": "second-after-reserved-session",
+                    "sid_tt": "second-after-reserved-sid",
+                    "sid_guard": "second-after-reserved-guard",
+                    "s_v_web_id": "second-after-reserved-verify",
+                    "ttwid": "second-after-reserved-wid",
+                    "msToken": "second-after-reserved-ms",
+                }
+            ),
+            proxy="http://main-second-after-reserved-proxy",
+            created_at=now - timedelta(hours=5),
+            last_validation_ok=now - timedelta(minutes=20),
+        )
+        db_session.add_all([first_strong, *weak_prefix, second_strong])
+        db_session.commit()
+
+        reserve_calls: list[int] = []
+
+        def fake_reserve_main_account(account_id: int, *_args, **_kwargs) -> bool:
+            reserve_calls.append(int(account_id))
+            return int(account_id) != first_strong.id
+
+        monkeypatch.setattr(account_service_module, "reserve_main_account", fake_reserve_main_account)
+
+        selected = get_free_account_for_main_comment(db_session)
+
+        assert selected is not None
+        assert selected.id == second_strong.id
+        assert reserve_calls[0] == first_strong.id
+        assert second_strong.id in reserve_calls
+
     def test_main_selector_scans_past_large_sid_guard_only_prefix(
         self,
         db_session: Session,

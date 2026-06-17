@@ -19,6 +19,7 @@ from executor.dom_actions import (
     comment_input_contains_expected_text,
     find_comment_input_smart,
     find_post_button_smart,
+    find_reply_composer_for_parent,
     find_reply_input_smart,
     find_reply_post_button_smart,
     get_comment_surface_state,
@@ -2292,12 +2293,17 @@ _JS_REPLY_DIRECT_POST_CLICK = r"""
         }
         return null;
     };
-    const rawButtons = [
+    let post = null;
+    let rawPost = null;
+    const markedPost = document.querySelector('[data-smart-reply-post="1"]');
+    if (markedPost && visible(markedPost) && composer.contains(markedPost) && !disabled(markedPost)) {
+        post = markedPost;
+        rawPost = markedPost;
+    }
+    const rawButtons = post ? [] : [
         ...composer.querySelectorAll('[data-e2e="comment-post"], [data-e2e*="comment-post"], [data-e2e="post-comment-button"]'),
         ...composer.querySelectorAll('button, [role="button"], div[tabindex="0"]'),
     ];
-    let post = null;
-    let rawPost = null;
     for (const raw of rawButtons) {
         const label = [
             raw.getAttribute && (raw.getAttribute('data-e2e') || ''),
@@ -3817,6 +3823,7 @@ async def _publish_via_current_input(
     aggressive: bool = False,
     reply_scoped: bool = False,
     parent_anchor_token: Optional[str] = None,
+    reply_target: Optional[Any] = None,
     comment_surface_ready: bool = False,
 ) -> PublishResult:
     started = time.monotonic()
@@ -4059,54 +4066,64 @@ async def _publish_via_current_input(
         0.1,
         min(input_search_timeout, max(0.1, input_search_outer_timeout - 0.25)),
     )
-    try:
-        if reply_scoped:
-            input_handle, input_info = await _asyncio_wait_for(
-                find_reply_input_smart(
+    if reply_scoped and reply_target is not None:
+        input_handle = getattr(reply_target, "input_handle", None)
+        input_info = DomActionResult(
+            bool(input_handle),
+            reason=None if input_handle else "reply_target_input_missing",
+            strategy=getattr(reply_target, "strategy", None) or "reply-resolved-target",
+            elapsed_seconds=time.monotonic() - started,
+            anchor_token=getattr(reply_target, "anchor_token", None) or parent_anchor_token,
+        )
+    else:
+        try:
+            if reply_scoped:
+                input_handle, input_info = await _asyncio_wait_for(
+                    find_reply_input_smart(
+                        page,
+                        parent_anchor_token=parent_anchor_token,
+                        max_total_seconds=input_search_inner_timeout,
+                    ),
+                    timeout=input_search_outer_timeout,
+                )
+            else:
+                input_handle, input_info = await _asyncio_wait_for(
+                    find_comment_input_smart(
+                        page,
+                        max_total_seconds=input_search_inner_timeout,
+                        aggressive=aggressive,
+                        skip_initial_open=comment_surface_ready,
+                        main_comment_aggressive=main_comment_aggressive,
+                    ),
+                    timeout=input_search_outer_timeout,
+                )
+        except asyncio.TimeoutError:
+            if reply_scoped and parent_anchor_token and reply_target is not None:
+                direct_result = await _publish_reply_comment_direct_dom(
                     page,
+                    text,
+                    started=started,
+                    max_total_seconds=max_total_seconds,
+                    expected_video_url=expected_video_url,
+                    correlation_id=correlation_id,
                     parent_anchor_token=parent_anchor_token,
-                    max_total_seconds=input_search_inner_timeout,
-                ),
-                timeout=input_search_outer_timeout,
-            )
-        else:
-            input_handle, input_info = await _asyncio_wait_for(
-                find_comment_input_smart(
+                    previous_reason="input_search_timeout",
+                )
+                if direct_result is not None:
+                    return direct_result
+            if main_comment_aggressive:
+                direct_result = await _publish_main_comment_direct_dom(
                     page,
-                    max_total_seconds=input_search_inner_timeout,
-                    aggressive=aggressive,
-                    skip_initial_open=comment_surface_ready,
-                    main_comment_aggressive=main_comment_aggressive,
-                ),
-                timeout=input_search_outer_timeout,
-            )
-    except asyncio.TimeoutError:
-        if reply_scoped and parent_anchor_token:
-            direct_result = await _publish_reply_comment_direct_dom(
-                page,
-                text,
-                started=started,
-                max_total_seconds=max_total_seconds,
-                expected_video_url=expected_video_url,
-                correlation_id=correlation_id,
-                parent_anchor_token=parent_anchor_token,
-                previous_reason="input_search_timeout",
-            )
-            if direct_result is not None:
-                return direct_result
-        if main_comment_aggressive:
-            direct_result = await _publish_main_comment_direct_dom(
-                page,
-                text,
-                started=started,
-                max_total_seconds=max_total_seconds,
-                expected_video_url=expected_video_url,
-                correlation_id=correlation_id,
-                previous_reason="input_search_timeout",
-            )
-            if direct_result is not None:
-                return direct_result
-        return _deadline_result("input_search")
+                    text,
+                    started=started,
+                    max_total_seconds=max_total_seconds,
+                    expected_video_url=expected_video_url,
+                    correlation_id=correlation_id,
+                    previous_reason="input_search_timeout",
+                )
+                if direct_result is not None:
+                    return direct_result
+            return _deadline_result("input_search")
     if _remaining() <= 0:
         return _deadline_result("after_input_search", getattr(input_info, "strategy", None))
     if not input_handle:
@@ -4139,7 +4156,7 @@ async def _publish_via_current_input(
                     error_reason=f"redirected_to_{input_info.redirected_to}",
                     elapsed_seconds=time.monotonic() - started,
                 )
-            if reply_scoped and parent_anchor_token:
+            if reply_scoped and parent_anchor_token and reply_target is not None:
                 direct_result = await _publish_reply_comment_direct_dom(
                     page,
                     text,
@@ -4265,37 +4282,66 @@ async def _publish_via_current_input(
 
     if _remaining() <= 0:
         return _deadline_result("before_typing", input_info.strategy)
-    typing_timeout = _typing_phase_timeout()
-    if typing_timeout <= 0:
-        return _deadline_result("before_typing", input_info.strategy)
+    typed_ok = False
     typed_result: Any = None
-    try:
-        typed_result = await _asyncio_wait_for(
-            type_into_comment(
-                page,
-                input_handle,
-                text,
-                deadline=time.monotonic() + typing_timeout,
-                fast=aggressive,
-                reply_scoped=reply_scoped,
-                anchor_token=parent_anchor_token,
-                allow_main_dom_fallback=False,
-            ),
-            timeout=typing_timeout,
-        )
-        typed_ok = _typing_result_ok(typed_result)
-    except asyncio.TimeoutError:
-        if await _text_visible_after_typing_timeout("typing", input_info.strategy):
+    if reply_scoped:
+        try:
+            already_ok, already_text = await _asyncio_wait_for(
+                _reply_scoped_input_contains_expected_text(page, text),
+                timeout=min(0.6 if aggressive else 1.0, max(0.2, _remaining())),
+            )
+        except Exception:
+            already_ok, already_text = False, ""
+        if already_ok:
             typed_ok = True
-        else:
-            if main_comment_aggressive:
-                await _clear_main_comment_composer_best_effort(
+            typed_result = {
+                "ok": True,
+                "reason": "already_exact",
+                "strategy": f"{input_info.strategy}+already-exact",
+                "text": already_text,
+                "last_text": already_text,
+                "anchor_bound": True,
+            }
+            _log_publish_trace(
+                "reply_input_already_exact",
+                page=page,
+                expected_video_url=expected_video_url,
+                correlation_id=correlation_id,
+                strategy=input_info.strategy,
+                input_text_len=len(already_text or ""),
+                input_preview=(already_text or "")[:60],
+            )
+    typing_timeout = _typing_phase_timeout()
+    if typing_timeout <= 0 and not typed_ok:
+        return _deadline_result("before_typing", input_info.strategy)
+    if not typed_ok:
+        try:
+            typed_result = await _asyncio_wait_for(
+                type_into_comment(
                     page,
-                    reason="typing_timeout_not_ready",
-                    expected_video_url=expected_video_url,
-                    correlation_id=correlation_id,
-                )
-            return _deadline_result("typing", input_info.strategy)
+                    input_handle,
+                    text,
+                    deadline=time.monotonic() + typing_timeout,
+                    fast=aggressive,
+                    reply_scoped=reply_scoped,
+                    anchor_token=parent_anchor_token,
+                    allow_main_dom_fallback=False,
+                ),
+                timeout=typing_timeout,
+            )
+            typed_ok = _typing_result_ok(typed_result)
+        except asyncio.TimeoutError:
+            if await _text_visible_after_typing_timeout("typing", input_info.strategy):
+                typed_ok = True
+            else:
+                if main_comment_aggressive:
+                    await _clear_main_comment_composer_best_effort(
+                        page,
+                        reason="typing_timeout_not_ready",
+                        expected_video_url=expected_video_url,
+                        correlation_id=correlation_id,
+                    )
+                return _deadline_result("typing", input_info.strategy)
 
     if not typed_ok:
         if await _text_visible_after_typing_timeout("typing_unverified", input_info.strategy):
@@ -4335,30 +4381,33 @@ async def _publish_via_current_input(
         retry_input_search_timeout = min(2.5 if aggressive else 5.0, _remaining())
         if retry_input_search_timeout <= 0:
             return _deadline_result("before_typing_retry_input_search", input_info.strategy)
-        try:
-            retry_handle, _ = await _asyncio_wait_for(
-                find_reply_input_smart(
-                    page,
-                    parent_anchor_token=parent_anchor_token,
-                    max_total_seconds=retry_input_search_timeout,
-                ) if reply_scoped else find_comment_input_smart(
-                    page,
-                    max_total_seconds=retry_input_search_timeout,
-                    aggressive=aggressive,
-                    skip_initial_open=comment_surface_ready,
-                    main_comment_aggressive=main_comment_aggressive,
-                ),
-                timeout=retry_input_search_timeout,
-            )
-        except asyncio.TimeoutError:
-            if main_comment_aggressive:
-                await _clear_main_comment_composer_best_effort(
-                    page,
-                    reason="typing_retry_input_search_timeout",
-                    expected_video_url=expected_video_url,
-                    correlation_id=correlation_id,
+        if reply_scoped and reply_target is not None:
+            retry_handle = input_handle
+        else:
+            try:
+                retry_handle, _ = await _asyncio_wait_for(
+                    find_reply_input_smart(
+                        page,
+                        parent_anchor_token=parent_anchor_token,
+                        max_total_seconds=retry_input_search_timeout,
+                    ) if reply_scoped else find_comment_input_smart(
+                        page,
+                        max_total_seconds=retry_input_search_timeout,
+                        aggressive=aggressive,
+                        skip_initial_open=comment_surface_ready,
+                        main_comment_aggressive=main_comment_aggressive,
+                    ),
+                    timeout=retry_input_search_timeout,
                 )
-            return _deadline_result("typing_retry_input_search", input_info.strategy)
+            except asyncio.TimeoutError:
+                if main_comment_aggressive:
+                    await _clear_main_comment_composer_best_effort(
+                        page,
+                        reason="typing_retry_input_search_timeout",
+                        expected_video_url=expected_video_url,
+                        correlation_id=correlation_id,
+                    )
+                return _deadline_result("typing_retry_input_search", input_info.strategy)
         if not retry_handle:
             retry_handle = input_handle
         if _remaining() <= 0:
@@ -4475,7 +4524,15 @@ async def _publish_via_current_input(
     remaining = max_total_seconds - (time.monotonic() - started)
     if remaining <= 0:
         return _deadline_result("before_post_button_search", input_info.strategy)
-    if reply_scoped:
+    if reply_scoped and reply_target is not None and getattr(reply_target, "post_button_handle", None) is not None:
+        post_button = getattr(reply_target, "post_button_handle", None)
+        post_info = DomActionResult(
+            True,
+            strategy=getattr(reply_target, "strategy", None) or "reply-resolved-target-post",
+            elapsed_seconds=time.monotonic() - started,
+            anchor_token=getattr(reply_target, "anchor_token", None) or parent_anchor_token,
+        )
+    elif reply_scoped:
         post_button, post_info = await find_reply_post_button_smart(
             page,
             max_total_seconds=min(3.0, max(remaining, 0.5)),
@@ -4699,6 +4756,27 @@ async def _publish_via_current_input(
                     post_was_enabled_at_click=False,
                     network_request_attempted=False,
                 )
+        if not post_was_enabled and reply_scoped:
+            safe_reason = disabled_reason or "reply_post_not_enabled"
+            _log_publish_trace(
+                "publish_result",
+                page=page,
+                expected_video_url=expected_video_url,
+                correlation_id=correlation_id,
+                status="dom_error",
+                reason=safe_reason,
+                post_was_enabled=False,
+                elapsed=round(time.monotonic() - started, 2),
+                level=logging.WARNING,
+            )
+            return PublishResult(
+                status="dom_error",
+                error_reason=safe_reason,
+                dom_strategy=input_info.strategy or post_info.strategy,
+                elapsed_seconds=time.monotonic() - started,
+                post_was_enabled_at_click=False,
+                network_request_attempted=False,
+            )
         if not post_was_enabled:
             logger.warning(
                 "[PUBLISH] Post button not enabled after wait: %s. Trying legacy force-click anyway.",
@@ -5836,10 +5914,12 @@ async def publish_reply_hybrid(
             return None
         probe_timeout = min(2.5 if fast_publish else 2.0, max(0.4, remaining))
         try:
-            input_handle, input_info = await _asyncio_wait_for(
-                find_reply_input_smart(
+            reply_target, input_info = await _asyncio_wait_for(
+                find_reply_composer_for_parent(
                     page,
                     parent_anchor_token=parent_anchor_token,
+                    expected_parent_text=parent_comment_text,
+                    parent_comment_id=parent_comment_id,
                     max_total_seconds=probe_timeout,
                 ),
                 timeout=probe_timeout,
@@ -5848,11 +5928,11 @@ async def publish_reply_hybrid(
             return None
         except Exception:
             return None
-        if not input_handle:
+        if not reply_target:
             return None
         strategy = getattr(input_info, "strategy", None) or "reply-input-visible"
         logger.info(
-            "[PUBLISH] Reply box %s timed out, but scoped reply input is visible via %s; continuing",
+            "[PUBLISH] Reply box %s timed out, but bonded reply composer is visible via %s; continuing",
             phase,
             strategy,
         )
@@ -6056,6 +6136,37 @@ async def publish_reply_hybrid(
     remaining = max_total_seconds - (time.monotonic() - started)
     if remaining <= 0:
         return _deadline_result("before_reply_input_publish", reply_open.strategy)
+    target_timeout = min(3.5 if fast_publish else 5.0, max(0.5, remaining))
+    try:
+        reply_target, target_info = await _asyncio_wait_for(
+            find_reply_composer_for_parent(
+                page,
+                parent_anchor_token=resolved_parent_anchor_token,
+                expected_parent_text=parent_comment_text,
+                parent_comment_id=parent_comment_id,
+                max_total_seconds=target_timeout,
+            ),
+            timeout=target_timeout,
+        )
+    except asyncio.TimeoutError:
+        return _deadline_result("reply_composer_resolve", reply_open.strategy)
+    except Exception as exc:
+        return PublishResult(
+            status="dom_error",
+            error_reason=f"reply_composer_resolve_exception:{str(exc)[:100]}",
+            elapsed_seconds=time.monotonic() - started,
+            dom_strategy=reply_open.strategy,
+        )
+    if not reply_target:
+        return PublishResult(
+            status="dom_error",
+            error_reason=f"reply_composer_not_resolved:{target_info.reason or 'unknown'}",
+            elapsed_seconds=time.monotonic() - started,
+            dom_strategy=reply_open.strategy,
+        )
+    remaining = max_total_seconds - (time.monotonic() - started)
+    if remaining <= 0:
+        return _deadline_result("after_reply_composer_resolve", reply_open.strategy)
     input_budget = remaining
     if max_total_seconds >= _REPLY_INPUT_MIN_SECONDS:
         min_input_budget = (
@@ -6073,7 +6184,59 @@ async def publish_reply_hybrid(
         aggressive=fast_publish,
         reply_scoped=True,
         parent_anchor_token=resolved_parent_anchor_token,
+        reply_target=reply_target,
     )
+    if (
+        result.status == "dom_error"
+        and str(result.error_reason or "").startswith("reply_direct_post_click_failed:reply_post_button_not_found")
+        and _remaining() > 1.0
+    ):
+        _log_publish_trace(
+            "reply_post_button_not_found_recover_start",
+            page=page,
+            expected_video_url=expected_video_url,
+            correlation_id=correlation_id,
+            strategy=result.dom_strategy,
+            remaining=round(_remaining(), 2),
+            level=logging.INFO,
+        )
+        recover_timeout = min(3.0 if fast_publish else 4.5, max(0.5, _remaining()))
+        try:
+            recovered_target, recovered_info = await _asyncio_wait_for(
+                find_reply_composer_for_parent(
+                    page,
+                    parent_anchor_token=resolved_parent_anchor_token,
+                    expected_parent_text=parent_comment_text,
+                    parent_comment_id=parent_comment_id,
+                    max_total_seconds=recover_timeout,
+                ),
+                timeout=recover_timeout,
+            )
+        except Exception:
+            recovered_target, recovered_info = None, None
+        if recovered_target is not None:
+            retry_budget = max_total_seconds - (time.monotonic() - started)
+            if retry_budget > 0.5:
+                result = await _publish_via_current_input(
+                    page,
+                    text,
+                    max_total_seconds=retry_budget,
+                    correlation_id=correlation_id,
+                    expected_video_url=expected_video_url,
+                    aggressive=fast_publish,
+                    reply_scoped=True,
+                    parent_anchor_token=resolved_parent_anchor_token,
+                    reply_target=recovered_target,
+                )
+        else:
+            _log_publish_trace(
+                "reply_post_button_not_found_recover_failed",
+                page=page,
+                expected_video_url=expected_video_url,
+                correlation_id=correlation_id,
+                reason=getattr(recovered_info, "reason", None),
+                level=logging.INFO,
+            )
     if result.dom_strategy is None:
         result.dom_strategy = reply_open.strategy
 

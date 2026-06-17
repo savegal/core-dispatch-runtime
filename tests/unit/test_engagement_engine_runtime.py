@@ -1636,6 +1636,7 @@ async def test_engagement_only_full_flow_reports_submitted_unconfirmed_reply(db_
                     account_id=reply_account.id,
                     attempted=True,
                     submitted_unconfirmed=True,
+                    counts_as_submitted=True,
                 )
             ],
             searched=True,
@@ -1726,6 +1727,9 @@ async def test_engagement_only_full_flow_runs_three_reply_variants_in_parallel(d
     async def _fake_close_browser_pool():
         close_calls.append("close")
 
+    monkeypatch.setattr(engagement_engine.settings, "PARALLEL_DYNAMIC_WORKER_POOL_ENABLED", True, raising=False)
+    monkeypatch.setattr(engagement_engine.settings, "PARALLEL_COMMENTING_TARGET_BROWSERS", 4, raising=False)
+    monkeypatch.setattr(engagement_engine.settings, "PARALLEL_COMMENTING_MAX_BROWSERS", 4, raising=False)
     monkeypatch.setattr(db_database, "get_sync_db_context", _fake_db_context)
     monkeypatch.setattr(engagement_engine, "get_free_account_for_reply", _fake_get_free_account_for_reply)
     monkeypatch.setattr(user_schema, "_reply_with_variant_on_all_mains", _fake_reply_with_variant_on_all_mains)
@@ -2358,7 +2362,7 @@ async def test_engagement_only_terminal_surface_failure_reports_active_and_pendi
 
 @pytest.mark.unit
 @pytest.mark.asyncio
-async def test_engagement_only_author_fallback_is_last_attempt_only(db_session, monkeypatch):
+async def test_engagement_only_reply_parent_search_is_text_first_with_author_hint(db_session, monkeypatch):
     import executor.user_schema as user_schema
 
     accounts = [
@@ -2391,7 +2395,7 @@ async def test_engagement_only_author_fallback_is_last_attempt_only(db_session, 
                 "allow_fallback": allow_parent_author_fallback,
             }
         )
-        if not allow_parent_author_fallback:
+        if require_parent_author_match or allow_parent_author_fallback:
             return user_schema.ReplyAttemptResult(replies=[], searched=True)
         return user_schema.ReplyAttemptResult(
             replies=[
@@ -2407,9 +2411,9 @@ async def test_engagement_only_author_fallback_is_last_attempt_only(db_session, 
                     attempted=True,
                     requested_parent_author="target_user",
                     matched_parent_author="found_user",
-                    parent_author_match_mode="text_author_fallback",
-                    author_fallback_used=True,
-                    author_fallback_reason="author_mismatch",
+                    parent_author_match_mode="text",
+                    author_fallback_used=False,
+                    author_fallback_reason=None,
                 )
             ],
             searched=True,
@@ -2430,12 +2434,11 @@ async def test_engagement_only_author_fallback_is_last_attempt_only(db_session, 
     )
 
     assert calls == [
-        {"account_id": 281, "require_author": True, "allow_fallback": False},
-        {"account_id": 282, "require_author": True, "allow_fallback": True},
+        {"account_id": 281, "require_author": False, "allow_fallback": False},
     ]
     assert resolved_author == "found_user"
     assert results[0]["success"] is True
-    assert results[0]["author_fallback_used"] is True
+    assert results[0]["author_fallback_used"] is False
     assert results[0]["requested_parent_author"] == "target_user"
     assert results[0]["matched_parent_author"] == "found_user"
 

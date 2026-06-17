@@ -197,7 +197,7 @@ def test_user_schema_status_unconfirmed_when_any_recorded_reply_failed():
 
 
 @pytest.mark.unit
-def test_user_schema_reply_submitted_unconfirmed_does_not_mark_main_unconfirmed():
+def test_user_schema_reply_submitted_unconfirmed_without_visibility_is_attempted_uncertain():
     res = UserSchemaResult(boost_enabled=False, boost_quantity=0)
     res.expected_reply_variants = 1
     res.published_mains.append(
@@ -230,12 +230,15 @@ def test_user_schema_reply_submitted_unconfirmed_does_not_mark_main_unconfirmed(
     dct = res.to_dict()
 
     assert dct["status"] == "submitted_unconfirmed"
-    assert dct["error"] == "reply_publication_unconfirmed"
+    assert dct["error"] == "reply_publication_incomplete"
     assert dct["engagement"]["main"]["submitted_unconfirmed"] is False
     assert dct["engagement"]["main"]["visibility_status"] == "public_confirmed"
     assert dct["engagement"]["main"]["error"] is None
-    assert dct["engagement"]["replies"]["submitted"] == 1
+    assert dct["engagement"]["replies"]["submitted"] == 0
     assert dct["engagement"]["replies"]["submitted_unconfirmed"] == 1
+    assert dct["engagement"]["replies"]["attempted_uncertain"] == 1
+    assert dct["engagement"]["replies"]["items"][0]["counts_as_submitted"] is False
+    assert dct["engagement"]["replies"]["items"][0]["attempted_uncertain"] is True
     assert [w["code"] for w in dct["warnings"]] == ["reply_submitted_unconfirmed"]
 
 
@@ -305,10 +308,11 @@ def test_user_schema_reply_summary_counts_not_started_variants():
     assert replies["requested_variants"] == 10
     assert replies["expected_submissions"] == 10
     assert replies["expected_per_variant"] == 1
-    assert replies["missing"] == 6
+    assert replies["missing"] == 10
     assert replies["total"] == 4
     assert replies["attempted"] == 4
-    assert replies["submitted"] == 4
+    assert replies["submitted"] == 0
+    assert replies["attempted_uncertain"] == 4
     assert replies["variant_outcomes"] == 3
     assert replies["variants_not_started"] == 7
 
@@ -415,6 +419,7 @@ async def test_publish_all_variants_streams_published_main(monkeypatch):
             comment_id=f"cid_{call_count['publish']}",
             network_captured=True,
             dom_strategy="data-e2e",
+            composer_clean_after_submit=True,
         )
 
     async def _fake_logged_out(*args, **kwargs):

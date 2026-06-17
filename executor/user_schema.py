@@ -1533,6 +1533,10 @@ class ReplyOutcome:
     parent_author_match_mode: Optional[str] = None
     author_fallback_used: bool = False
     author_fallback_reason: Optional[str] = None
+    reply_comment_id: Optional[str] = None
+    local_confirmed: bool = False
+    reply_confirmation: Optional[str] = None
+    counts_as_submitted: bool = False
 
 
 @dataclass
@@ -1585,8 +1589,13 @@ class UserSchemaResult:
         submitted_unconfirmed_replies = sum(
             1 for r in self.replies if getattr(r, "submitted_unconfirmed", False)
         )
-        submitted_replies = sum(
-            1 for r in self.replies if r.success or getattr(r, "submitted_unconfirmed", False)
+        submitted_replies = sum(1 for r in self.replies if _reply_outcome_submitted(r))
+        attempted_uncertain_replies = sum(
+            1
+            for r in self.replies
+            if getattr(r, "attempted", False)
+            and getattr(r, "submitted_unconfirmed", False)
+            and not _reply_outcome_submitted(r)
         )
         attempted_replies = sum(1 for r in self.replies if getattr(r, "attempted", False))
         failed_replies = sum(
@@ -1749,6 +1758,7 @@ class UserSchemaResult:
                     "submitted": submitted_replies,
                     "missing": missing_reply_submissions,
                     "submitted_unconfirmed": submitted_unconfirmed_replies,
+                    "attempted_uncertain": attempted_uncertain_replies,
                     "items": [
                         {
                             "text": r.text,
@@ -1759,6 +1769,15 @@ class UserSchemaResult:
                             "success": r.success,
                             "attempted": r.attempted,
                             "submitted_unconfirmed": getattr(r, "submitted_unconfirmed", False),
+                            "reply_comment_id": getattr(r, "reply_comment_id", None),
+                            "local_confirmed": getattr(r, "local_confirmed", False),
+                            "reply_confirmation": getattr(r, "reply_confirmation", None),
+                            "counts_as_submitted": _reply_outcome_submitted(r),
+                            "attempted_uncertain": bool(
+                                getattr(r, "attempted", False)
+                                and getattr(r, "submitted_unconfirmed", False)
+                                and not _reply_outcome_submitted(r)
+                            ),
                             "method": r.method,
                             "error": r.error,
                             "account_id": r.account_id,
@@ -3377,6 +3396,55 @@ def _is_critical_publish_failure(result: "PublishResult") -> bool:
     return False
 
 
+_REPLY_RECOVERABLE_DOM_PUBLISH_PREFIXES = (
+    "post_button_not_found",
+    "post_button_stayed_disabled",
+    "post_button_input_not_ready:",
+    "reply_post_not_enabled",
+    "reply_box_open_timeout",
+    "reply_box_not_open:",
+    "reply_composer_not_resolved:",
+    "reply_direct_post_click_failed:reply_post_button_not_found",
+    "reply_direct_post_click_failed:reply_post_button_disabled_or_blocked",
+)
+
+
+def _is_recoverable_reply_dom_publish_failure(reason: Optional[str]) -> bool:
+    safe = str(reason or "")
+    if not safe:
+        return False
+    if _looks_like_closed_page_error(safe):
+        return False
+    if safe.startswith(("captcha_challenge:", "captcha_challenge_timeout:")):
+        return False
+    hard_markers = (
+        "visible_login_ui",
+        "logged_out",
+        "login_required",
+        "url_drift_to_other_video",
+        "reply_parent_mismatch",
+        "redirected_to_",
+    )
+    if any(marker in safe for marker in hard_markers):
+        return False
+    if _is_soft_publish_deadline_failure(safe):
+        return True
+    return safe.startswith(_REPLY_RECOVERABLE_DOM_PUBLISH_PREFIXES)
+
+
+def _should_record_reply_publish_runtime_failure(reason: Optional[str]) -> bool:
+    if _is_recoverable_reply_dom_publish_failure(reason):
+        return False
+    return _should_record_publish_runtime_failure(reason)
+
+
+def _is_critical_reply_publish_failure(result: "PublishResult") -> bool:
+    reason = getattr(result, "error_reason", None)
+    if _is_recoverable_reply_dom_publish_failure(reason):
+        return False
+    return _is_critical_publish_failure(result)
+
+
 def _is_input_not_found_publish_failure(result: "PublishResult") -> bool:
     reason = (result.error_reason or "")
     return result.status == "dom_error" and reason.startswith("input_not_found:")
@@ -4525,6 +4593,15 @@ def _batch_parent_search_should_try_single_fallback(info: Optional[Dict[str, Any
         return True
     if bool(info.get("partial_returned")):
         return True
+    if _parent_search_info_int(info, "author_fallback_count") > 0:
+        return True
+    if info.get("author_fallback_candidates"):
+        return True
+    missing_count = _parent_search_info_int(info, "missing_count")
+    target_count = _parent_search_info_int(info, "target_count")
+    found_count = _parent_search_info_int(info, "found_count")
+    if missing_count > 0 and (found_count > 0 or target_count <= 12):
+        return True
     return not (
         _parent_search_info_int(info, "max_seen_rows") > 0
         or _parent_search_info_int(info, "last_row_count") > 0
@@ -4672,7 +4749,11 @@ def _reply_outcome_parent_keys(outcome: ReplyOutcome) -> set[str]:
 
 
 def _reply_outcome_submitted(outcome: ReplyOutcome) -> bool:
-    return bool(outcome.success or getattr(outcome, "submitted_unconfirmed", False))
+    if bool(outcome.success):
+        return True
+    if not bool(getattr(outcome, "submitted_unconfirmed", False)):
+        return False
+    return bool(getattr(outcome, "counts_as_submitted", False))
 
 
 def _reply_outcomes_submitted_parent_keys(outcomes: List[ReplyOutcome]) -> set[str]:
@@ -4960,6 +5041,54 @@ def _coerce_main_anchor(value: Any, source_main: Optional[PublishedMain] = None)
             parent_key=_main_parent_key(source_main) if source_main else None,
         )
     return MainAnchor(matched_text=None, parent_comment_id=None, source_main=source_main)
+
+
+async def _revalidate_cached_main_anchor(
+    page: Page,
+    anchor: MainAnchor,
+    *,
+    expected_text: Optional[str],
+) -> bool:
+    token = str(getattr(anchor, "anchor_token", "") or "").strip()
+    expected = " ".join(str(expected_text or anchor.open_text or anchor.matched_text or "").split()).strip()
+    if not token or not expected:
+        return False
+    try:
+        state = await page.evaluate(
+            """
+            ([token, expected]) => {
+                const normalize = (value) => String(value || '').replace(/\\s+/g, ' ').trim().toLowerCase();
+                const el = [...document.querySelectorAll('[data-smart-parent-anchor]')]
+                    .find(node => (node.getAttribute('data-smart-parent-anchor') || '') === token);
+                if (!el || !el.getBoundingClientRect) {
+                    return { ok: false, reason: 'anchor_not_found' };
+                }
+                const r = el.getBoundingClientRect();
+                const st = getComputedStyle(el);
+                const visible = r.width > 0 && r.height > 0 && st.display !== 'none' && st.visibility !== 'hidden';
+                if (!visible) {
+                    return { ok: false, reason: 'anchor_not_visible' };
+                }
+                const actual = normalize(el.innerText || el.textContent || '');
+                const needle = normalize(expected);
+                return {
+                    ok: Boolean(needle && actual.includes(needle)),
+                    reason: actual.includes(needle) ? 'ok' : 'text_mismatch',
+                    textPreview: actual.slice(0, 120),
+                    rect: {
+                        top: Math.round(r.top),
+                        bottom: Math.round(r.bottom),
+                        left: Math.round(r.left),
+                        right: Math.round(r.right),
+                    },
+                };
+            }
+            """,
+            [token, expected],
+        )
+    except Exception:
+        return False
+    return bool(isinstance(state, dict) and state.get("ok"))
 
 
 def _main_from_anchor(main: PublishedMain, anchor: MainAnchor) -> PublishedMain:
@@ -5446,7 +5575,10 @@ async def _find_main_anchor(
                 author_anchors = []
             if author_anchors:
                 return author_anchors[0]
-            continue
+            logger.info(
+                "[USER_SCHEMA] author-scoped parent search missed for text=%r; falling back to text-only parent search",
+                text[:80],
+            )
         try:
             single_search_timeout = max(0.5, deadline - time.monotonic())
             found, info = await asyncio.wait_for(
@@ -5458,6 +5590,7 @@ async def _find_main_anchor(
                     ensure_open=False,
                     strict_scope=True,
                     top_level_only=True,
+                    min_match_ratio=1.0,
                 ),
                 timeout=single_search_timeout,
             )
@@ -5543,7 +5676,7 @@ async def _find_main_anchors_batch(
                 scroll_delay_ms=_REPLY_MAIN_SEARCH_SCROLL_DELAY_MS,
                 ensure_open=False,
                 strict_scope=True,
-                min_match_ratio=0.7,
+                min_match_ratio=1.0,
                 return_partial_on_found=True,
                 partial_found_sink=partial_found_map,
                 top_level_only=True,
@@ -5729,6 +5862,11 @@ async def _find_main_anchors_batch(
     info["target_count"] = len(candidates)
     info["missing_count"] = len(missing_targets)
     info["found_count"] = len(anchors)
+    info["author_fallback_count"] = sum(
+        len(items)
+        for items in ((info.get("author_fallback_candidates") or {}).values())
+        if isinstance(items, list)
+    ) or None
     return anchors, info
 
 
@@ -5897,6 +6035,10 @@ async def _verify_reply_visible_near_parent(
                         if (haystack.length <= Math.max(needle.length * 4, needle.length + 120) && haystack.includes(needle)) return true;
                         return false;
                     };
+                    const replyMatches = (haystack, needle) => {
+                        if (!haystack || !needle) return false;
+                        return haystack === needle;
+                    };
 
                     let parentRoot = null;
                     if (targetId) {
@@ -5919,7 +6061,7 @@ async def _verify_reply_visible_near_parent(
                     const directReplies = [...parentRoot.querySelectorAll(replyTextSelector)].filter(visible);
                     for (const node of directReplies) {
                         const text = textOf(node);
-                        if (textMatches(text, replyNeedle)) {
+                        if (replyMatches(text, replyNeedle)) {
                             return { found: true, reason: 'reply_inside_parent', text: text.slice(0, 120) };
                         }
                     }
@@ -5939,7 +6081,7 @@ async def _verify_reply_visible_near_parent(
                         if (r.top < parentTop - 4) continue;
                         if (nextMainTop !== null && r.top >= nextMainTop - 2) continue;
                         const text = textOf(node);
-                        if (textMatches(text, replyNeedle)) {
+                        if (replyMatches(text, replyNeedle)) {
                             return { found: true, reason: 'reply_between_parent_and_next_main', text: text.slice(0, 120) };
                         }
                     }
@@ -7368,6 +7510,29 @@ async def _reply_with_variant_on_all_mains(
                         )
                     )
                     return await _finish_reply_attempt(ReplyAttemptResult(replies=results, searched=True))
+                if anchor_from_batch and anchor is not None and remaining_seconds <= 0:
+                    anchor_still_valid = await _revalidate_cached_main_anchor(
+                        page,
+                        anchor,
+                        expected_text=main_text,
+                    )
+                    if not anchor_still_valid:
+                        _log_user_trace(
+                            "reply_cached_anchor_revalidate_failed",
+                            page=page,
+                            expected_video_url=target_media_url,
+                            correlation_id=correlation_id,
+                            account_id=account.id,
+                            variant_index=variant_index,
+                            parent_key=main_key[:80],
+                            anchor_preview=(anchor.open_text or anchor.matched_text or "")[:80],
+                            level=logging.INFO,
+                        )
+                        anchor = None
+                        anchor_from_batch = False
+                        remaining_seconds = search_deadline - time.monotonic()
+                        if remaining_seconds <= 0:
+                            break
                 if anchor is None:
                     cached_mains, cache_applied_single = await _apply_shared_parent_search_cache(
                         shared_parent_cache,
@@ -7693,10 +7858,39 @@ async def _reply_with_variant_on_all_mains(
                         )
                     continue
 
-                success = publish_result.status == "success" and bool(publish_result.comment_id)
+                network_confirmed = publish_result.status == "success" and bool(publish_result.comment_id)
                 submitted_unconfirmed = _reply_publish_submitted_unconfirmed(publish_result)
-                submitted = success or submitted_unconfirmed
-                if submitted:
+                local_reply_confirmed = False
+                if not network_confirmed and submitted_unconfirmed:
+                    try:
+                        local_reply_confirmed = await _verify_reply_visible_near_parent(
+                            page,
+                            reply_text=reply_text,
+                            parent_text=open_parent_text,
+                            parent_comment_id=open_parent_id or parent_id,
+                            correlation_id=sub_corr,
+                        )
+                    except Exception as verify_exc:
+                        logger.debug(
+                            "[USER_SCHEMA] %s reply local confirmation probe failed: %s",
+                            sub_corr,
+                            str(verify_exc)[:120],
+                        )
+                        local_reply_confirmed = False
+                    if local_reply_confirmed:
+                        submitted_unconfirmed = False
+                success = bool(network_confirmed or local_reply_confirmed)
+                counts_as_submitted = bool(success)
+                maybe_submitted = bool(success or submitted_unconfirmed)
+                if network_confirmed:
+                    reply_confirmation = "network_comment_id"
+                elif local_reply_confirmed:
+                    reply_confirmation = "local_visible_near_parent"
+                elif submitted_unconfirmed:
+                    reply_confirmation = "submitted_unconfirmed"
+                else:
+                    reply_confirmation = None
+                if counts_as_submitted:
                     submitted_keys = {
                         str(key).strip()
                         for key in (
@@ -7730,9 +7924,13 @@ async def _reply_with_variant_on_all_mains(
                     parent_author_match_mode=anchor.found_by,
                     author_fallback_used=anchor.author_fallback_used,
                     author_fallback_reason=anchor.author_fallback_reason,
+                    reply_comment_id=publish_result.comment_id if network_confirmed else None,
+                    local_confirmed=local_reply_confirmed,
+                    reply_confirmation=reply_confirmation,
+                    counts_as_submitted=counts_as_submitted,
                 )
                 results.append(outcome)
-                if submitted and on_submitted_outcome is not None:
+                if counts_as_submitted and on_submitted_outcome is not None:
                     try:
                         on_submitted_outcome(outcome)
                     except Exception as callback_exc:
@@ -7754,16 +7952,18 @@ async def _reply_with_variant_on_all_mains(
                     parent_id=parent_id,
                     parent_key=dedup_key[:80],
                     anchor_preview=anchor_text[:80],
-                    local_confirmed=False,
+                    local_confirmed=local_reply_confirmed,
                     submitted_unconfirmed=submitted_unconfirmed,
+                    counts_as_submitted=counts_as_submitted,
+                    reply_confirmation=reply_confirmation,
                     comment_id=publish_result.comment_id,
-                    level=logging.INFO if submitted else logging.WARNING,
+                    level=logging.INFO if maybe_submitted else logging.WARNING,
                 )
                 if success:
                     _register_runtime_success(db, account, scope="reply")
                 elif submitted_unconfirmed:
                     logger.info(
-                        "[USER_SCHEMA] %s reply submitted_unconfirmed after %s; not retrying this parent",
+                        "[USER_SCHEMA] %s reply submitted_unconfirmed after %s; parent remains pending unless later confirmed",
                         sub_corr,
                         publish_result.error_reason or publish_result.status,
                     )
@@ -7784,7 +7984,7 @@ async def _reply_with_variant_on_all_mains(
                             sub_corr,
                             failure_reason,
                         )
-                    elif not _should_record_publish_runtime_failure(failure_reason):
+                    elif not _should_record_reply_publish_runtime_failure(failure_reason):
                         logger.info(
                             "[USER_SCHEMA] %s: reply DOM publish path failed; keeping account health unchanged: %s",
                             sub_corr,
@@ -7792,7 +7992,7 @@ async def _reply_with_variant_on_all_mains(
                         )
                     else:
                         _register_runtime_failure(db, account, f"reply_failed:{failure_reason}")
-                    if _is_critical_publish_failure(publish_result):
+                    if _is_critical_reply_publish_failure(publish_result):
                         logger.warning(
                             "[USER_SCHEMA] %s: critical reply failure (%s), switching account",
                             sub_corr,
@@ -7807,7 +8007,7 @@ async def _reply_with_variant_on_all_mains(
                             )
                         )
 
-                if submitted and not _publish_result_allows_same_page_reuse(publish_result):
+                if maybe_submitted and not _publish_result_allows_same_page_reuse(publish_result):
                     logger.info(
                         "[USER_SCHEMA] %s reply submit used DOM composer but cleanup was not strictly proven; "
                         "stopping this reply account/page before the next parent",
@@ -7825,6 +8025,7 @@ async def _reply_with_variant_on_all_mains(
                         composer_clean_after_submit=getattr(publish_result, "composer_clean_after_submit", None),
                         dom_strategy=publish_result.dom_strategy,
                         submitted_unconfirmed=submitted_unconfirmed,
+                        counts_as_submitted=counts_as_submitted,
                         level=logging.INFO,
                     )
                     return await _finish_reply_attempt(
@@ -7836,7 +8037,7 @@ async def _reply_with_variant_on_all_mains(
                         )
                     )
 
-                if submitted:
+                if success:
                     try:
                         fast_reply = _is_parallel_reply_correlation(sub_corr)
                         try:
@@ -8259,7 +8460,7 @@ async def _maybe_order_likes(
 
 
 def _reply_outcome_counts_for_likes(outcome: ReplyOutcome) -> bool:
-    return bool(outcome.success or getattr(outcome, "submitted_unconfirmed", False))
+    return _reply_outcome_submitted(outcome)
 
 
 # ---------------------------------------------------------------------------
@@ -10385,7 +10586,12 @@ async def execute_user_schema_parallel(
                 len(main_candidates),
             )
             try:
-                author_required = any((main.tiktok_username or "").strip() for main in main_candidates)
+                author_hints_present = any((main.tiktok_username or "").strip() for main in main_candidates)
+                if author_hints_present:
+                    logger.info(
+                        "Task %s: reply parent search has author hints, but will use text-first matching",
+                        task_id,
+                    )
                 attempt_result = await asyncio.wait_for(
                     _reply_with_variant_on_all_mains(
                         attempt_db,
@@ -10398,8 +10604,8 @@ async def execute_user_schema_parallel(
                         fallback_main_texts=None,
                         already_replied_parent_keys=submitted_parent_keys,
                         fallback_allowed=False,
-                        require_parent_author_match=author_required,
-                        allow_parent_author_fallback=author_required,
+                        require_parent_author_match=False,
+                        allow_parent_author_fallback=False,
                         shared_parent_cache=shared_parent_cache,
                         on_submitted_outcome=_record_incremental_submitted_reply,
                     ),
@@ -11720,7 +11926,12 @@ async def execute_user_schema_full(
                         and task_confident_empty_misses >= 1
                         and fallback_main_attempts < _MAX_REPLY_FALLBACK_MAIN_ATTEMPTS
                     )
-                    author_required = any((main.tiktok_username or "").strip() for main in active_mains)
+                    author_hints_present = any((main.tiktok_username or "").strip() for main in active_mains)
+                    if author_hints_present:
+                        logger.info(
+                            "Task %s: reply parent search has author hints, but will use text-first matching",
+                            task_id,
+                        )
                     try:
                         attempt_result = await _reply_with_variant_on_all_mains(
                             db,
@@ -11740,8 +11951,8 @@ async def execute_user_schema_full(
                             ),
                             already_replied_parent_keys=variant_submitted_parent_keys,
                             fallback_allowed=fallback_allowed,
-                            require_parent_author_match=author_required,
-                            allow_parent_author_fallback=author_required,
+                            require_parent_author_match=False,
+                            allow_parent_author_fallback=False,
                         )
                     finally:
                         try:

@@ -1895,8 +1895,13 @@ def get_free_account_for_main_comment(
     runtime_last_resort_candidates: list[tuple[tuple[Any, ...], Account, dict[str, Any], int]] = []
     last_resort_candidates: list[tuple[tuple[Any, ...], Account, dict[str, Any], int]] = []
     candidates: list[Account] = []
+    try:
+        desired_ranked_candidates = int(getattr(settings, "PARALLEL_COMMENTING_TARGET_BROWSERS", 3) or 3)
+    except (TypeError, ValueError):
+        desired_ranked_candidates = 3
+    desired_ranked_candidates = max(1, min(10, desired_ranked_candidates))
     offset = 0
-    while offset < max_candidate_scan and not ranked_candidates:
+    while offset < max_candidate_scan and len(ranked_candidates) < desired_ranked_candidates:
         candidate_query = (
             query
             .order_by(*order_by_clauses)

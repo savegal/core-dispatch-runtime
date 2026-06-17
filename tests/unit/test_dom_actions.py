@@ -1093,15 +1093,13 @@ async def test_like_parent_comment_if_safe_is_best_effort():
 
 @pytest.mark.unit
 @pytest.mark.asyncio
-async def test_open_reply_box_requires_reply_input_activation(monkeypatch):
+async def test_open_reply_box_requires_bonded_reply_composer(monkeypatch):
     class _Page:
         async def evaluate(self, script, *_args):
             if script == dom_actions._JS_OPEN_REPLY:
                 return {"clicked": True, "strategy": "parent-text-match"}
-            if script == dom_actions._JS_REPLY_INPUT_ACTIVE:
-                return {"active": False, "reason": "reply_input_not_activated"}
             if script == dom_actions._JS_FIND_REPLY_INPUT:
-                return {"found": False, "reason": "reply_input_not_found"}
+                return {"found": False, "reason": "reply_composer_triple_not_found"}
             raise AssertionError("unexpected script")
 
         async def wait_for_selector(self, *_args, **_kwargs):
@@ -1115,21 +1113,24 @@ async def test_open_reply_box_requires_reply_input_activation(monkeypatch):
     result = await dom_actions.open_reply_box(_Page(), parent_comment_text="parent")
 
     assert result.success is False
-    assert result.reason == "reply_input_not_activated"
+    assert result.reason == "reply_composer_triple_not_found"
 
 
 @pytest.mark.unit
 @pytest.mark.asyncio
-async def test_open_reply_box_accepts_scoped_input_after_activation_miss(monkeypatch):
+async def test_open_reply_box_accepts_bonded_composer_after_click(monkeypatch):
     class _Page:
         async def evaluate(self, script, args=None):
             if script == dom_actions._JS_OPEN_REPLY:
                 return {"clicked": True, "strategy": "parent-anchor-reply", "anchorToken": "anchor-1"}
-            if script == dom_actions._JS_REPLY_INPUT_ACTIVE:
-                return {"active": False, "reason": "reply_input_not_activated"}
             if script == dom_actions._JS_FIND_REPLY_INPUT:
                 assert args == ["anchor-1"]
-                return {"found": True, "strategy": "reply-scoped-anchor-input", "score": 9000}
+                return {
+                    "found": True,
+                    "strategy": "reply-composer-between_parent_and_next_row",
+                    "score": 19000,
+                    "anchorToken": "anchor-1",
+                }
             raise AssertionError("unexpected script")
 
         async def wait_for_selector(self, *_args, **_kwargs):
@@ -1148,31 +1149,41 @@ async def test_open_reply_box_accepts_scoped_input_after_activation_miss(monkeyp
 
     assert result.success is True
     assert result.anchor_token == "anchor-1"
-    assert result.strategy == "parent-anchor-reply+scoped-input-visible"
+    assert result.strategy == "parent-anchor-reply+reply-composer-between_parent_and_next_row"
 
 
 @pytest.mark.unit
 @pytest.mark.asyncio
-async def test_find_reply_input_smart_uses_handle_without_selector_roundtrip(monkeypatch):
-    calls = {"handle": 0, "query": 0}
+async def test_find_reply_input_smart_uses_bonded_target_handles(monkeypatch):
+    calls = {"handle": 0, "state": 0}
 
     class _Handle:
+        def __init__(self, kind="input"):
+            self.kind = kind
+
         async def evaluate(self, _script):
-            return {"strategy": "reply-scoped-anchor-input", "score": "9000"}
+            return {"strategy": f"reply-{self.kind}", "score": "19000"}
 
     class _Page:
-        async def evaluate_handle(self, script, args):
+        async def evaluate_handle(self, script, args=None):
             calls["handle"] += 1
-            assert script == dom_actions._JS_FIND_REPLY_INPUT_HANDLE
-            assert args == ["anchor-1"]
-            return _Handle()
-
-        async def query_selector(self, _selector):
-            calls["query"] += 1
-            raise AssertionError("reply input handle path should not query_selector after found")
+            if script == dom_actions._JS_FIND_REPLY_INPUT_HANDLE:
+                assert args == ["anchor-1"]
+                return _Handle("input")
+            if "data-smart-reply-composer" in script:
+                return _Handle("composer")
+            if "data-smart-reply-post" in script:
+                return _Handle("post")
+            raise AssertionError("unexpected handle script")
 
         async def evaluate(self, _script):
-            raise AssertionError("reply input handle path should not need state lookup after found")
+            calls["state"] += 1
+            return {
+                "found": True,
+                "strategy": "reply-composer-between_parent_and_next_row",
+                "score": 19000,
+                "anchorToken": "anchor-1",
+            }
 
     input_handle, result = await dom_actions.find_reply_input_smart(
         _Page(),
@@ -1182,8 +1193,8 @@ async def test_find_reply_input_smart_uses_handle_without_selector_roundtrip(mon
 
     assert input_handle is not None
     assert result.success is True
-    assert result.strategy == "reply-scoped-anchor-input"
-    assert calls == {"handle": 1, "query": 0}
+    assert result.strategy == "reply-composer-between_parent_and_next_row"
+    assert calls == {"handle": 3, "state": 1}
 
 
 @pytest.mark.unit
@@ -1255,13 +1266,27 @@ def test_open_reply_box_prefers_parent_dom_anchor_before_text_search():
 def test_reply_input_finder_requires_live_parent_anchor_scope():
     script = dom_actions._JS_FIND_REPLY_INPUT
 
-    assert "anchorMissing" in script
-    assert "selected.score < 8000" in script
+    assert "parent_anchor_token_missing" in script
+    assert "reply_composer_triple_not_found" in script
     assert "parent_anchor_not_found" in script
+    assert "input_without_post" in script
+    assert "global_main_composer" in script
     assert "data-smart-reply-anchor-token" in script
     assert "editor.setAttribute('data-smart-id', 'comment-input')" not in script
     assert "editor.removeAttribute('data-smart-id')" in script
     assert "editor.removeAttribute('data-smart-main-input')" in script
+
+
+@pytest.mark.unit
+def test_reply_input_finder_accepts_disabled_post_candidate_before_typing():
+    script = dom_actions._JS_FIND_REPLY_INPUT
+
+    assert "allowDisabled" in script
+    assert "if (!allowDisabled && disabled(el)) continue" in script
+    assert "if (!allowDisabled && st.pointerEvents === 'none') continue" in script
+    assert "findPostInside(cur, inputRect, {allowDisabled: true})" in script
+    assert "postInitiallyDisabled" in script
+    assert "data-smart-reply-post-initial-disabled" in script
 
 
 @pytest.mark.unit
@@ -1275,6 +1300,17 @@ def test_reply_post_finder_does_not_fallback_to_global_comment_markers():
     assert '[data-smart-reply-post="1"]' in handle_script
     assert '[data-smart-id=\\"comment-post\\"]' not in handle_script
     assert "document.querySelector('[data-smart-reply-post=\"1\"]')" in enabled_source
+    assert "const replyPostCandidates = () =>" in enabled_source
+    assert "composer.querySelectorAll(selector)" in enabled_source
+    assert "reply-enabled-refind" in enabled_source
+    assert "let sawDisabled = null" in enabled_source
+    assert "if (sawDisabled) return sawDisabled" in enabled_source
+    assert "const isAccessoryReplyIcon = (raw) =>" in enabled_source
+    assert "label.includes('emoji')" in enabled_source
+    assert "label.includes('mention')" in enabled_source
+    assert "compact === '@'" in enabled_source
+    assert "const usableInputRect = (input) =>" in enabled_source
+    assert "const inputRect = usableInputRect(input)" in enabled_source
 
 
 # ---------------------------------------------------------------------------
@@ -1292,8 +1328,10 @@ def test_atomic_set_comment_text_js_preserves_reply_scoping():
     assert "const replyProbe =" in script
     assert "data-smart-reply-input" in script
     assert "reply_marked_input_missing" in script
-    # The embedded reply finder keeps its anti "reply-as-main" guard reasons.
-    assert "reply_input_not_scoped_to_parent" in script
+    # The embedded reply finder keeps its bonded-composer guard reasons.
+    assert "reply_composer_triple_not_found" in script
+    assert "input_without_post" in script
+    assert "global_main_composer" in script
     assert "parent_anchor_not_found" in script
     assert "real.removeAttribute('data-smart-id')" in script
     assert "real.removeAttribute('data-smart-main-input')" in script

@@ -249,6 +249,30 @@ def test_is_critical_publish_failure(status, reason, expected):
 @pytest.mark.parametrize(
     "status,reason,expected",
     [
+        ("dom_error", "post_button_not_found", False),
+        ("dom_error", "post_button_stayed_disabled", False),
+        ("dom_error", "post_button_input_not_ready:input_empty", False),
+        ("dom_error", "reply_box_not_open:reply_button_not_found", False),
+        ("dom_error", "reply_composer_not_resolved:reply_composer_triple_not_found", False),
+        ("dom_error", "reply_post_not_enabled", False),
+        ("timeout", "publish_deadline_exceeded:reply_composer_resolve", False),
+        ("dom_error", "reply_parent_mismatch:expected=1 actual=2", True),
+        ("redirected", "redirected_to_login", True),
+        ("dom_error", "captcha_challenge:slider", True),
+        ("dom_error", "Page.evaluate: Target page, context or browser has been closed", True),
+    ],
+)
+def test_is_critical_reply_publish_failure_treats_composer_dom_failures_as_recoverable(status, reason, expected):
+    from executor.user_schema import _is_critical_reply_publish_failure
+
+    result = SimpleNamespace(status=status, error_reason=reason)
+    assert _is_critical_reply_publish_failure(result) is expected
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize(
+    "status,reason,expected",
+    [
         ("dom_error", "post_button_input_not_ready:input_empty", True),
         ("dom_error", "post_button_input_not_ready:placeholder_leak", True),
         ("timeout", "publish_deadline_exceeded:input_search", True),
@@ -341,6 +365,27 @@ def test_should_record_publish_runtime_failure(reason, expected):
 
 
 @pytest.mark.unit
+@pytest.mark.parametrize(
+    "reason,expected",
+    [
+        ("post_button_not_found", False),
+        ("post_button_stayed_disabled", False),
+        ("reply_box_not_open:reply_button_not_found", False),
+        ("reply_composer_not_resolved:reply_composer_triple_not_found", False),
+        ("reply_post_not_enabled", False),
+        ("publish_deadline_exceeded:reply_composer_resolve", False),
+        ("reply_parent_mismatch:expected=1 actual=2", True),
+        ("captcha_challenge:slider", False),
+        (None, True),
+    ],
+)
+def test_should_record_reply_publish_runtime_failure_keeps_dom_failures_off_account_health(reason, expected):
+    from executor import user_schema
+
+    assert user_schema._should_record_reply_publish_runtime_failure(reason) is expected
+
+
+@pytest.mark.unit
 def test_user_schema_manual_captcha_wait_disabled_by_default(monkeypatch):
     from executor import user_schema
 
@@ -412,7 +457,7 @@ async def test_find_main_anchors_batch_uses_single_author_fallback(monkeypatch):
 
 @pytest.mark.unit
 @pytest.mark.asyncio
-async def test_find_main_anchors_batch_relaxes_text_ratio_when_author_matching(monkeypatch):
+async def test_find_main_anchors_batch_uses_exact_text_ratio_for_reply_parent(monkeypatch):
     from executor import user_schema
 
     calls = []
@@ -442,7 +487,7 @@ async def test_find_main_anchors_batch_relaxes_text_ratio_when_author_matching(m
 
     assert calls
     assert calls[0]["require_author_match"] is True
-    assert calls[0]["min_match_ratio"] == 0.7
+    assert calls[0]["min_match_ratio"] == 1.0
 
 
 @pytest.mark.unit
@@ -1029,6 +1074,7 @@ def test_user_schema_parent_id_lookup_does_not_trust_data_id():
     assert 'f\'[data-id="{escaped}"]\'' not in find_source
     assert "root.getAttribute('data-id')" not in verify_source
     assert '[id="comment-{escaped}"]' in find_source
+    assert "replyMatches(text, replyNeedle)" in verify_source
 
 
 @pytest.mark.unit
@@ -3180,7 +3226,7 @@ async def test_find_main_anchor_propagates_comment_list_not_open(monkeypatch):
 
 @pytest.mark.unit
 @pytest.mark.asyncio
-async def test_reply_ambiguous_publish_is_recorded_without_local_reply_verification(monkeypatch):
+async def test_reply_ambiguous_publish_without_local_visibility_keeps_parent_pending(monkeypatch):
     from executor import user_schema
     from executor.publish_action import PublishResult
 
@@ -3216,7 +3262,7 @@ async def test_reply_ambiguous_publish_is_recorded_without_local_reply_verificat
         )
 
     async def fake_verify_reply(*_args, **_kwargs):
-        raise AssertionError("reply visibility verification must not run in publish-only flow")
+        return False
 
     async def fake_sleep(_seconds):
         return None
@@ -3259,14 +3305,107 @@ async def test_reply_ambiguous_publish_is_recorded_without_local_reply_verificat
     assert len(result.replies) == 1
     assert result.replies[0].success is False
     assert result.replies[0].submitted_unconfirmed is True
+    assert result.replies[0].counts_as_submitted is False
+    assert result.replies[0].reply_confirmation == "submitted_unconfirmed"
     assert result.replies[0].attempted is True
     assert result.replies[0].error == "stealth_reject_empty_body"
     assert result.replies[0].parent_comment_id == "cid-main"
     assert result.replies[0].method == "reply-dom"
     assert [p.text for p in result.found_mains] == ["main one"]
     assert "cid-main" in result.attempted_parent_keys
-    assert "cid-main" in done_parent_keys
+    assert "cid-main" not in done_parent_keys
     assert not failures
+
+
+@pytest.mark.unit
+@pytest.mark.asyncio
+async def test_reply_ambiguous_publish_with_local_visibility_counts_as_submitted(monkeypatch):
+    from executor import user_schema
+    from executor.publish_action import PublishResult
+
+    class FakePage:
+        url = "https://www.tiktok.com/@demo/video/1234567890123456789"
+
+        def is_closed(self):
+            return False
+
+        async def close(self):
+            return None
+
+    class FakeContext:
+        async def close(self):
+            return None
+
+    async def fake_create_page_for_account(_account):
+        return FakeContext(), FakePage()
+
+    async def fake_login_ready(*_args, **_kwargs):
+        return True, None
+
+    async def fake_find_main_anchor(*_args, **_kwargs):
+        return "main one", "cid-main"
+
+    async def fake_publish_reply(*_args, **_kwargs):
+        return PublishResult(
+            status="failed",
+            error_reason="stealth_reject_empty_body",
+            network_captured=True,
+            dom_strategy="reply-dom",
+            post_was_enabled_at_click=True,
+            composer_clean_after_submit=True,
+        )
+
+    async def fake_verify_reply(*_args, **_kwargs):
+        return True
+
+    async def fake_sleep(_seconds):
+        return None
+
+    successes = []
+    done_parent_keys = set()
+
+    monkeypatch.setattr(user_schema, "create_page_for_account", fake_create_page_for_account)
+    monkeypatch.setattr(user_schema, "_ensure_account_login_ready", fake_login_ready)
+    monkeypatch.setattr(user_schema, "needs_enrichment", lambda _account: False)
+    monkeypatch.setattr(user_schema, "_ensure_page_on_target_media", AsyncMock(return_value=True))
+    monkeypatch.setattr(user_schema, "_open_comment_list_with_safe_retry", AsyncMock(return_value=True))
+    monkeypatch.setattr(user_schema, "_find_main_anchor", fake_find_main_anchor)
+    monkeypatch.setattr(user_schema, "publish_reply_hybrid", fake_publish_reply)
+    monkeypatch.setattr(user_schema, "_verify_reply_visible_near_parent", fake_verify_reply)
+    monkeypatch.setattr(user_schema, "_should_like_parent_before_reply", lambda *_args, **_kwargs: False)
+    monkeypatch.setattr(user_schema.asyncio, "sleep", fake_sleep)
+    monkeypatch.setattr(user_schema, "_register_runtime_success", lambda *_args, **_kwargs: successes.append(_args))
+
+    result = await user_schema._reply_with_variant_on_all_mains(
+        SimpleNamespace(),
+        SimpleNamespace(id=77, proxy=None),
+        "https://www.tiktok.com/@demo/video/1234567890123456789",
+        [
+            user_schema.PublishedMain(
+                text="main one",
+                comment_id="cid-main",
+                network_confirmed=True,
+                local_confirmed=True,
+                method="hybrid_dom",
+                account_id=10,
+                tiktok_username=None,
+            )
+        ],
+        "reply text",
+        variant_index=1,
+        correlation_id="task_1_reply",
+        already_replied_parent_keys=done_parent_keys,
+    )
+
+    assert len(result.replies) == 1
+    assert result.replies[0].success is True
+    assert result.replies[0].submitted_unconfirmed is False
+    assert result.replies[0].local_confirmed is True
+    assert result.replies[0].counts_as_submitted is True
+    assert result.replies[0].reply_confirmation == "local_visible_near_parent"
+    assert "cid-main" in result.attempted_parent_keys
+    assert "cid-main" in done_parent_keys
+    assert successes
 
 
 @pytest.mark.unit
@@ -3793,6 +3932,9 @@ async def test_reply_http_parent_unconfirmed_is_not_retried_via_dom(monkeypatch)
     async def fail_restore(*_args, **_kwargs):
         raise AssertionError("submitted HTTP reply should not need DOM anchor restoration")
 
+    async def fake_verify_reply(*_args, **_kwargs):
+        return False
+
     async def fake_sleep(_seconds):
         return None
 
@@ -3808,6 +3950,7 @@ async def test_reply_http_parent_unconfirmed_is_not_retried_via_dom(monkeypatch)
     monkeypatch.setattr(user_schema, "_find_main_anchor", AsyncMock(side_effect=AssertionError("single search should not run")))
     monkeypatch.setattr(user_schema, "_prepare_user_schema_http_session", fake_prepare)
     monkeypatch.setattr(user_schema, "_publish_reply_http_first_if_eligible", fake_http)
+    monkeypatch.setattr(user_schema, "_verify_reply_visible_near_parent", fake_verify_reply)
     monkeypatch.setattr(user_schema, "_restore_comment_list_position_for_anchor", fail_restore)
     monkeypatch.setattr(user_schema, "publish_reply_hybrid", fail_dom_publish)
     monkeypatch.setattr(user_schema.asyncio, "sleep", fake_sleep)
@@ -3834,10 +3977,12 @@ async def test_reply_http_parent_unconfirmed_is_not_retried_via_dom(monkeypatch)
     assert len(result.replies) == 1
     assert result.replies[0].success is False
     assert result.replies[0].submitted_unconfirmed is True
+    assert result.replies[0].counts_as_submitted is False
+    assert result.replies[0].reply_confirmation == "submitted_unconfirmed"
     assert result.replies[0].error == "reply_parent_unconfirmed_after_submit"
     assert result.replies[0].parent_comment_id == parent_cid
     assert parent_cid in result.attempted_parent_keys
-    assert parent_cid in done_parent_keys
+    assert parent_cid not in done_parent_keys
     assert runtime_failures == []
 
 
@@ -4274,6 +4419,15 @@ async def test_reply_publishes_cached_batch_anchors_after_search_deadline(monkey
         def is_closed(self):
             return False
 
+        async def evaluate(self, _script, args):
+            token, expected = args
+            text_by_token = {
+                "anchor-1": "main one visible",
+                "anchor-2": "main two visible",
+            }
+            text = text_by_token.get(token, "")
+            return {"ok": bool(expected and expected in text), "reason": "ok"}
+
         async def close(self):
             return None
 
@@ -4320,6 +4474,7 @@ async def test_reply_publishes_cached_batch_anchors_after_search_deadline(monkey
                 parent_comment_id="cid-1",
                 open_text="main one visible",
                 found_by="text",
+                anchor_token="anchor-1",
                 source_main=main_candidates[0],
             ),
             user_schema.MainAnchor(
@@ -4327,6 +4482,7 @@ async def test_reply_publishes_cached_batch_anchors_after_search_deadline(monkey
                 parent_comment_id="cid-2",
                 open_text="main two visible",
                 found_by="text",
+                anchor_token="anchor-2",
                 source_main=main_candidates[1],
             ),
         ], {}
@@ -8572,6 +8728,7 @@ async def test_parallel_mode_stop_preserves_partial_submitted_reply_outcomes(mon
                     attempted=True,
                     submitted_unconfirmed=True,
                     parent_key=user_schema._main_parent_key(submitted_main),
+                    counts_as_submitted=True,
                 )
             ],
             found_mains=[submitted_main],
@@ -8926,6 +9083,7 @@ async def test_parallel_mode_carries_submitted_parent_keys_across_reply_retries(
                         account_id=account.id,
                         attempted=True,
                         submitted_unconfirmed=True,
+                        counts_as_submitted=True,
                     )
                 ],
                 found_mains=list(main_candidates),
@@ -9061,6 +9219,7 @@ async def test_parallel_reply_timeout_preserves_streamed_submitted_parent(monkey
                 account_id=account.id,
                 attempted=True,
                 submitted_unconfirmed=True,
+                counts_as_submitted=True,
             )
             kwargs["on_submitted_outcome"](outcome)
             raise asyncio.TimeoutError()
@@ -9676,7 +9835,7 @@ async def test_maybe_order_likes_allows_submitted_main_without_observer(monkeypa
 
 
 @pytest.mark.unit
-def test_submitted_unconfirmed_reply_counts_for_likes():
+def test_unconfirmed_reply_without_visible_confirmation_does_not_count_for_likes():
     from executor import user_schema
 
     assert user_schema._reply_outcome_counts_for_likes(
@@ -9691,6 +9850,23 @@ def test_submitted_unconfirmed_reply_counts_for_likes():
             account_id=201,
             attempted=True,
             submitted_unconfirmed=True,
+        )
+    ) is False
+    assert user_schema._reply_outcome_counts_for_likes(
+        user_schema.ReplyOutcome(
+            text="reply",
+            variant_index=1,
+            matched_main_text="main",
+            parent_comment_id=None,
+            success=False,
+            method="hybrid_dom",
+            error=None,
+            account_id=201,
+            attempted=True,
+            submitted_unconfirmed=True,
+            local_confirmed=True,
+            reply_confirmation="local_visible_near_parent",
+            counts_as_submitted=True,
         )
     ) is True
     assert user_schema._reply_outcome_counts_for_likes(
@@ -9782,7 +9958,7 @@ async def test_parallel_likes_single_top_orders_most_answered_author(monkeypatch
         [
             user_schema.ReplyOutcome("r1", 1, "m1", "cid1", True, "hybrid_dom", None, 201, matched_parent_author="main_a"),
             user_schema.ReplyOutcome("r2", 2, "m2", "cid2", True, "hybrid_dom", None, 202, matched_parent_author="main_b"),
-            user_schema.ReplyOutcome("r3", 3, "m2", "cid2", False, "hybrid_dom", "stealth", 203, submitted_unconfirmed=True, matched_parent_author="main_b"),
+            user_schema.ReplyOutcome("r3", 3, "m2", "cid2", True, "hybrid_dom", None, 203, matched_parent_author="main_b"),
         ]
     )
 
@@ -9897,11 +10073,10 @@ def test_parallel_likes_target_falls_back_to_expected_main_username_by_cid():
             1,
             "m1",
             "cid1",
-            False,
+            True,
             "hybrid_dom",
-            "stealth",
+            None,
             201,
-            submitted_unconfirmed=True,
         )
     )
 

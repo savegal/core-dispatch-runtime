@@ -1,4 +1,5 @@
 import asyncio
+import inspect
 import json
 import time
 from types import SimpleNamespace
@@ -41,6 +42,41 @@ class _FakeButton:
 
     async def evaluate(self, _script):
         return None
+
+
+def _fake_reply_target(anchor_token="fresh-anchor-token"):
+    return SimpleNamespace(
+        input_handle=_FakeInput(),
+        composer_handle=SimpleNamespace(),
+        post_button_handle=_FakeButton(),
+        anchor_token=anchor_token,
+        strategy="reply-composer-test",
+        diagnostics={"anchorToken": anchor_token},
+    )
+
+
+async def _fake_find_reply_composer_for_parent(*args, **kwargs):
+    anchor_token = kwargs.get("parent_anchor_token") or "anchor-1"
+    return _fake_reply_target(anchor_token), SimpleNamespace(
+        success=True,
+        strategy="reply-composer-test",
+        reason=None,
+        elapsed_seconds=0.1,
+    )
+
+
+@pytest.mark.unit
+def test_reply_publish_does_not_force_click_when_enabled_gate_fails():
+    source = inspect.getsource(publish_action._publish_via_current_input)
+
+    reply_guard = "if not post_was_enabled and reply_scoped:"
+    legacy_force_click = "Trying legacy force-click anyway"
+    assert reply_guard in source
+    assert legacy_force_click in source
+    assert source.index(reply_guard) < source.index(legacy_force_click)
+    guarded_block = source.split(reply_guard, 1)[1].split(legacy_force_click, 1)[0]
+    assert 'status="dom_error"' in guarded_block
+    assert "network_request_attempted=False" in guarded_block
 
 
 class _FakeResponse:
@@ -307,6 +343,7 @@ async def test_publish_reply_hybrid_comment_id_without_parent_is_unconfirmed(mon
     monkeypatch.setattr(publish_action, "_logged_out_publish_result_if_visible", _fake_none)
     monkeypatch.setattr(publish_action, "_publish_url_guard_result", lambda *args, **kwargs: None)
     monkeypatch.setattr(publish_action, "open_reply_box", _fake_open_reply_box)
+    monkeypatch.setattr(publish_action, "find_reply_composer_for_parent", _fake_find_reply_composer_for_parent)
     monkeypatch.setattr(publish_action, "_publish_via_current_input", _fake_publish_current_input)
 
     result = await publish_action.publish_reply_hybrid(
@@ -496,6 +533,7 @@ async def test_publish_reply_hybrid_uses_fresh_anchor_from_open_reply_box(monkey
     async def _fake_publish_via_current_input(*args, **kwargs):
         captured["parent_anchor_token"] = kwargs.get("parent_anchor_token")
         captured["reply_scoped"] = kwargs.get("reply_scoped")
+        captured["reply_target_anchor"] = getattr(kwargs.get("reply_target"), "anchor_token", None)
         return publish_action.PublishResult(
             status="success",
             comment_id="reply_cid",
@@ -509,6 +547,11 @@ async def test_publish_reply_hybrid_uses_fresh_anchor_from_open_reply_box(monkey
     monkeypatch.setattr(publish_action, "_captcha_result_if_present", _fake_none)
     monkeypatch.setattr(publish_action, "_logged_out_publish_result_if_visible", _fake_none)
     monkeypatch.setattr(publish_action, "open_reply_box", _fake_open_reply_box)
+    monkeypatch.setattr(
+        publish_action,
+        "find_reply_composer_for_parent",
+        AsyncMock(return_value=(_fake_reply_target("fresh-anchor-token"), SimpleNamespace(success=True, strategy="reply-composer-test", reason=None))),
+    )
     monkeypatch.setattr(publish_action, "_publish_via_current_input", _fake_publish_via_current_input)
 
     result = await publish_action.publish_reply_hybrid(
@@ -527,6 +570,7 @@ async def test_publish_reply_hybrid_uses_fresh_anchor_from_open_reply_box(monkey
     assert captured == {
         "parent_anchor_token": "fresh-anchor-token",
         "reply_scoped": True,
+        "reply_target_anchor": "fresh-anchor-token",
     }
 
 
@@ -555,6 +599,7 @@ async def test_publish_reply_hybrid_parallel_reply_uses_three_open_attempts_and_
     async def _fake_publish_via_current_input(*args, **kwargs):
         captured["reply_scoped"] = kwargs.get("reply_scoped")
         captured["parent_anchor_token"] = kwargs.get("parent_anchor_token")
+        captured["reply_target_anchor"] = getattr(kwargs.get("reply_target"), "anchor_token", None)
         return publish_action.PublishResult(
             status="success",
             comment_id="reply_cid",
@@ -569,6 +614,11 @@ async def test_publish_reply_hybrid_parallel_reply_uses_three_open_attempts_and_
     monkeypatch.setattr(publish_action, "_captcha_result_if_present", _fake_none)
     monkeypatch.setattr(publish_action, "_logged_out_publish_result_if_visible", _fake_none)
     monkeypatch.setattr(publish_action, "open_reply_box", _fake_open_reply_box)
+    monkeypatch.setattr(
+        publish_action,
+        "find_reply_composer_for_parent",
+        AsyncMock(return_value=(_fake_reply_target("fresh-anchor-token"), SimpleNamespace(success=True, strategy="reply-composer-test", reason=None))),
+    )
     monkeypatch.setattr(publish_action, "_publish_via_current_input", _fake_publish_via_current_input)
 
     result = await publish_action.publish_reply_hybrid(
@@ -588,6 +638,7 @@ async def test_publish_reply_hybrid_parallel_reply_uses_three_open_attempts_and_
     assert 11.0 <= captured["timeouts"][0] <= 12.0
     assert captured["reply_scoped"] is True
     assert captured["parent_anchor_token"] == "fresh-anchor-token"
+    assert captured["reply_target_anchor"] == "fresh-anchor-token"
 
 
 @pytest.mark.unit
@@ -602,10 +653,12 @@ async def test_publish_reply_hybrid_recovers_open_timeout_when_scoped_input_visi
     async def _timeout_open_reply_box(*args, **kwargs):
         raise asyncio.TimeoutError()
 
-    async def _fake_find_reply_input_smart(*args, **kwargs):
+    async def _fake_find_reply_composer_for_parent(*args, **kwargs):
         captured["recover_anchor"] = kwargs.get("parent_anchor_token")
-        return _FakeInput(), SimpleNamespace(
-            strategy="reply-scoped-anchor-input",
+        target = _fake_reply_target(kwargs.get("parent_anchor_token") or "anchor-1")
+        return target, SimpleNamespace(
+            success=True,
+            strategy="reply-composer-test",
             elapsed_seconds=0.1,
             reason=None,
         )
@@ -613,6 +666,7 @@ async def test_publish_reply_hybrid_recovers_open_timeout_when_scoped_input_visi
     async def _fake_publish_via_current_input(*args, **kwargs):
         captured["reply_scoped"] = kwargs.get("reply_scoped")
         captured["publish_anchor"] = kwargs.get("parent_anchor_token")
+        captured["reply_target_anchor"] = getattr(kwargs.get("reply_target"), "anchor_token", None)
         captured["aggressive"] = kwargs.get("aggressive")
         return publish_action.PublishResult(status="success", comment_id="reply_cid")
 
@@ -620,7 +674,7 @@ async def test_publish_reply_hybrid_recovers_open_timeout_when_scoped_input_visi
     monkeypatch.setattr(publish_action, "_captcha_result_if_present", _fake_none)
     monkeypatch.setattr(publish_action, "_logged_out_publish_result_if_visible", _fake_none)
     monkeypatch.setattr(publish_action, "open_reply_box", _timeout_open_reply_box)
-    monkeypatch.setattr(publish_action, "find_reply_input_smart", _fake_find_reply_input_smart)
+    monkeypatch.setattr(publish_action, "find_reply_composer_for_parent", _fake_find_reply_composer_for_parent)
     monkeypatch.setattr(publish_action, "_publish_via_current_input", _fake_publish_via_current_input)
 
     result = await publish_action.publish_reply_hybrid(
@@ -640,8 +694,74 @@ async def test_publish_reply_hybrid_recovers_open_timeout_when_scoped_input_visi
         "recover_anchor": "anchor-1",
         "reply_scoped": True,
         "publish_anchor": "anchor-1",
+        "reply_target_anchor": "anchor-1",
         "aggressive": True,
     }
+
+
+@pytest.mark.unit
+@pytest.mark.asyncio
+async def test_publish_reply_hybrid_recovers_reply_post_button_not_found(monkeypatch):
+    page = _FakePage()
+    captured = {"publish_calls": 0, "target_resolves": 0}
+
+    async def _fake_none(*args, **kwargs):
+        return None
+
+    async def _fake_open_reply_box(*args, **kwargs):
+        return SimpleNamespace(
+            success=True,
+            strategy="parent-anchor-reply",
+            reason=None,
+            anchor_token="anchor-1",
+        )
+
+    async def _fake_find_reply_composer_for_parent(*args, **kwargs):
+        captured["target_resolves"] += 1
+        return _fake_reply_target("anchor-1"), SimpleNamespace(
+            success=True,
+            strategy="reply-composer-test",
+            reason=None,
+        )
+
+    async def _fake_publish_via_current_input(*args, **kwargs):
+        captured["publish_calls"] += 1
+        assert getattr(kwargs.get("reply_target"), "anchor_token", None) == "anchor-1"
+        if captured["publish_calls"] == 1:
+            return publish_action.PublishResult(
+                status="dom_error",
+                error_reason="reply_direct_post_click_failed:reply_post_button_not_found",
+                dom_strategy="reply-direct-smart-type",
+            )
+        return publish_action.PublishResult(
+            status="success",
+            comment_id="reply_cid",
+            network_captured=True,
+            network_request_attempted=True,
+            network_response_json={"comment": {"cid": "reply_cid"}},
+            post_was_enabled_at_click=True,
+        )
+
+    monkeypatch.setattr(publish_action, "_publish_url_guard_result", lambda *args, **kwargs: None)
+    monkeypatch.setattr(publish_action, "_captcha_result_if_present", _fake_none)
+    monkeypatch.setattr(publish_action, "_logged_out_publish_result_if_visible", _fake_none)
+    monkeypatch.setattr(publish_action, "open_reply_box", _fake_open_reply_box)
+    monkeypatch.setattr(publish_action, "find_reply_composer_for_parent", _fake_find_reply_composer_for_parent)
+    monkeypatch.setattr(publish_action, "_publish_via_current_input", _fake_publish_via_current_input)
+
+    result = await publish_action.publish_reply_hybrid(
+        page,
+        "reply text",
+        parent_comment_text="parent",
+        parent_anchor_token="anchor-1",
+        max_total_seconds=20.0,
+        correlation_id="task_1_parallel_reply_v1_a1_acc10_to_text",
+        expected_video_url=page.url,
+        comments_already_open=True,
+    )
+
+    assert result.status == "success"
+    assert captured == {"publish_calls": 2, "target_resolves": 2}
 
 
 @pytest.mark.unit
@@ -883,6 +1003,7 @@ async def test_publish_reply_hybrid_uses_local_deadline_helpers(monkeypatch):
     monkeypatch.setattr(publish_action, "_logged_out_publish_result_if_visible", _fake_none)
     monkeypatch.setattr(publish_action, "open_comment_section", _fake_open_comment_section)
     monkeypatch.setattr(publish_action, "open_reply_box", _fake_open_reply_box)
+    monkeypatch.setattr(publish_action, "find_reply_composer_for_parent", _fake_find_reply_composer_for_parent)
     monkeypatch.setattr(publish_action, "_publish_via_current_input", _fake_publish_via_current_input)
 
     result = await publish_action.publish_reply_hybrid(
@@ -925,6 +1046,7 @@ async def test_publish_reply_hybrid_uses_open_surface_fast_path(monkeypatch):
     monkeypatch.setattr(publish_action, "_logged_out_publish_result_if_visible", _fake_none)
     monkeypatch.setattr(publish_action, "open_comment_section", _fake_open_comment_section)
     monkeypatch.setattr(publish_action, "open_reply_box", _fake_open_reply_box)
+    monkeypatch.setattr(publish_action, "find_reply_composer_for_parent", _fake_find_reply_composer_for_parent)
     monkeypatch.setattr(publish_action, "_publish_via_current_input", _fake_publish_via_current_input)
 
     result = await publish_action.publish_reply_hybrid(
@@ -965,6 +1087,7 @@ async def test_publish_reply_hybrid_keeps_minimum_input_budget_after_parent_open
     monkeypatch.setattr(publish_action, "_captcha_result_if_present", _fake_none)
     monkeypatch.setattr(publish_action, "_logged_out_publish_result_if_visible", _fake_none)
     monkeypatch.setattr(publish_action, "open_reply_box", _fake_open_reply_box)
+    monkeypatch.setattr(publish_action, "find_reply_composer_for_parent", _fake_find_reply_composer_for_parent)
     monkeypatch.setattr(publish_action, "_publish_via_current_input", _fake_publish_via_current_input)
 
     result = await publish_action.publish_reply_hybrid(
@@ -1003,6 +1126,7 @@ async def test_publish_reply_hybrid_does_not_expand_small_deadline_budget(monkey
     monkeypatch.setattr(publish_action, "_captcha_result_if_present", _fake_none)
     monkeypatch.setattr(publish_action, "_logged_out_publish_result_if_visible", _fake_none)
     monkeypatch.setattr(publish_action, "open_reply_box", _fake_open_reply_box)
+    monkeypatch.setattr(publish_action, "find_reply_composer_for_parent", _fake_find_reply_composer_for_parent)
     monkeypatch.setattr(publish_action, "_publish_via_current_input", _fake_publish_via_current_input)
 
     result = await publish_action.publish_reply_hybrid(
@@ -1041,6 +1165,7 @@ async def test_publish_reply_hybrid_uses_smaller_parallel_minimum_input_budget(m
     monkeypatch.setattr(publish_action, "_captcha_result_if_present", _fake_none)
     monkeypatch.setattr(publish_action, "_logged_out_publish_result_if_visible", _fake_none)
     monkeypatch.setattr(publish_action, "open_reply_box", _fake_open_reply_box)
+    monkeypatch.setattr(publish_action, "find_reply_composer_for_parent", _fake_find_reply_composer_for_parent)
     monkeypatch.setattr(publish_action, "_publish_via_current_input", _fake_publish_via_current_input)
 
     result = await publish_action.publish_reply_hybrid(
@@ -3188,17 +3313,15 @@ async def test_reply_direct_dom_fallback_no_id_with_api_error_is_not_unconfirmed
 
 @pytest.mark.unit
 @pytest.mark.asyncio
-async def test_publish_current_input_uses_reply_direct_dom_fallback_after_input_not_found(monkeypatch):
+async def test_publish_current_input_does_not_use_reply_direct_fallback_without_target_after_input_not_found(monkeypatch):
     page = _FakePage()
-    calls = {}
+    calls = {"direct": 0}
 
     async def _fake_find_reply_input_smart(*args, **kwargs):
         return None, SimpleNamespace(reason="timeout", redirected_to=None, strategy=None)
 
     async def _fake_publish_reply_comment_direct_dom(*args, **kwargs):
-        calls["previous_reason"] = kwargs.get("previous_reason")
-        calls["parent_anchor_token"] = kwargs.get("parent_anchor_token")
-        calls["text"] = args[1]
+        calls["direct"] += 1
         return publish_action.PublishResult(
             status="success",
             comment_id="cid_reply_direct",
@@ -3222,20 +3345,16 @@ async def test_publish_current_input_uses_reply_direct_dom_fallback_after_input_
         parent_anchor_token="pa-1",
     )
 
-    assert result.status == "success"
-    assert result.comment_id == "cid_reply_direct"
-    assert calls == {
-        "previous_reason": "timeout",
-        "parent_anchor_token": "pa-1",
-        "text": "reply text",
-    }
+    assert result.status == "dom_error"
+    assert result.error_reason == "input_not_found: timeout"
+    assert calls == {"direct": 0}
 
 
 @pytest.mark.unit
 @pytest.mark.asyncio
-async def test_publish_current_input_uses_reply_direct_dom_fallback_after_input_search_timeout(monkeypatch):
+async def test_publish_current_input_does_not_use_reply_direct_fallback_without_target_after_input_search_timeout(monkeypatch):
     page = _FakePage()
-    calls = {}
+    calls = {"direct": 0}
 
     async def _fake_find_reply_input_smart(*args, **kwargs):
         raise AssertionError("fake wait_for should time this coroutine out")
@@ -3247,8 +3366,7 @@ async def test_publish_current_input_uses_reply_direct_dom_fallback_after_input_
         raise asyncio.TimeoutError()
 
     async def _fake_publish_reply_comment_direct_dom(*args, **kwargs):
-        calls["previous_reason"] = kwargs.get("previous_reason")
-        calls["parent_anchor_token"] = kwargs.get("parent_anchor_token")
+        calls["direct"] += 1
         return publish_action.PublishResult(status="success", comment_id="cid_reply_direct_timeout")
 
     monkeypatch.setattr(publish_action, "suppress_keyboard_shortcuts_overlay", AsyncMock(return_value=0))
@@ -3268,12 +3386,9 @@ async def test_publish_current_input_uses_reply_direct_dom_fallback_after_input_
         parent_anchor_token="pa-2",
     )
 
-    assert result.status == "success"
-    assert result.comment_id == "cid_reply_direct_timeout"
-    assert calls == {
-        "previous_reason": "input_search_timeout",
-        "parent_anchor_token": "pa-2",
-    }
+    assert result.status == "timeout"
+    assert result.error_reason == "publish_deadline_exceeded:input_search"
+    assert calls == {"direct": 0}
 
 
 @pytest.mark.unit
