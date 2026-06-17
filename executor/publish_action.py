@@ -22,6 +22,7 @@ from executor.dom_actions import (
     find_reply_composer_for_parent,
     find_reply_input_smart,
     find_reply_post_button_smart,
+    find_reply_send_candidate_for_optimistic_click,
     get_comment_surface_state,
     open_comment_section,
     open_reply_box,
@@ -49,6 +50,14 @@ _PARALLEL_FAST_PUBLISH_MARKERS = (
     "_parallel_main_",
     "_parallel_reply_",
     "_engagement_reply_",
+)
+_REPLY_SEND_RECOVERABLE_RETRY_PREFIXES = (
+    "post_button_stayed_disabled",
+    "post_button_not_found",
+    "post_button_input_not_ready:",
+    "reply_post_not_enabled",
+    "reply_composer_not_resolved:",
+    "reply_direct_post_click_failed:reply_post_button_not_found",
 )
 _PARALLEL_MAIN_OPEN_COMMENTS_SECONDS_DEFAULT = 12.0
 _PARALLEL_MAIN_INPUT_SEARCH_SECONDS_DEFAULT = 8.0
@@ -88,6 +97,25 @@ def _extract_tiktok_media_id(url: Optional[str]) -> Optional[str]:
 def _is_parallel_fast_publish(correlation_id: Optional[str]) -> bool:
     text = str(correlation_id or "")
     return any(marker in text for marker in _PARALLEL_FAST_PUBLISH_MARKERS)
+
+
+def _is_recoverable_reply_send_reason(reason: Optional[str]) -> bool:
+    safe = str(reason or "")
+    if not safe:
+        return False
+    if safe.startswith("publish_deadline_exceeded:reply_composer_resolve"):
+        return True
+    return safe.startswith(_REPLY_SEND_RECOVERABLE_RETRY_PREFIXES)
+
+
+def _reply_post_gate_reason_allows_scoped_recovery(reason: Optional[str]) -> bool:
+    safe = str(reason or "")
+    return safe.startswith((
+        "post_button_stayed_disabled",
+        "post_button_not_found",
+        "reply_post_not_enabled",
+        "post_button_input_not_ready:",
+    ))
 
 
 def _post_click_fallback_selector(*, reply_scoped: bool) -> str:
@@ -2644,6 +2672,155 @@ async def _nudge_main_comment_post_state(
     return ok
 
 
+async def _reply_target_input_exact_text_state(page: Page, text: str) -> Dict[str, Any]:
+    """Read the bonded reply input only; never inspect global/main composers."""
+    try:
+        result = await page.evaluate(
+            r"""
+            ([expectedText]) => {
+                const normalize = (value) => String(value || '')
+                    .normalize('NFC')
+                    .replace(/[\u200b\u200c\ufeff]/g, '')
+                    .replace(/\u00a0/g, ' ')
+                    .replace(/\s+/g, ' ')
+                    .trim();
+                const isRealEditor = (el) => el && (
+                    el.isContentEditable ||
+                    (el.getAttribute && el.getAttribute('contenteditable') === 'true') ||
+                    el.tagName === 'TEXTAREA' ||
+                    el.tagName === 'INPUT' ||
+                    (el.getAttribute && el.getAttribute('role') === 'textbox')
+                );
+                const resolveInnerEditor = (raw) => {
+                    if (!raw) return null;
+                    if (isRealEditor(raw)) return raw;
+                    if (!raw.querySelector) return raw;
+                    return raw.querySelector(
+                        'div[contenteditable="true"], [contenteditable="true"], textarea, input, [role="textbox"]'
+                    ) || raw;
+                };
+                const input = document.querySelector('[data-smart-reply-input="1"]');
+                const composer = document.querySelector('[data-smart-reply-composer="1"]');
+                if (!input || !composer || !composer.contains(input)) {
+                    return { ok: false, reason: 'reply_input_not_bound' };
+                }
+                const editor = resolveInnerEditor(input);
+                const raw = editor
+                    ? ((editor.value !== undefined && editor.value !== null && editor.value !== '')
+                        ? editor.value
+                        : (editor.textContent || editor.innerText || ''))
+                    : '';
+                const text = normalize(raw);
+                const expected = normalize(expectedText);
+                return {
+                    ok: Boolean(expected) && text === expected,
+                    reason: Boolean(expected) && text === expected ? 'exact' : 'text_mismatch',
+                    text,
+                    textLen: text.length,
+                    expected,
+                };
+            }
+            """,
+            [text or ""],
+        )
+        return result if isinstance(result, dict) else {"ok": False, "reason": "probe_non_dict"}
+    except Exception as exc:
+        logger.debug("[PUBLISH] Reply input exact-state probe failed: %s", str(exc)[:120])
+        return {"ok": False, "reason": "probe_exception"}
+
+
+async def _nudge_reply_comment_post_state(
+    page: Page,
+    text: str,
+    *,
+    reply_target: Optional[Any] = None,
+    expected_video_url: Optional[str] = None,
+    correlation_id: Optional[str] = None,
+) -> bool:
+    """Flush TikTok reply DraftEditor/React state after exact text is visible."""
+    before = await _reply_target_input_exact_text_state(page, text)
+    if not before.get("ok"):
+        return False
+    input_handle = getattr(reply_target, "input_handle", None) if reply_target is not None else None
+    try:
+        if input_handle is not None:
+            try:
+                await input_handle.scroll_into_view_if_needed(timeout=1000)
+            except Exception:
+                pass
+            box = None
+            try:
+                box = await input_handle.bounding_box()
+            except Exception:
+                box = None
+            if box:
+                await page.mouse.click(
+                    float(box["x"] + box["width"] / 2),
+                    float(box["y"] + max(1.0, box["height"] / 2)),
+                )
+            else:
+                try:
+                    await input_handle.click(timeout=1000)
+                except Exception:
+                    await input_handle.evaluate(
+                        """
+                        el => {
+                            try { el.focus(); } catch (_) {}
+                            try {
+                                const range = document.createRange();
+                                range.selectNodeContents(el);
+                                range.collapse(false);
+                                const sel = window.getSelection();
+                                sel.removeAllRanges();
+                                sel.addRange(range);
+                            } catch (_) {}
+                        }
+                        """
+                    )
+        else:
+            await page.evaluate(
+                """
+                () => {
+                    const el = document.querySelector('[data-smart-reply-input="1"]');
+                    if (!el) return false;
+                    try { el.focus(); } catch (_) {}
+                    try {
+                        const range = document.createRange();
+                        range.selectNodeContents(el);
+                        range.collapse(false);
+                        const sel = window.getSelection();
+                        sel.removeAllRanges();
+                        sel.addRange(range);
+                    } catch (_) {}
+                    return true;
+                }
+                """
+            )
+        await asyncio.sleep(0.06)
+        await page.keyboard.press("End")
+        await page.keyboard.insert_text(" ")
+        await page.keyboard.press("Backspace")
+        await asyncio.sleep(0.20)
+    except Exception as exc:
+        logger.debug("[PUBLISH] Reply composer post-state nudge failed: %s", str(exc)[:120])
+        return False
+
+    after = await _reply_target_input_exact_text_state(page, text)
+    ok = bool(after.get("ok"))
+    _log_publish_trace(
+        "reply_post_state_nudge",
+        page=page,
+        expected_video_url=expected_video_url,
+        correlation_id=correlation_id,
+        ok=ok,
+        before_reason=before.get("reason"),
+        after_reason=after.get("reason"),
+        input_text_len=int(after.get("textLen") or 0),
+        level=logging.INFO if ok else logging.WARNING,
+    )
+    return ok
+
+
 async def _type_main_comment_by_mouse_keyboard(page: Page, text: str, *, fast: bool = True) -> dict[str, Any]:
     """Type a top-level comment through a real focused editor path.
 
@@ -4591,6 +4768,7 @@ async def _publish_via_current_input(
     # be via synthetic dispatch on a disabled button; treat such submits as
     # unverified unless we capture a network response.
     post_was_enabled = bool(enabled_button)
+    reply_optimistic_send_click = False
     if enabled_button:
         post_button = enabled_button
     else:
@@ -4633,7 +4811,11 @@ async def _publish_via_current_input(
                         correlation_id or "unknown",
                     )
 
-        if not post_was_enabled and disabled_reason.startswith("post_button_input_not_ready:"):
+        if (
+            not post_was_enabled
+            and not reply_scoped
+            and disabled_reason.startswith("post_button_input_not_ready:")
+        ):
             if main_comment_aggressive:
                 state = await _main_comment_input_committed_text_state(page, text)
                 if isinstance(state, dict) and state.get("ok"):
@@ -4756,6 +4938,84 @@ async def _publish_via_current_input(
                     post_was_enabled_at_click=False,
                     network_request_attempted=False,
                 )
+        if (
+            not post_was_enabled
+            and reply_scoped
+            and _reply_post_gate_reason_allows_scoped_recovery(disabled_reason)
+            and _remaining() > 0.45
+        ):
+            exact_state = await _reply_target_input_exact_text_state(page, text)
+            if exact_state.get("ok"):
+                nudged = await _nudge_reply_comment_post_state(
+                    page,
+                    text,
+                    reply_target=reply_target,
+                    expected_video_url=expected_video_url,
+                    correlation_id=correlation_id,
+                )
+                if nudged and _remaining() > 0.25:
+                    try:
+                        retry_enabled_button, retry_enabled_info = await wait_for_post_button_enabled(
+                            page,
+                            max_wait_seconds=min(0.9 if fast_publish else 1.2, max(_remaining(), 0.25)),
+                            reply_scoped=True,
+                            expected_text=text,
+                        )
+                    except Exception:
+                        retry_enabled_button, retry_enabled_info = None, None
+                    if retry_enabled_button:
+                        post_button = retry_enabled_button
+                        enabled_info = retry_enabled_info or enabled_info
+                        post_was_enabled = True
+                        _log_publish_trace(
+                            "reply_post_enabled_after_nudge",
+                            page=page,
+                            expected_video_url=expected_video_url,
+                            correlation_id=correlation_id,
+                            reason=disabled_reason,
+                            level=logging.INFO,
+                        )
+                if not post_was_enabled and _remaining() > 0.2:
+                    optimistic_button, optimistic_info = await find_reply_send_candidate_for_optimistic_click(
+                        page,
+                        expected_text=text,
+                        max_total_seconds=min(0.8 if fast_publish else 1.0, max(_remaining(), 0.2)),
+                    )
+                    if optimistic_button:
+                        post_button = optimistic_button
+                        enabled_info = optimistic_info
+                        post_was_enabled = True
+                        reply_optimistic_send_click = True
+                        _log_publish_trace(
+                            "reply_optimistic_send_selected",
+                            page=page,
+                            expected_video_url=expected_video_url,
+                            correlation_id=correlation_id,
+                            previous_reason=disabled_reason,
+                            strategy=getattr(optimistic_info, "strategy", None),
+                            level=logging.INFO,
+                        )
+                    else:
+                        _log_publish_trace(
+                            "reply_optimistic_send_unavailable",
+                            page=page,
+                            expected_video_url=expected_video_url,
+                            correlation_id=correlation_id,
+                            previous_reason=disabled_reason,
+                            reason=getattr(optimistic_info, "reason", None),
+                            level=logging.INFO,
+                        )
+            else:
+                _log_publish_trace(
+                    "reply_post_disabled_nudge_skipped",
+                    page=page,
+                    expected_video_url=expected_video_url,
+                    correlation_id=correlation_id,
+                    reason=exact_state.get("reason"),
+                    input_preview=str(exact_state.get("text") or "")[:80],
+                    level=logging.INFO,
+                )
+
         if not post_was_enabled and reply_scoped:
             safe_reason = disabled_reason or "reply_post_not_enabled"
             _log_publish_trace(
@@ -4788,6 +5048,7 @@ async def _publish_via_current_input(
         expected_video_url=expected_video_url,
         correlation_id=correlation_id,
         post_was_enabled=post_was_enabled,
+        optimistic_reply_send=reply_optimistic_send_click,
         reason=getattr(enabled_info, "reason", None),
         strategy=getattr(enabled_info, "strategy", None),
     )
@@ -5951,6 +6212,108 @@ async def publish_reply_hybrid(
             elapsed_seconds=time.monotonic() - started,
         )
 
+    async def _resolve_reply_target_with_reclick(
+        *,
+        anchor_token: Optional[str],
+        open_strategy: Optional[str],
+    ) -> tuple[Optional[Any], DomActionResult]:
+        last_info = DomActionResult(
+            False,
+            reason="reply_composer_not_resolved",
+            strategy=open_strategy,
+            elapsed_seconds=time.monotonic() - started,
+            anchor_token=anchor_token,
+        )
+        token_for_probe = str(anchor_token or "").strip()
+        for attempt in range(2):
+            remaining = _remaining()
+            if remaining <= 0:
+                return None, DomActionResult(
+                    False,
+                    reason="publish_deadline_exceeded:reply_composer_resolve",
+                    strategy=open_strategy,
+                    elapsed_seconds=time.monotonic() - started,
+                    anchor_token=token_for_probe or None,
+                )
+            target_timeout = min(
+                (2.0 if fast_publish else 3.0) if attempt else (2.5 if fast_publish else 4.0),
+                max(0.5, remaining),
+            )
+            try:
+                reply_target, target_info = await _asyncio_wait_for(
+                    find_reply_composer_for_parent(
+                        page,
+                        parent_anchor_token=token_for_probe,
+                        expected_parent_text=parent_comment_text,
+                        parent_comment_id=parent_comment_id,
+                        max_total_seconds=target_timeout,
+                    ),
+                    timeout=target_timeout,
+                )
+            except asyncio.TimeoutError:
+                target_info = DomActionResult(
+                    False,
+                    reason="reply_composer_resolve_timeout",
+                    strategy=open_strategy,
+                    elapsed_seconds=time.monotonic() - started,
+                    anchor_token=token_for_probe or None,
+                )
+                reply_target = None
+            except Exception as exc:
+                return None, DomActionResult(
+                    False,
+                    reason=f"reply_composer_resolve_exception:{str(exc)[:100]}",
+                    strategy=open_strategy,
+                    elapsed_seconds=time.monotonic() - started,
+                    anchor_token=token_for_probe or None,
+                )
+            last_info = target_info
+            if reply_target:
+                if attempt:
+                    _log_publish_trace(
+                        "reply_composer_resolve_recovered_after_reclick",
+                        page=page,
+                        expected_video_url=expected_video_url,
+                        correlation_id=correlation_id,
+                        strategy=getattr(target_info, "strategy", None),
+                        anchor_token=token_for_probe or None,
+                        level=logging.INFO,
+                    )
+                return reply_target, target_info
+            if attempt == 0 and _remaining() > 0.8:
+                _log_publish_trace(
+                    "reply_composer_resolve_reclick",
+                    page=page,
+                    expected_video_url=expected_video_url,
+                    correlation_id=correlation_id,
+                    reason=getattr(target_info, "reason", None),
+                    strategy=getattr(target_info, "strategy", None) or open_strategy,
+                    level=logging.INFO,
+                )
+                try:
+                    reclick_open = await _asyncio_wait_for(
+                        open_reply_box(
+                            page,
+                            parent_comment_text,
+                            parent_comment_id,
+                            token_for_probe,
+                            max_attempts=1,
+                        ),
+                        timeout=max(0.4, min(_remaining(), 1.5 if fast_publish else 2.0)),
+                    )
+                    if getattr(reclick_open, "anchor_token", None):
+                        token_for_probe = getattr(reclick_open, "anchor_token")
+                except Exception as exc:
+                    last_info = DomActionResult(
+                        False,
+                        reason=f"reply_composer_reclick_failed:{str(exc)[:80]}",
+                        strategy=open_strategy,
+                        elapsed_seconds=time.monotonic() - started,
+                        anchor_token=token_for_probe or None,
+                    )
+                await asyncio.sleep(0.25)
+        return None, last_info
+
     drift_result = _publish_url_guard_result(
         page,
         expected_video_url,
@@ -5974,8 +6337,8 @@ async def publish_reply_hybrid(
     if logged_out_result:
         return logged_out_result
     reply_open = None
-    reply_box_attempts = 3 if fast_publish else None
-    reply_box_timeout = 12.0 if fast_publish else 10.0
+    reply_box_attempts = 2 if fast_publish else None
+    reply_box_timeout = 6.0 if fast_publish else 8.0
     if comments_already_open:
         if _remaining() <= 0:
             return _deadline_result("before_open_reply_box")
@@ -6136,31 +6499,24 @@ async def publish_reply_hybrid(
     remaining = max_total_seconds - (time.monotonic() - started)
     if remaining <= 0:
         return _deadline_result("before_reply_input_publish", reply_open.strategy)
-    target_timeout = min(3.5 if fast_publish else 5.0, max(0.5, remaining))
-    try:
-        reply_target, target_info = await _asyncio_wait_for(
-            find_reply_composer_for_parent(
-                page,
-                parent_anchor_token=resolved_parent_anchor_token,
-                expected_parent_text=parent_comment_text,
-                parent_comment_id=parent_comment_id,
-                max_total_seconds=target_timeout,
-            ),
-            timeout=target_timeout,
-        )
-    except asyncio.TimeoutError:
-        return _deadline_result("reply_composer_resolve", reply_open.strategy)
-    except Exception as exc:
+    reply_target, target_info = await _resolve_reply_target_with_reclick(
+        anchor_token=resolved_parent_anchor_token,
+        open_strategy=reply_open.strategy,
+    )
+    target_reason = str(getattr(target_info, "reason", "") or "")
+    if target_reason.startswith("reply_composer_resolve_exception:"):
         return PublishResult(
             status="dom_error",
-            error_reason=f"reply_composer_resolve_exception:{str(exc)[:100]}",
+            error_reason=target_reason,
             elapsed_seconds=time.monotonic() - started,
             dom_strategy=reply_open.strategy,
         )
+    if target_reason == "publish_deadline_exceeded:reply_composer_resolve":
+        return _deadline_result("reply_composer_resolve", reply_open.strategy)
     if not reply_target:
         return PublishResult(
             status="dom_error",
-            error_reason=f"reply_composer_not_resolved:{target_info.reason or 'unknown'}",
+            error_reason=f"reply_composer_not_resolved:{target_reason or 'unknown'}",
             elapsed_seconds=time.monotonic() - started,
             dom_strategy=reply_open.strategy,
         )
@@ -6187,20 +6543,21 @@ async def publish_reply_hybrid(
         reply_target=reply_target,
     )
     if (
-        result.status == "dom_error"
-        and str(result.error_reason or "").startswith("reply_direct_post_click_failed:reply_post_button_not_found")
+        result.status in {"dom_error", "timeout"}
+        and _is_recoverable_reply_send_reason(result.error_reason)
         and _remaining() > 1.0
     ):
         _log_publish_trace(
-            "reply_post_button_not_found_recover_start",
+            "reply_send_recover_start",
             page=page,
             expected_video_url=expected_video_url,
             correlation_id=correlation_id,
+            reason=result.error_reason,
             strategy=result.dom_strategy,
             remaining=round(_remaining(), 2),
             level=logging.INFO,
         )
-        recover_timeout = min(3.0 if fast_publish else 4.5, max(0.5, _remaining()))
+        recover_timeout = min(2.0 if fast_publish else 3.0, max(0.5, _remaining()))
         try:
             recovered_target, recovered_info = await _asyncio_wait_for(
                 find_reply_composer_for_parent(
@@ -6230,7 +6587,7 @@ async def publish_reply_hybrid(
                 )
         else:
             _log_publish_trace(
-                "reply_post_button_not_found_recover_failed",
+                "reply_send_recover_failed",
                 page=page,
                 expected_video_url=expected_video_url,
                 correlation_id=correlation_id,

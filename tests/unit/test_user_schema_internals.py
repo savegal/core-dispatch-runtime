@@ -1075,6 +1075,9 @@ def test_user_schema_parent_id_lookup_does_not_trust_data_id():
     assert "root.getAttribute('data-id')" not in verify_source
     assert '[id="comment-{escaped}"]' in find_source
     assert "replyMatches(text, replyNeedle)" in verify_source
+    assert "allowExpand" in verify_source
+    assert "reply_expander_clicked" in verify_source
+    assert "label === 'reply'" in verify_source
 
 
 @pytest.mark.unit

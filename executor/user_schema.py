@@ -5962,7 +5962,7 @@ async def _verify_reply_visible_near_parent(
         try:
             result = await page.evaluate(
                 r"""
-                ({replyText, parentText, parentId}) => {
+                ({replyText, parentText, parentId, allowExpand}) => {
                     const normalize = (value) => String(value || '')
                         .replace(/[\u200b-\u200d\ufeff]/g, '')
                         .replace(/\s+/g, ' ')
@@ -6085,6 +6085,42 @@ async def _verify_reply_visible_near_parent(
                             return { found: true, reason: 'reply_between_parent_and_next_main', text: text.slice(0, 120) };
                         }
                     }
+                    if (allowExpand) {
+                        const parentBottom = parentRoot.getBoundingClientRect().bottom;
+                        const controls = [...list.querySelectorAll('button, [role="button"], div[tabindex="0"], span')]
+                            .filter(visible)
+                            .map(node => {
+                                const r = node.getBoundingClientRect();
+                                const label = textOf(node);
+                                return { node, r, label };
+                            })
+                            .filter(item => {
+                                if (!item.label) return false;
+                                if (item.r.top < parentBottom - 6) return false;
+                                if (nextMainTop !== null && item.r.top >= nextMainTop - 2) return false;
+                                const label = item.label;
+                                if (label === 'reply' || label === 'reply to') return false;
+                                const hasNumber = /\d/.test(label);
+                                return (
+                                    label.includes('view') ||
+                                    label.includes('show') ||
+                                    label.includes('more') ||
+                                    label.includes('replies') ||
+                                    label.includes('ответ') ||
+                                    label.includes('відпов') ||
+                                    label.includes('показ')
+                                ) && (hasNumber || label.includes('replies') || label.includes('ответ') || label.includes('відпов'));
+                            })
+                            .sort((a, b) => a.r.top - b.r.top);
+                        if (controls.length) {
+                            try { controls[0].node.click(); } catch (_) {}
+                            return {
+                                found: false,
+                                reason: 'reply_expander_clicked',
+                                text: controls[0].label.slice(0, 120),
+                            };
+                        }
+                    }
                     return { found: false, reason: 'reply_not_found_under_parent' };
                 }
                 """,
@@ -6092,6 +6128,7 @@ async def _verify_reply_visible_near_parent(
                     "replyText": reply_text,
                     "parentText": parent_text or "",
                     "parentId": parent_comment_id or "",
+                    "allowExpand": attempt == 1,
                 },
             )
         except Exception as exc:
@@ -7246,6 +7283,7 @@ async def _reply_with_variant_on_all_mains(
                 )
             )
         sent_for_parents: set[str] = set(already_replied_parent_keys)
+        attempted_for_parents: set[str] = set()
         remaining_mains = [
             m
             for m in _pending_expected_mains_for_reply_variant(
@@ -7477,6 +7515,37 @@ async def _reply_with_variant_on_all_mains(
             for main in ordered_remaining_mains:
                 main_text = main.text
                 main_key = _main_parent_key(main)
+                pre_search_keys = {
+                    str(key).strip()
+                    for key in (
+                        main_key,
+                        getattr(main, "comment_id", None),
+                        _dedup_key(main_text),
+                    )
+                    if str(key or "").strip()
+                }
+                if pre_search_keys & sent_for_parents:
+                    _log_user_trace(
+                        "reply_parent_already_handled_pre_search",
+                        page=page,
+                        expected_video_url=target_media_url,
+                        correlation_id=correlation_id,
+                        account_id=account.id,
+                        variant_index=variant_index,
+                        parent_key=next(iter(pre_search_keys & sent_for_parents))[:80],
+                    )
+                    continue
+                if pre_search_keys & attempted_for_parents:
+                    _log_user_trace(
+                        "reply_parent_already_attempted_this_account_pre_search",
+                        page=page,
+                        expected_video_url=target_media_url,
+                        correlation_id=correlation_id,
+                        account_id=account.id,
+                        variant_index=variant_index,
+                        parent_key=next(iter(pre_search_keys & attempted_for_parents))[:80],
+                    )
+                    continue
                 anchor = batch_anchors_by_key.pop(main_key, None)
                 anchor_from_batch = anchor is not None
                 remaining_seconds = search_deadline - time.monotonic()
@@ -7680,10 +7749,6 @@ async def _reply_with_variant_on_all_mains(
                     parent_id=parent_id,
                     anchor_preview=anchor_text[:80],
                 )
-                try:
-                    remaining_mains.remove(main)
-                except ValueError:
-                    pass
                 found_main = _main_from_anchor(main, anchor)
                 anchor_text_key = _dedup_key(anchor_text)
                 found_key = str(
@@ -7705,9 +7770,9 @@ async def _reply_with_variant_on_all_mains(
                     or _main_parent_key(found_main)
                     or anchor_text_key
                 ).strip()
-                if dedup_key in sent_for_parents:
+                if dedup_key in sent_for_parents or dedup_key in attempted_for_parents:
                     _log_user_trace(
-                        "reply_parent_already_handled",
+                        "reply_parent_already_handled" if dedup_key in sent_for_parents else "reply_parent_already_attempted_this_account",
                         page=page,
                         expected_video_url=target_media_url,
                         correlation_id=correlation_id,
@@ -7718,7 +7783,8 @@ async def _reply_with_variant_on_all_mains(
                         anchor_preview=anchor_text[:80],
                     )
                     continue
-                sent_for_parents.add(dedup_key)
+                if dedup_key:
+                    attempted_for_parents.add(dedup_key)
 
                 sub_corr = f"{correlation_id}_to_{(parent_id or 'text')[:20]}"
                 open_parent_text = anchor.open_text or anchor_text
@@ -7882,6 +7948,13 @@ async def _reply_with_variant_on_all_mains(
                 success = bool(network_confirmed or local_reply_confirmed)
                 counts_as_submitted = bool(success)
                 maybe_submitted = bool(success or submitted_unconfirmed)
+                if maybe_submitted:
+                    if dedup_key:
+                        sent_for_parents.add(dedup_key)
+                    try:
+                        remaining_mains.remove(main)
+                    except ValueError:
+                        pass
                 if network_confirmed:
                     reply_confirmation = "network_comment_id"
                 elif local_reply_confirmed:

@@ -1294,6 +1294,7 @@ def test_reply_post_finder_does_not_fallback_to_global_comment_markers():
     script = dom_actions._JS_FIND_REPLY_POST_BUTTON
     handle_script = "".join(dom_actions._JS_FIND_REPLY_POST_BUTTON_HANDLE)
     enabled_source = inspect.getsource(dom_actions.wait_for_post_button_enabled)
+    optimistic_source = inspect.getsource(dom_actions.find_reply_send_candidate_for_optimistic_click)
 
     assert 'document.querySelector(\'[data-smart-reply-input="1"]\')' in script
     assert 'document.querySelector(\'[data-smart-id="comment-input"]\')' not in script
@@ -1311,6 +1312,15 @@ def test_reply_post_finder_does_not_fallback_to_global_comment_markers():
     assert "compact === '@'" in enabled_source
     assert "const usableInputRect = (input) =>" in enabled_source
     assert "const inputRect = usableInputRect(input)" in enabled_source
+    assert enabled_source.index("raw.closest('button')") < enabled_source.index("raw,")
+    assert "document.querySelector('[data-smart-reply-input=\"1\"]')" in optimistic_source
+    assert "document.querySelector('[data-smart-reply-composer=\"1\"]')" in optimistic_source
+    assert "inputText !== expected" in optimistic_source
+    assert "reply-optimistic-send" in optimistic_source
+    assert "compact === '@'" in optimistic_source
+    assert "label.includes('mention')" in optimistic_source
+    assert "st.pointerEvents === 'none'" in optimistic_source
+    assert "raw.closest && raw.closest('button')" in optimistic_source
 
 
 # ---------------------------------------------------------------------------

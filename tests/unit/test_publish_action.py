@@ -66,14 +66,16 @@ async def _fake_find_reply_composer_for_parent(*args, **kwargs):
 
 
 @pytest.mark.unit
-def test_reply_publish_does_not_force_click_when_enabled_gate_fails():
+def test_reply_publish_tries_scoped_recovery_before_disabled_gate_failure():
     source = inspect.getsource(publish_action._publish_via_current_input)
 
     reply_guard = "if not post_was_enabled and reply_scoped:"
+    scoped_recovery = "reply_optimistic_send_selected"
     legacy_force_click = "Trying legacy force-click anyway"
     assert reply_guard in source
+    assert scoped_recovery in source
     assert legacy_force_click in source
-    assert source.index(reply_guard) < source.index(legacy_force_click)
+    assert source.index(scoped_recovery) < source.index(reply_guard) < source.index(legacy_force_click)
     guarded_block = source.split(reply_guard, 1)[1].split(legacy_force_click, 1)[0]
     assert 'status="dom_error"' in guarded_block
     assert "network_request_attempted=False" in guarded_block
@@ -477,6 +479,9 @@ async def test_publish_via_current_input_uses_reply_scoped_helpers(monkeypatch):
     async def _fake_clear_post_click_blockers(*args, **kwargs):
         return button, {"tag": "BUTTON", "e2e": "comment-post"}, True
 
+    async def _fake_type_into_comment(*args, **kwargs):
+        return {"ok": True, "strategy": "reply-test-type", "text": "reply text", "anchor_bound": True}
+
     async def _fake_suppress_keyboard_shortcuts_overlay(*args, **kwargs):
         return 0
 
@@ -576,7 +581,7 @@ async def test_publish_reply_hybrid_uses_fresh_anchor_from_open_reply_box(monkey
 
 @pytest.mark.unit
 @pytest.mark.asyncio
-async def test_publish_reply_hybrid_parallel_reply_uses_three_open_attempts_and_longer_budget(monkeypatch):
+async def test_publish_reply_hybrid_parallel_reply_uses_fast_open_attempts_and_budget(monkeypatch):
     page = _FakePage()
     captured = {}
 
@@ -634,8 +639,8 @@ async def test_publish_reply_hybrid_parallel_reply_uses_three_open_attempts_and_
     )
 
     assert result.status == "success"
-    assert captured["max_attempts"] == 3
-    assert 11.0 <= captured["timeouts"][0] <= 12.0
+    assert captured["max_attempts"] == 2
+    assert 5.5 <= captured["timeouts"][0] <= 6.0
     assert captured["reply_scoped"] is True
     assert captured["parent_anchor_token"] == "fresh-anchor-token"
     assert captured["reply_target_anchor"] == "fresh-anchor-token"
@@ -701,7 +706,7 @@ async def test_publish_reply_hybrid_recovers_open_timeout_when_scoped_input_visi
 
 @pytest.mark.unit
 @pytest.mark.asyncio
-async def test_publish_reply_hybrid_recovers_reply_post_button_not_found(monkeypatch):
+async def test_publish_reply_hybrid_recovers_reply_send_soft_failure(monkeypatch):
     page = _FakePage()
     captured = {"publish_calls": 0, "target_resolves": 0}
 
@@ -730,7 +735,7 @@ async def test_publish_reply_hybrid_recovers_reply_post_button_not_found(monkeyp
         if captured["publish_calls"] == 1:
             return publish_action.PublishResult(
                 status="dom_error",
-                error_reason="reply_direct_post_click_failed:reply_post_button_not_found",
+                error_reason="post_button_stayed_disabled",
                 dom_strategy="reply-direct-smart-type",
             )
         return publish_action.PublishResult(
@@ -762,6 +767,73 @@ async def test_publish_reply_hybrid_recovers_reply_post_button_not_found(monkeyp
 
     assert result.status == "success"
     assert captured == {"publish_calls": 2, "target_resolves": 2}
+
+
+@pytest.mark.unit
+@pytest.mark.asyncio
+async def test_publish_reply_hybrid_reclicks_when_composer_resolve_misses_once(monkeypatch):
+    page = _FakePage()
+    captured = {"open_calls": 0, "target_resolves": 0, "publish_calls": 0}
+
+    async def _fake_none(*args, **kwargs):
+        return None
+
+    async def _fake_open_reply_box(*args, **kwargs):
+        captured["open_calls"] += 1
+        return SimpleNamespace(
+            success=True,
+            strategy="parent-anchor-reply",
+            reason=None,
+            anchor_token="anchor-1",
+        )
+
+    async def _fake_find_reply_composer_for_parent(*args, **kwargs):
+        captured["target_resolves"] += 1
+        if captured["target_resolves"] == 1:
+            return None, SimpleNamespace(
+                success=False,
+                strategy="reply-composer-test",
+                reason="reply_composer_triple_not_found",
+            )
+        return _fake_reply_target("anchor-1"), SimpleNamespace(
+            success=True,
+            strategy="reply-composer-test",
+            reason=None,
+        )
+
+    async def _fake_publish_via_current_input(*args, **kwargs):
+        captured["publish_calls"] += 1
+        assert getattr(kwargs.get("reply_target"), "anchor_token", None) == "anchor-1"
+        return publish_action.PublishResult(
+            status="success",
+            comment_id="reply_cid",
+            network_captured=True,
+            network_request_attempted=True,
+            network_response_json={"comment": {"cid": "reply_cid"}},
+            post_was_enabled_at_click=True,
+        )
+
+    monkeypatch.setattr(publish_action, "_publish_url_guard_result", lambda *args, **kwargs: None)
+    monkeypatch.setattr(publish_action, "_captcha_result_if_present", _fake_none)
+    monkeypatch.setattr(publish_action, "_logged_out_publish_result_if_visible", _fake_none)
+    monkeypatch.setattr(publish_action, "open_reply_box", _fake_open_reply_box)
+    monkeypatch.setattr(publish_action, "find_reply_composer_for_parent", _fake_find_reply_composer_for_parent)
+    monkeypatch.setattr(publish_action, "_publish_via_current_input", _fake_publish_via_current_input)
+    monkeypatch.setattr(publish_action.asyncio, "sleep", AsyncMock(return_value=None))
+
+    result = await publish_action.publish_reply_hybrid(
+        page,
+        "reply text",
+        parent_comment_text="parent",
+        parent_anchor_token="anchor-1",
+        max_total_seconds=20.0,
+        correlation_id="task_1_parallel_reply_v1_a1_acc10_to_text",
+        expected_video_url=page.url,
+        comments_already_open=True,
+    )
+
+    assert result.status == "success"
+    assert captured == {"open_calls": 2, "target_resolves": 2, "publish_calls": 1}
 
 
 @pytest.mark.unit
@@ -2202,6 +2274,81 @@ async def test_publish_tries_legacy_click_when_post_button_stays_disabled(monkey
     assert page.synthetic_dispatch_count == 0
     assert page.click_count == 1
     assert page.removed == ["request", "response"]
+
+
+@pytest.mark.unit
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "gate_reason",
+    [
+        "post_button_stayed_disabled:low_opacity",
+        "post_button_input_not_ready:input_empty",
+        "reply_post_not_enabled",
+    ],
+)
+async def test_reply_publish_uses_nudge_and_optimistic_send_for_recoverable_gate_reason(monkeypatch, gate_reason):
+    page = _FakePage()
+    page.mouse = _RequestOnlyMouse(page)
+    button = _FakeButton()
+    calls = {"nudge": 0, "optimistic": 0}
+
+    async def _fake_sleep(_seconds):
+        return None
+
+    async def _fake_detect_captcha(*args, **kwargs):
+        return False, None
+
+    async def _fake_wait_for_post_button_enabled(*args, **kwargs):
+        return None, SimpleNamespace(strategy=None, reason=gate_reason)
+
+    async def _fake_reply_exact(*args, **kwargs):
+        return {"ok": True, "reason": "exact", "text": "reply text", "textLen": len("reply text")}
+
+    async def _fake_nudge(*args, **kwargs):
+        calls["nudge"] += 1
+        return True
+
+    async def _fake_optimistic(*args, **kwargs):
+        calls["optimistic"] += 1
+        return button, SimpleNamespace(strategy="reply-optimistic-send", reason="reply_optimistic_send_candidate")
+
+    async def _fake_ensure_click_target_clear(*args, **kwargs):
+        return None
+
+    async def _fake_clear_post_click_blockers(*args, **kwargs):
+        return button, {"tag": "BUTTON", "e2e": "comment-post"}, True
+
+    async def _fake_type_into_comment(*args, **kwargs):
+        return {"ok": True, "strategy": "reply-test-type", "text": "reply text", "anchor_bound": True}
+
+    monkeypatch.setattr(publish_action.asyncio, "sleep", _fake_sleep)
+    monkeypatch.setattr(publish_action, "detect_captcha", _fake_detect_captcha)
+    monkeypatch.setattr(publish_action, "suppress_keyboard_shortcuts_overlay", AsyncMock(return_value=0))
+    monkeypatch.setattr(publish_action, "wait_for_post_button_enabled", _fake_wait_for_post_button_enabled)
+    monkeypatch.setattr(publish_action, "_reply_target_input_exact_text_state", _fake_reply_exact)
+    monkeypatch.setattr(publish_action, "_nudge_reply_comment_post_state", _fake_nudge)
+    monkeypatch.setattr(publish_action, "find_reply_send_candidate_for_optimistic_click", _fake_optimistic)
+    monkeypatch.setattr(publish_action, "ensure_click_target_clear", _fake_ensure_click_target_clear)
+    monkeypatch.setattr(publish_action, "_clear_post_click_blockers", _fake_clear_post_click_blockers)
+    monkeypatch.setattr(publish_action, "type_into_comment", _fake_type_into_comment)
+    monkeypatch.setattr(publish_action, "_composer_cleared_state", AsyncMock(return_value={"exists": True, "empty": True}))
+
+    result = await publish_action._publish_via_current_input(
+        page,
+        "reply text",
+        max_total_seconds=10.0,
+        correlation_id="task_1_parallel_reply_v1_a1_acc10_to_text",
+        reply_scoped=True,
+        parent_anchor_token="anchor-1",
+        reply_target=_fake_reply_target("anchor-1"),
+    )
+
+    assert calls == {"nudge": 1, "optimistic": 1}
+    assert page.click_count == 1
+    assert result.status == "failed"
+    assert result.error_reason == "composer_cleared_after_submit"
+    assert result.post_was_enabled_at_click is True
+    assert result.composer_clean_after_submit is True
 
 
 @pytest.mark.unit

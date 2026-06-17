@@ -6330,6 +6330,270 @@ async def find_reply_post_button_smart(
     )
 
 
+async def find_reply_send_candidate_for_optimistic_click(
+    page: Page,
+    *,
+    expected_text: str,
+    max_total_seconds: float = 1.0,
+) -> tuple[Optional[Any], DomActionResult]:
+    """Find a bounded reply send candidate when strict enabled detection stalls."""
+    started = time.monotonic()
+    last_reason: Optional[str] = None
+
+    def _as_element_handle(handle: Any) -> Optional[Any]:
+        if not handle:
+            return None
+        as_element = getattr(handle, "as_element", None)
+        if callable(as_element):
+            try:
+                return as_element()
+            except Exception:
+                return None
+        return handle
+
+    while time.monotonic() - started < max_total_seconds:
+        try:
+            result = await page.evaluate(
+                r"""
+                ([expectedText]) => {
+                    document
+                        .querySelectorAll('[data-smart-id="comment-post-ready"]')
+                        .forEach(el => el.removeAttribute('data-smart-id'));
+
+                    const visible = (el) => {
+                        if (!el || !el.getBoundingClientRect) return false;
+                        const r = el.getBoundingClientRect();
+                        const st = getComputedStyle(el);
+                        return r.width > 0 && r.height > 0 && st.display !== 'none' && st.visibility !== 'hidden';
+                    };
+                    const normalize = (value) => String(value || '')
+                        .normalize('NFC')
+                        .replace(/[\u200b\u200c\ufeff]/g, '')
+                        .replace(/\u00a0/g, ' ')
+                        .replace(/\s+/g, ' ')
+                        .trim();
+                    const isRealEditor = (el) => el && (
+                        el.isContentEditable ||
+                        (el.getAttribute && el.getAttribute('contenteditable') === 'true') ||
+                        el.tagName === 'TEXTAREA' ||
+                        el.tagName === 'INPUT' ||
+                        (el.getAttribute && el.getAttribute('role') === 'textbox')
+                    );
+                    const resolveInnerEditor = (raw) => {
+                        if (!raw) return null;
+                        if (isRealEditor(raw)) return raw;
+                        if (!raw.querySelector) return raw;
+                        return raw.querySelector(
+                            'div[contenteditable="true"], [contenteditable="true"], textarea, input, [role="textbox"]'
+                        ) || raw;
+                    };
+                    const readEditorText = (editor) => {
+                        if (!editor) return '';
+                        const raw = (editor.value !== undefined && editor.value !== null && editor.value !== '')
+                            ? editor.value
+                            : (editor.textContent || editor.innerText || '');
+                        return normalize(raw);
+                    };
+
+                    const input = document.querySelector('[data-smart-reply-input="1"]');
+                    const composer = document.querySelector('[data-smart-reply-composer="1"]');
+                    if (!input || !composer || !composer.contains(input) || !visible(composer)) {
+                        return { found: false, reason: 'reply_composer_not_bound' };
+                    }
+                    const editor = resolveInnerEditor(input);
+                    const inputText = readEditorText(editor);
+                    const expected = normalize(expectedText);
+                    if (!expected || inputText !== expected) {
+                        return {
+                            found: false,
+                            reason: 'reply_input_text_not_exact',
+                            inputText: inputText.slice(0, 100),
+                            expectedText: expected.slice(0, 100),
+                        };
+                    }
+
+                    const usableInputRect = () => {
+                        for (const node of [input, input.parentElement, input.parentElement && input.parentElement.parentElement].filter(Boolean)) {
+                            if (!node.getBoundingClientRect) continue;
+                            const r = node.getBoundingClientRect();
+                            if (r.width > 0 && (visible(node) || r.height > 0)) return r;
+                        }
+                        return null;
+                    };
+                    const inputRect = usableInputRect();
+                    if (!inputRect) {
+                        return { found: false, reason: 'reply_input_rect_missing' };
+                    }
+
+                    const buttonLabel = (raw) => {
+                        const nodes = [
+                            raw,
+                            raw && raw.closest && raw.closest('button'),
+                            raw && raw.closest && raw.closest('[role="button"]'),
+                            raw && raw.closest && raw.closest('div[tabindex="0"]'),
+                            raw && raw.parentElement,
+                            raw && raw.parentElement && raw.parentElement.parentElement,
+                        ].filter(Boolean);
+                        const seen = new Set();
+                        const parts = [];
+                        for (const node of nodes) {
+                            if (!node || seen.has(node)) continue;
+                            seen.add(node);
+                            const r = node.getBoundingClientRect ? node.getBoundingClientRect() : null;
+                            parts.push(
+                                node.getAttribute && (node.getAttribute('data-e2e') || ''),
+                                node.getAttribute && (node.getAttribute('data-smart-reply-post') || ''),
+                                node.getAttribute && (node.getAttribute('aria-label') || ''),
+                                node.getAttribute && (node.getAttribute('title') || ''),
+                                node.getAttribute && (node.getAttribute('data-testid') || ''),
+                                node.getAttribute && (node.getAttribute('class') || ''),
+                                r && r.width <= 360 && r.height <= 160 ? (node.innerText || node.textContent || '') : ''
+                            );
+                        }
+                        return parts.join(' ').replace(/\s+/g, ' ').trim().toLowerCase();
+                    };
+                    const isAccessory = (raw) => {
+                        const label = buttonLabel(raw);
+                        const compact = label.replace(/\s+/g, '');
+                        return label.includes('emoji') ||
+                            label.includes('emoticon') ||
+                            label.includes('smile') ||
+                            label.includes('sticker') ||
+                            label.includes('mention') ||
+                            label.includes('tag people') ||
+                            label.includes('add mention') ||
+                            compact === '@';
+                    };
+                    const looksSend = (raw) => {
+                        if (!raw || isAccessory(raw)) return false;
+                        if (raw.getAttribute && raw.getAttribute('data-smart-reply-post') === '1') return true;
+                        const r = raw.getBoundingClientRect ? raw.getBoundingClientRect() : null;
+                        const label = buttonLabel(raw);
+                        const iconNearInput = r &&
+                            r.bottom >= inputRect.top - 24 &&
+                            r.top <= inputRect.bottom + 24 &&
+                            r.left >= inputRect.left + Math.max(45, inputRect.width * 0.45);
+                        return label.includes('comment-post') ||
+                            label.includes('post') ||
+                            label.includes('send') ||
+                            label.includes('submit') ||
+                            label.includes('\u043e\u043f\u0443\u0431\u043b') ||
+                            label.includes('\u043e\u0442\u043f\u0440\u0430\u0432') ||
+                            Boolean(iconNearInput);
+                    };
+                    const targetFor = (raw) => {
+                        const candidates = [
+                            raw && raw.closest && raw.closest('button'),
+                            raw && raw.closest && raw.closest('[role="button"]'),
+                            raw && raw.closest && raw.closest('div[tabindex="0"]'),
+                            raw,
+                            raw && raw.parentElement,
+                            raw && raw.parentElement && raw.parentElement.parentElement,
+                        ].filter(Boolean);
+                        const seen = new Set();
+                        for (const el of candidates) {
+                            if (!el || seen.has(el) || !composer.contains(el) || !visible(el)) continue;
+                            seen.add(el);
+                            const r = el.getBoundingClientRect();
+                            if (r.width > 360 || r.height > 160) continue;
+                            const st = getComputedStyle(el);
+                            if (st.pointerEvents === 'none') continue;
+                            if (el.hasAttribute('disabled') || el.getAttribute('aria-disabled') === 'true' || el.classList.contains('disabled')) continue;
+                            return el;
+                        }
+                        return null;
+                    };
+
+                    const rawCandidates = [];
+                    const seenRaw = new Set();
+                    const addRaw = (raw) => {
+                        if (!raw || seenRaw.has(raw) || !composer.contains(raw) || !visible(raw)) return;
+                        if (!looksSend(raw)) return;
+                        seenRaw.add(raw);
+                        rawCandidates.push(raw);
+                    };
+                    addRaw(document.querySelector('[data-smart-reply-post="1"]'));
+                    for (const selector of [
+                        '[data-e2e="comment-post"]',
+                        '[data-e2e*="comment-post"]',
+                        '[data-e2e="post-comment-button"]',
+                        'button',
+                        '[role="button"]',
+                        'div[tabindex="0"]',
+                        'svg',
+                    ]) {
+                        for (const raw of composer.querySelectorAll(selector)) {
+                            addRaw(raw);
+                            if (rawCandidates.length >= 24) break;
+                        }
+                        if (rawCandidates.length >= 24) break;
+                    }
+                    const candidates = rawCandidates
+                        .map(raw => ({ raw, target: targetFor(raw) }))
+                        .filter(item => item.target)
+                        .sort((a, b) => {
+                            const ar = a.target.getBoundingClientRect();
+                            const br = b.target.getBoundingClientRect();
+                            return (br.right || br.left || 0) - (ar.right || ar.left || 0);
+                        });
+                    const selected = candidates[0];
+                    if (!selected) {
+                        return {
+                            found: false,
+                            reason: rawCandidates.length ? 'reply_send_candidate_hard_disabled' : 'reply_send_candidate_not_found',
+                            candidateCount: rawCandidates.length,
+                        };
+                    }
+                    const el = selected.target;
+                    el.setAttribute('data-smart-id', 'comment-post-ready');
+                    el.setAttribute('data-smart-reply-post', '1');
+                    el.setAttribute('data-smart-reply-post-strategy', 'reply-optimistic-send');
+                    el.setAttribute('data-smart-reply-post-target', el.tagName || '');
+                    const r = el.getBoundingClientRect();
+                    const st = getComputedStyle(el);
+                    return {
+                        found: true,
+                        reason: 'reply_optimistic_send_candidate',
+                        strategy: 'reply-optimistic-send',
+                        inputText: inputText.slice(0, 100),
+                        tag: el.tagName,
+                        opacity: st.opacity,
+                        pointerEvents: st.pointerEvents,
+                        x: Math.round(r.x),
+                        y: Math.round(r.y),
+                        w: Math.round(r.width),
+                        h: Math.round(r.height),
+                        candidateCount: rawCandidates.length,
+                    };
+                }
+                """,
+                [expected_text or ""],
+            )
+        except Exception as exc:
+            last_reason = f"optimistic_probe_exception:{str(exc)[:100]}"
+            await asyncio.sleep(0.15)
+            continue
+
+        if isinstance(result, dict) and result.get("found"):
+            element = await page.query_selector('[data-smart-id="comment-post-ready"]')
+            if element:
+                return element, DomActionResult(
+                    True,
+                    strategy=result.get("strategy") or "reply-optimistic-send",
+                    reason=result.get("reason"),
+                    elapsed_seconds=time.monotonic() - started,
+                )
+        if isinstance(result, dict):
+            last_reason = str(result.get("reason") or "reply_optimistic_send_not_found")
+        await asyncio.sleep(0.15)
+
+    return None, DomActionResult(
+        False,
+        reason=last_reason or "reply_optimistic_send_timeout",
+        elapsed_seconds=time.monotonic() - started,
+    )
+
+
 async def find_post_button_smart(page: Page, *, max_total_seconds: float = 4.0) -> tuple[Optional[Any], DomActionResult]:
     started = time.monotonic()
     while time.monotonic() - started < max_total_seconds:
@@ -6400,10 +6664,10 @@ async def wait_for_post_button_enabled(
                     const clickTargetFor = (raw) => {
                         if (!raw) return null;
                         const candidates = [
-                            raw,
                             raw.closest('button'),
                             raw.closest('[role="button"]'),
                             raw.closest('div[tabindex="0"]'),
+                            raw,
                             raw.parentElement,
                             raw.parentElement && raw.parentElement.parentElement,
                         ].filter(Boolean);
