@@ -3309,6 +3309,8 @@ async def test_reply_ambiguous_publish_without_local_visibility_keeps_parent_pen
     assert result.replies[0].success is False
     assert result.replies[0].submitted_unconfirmed is True
     assert result.replies[0].counts_as_submitted is False
+    assert result.replies[0].soft_submitted is True
+    assert result.replies[0].reply_attempt_key
     assert result.replies[0].reply_confirmation == "submitted_unconfirmed"
     assert result.replies[0].attempted is True
     assert result.replies[0].error == "stealth_reject_empty_body"
@@ -3316,8 +3318,170 @@ async def test_reply_ambiguous_publish_without_local_visibility_keeps_parent_pen
     assert result.replies[0].method == "reply-dom"
     assert [p.text for p in result.found_mains] == ["main one"]
     assert "cid-main" in result.attempted_parent_keys
+    assert result.soft_submitted_reply_keys == {result.replies[0].reply_attempt_key}
     assert "cid-main" not in done_parent_keys
     assert not failures
+
+
+@pytest.mark.unit
+@pytest.mark.asyncio
+async def test_reply_soft_submitted_key_suppresses_duplicate_retry(monkeypatch):
+    from executor import user_schema
+
+    class FakePage:
+        url = "https://www.tiktok.com/@demo/video/1234567890123456789"
+
+        def is_closed(self):
+            return False
+
+        async def close(self):
+            return None
+
+    class FakeContext:
+        async def close(self):
+            return None
+
+    main = user_schema.PublishedMain(
+        text="main one",
+        comment_id="cid-main",
+        network_confirmed=True,
+        local_confirmed=True,
+        method="hybrid_dom",
+        account_id=10,
+        tiktok_username=None,
+    )
+    soft_key = user_schema._reply_attempt_key("cid-main", "reply text")
+
+    async def fake_create_page_for_account(_account):
+        return FakeContext(), FakePage()
+
+    async def fake_login_ready(*_args, **_kwargs):
+        return True, None
+
+    async def fail_find_main_anchor(*_args, **_kwargs):
+        raise AssertionError("soft-submitted parent should be skipped before anchor search")
+
+    async def fail_publish_reply(*_args, **_kwargs):
+        raise AssertionError("soft-submitted parent should not be published again")
+
+    async def fake_sleep(_seconds):
+        return None
+
+    monkeypatch.setattr(user_schema, "create_page_for_account", fake_create_page_for_account)
+    monkeypatch.setattr(user_schema, "_ensure_account_login_ready", fake_login_ready)
+    monkeypatch.setattr(user_schema, "needs_enrichment", lambda _account: False)
+    monkeypatch.setattr(user_schema, "_ensure_page_on_target_media", AsyncMock(return_value=True))
+    monkeypatch.setattr(user_schema, "_open_comment_list_with_safe_retry", AsyncMock(return_value=True))
+    monkeypatch.setattr(user_schema, "_wait_for_searchable_comment_surface", AsyncMock(return_value=True))
+    monkeypatch.setattr(user_schema, "_find_main_anchor", fail_find_main_anchor)
+    monkeypatch.setattr(user_schema, "publish_reply_hybrid", fail_publish_reply)
+    monkeypatch.setattr(user_schema.asyncio, "sleep", fake_sleep)
+
+    result = await user_schema._reply_with_variant_on_all_mains(
+        SimpleNamespace(),
+        SimpleNamespace(id=88, proxy=None),
+        "https://www.tiktok.com/@demo/video/1234567890123456789",
+        [main],
+        "reply text",
+        variant_index=1,
+        correlation_id="task_soft_skip",
+        soft_submitted_reply_keys={soft_key},
+    )
+
+    assert result.replies == []
+    assert result.found_mains == []
+    assert result.searched is True
+
+
+@pytest.mark.unit
+@pytest.mark.asyncio
+async def test_reply_already_present_local_skips_publish_and_counts_submitted(monkeypatch):
+    from executor import user_schema
+
+    class FakePage:
+        url = "https://www.tiktok.com/@demo/video/1234567890123456789"
+
+        def is_closed(self):
+            return False
+
+        async def close(self):
+            return None
+
+    class FakeContext:
+        async def close(self):
+            return None
+
+    async def fake_create_page_for_account(_account):
+        return FakeContext(), FakePage()
+
+    async def fake_login_ready(*_args, **_kwargs):
+        return True, None
+
+    async def fake_find_main_anchor(*_args, **_kwargs):
+        return user_schema.MainAnchor(
+            matched_text="main one",
+            parent_comment_id="cid-main",
+            open_text="main one",
+            found_by="id",
+            id_verified=True,
+            anchor_token="anchor-1",
+        )
+
+    async def fake_verify_reply(*_args, **_kwargs):
+        return True
+
+    async def fail_publish_reply(*_args, **_kwargs):
+        raise AssertionError("already-present reply should not be published again")
+
+    async def fake_sleep(_seconds):
+        return None
+
+    done_parent_keys = set()
+    submitted = []
+
+    monkeypatch.setattr(user_schema, "create_page_for_account", fake_create_page_for_account)
+    monkeypatch.setattr(user_schema, "_ensure_account_login_ready", fake_login_ready)
+    monkeypatch.setattr(user_schema, "needs_enrichment", lambda _account: False)
+    monkeypatch.setattr(user_schema, "_ensure_page_on_target_media", AsyncMock(return_value=True))
+    monkeypatch.setattr(user_schema, "_open_comment_list_with_safe_retry", AsyncMock(return_value=True))
+    monkeypatch.setattr(user_schema, "_wait_for_searchable_comment_surface", AsyncMock(return_value=True))
+    monkeypatch.setattr(user_schema, "_find_main_anchor", fake_find_main_anchor)
+    monkeypatch.setattr(user_schema, "_verify_reply_visible_near_parent", fake_verify_reply)
+    monkeypatch.setattr(user_schema, "publish_reply_hybrid", fail_publish_reply)
+    monkeypatch.setattr(user_schema.asyncio, "sleep", fake_sleep)
+
+    result = await user_schema._reply_with_variant_on_all_mains(
+        SimpleNamespace(),
+        SimpleNamespace(id=77, proxy=None),
+        "https://www.tiktok.com/@demo/video/1234567890123456789",
+        [
+            user_schema.PublishedMain(
+                text="main one",
+                comment_id="cid-main",
+                network_confirmed=True,
+                local_confirmed=True,
+                method="hybrid_dom",
+                account_id=10,
+                tiktok_username=None,
+            )
+        ],
+        "reply text",
+        variant_index=1,
+        correlation_id="task_already_present",
+        already_replied_parent_keys=done_parent_keys,
+        on_submitted_outcome=submitted.append,
+    )
+
+    assert len(result.replies) == 1
+    assert result.replies[0].success is True
+    assert result.replies[0].attempted is False
+    assert result.replies[0].already_present_local is True
+    assert result.replies[0].local_confirmed is True
+    assert result.replies[0].counts_as_submitted is True
+    assert result.replies[0].reply_confirmation == "already_present_local"
+    assert result.replies[0].method == "local_dedupe_skip"
+    assert "cid-main" in done_parent_keys
+    assert submitted == result.replies
 
 
 @pytest.mark.unit
@@ -3358,8 +3522,12 @@ async def test_reply_ambiguous_publish_with_local_visibility_counts_as_submitted
             composer_clean_after_submit=True,
         )
 
+    verify_calls = 0
+
     async def fake_verify_reply(*_args, **_kwargs):
-        return True
+        nonlocal verify_calls
+        verify_calls += 1
+        return verify_calls > 1
 
     async def fake_sleep(_seconds):
         return None

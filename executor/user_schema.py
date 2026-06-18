@@ -1537,6 +1537,9 @@ class ReplyOutcome:
     local_confirmed: bool = False
     reply_confirmation: Optional[str] = None
     counts_as_submitted: bool = False
+    soft_submitted: bool = False
+    already_present_local: bool = False
+    reply_attempt_key: Optional[str] = None
 
 
 @dataclass
@@ -1554,6 +1557,7 @@ class ReplyAttemptResult:
     parent_search_max_seen_rows: int = 0
     parent_search_last_row_count: int = 0
     parent_search_unique_rows_seen: int = 0
+    soft_submitted_reply_keys: set[str] = field(default_factory=set)
 
 
 @dataclass
@@ -1588,6 +1592,12 @@ class UserSchemaResult:
         successful_replies = sum(1 for r in self.replies if r.success)
         submitted_unconfirmed_replies = sum(
             1 for r in self.replies if getattr(r, "submitted_unconfirmed", False)
+        )
+        soft_submitted_replies = sum(
+            1 for r in self.replies if _reply_outcome_soft_submitted(r)
+        )
+        already_present_local_replies = sum(
+            1 for r in self.replies if getattr(r, "already_present_local", False)
         )
         submitted_replies = sum(1 for r in self.replies if _reply_outcome_submitted(r))
         attempted_uncertain_replies = sum(
@@ -1758,6 +1768,8 @@ class UserSchemaResult:
                     "submitted": submitted_replies,
                     "missing": missing_reply_submissions,
                     "submitted_unconfirmed": submitted_unconfirmed_replies,
+                    "soft_submitted": soft_submitted_replies,
+                    "already_present_local": already_present_local_replies,
                     "attempted_uncertain": attempted_uncertain_replies,
                     "items": [
                         {
@@ -1771,6 +1783,9 @@ class UserSchemaResult:
                             "submitted_unconfirmed": getattr(r, "submitted_unconfirmed", False),
                             "reply_comment_id": getattr(r, "reply_comment_id", None),
                             "local_confirmed": getattr(r, "local_confirmed", False),
+                            "soft_submitted": _reply_outcome_soft_submitted(r),
+                            "already_present_local": getattr(r, "already_present_local", False),
+                            "reply_attempt_key": getattr(r, "reply_attempt_key", None),
                             "reply_confirmation": getattr(r, "reply_confirmation", None),
                             "counts_as_submitted": _reply_outcome_submitted(r),
                             "attempted_uncertain": bool(
@@ -4756,6 +4771,85 @@ def _reply_outcome_submitted(outcome: ReplyOutcome) -> bool:
     return bool(getattr(outcome, "counts_as_submitted", False))
 
 
+def _reply_attempt_key(parent_key: Optional[str], reply_text: Optional[str]) -> Optional[str]:
+    parent = str(parent_key or "").strip()
+    reply = _dedup_key(reply_text)
+    if not parent or not reply:
+        return None
+    return f"parent:{parent}:reply:{reply}"
+
+
+def _reply_attempt_keys_for_main(main: PublishedMain, reply_text: Optional[str]) -> set[str]:
+    keys: set[str] = set()
+    identity_keys = _main_exact_identity_keys(main) or _main_parent_keys(main)
+    for parent_key in identity_keys:
+        attempt_key = _reply_attempt_key(parent_key, reply_text)
+        if attempt_key:
+            keys.add(attempt_key)
+    return keys
+
+
+def _reply_attempt_key_for_outcome(outcome: ReplyOutcome) -> Optional[str]:
+    explicit = str(getattr(outcome, "reply_attempt_key", "") or "").strip()
+    if explicit:
+        return explicit
+    parent_key = _reply_outcome_parent_key(outcome)
+    if not parent_key:
+        parent_key = _dedup_key(getattr(outcome, "matched_main_text", None))
+    return _reply_attempt_key(parent_key, getattr(outcome, "text", None))
+
+
+def _reply_outcome_soft_submitted(outcome: ReplyOutcome) -> bool:
+    if _reply_outcome_submitted(outcome):
+        return False
+    if bool(getattr(outcome, "soft_submitted", False)):
+        return True
+    return bool(
+        getattr(outcome, "attempted", False)
+        and getattr(outcome, "submitted_unconfirmed", False)
+    )
+
+
+def _reply_soft_submitted_key_matches_main(
+    main: PublishedMain,
+    reply_text: str,
+    soft_submitted_reply_keys: set[str],
+) -> bool:
+    if not soft_submitted_reply_keys:
+        return False
+    return bool(_reply_attempt_keys_for_main(main, reply_text) & soft_submitted_reply_keys)
+
+
+def _pending_expected_mains_for_reply_variant_with_soft_locks(
+    main_candidates: List[PublishedMain],
+    submitted_keys: set[str],
+    soft_submitted_reply_keys: set[str],
+    reply_text: str,
+) -> List[PublishedMain]:
+    return [
+        main
+        for main in _pending_expected_mains_for_reply_variant(main_candidates, submitted_keys)
+        if not _reply_soft_submitted_key_matches_main(main, reply_text, soft_submitted_reply_keys)
+    ]
+
+
+def _reply_outcomes_soft_submitted_reply_keys_for_expected_mains(
+    outcomes: List[ReplyOutcome],
+    main_candidates: List[PublishedMain],
+) -> set[str]:
+    keys: set[str] = set()
+    for outcome in outcomes or []:
+        if not _reply_outcome_soft_submitted(outcome):
+            continue
+        outcome_key = _reply_attempt_key_for_outcome(outcome)
+        if outcome_key:
+            keys.add(outcome_key)
+        main = _find_expected_main_for_reply_outcome(outcome, main_candidates)
+        if main is not None:
+            keys.update(_reply_attempt_keys_for_main(main, outcome.text))
+    return keys
+
+
 def _reply_outcomes_submitted_parent_keys(outcomes: List[ReplyOutcome]) -> set[str]:
     keys: set[str] = set()
     for outcome in outcomes or []:
@@ -4822,32 +4916,41 @@ def _reply_pending_parent_report(
     reply_variants: List[str],
     main_candidates: List[PublishedMain],
     submitted_keys_by_variant: Dict[int, set[str]],
+    soft_submitted_reply_keys_by_variant: Optional[Dict[int, set[str]]] = None,
 ) -> List[Dict[str, Any]]:
     report: List[Dict[str, Any]] = []
+    soft_submitted_reply_keys_by_variant = soft_submitted_reply_keys_by_variant or {}
     for variant_index, reply_text in enumerate(reply_variants or [], start=1):
-        pending_mains = _pending_expected_mains_for_reply_variant(
+        soft_keys = soft_submitted_reply_keys_by_variant.get(variant_index, set())
+        pending_mains = _pending_expected_mains_for_reply_variant_with_soft_locks(
             main_candidates,
             submitted_keys_by_variant.get(variant_index, set()),
+            soft_keys,
+            reply_text,
         )
         if not pending_mains:
             continue
-        report.append(
-            {
-                "variant_index": variant_index,
-                "reply_text": reply_text,
-                "pending_count": len(pending_mains),
-                "pending_parents": [
-                    {
-                        "text": main.text,
-                        "comment_id": main.comment_id,
-                        "account_id": main.account_id,
-                        "tiktok_username": main.tiktok_username,
-                        "parent_key": _main_parent_key(main),
-                    }
-                    for main in pending_mains
-                ],
-            }
-        )
+        soft_locked_count = len(
+            _pending_expected_mains_for_reply_variant(main_candidates, submitted_keys_by_variant.get(variant_index, set()))
+        ) - len(pending_mains)
+        item = {
+            "variant_index": variant_index,
+            "reply_text": reply_text,
+            "pending_count": len(pending_mains),
+            "pending_parents": [
+                {
+                    "text": main.text,
+                    "comment_id": main.comment_id,
+                    "account_id": main.account_id,
+                    "tiktok_username": main.tiktok_username,
+                    "parent_key": _main_parent_key(main),
+                }
+                for main in pending_mains
+            ],
+        }
+        if soft_locked_count > 0:
+            item["soft_submitted_count"] = soft_locked_count
+        report.append(item)
     return report
 
 
@@ -5946,6 +6049,9 @@ async def _verify_reply_visible_near_parent(
     parent_text: Optional[str],
     parent_comment_id: Optional[str],
     correlation_id: str,
+    parent_anchor_token: Optional[str] = None,
+    fast: bool = False,
+    log_negative: bool = False,
 ) -> bool:
     """Best-effort local check for ambiguous reply submits.
 
@@ -5958,16 +6064,24 @@ async def _verify_reply_visible_near_parent(
         return False
 
     for attempt in range(1, 3):
-        await asyncio.sleep(0.8 if attempt == 1 else 1.2)
+        await asyncio.sleep((0.25 if attempt == 1 else 0.5) if fast else (0.8 if attempt == 1 else 1.2))
         try:
             result = await page.evaluate(
                 r"""
-                ({replyText, parentText, parentId, allowExpand}) => {
+                ({replyText, parentText, parentId, parentAnchorToken, allowExpand}) => {
                     const normalize = (value) => String(value || '')
                         .replace(/[\u200b-\u200d\ufeff]/g, '')
                         .replace(/\s+/g, ' ')
                         .trim()
                         .toLowerCase();
+                    const cssEscape = (value) => {
+                        try {
+                            if (window.CSS && typeof window.CSS.escape === 'function') {
+                                return window.CSS.escape(String(value || ''));
+                            }
+                        } catch (_) {}
+                        return String(value || '').replace(/["\\]/g, '\\$&');
+                    };
                     const visible = (el) => {
                         if (!el || !el.getBoundingClientRect) return false;
                         const r = el.getBoundingClientRect();
@@ -5977,7 +6091,8 @@ async def _verify_reply_visible_near_parent(
                     const replyNeedle = normalize(replyText);
                     const parentNeedle = normalize(parentText);
                     const targetId = String(parentId || '').trim();
-                    if (!replyNeedle || (!parentNeedle && !targetId)) {
+                    const targetAnchorToken = String(parentAnchorToken || '').trim();
+                    if (!replyNeedle || (!parentNeedle && !targetId && !targetAnchorToken)) {
                         return { found: false, reason: 'missing_needles' };
                     }
 
@@ -6041,8 +6156,16 @@ async def _verify_reply_visible_near_parent(
                     };
 
                     let parentRoot = null;
+                    if (targetAnchorToken) {
+                        const anchorNode = document.querySelector(
+                            `[data-smart-parent-anchor="${cssEscape(targetAnchorToken)}"]`
+                        );
+                        if (anchorNode && visible(anchorNode)) {
+                            parentRoot = anchorNode.closest(rootSelector) || anchorNode;
+                        }
+                    }
                     if (targetId) {
-                        parentRoot = roots.find(root => {
+                        parentRoot = parentRoot || roots.find(root => {
                             const values = [
                                 root.getAttribute('data-cid'),
                                 root.getAttribute('data-comment-id'),
@@ -6128,6 +6251,7 @@ async def _verify_reply_visible_near_parent(
                     "replyText": reply_text,
                     "parentText": parent_text or "",
                     "parentId": parent_comment_id or "",
+                    "parentAnchorToken": parent_anchor_token or "",
                     "allowExpand": attempt == 1,
                 },
             )
@@ -6149,7 +6273,8 @@ async def _verify_reply_visible_near_parent(
             found=found,
             reason=(result or {}).get("reason") if isinstance(result, dict) else None,
             text_preview=(result or {}).get("text") if isinstance(result, dict) else None,
-            level=logging.INFO if found else logging.DEBUG,
+            parent_anchor_token=parent_anchor_token,
+            level=logging.INFO if (found or log_negative) else logging.DEBUG,
         )
         if found:
             return True
@@ -6659,12 +6784,16 @@ async def _reply_with_variant_on_all_mains(
     allow_parent_author_fallback: bool = False,
     shared_parent_cache: Optional[_SharedParentSearchCache] = None,
     on_submitted_outcome: Optional[Callable[[ReplyOutcome], None]] = None,
+    soft_submitted_reply_keys: Optional[set[str]] = None,
+    inflight_reply_keys: Optional[set[str]] = None,
+    on_soft_submitted_outcome: Optional[Callable[[ReplyOutcome], None]] = None,
 ) -> ReplyAttemptResult:
     """Один reply-аккаунт пишет один вариант ответа на каждый найденный main."""
     results: List[ReplyOutcome] = []
     found_mains_by_key: Dict[str, PublishedMain] = {}
     attempted_parent_keys: set[str] = set()
     submitted_parent_keys: set[str] = set()
+    soft_submitted_keys_this_attempt: set[str] = set()
     search_attempted = False
     search_saw_rows = False
     search_inconclusive = False
@@ -6710,6 +6839,10 @@ async def _reply_with_variant_on_all_mains(
         )
     if already_replied_parent_keys is None:
         already_replied_parent_keys = set()
+    if soft_submitted_reply_keys is None:
+        soft_submitted_reply_keys = set()
+    if inflight_reply_keys is None:
+        inflight_reply_keys = set()
     context = None
     page = None
     close_reason = "reply_attempt_done"
@@ -7099,10 +7232,13 @@ async def _reply_with_variant_on_all_mains(
                 result.submitted_parent_keys_count = sum(
                     1 for outcome in result.replies if _reply_outcome_submitted(outcome)
                 )
+            result.soft_submitted_reply_keys.update(soft_submitted_keys_this_attempt)
             if result.fallback_mains:
                 close_reason = "reply_fallback_main_published"
             elif any(_reply_outcome_submitted(outcome) for outcome in result.replies):
                 close_reason = "reply_submitted"
+            elif any(_reply_outcome_soft_submitted(outcome) for outcome in result.replies):
+                close_reason = "reply_soft_submitted"
             elif result.replies:
                 last_error = next(
                     (str(outcome.error or "").strip() for outcome in reversed(result.replies) if outcome.error),
@@ -7284,13 +7420,18 @@ async def _reply_with_variant_on_all_mains(
             )
         sent_for_parents: set[str] = set(already_replied_parent_keys)
         attempted_for_parents: set[str] = set()
+        active_soft_submitted_reply_keys = soft_submitted_reply_keys
+        active_inflight_reply_keys = inflight_reply_keys
         remaining_mains = [
             m
-            for m in _pending_expected_mains_for_reply_variant(
+            for m in _pending_expected_mains_for_reply_variant_with_soft_locks(
                 main_candidates,
                 already_replied_parent_keys,
+                active_soft_submitted_reply_keys,
+                reply_text,
             )
             if (m.text or "").strip()
+            and not (_reply_attempt_keys_for_main(m, reply_text) & active_inflight_reply_keys)
         ]
         remaining_mains, cache_applied_pending = await _apply_shared_parent_search_cache(
             shared_parent_cache,
@@ -7307,7 +7448,12 @@ async def _reply_with_variant_on_all_mains(
                 applied_count=cache_applied_pending,
                 phase="pending_before_search",
             )
-        skipped_parent_count = len(main_candidates) - len(remaining_mains)
+        submitted_pending_mains = _pending_expected_mains_for_reply_variant(
+            main_candidates,
+            already_replied_parent_keys,
+        )
+        skipped_soft_parent_count = max(0, len(submitted_pending_mains) - len(remaining_mains))
+        skipped_parent_count = len(main_candidates) - len(submitted_pending_mains)
         if skipped_parent_count:
             _log_user_trace(
                 "reply_variant_skipped_already_answered_parents",
@@ -7317,6 +7463,17 @@ async def _reply_with_variant_on_all_mains(
                 account_id=account.id,
                 variant_index=variant_index,
                 skipped_parent_count=skipped_parent_count,
+                pending_parent_count=len(remaining_mains),
+            )
+        if skipped_soft_parent_count:
+            _log_user_trace(
+                "reply_variant_skipped_soft_submitted_parents",
+                page=page,
+                expected_video_url=target_media_url,
+                correlation_id=correlation_id,
+                account_id=account.id,
+                variant_index=variant_index,
+                skipped_parent_count=skipped_soft_parent_count,
                 pending_parent_count=len(remaining_mains),
             )
         search_timeout_seconds, search_pass_seconds, search_scrolls = _reply_parent_search_budget(
@@ -7524,6 +7681,7 @@ async def _reply_with_variant_on_all_mains(
                     )
                     if str(key or "").strip()
                 }
+                pre_search_reply_keys = _reply_attempt_keys_for_main(main, reply_text)
                 if pre_search_keys & sent_for_parents:
                     _log_user_trace(
                         "reply_parent_already_handled_pre_search",
@@ -7544,6 +7702,30 @@ async def _reply_with_variant_on_all_mains(
                         account_id=account.id,
                         variant_index=variant_index,
                         parent_key=next(iter(pre_search_keys & attempted_for_parents))[:80],
+                    )
+                    continue
+                if pre_search_reply_keys & active_soft_submitted_reply_keys:
+                    _log_user_trace(
+                        "reply_parent_soft_submitted_pre_search",
+                        page=page,
+                        expected_video_url=target_media_url,
+                        correlation_id=correlation_id,
+                        account_id=account.id,
+                        variant_index=variant_index,
+                        reply_attempt_key=next(iter(pre_search_reply_keys & active_soft_submitted_reply_keys))[:120],
+                        parent_key=main_key[:80],
+                    )
+                    continue
+                if pre_search_reply_keys & active_inflight_reply_keys:
+                    _log_user_trace(
+                        "reply_parent_inflight_pre_search",
+                        page=page,
+                        expected_video_url=target_media_url,
+                        correlation_id=correlation_id,
+                        account_id=account.id,
+                        variant_index=variant_index,
+                        reply_attempt_key=next(iter(pre_search_reply_keys & active_inflight_reply_keys))[:120],
+                        parent_key=main_key[:80],
                     )
                     continue
                 anchor = batch_anchors_by_key.pop(main_key, None)
@@ -7770,6 +7952,10 @@ async def _reply_with_variant_on_all_mains(
                     or _main_parent_key(found_main)
                     or anchor_text_key
                 ).strip()
+                reply_attempt_key = _reply_attempt_key(
+                    dedup_key or _main_parent_key(found_main) or anchor_text_key,
+                    reply_text,
+                )
                 if dedup_key in sent_for_parents or dedup_key in attempted_for_parents:
                     _log_user_trace(
                         "reply_parent_already_handled" if dedup_key in sent_for_parents else "reply_parent_already_attempted_this_account",
@@ -7779,6 +7965,34 @@ async def _reply_with_variant_on_all_mains(
                         account_id=account.id,
                         variant_index=variant_index,
                         parent_key=dedup_key[:80],
+                        parent_id=parent_id,
+                        anchor_preview=anchor_text[:80],
+                    )
+                    continue
+                if reply_attempt_key and reply_attempt_key in active_soft_submitted_reply_keys:
+                    _log_user_trace(
+                        "reply_parent_soft_submitted_after_anchor",
+                        page=page,
+                        expected_video_url=target_media_url,
+                        correlation_id=correlation_id,
+                        account_id=account.id,
+                        variant_index=variant_index,
+                        parent_key=dedup_key[:80],
+                        reply_attempt_key=reply_attempt_key[:120],
+                        parent_id=parent_id,
+                        anchor_preview=anchor_text[:80],
+                    )
+                    continue
+                if reply_attempt_key and reply_attempt_key in active_inflight_reply_keys:
+                    _log_user_trace(
+                        "reply_parent_inflight_after_anchor",
+                        page=page,
+                        expected_video_url=target_media_url,
+                        correlation_id=correlation_id,
+                        account_id=account.id,
+                        variant_index=variant_index,
+                        parent_key=dedup_key[:80],
+                        reply_attempt_key=reply_attempt_key[:120],
                         parent_id=parent_id,
                         anchor_preview=anchor_text[:80],
                     )
@@ -7795,6 +8009,7 @@ async def _reply_with_variant_on_all_mains(
                         and _looks_like_tiktok_comment_id(parent_id)
                     )
                 ) else None
+                inflight_key_added = False
                 try:
                     if not await _ensure_page_on_target_media(
                         page,
@@ -7847,8 +8062,89 @@ async def _reply_with_variant_on_all_mains(
                                 searched=True,
                             )
                         )
+                    already_present_local = await _verify_reply_visible_near_parent(
+                        page,
+                        reply_text=reply_text,
+                        parent_text=open_parent_text,
+                        parent_comment_id=open_parent_id or parent_id,
+                        parent_anchor_token=anchor.anchor_token,
+                        correlation_id=f"{sub_corr}_preflight",
+                        fast=True,
+                    )
+                    if already_present_local:
+                        submitted_keys = {
+                            str(key).strip()
+                            for key in (
+                                parent_id,
+                                found_main.comment_id,
+                                main.comment_id if anchor.found_by == "id" else None,
+                            )
+                            if str(key or "").strip()
+                        }
+                        if not submitted_keys:
+                            anchor_key = dedup_key or _main_parent_key(found_main)
+                            if anchor_key:
+                                submitted_keys.add(anchor_key)
+                        already_replied_parent_keys.update(submitted_keys)
+                        submitted_parent_keys.update(submitted_keys)
+                        if dedup_key:
+                            sent_for_parents.add(dedup_key)
+                        try:
+                            remaining_mains.remove(main)
+                        except ValueError:
+                            pass
+                        outcome = ReplyOutcome(
+                            text=reply_text,
+                            variant_index=variant_index,
+                            matched_main_text=anchor_text,
+                            parent_comment_id=parent_id,
+                            success=True,
+                            method="local_dedupe_skip",
+                            error=None,
+                            account_id=account.id,
+                            attempted=False,
+                            submitted_unconfirmed=False,
+                            parent_key=dedup_key or None,
+                            requested_parent_author=anchor.requested_author,
+                            matched_parent_author=anchor.matched_author,
+                            parent_author_match_mode=anchor.found_by,
+                            author_fallback_used=anchor.author_fallback_used,
+                            author_fallback_reason=anchor.author_fallback_reason,
+                            local_confirmed=True,
+                            reply_confirmation="already_present_local",
+                            counts_as_submitted=True,
+                            already_present_local=True,
+                            reply_attempt_key=reply_attempt_key,
+                        )
+                        results.append(outcome)
+                        if on_submitted_outcome is not None:
+                            try:
+                                on_submitted_outcome(outcome)
+                            except Exception as callback_exc:
+                                logger.debug(
+                                    "[USER_SCHEMA] %s submitted reply outcome callback failed: %s",
+                                    sub_corr,
+                                    str(callback_exc)[:120],
+                                )
+                        _log_user_trace(
+                            "reply_already_present_local",
+                            page=page,
+                            expected_video_url=target_media_url,
+                            correlation_id=sub_corr,
+                            account_id=account.id,
+                            variant_index=variant_index,
+                            parent_id=parent_id,
+                            parent_key=dedup_key[:80],
+                            reply_attempt_key=(reply_attempt_key or "")[:120],
+                            anchor_preview=anchor_text[:80],
+                            level=logging.INFO,
+                        )
+                        continue
                     if dedup_key:
                         attempted_parent_keys.add(dedup_key)
+                    if reply_attempt_key:
+                        active_inflight_reply_keys.add(reply_attempt_key)
+                        inflight_key_added = True
                     publish_result = None
                     if open_parent_id and not reply_dom_first and reply_http_enabled:
                         if not reply_http_session_prepared:
@@ -7923,6 +8219,9 @@ async def _reply_with_variant_on_all_mains(
                             )
                         )
                     continue
+                finally:
+                    if inflight_key_added and reply_attempt_key:
+                        active_inflight_reply_keys.discard(reply_attempt_key)
 
                 network_confirmed = publish_result.status == "success" and bool(publish_result.comment_id)
                 submitted_unconfirmed = _reply_publish_submitted_unconfirmed(publish_result)
@@ -7934,6 +8233,7 @@ async def _reply_with_variant_on_all_mains(
                             reply_text=reply_text,
                             parent_text=open_parent_text,
                             parent_comment_id=open_parent_id or parent_id,
+                            parent_anchor_token=anchor.anchor_token,
                             correlation_id=sub_corr,
                         )
                     except Exception as verify_exc:
@@ -7947,6 +8247,7 @@ async def _reply_with_variant_on_all_mains(
                         submitted_unconfirmed = False
                 success = bool(network_confirmed or local_reply_confirmed)
                 counts_as_submitted = bool(success)
+                soft_submitted = bool(submitted_unconfirmed and not counts_as_submitted)
                 maybe_submitted = bool(success or submitted_unconfirmed)
                 if maybe_submitted:
                     if dedup_key:
@@ -7979,6 +8280,9 @@ async def _reply_with_variant_on_all_mains(
                             submitted_keys.add(anchor_key)
                     already_replied_parent_keys.update(submitted_keys)
                     submitted_parent_keys.update(submitted_keys)
+                if soft_submitted and reply_attempt_key:
+                    active_soft_submitted_reply_keys.add(reply_attempt_key)
+                    soft_submitted_keys_this_attempt.add(reply_attempt_key)
 
                 outcome = ReplyOutcome(
                     text=reply_text,
@@ -8001,6 +8305,8 @@ async def _reply_with_variant_on_all_mains(
                     local_confirmed=local_reply_confirmed,
                     reply_confirmation=reply_confirmation,
                     counts_as_submitted=counts_as_submitted,
+                    soft_submitted=soft_submitted,
+                    reply_attempt_key=reply_attempt_key,
                 )
                 results.append(outcome)
                 if counts_as_submitted and on_submitted_outcome is not None:
@@ -8009,6 +8315,15 @@ async def _reply_with_variant_on_all_mains(
                     except Exception as callback_exc:
                         logger.debug(
                             "[USER_SCHEMA] %s submitted reply outcome callback failed: %s",
+                            sub_corr,
+                            str(callback_exc)[:120],
+                        )
+                if soft_submitted and on_soft_submitted_outcome is not None:
+                    try:
+                        on_soft_submitted_outcome(outcome)
+                    except Exception as callback_exc:
+                        logger.debug(
+                            "[USER_SCHEMA] %s soft-submitted reply outcome callback failed: %s",
                             sub_corr,
                             str(callback_exc)[:120],
                         )
@@ -8028,6 +8343,8 @@ async def _reply_with_variant_on_all_mains(
                     local_confirmed=local_reply_confirmed,
                     submitted_unconfirmed=submitted_unconfirmed,
                     counts_as_submitted=counts_as_submitted,
+                    soft_submitted=soft_submitted,
+                    reply_attempt_key=(reply_attempt_key or "")[:120],
                     reply_confirmation=reply_confirmation,
                     comment_id=publish_result.comment_id,
                     level=logging.INFO if maybe_submitted else logging.WARNING,
@@ -8036,7 +8353,8 @@ async def _reply_with_variant_on_all_mains(
                     _register_runtime_success(db, account, scope="reply")
                 elif submitted_unconfirmed:
                     logger.info(
-                        "[USER_SCHEMA] %s reply submitted_unconfirmed after %s; parent remains pending unless later confirmed",
+                        "[USER_SCHEMA] %s reply submitted_unconfirmed after %s; "
+                        "soft-locking parent+reply_text to suppress duplicate retry in this task",
                         sub_corr,
                         publish_result.error_reason or publish_result.status,
                     )
@@ -8669,11 +8987,13 @@ async def execute_user_schema_parallel(
             int(getattr(outcome, "account_id", 0) or 0),
             bool(getattr(outcome, "success", False)),
             bool(getattr(outcome, "submitted_unconfirmed", False)),
+            bool(getattr(outcome, "soft_submitted", False)),
+            bool(getattr(outcome, "already_present_local", False)),
             str(getattr(outcome, "error", "") or ""),
         )
 
     def _merge_reported_reply_outcomes_into_result() -> None:
-        """Keep partial submitted replies visible if a later retry is interrupted."""
+        """Keep partial submitted/soft-submitted replies visible after retries."""
         if not reply_reported_outcomes_by_variant:
             return
         reported_keys = {
@@ -8682,7 +9002,7 @@ async def execute_user_schema_parallel(
         }
         for outcomes in reply_reported_outcomes_by_variant.values():
             for outcome in outcomes:
-                if not _reply_outcome_submitted(outcome):
+                if not (_reply_outcome_submitted(outcome) or _reply_outcome_soft_submitted(outcome)):
                     continue
                 key = _reply_outcome_report_key(outcome)
                 if key in reported_keys:
@@ -10292,14 +10612,25 @@ async def execute_user_schema_parallel(
             for reply in result.replies
             if getattr(reply, "submitted_unconfirmed", False)
         )
-        reply_remaining = max(0, reply_expected - reply_submitted) if reply_expected else 0
+        reply_soft_submitted = sum(1 for reply in result.replies if _reply_outcome_soft_submitted(reply))
+        reply_already_present = sum(
+            1
+            for reply in result.replies
+            if getattr(reply, "already_present_local", False)
+        )
+        reply_remaining = max(0, reply_expected - reply_submitted - reply_soft_submitted) if reply_expected else 0
         submitted_unconfirmed_total = main_unconfirmed + reply_unconfirmed
         if submitted_unconfirmed_total:
             reason_counts["submitted_unconfirmed"] = submitted_unconfirmed_total
+        if reply_soft_submitted:
+            reason_counts["reply_soft_submitted"] = reply_soft_submitted
+        if reply_already_present:
+            reason_counts["reply_already_present_local"] = reply_already_present
         logger.info(
             "Task %s: parallel order summary phase=%s main=%s/%s "
             "main_unconfirmed=%s main_remaining=%s replies=%s/%s "
-            "reply_unconfirmed=%s reply_remaining=%s close_reasons=%s error=%s",
+            "reply_unconfirmed=%s reply_soft_submitted=%s "
+            "reply_already_present=%s reply_remaining=%s close_reasons=%s error=%s",
             task_id,
             phase,
             main_submitted,
@@ -10309,6 +10640,8 @@ async def execute_user_schema_parallel(
             reply_submitted,
             reply_expected,
             reply_unconfirmed,
+            reply_soft_submitted,
+            reply_already_present,
             reply_remaining,
             dict(sorted(reason_counts.items())),
             result.error or "none",
@@ -10591,6 +10924,8 @@ async def execute_user_schema_parallel(
         return _merge_distinct_main_candidates(candidates)
 
     reply_submitted_parent_keys_by_variant: Dict[int, set[str]] = {}
+    reply_soft_submitted_keys_by_variant: Dict[int, set[str]] = {}
+    reply_inflight_keys_by_variant: Dict[int, set[str]] = {}
     reply_found_mains_by_variant: Dict[int, Dict[str, PublishedMain]] = {}
 
     async def _run_reply_variant_attempt(
@@ -10604,6 +10939,8 @@ async def execute_user_schema_parallel(
             text=reply_text,
         )
         submitted_parent_keys = reply_submitted_parent_keys_by_variant.setdefault(variant_index, set())
+        soft_submitted_keys = reply_soft_submitted_keys_by_variant.setdefault(variant_index, set())
+        inflight_reply_keys = reply_inflight_keys_by_variant.setdefault(variant_index, set())
         reported_outcomes = reply_reported_outcomes_by_variant.setdefault(variant_index, [])
         found_mains_by_key = reply_found_mains_by_variant.setdefault(variant_index, {})
 
@@ -10615,6 +10952,19 @@ async def execute_user_schema_parallel(
                 reported_outcomes.append(outcome)
             submitted_parent_keys.update(
                 _reply_outcomes_submitted_parent_keys_for_expected_mains(
+                    [outcome],
+                    main_candidates,
+                )
+            )
+
+        def _record_incremental_soft_submitted_reply(outcome: ReplyOutcome) -> None:
+            if not _reply_outcome_soft_submitted(outcome):
+                return
+            key = _reply_outcome_report_key(outcome)
+            if not any(_reply_outcome_report_key(existing) == key for existing in reported_outcomes):
+                reported_outcomes.append(outcome)
+            soft_submitted_keys.update(
+                _reply_outcomes_soft_submitted_reply_keys_for_expected_mains(
                     [outcome],
                     main_candidates,
                 )
@@ -10681,6 +11031,9 @@ async def execute_user_schema_parallel(
                         allow_parent_author_fallback=False,
                         shared_parent_cache=shared_parent_cache,
                         on_submitted_outcome=_record_incremental_submitted_reply,
+                        soft_submitted_reply_keys=soft_submitted_keys,
+                        inflight_reply_keys=inflight_reply_keys,
+                        on_soft_submitted_outcome=_record_incremental_soft_submitted_reply,
                     ),
                     timeout=reply_worker_attempt_timeout_seconds,
                 )
@@ -10771,6 +11124,21 @@ async def execute_user_schema_parallel(
                     main_candidates,
                 )
             )
+        soft_submitted_outcomes = [
+            outcome for outcome in outcomes if _reply_outcome_soft_submitted(outcome)
+        ]
+        if soft_submitted_outcomes:
+            for outcome in soft_submitted_outcomes:
+                key = _reply_outcome_report_key(outcome)
+                if not any(_reply_outcome_report_key(existing) == key for existing in reported_outcomes):
+                    reported_outcomes.append(outcome)
+            soft_submitted_keys.update(attempt_result.soft_submitted_reply_keys)
+            soft_submitted_keys.update(
+                _reply_outcomes_soft_submitted_reply_keys_for_expected_mains(
+                    soft_submitted_outcomes,
+                    main_candidates,
+                )
+            )
 
         found_mains = attempt_result.found_mains
         if not found_mains and outcomes:
@@ -10784,13 +11152,15 @@ async def execute_user_schema_parallel(
                     found_mains_by_key[found_key] = found_main
             active_for_variant = _normalize_main_candidates(list(found_mains_by_key.values()))
             variant_result.found_mains = active_for_variant
-            pending_expected_mains = _pending_expected_mains_for_reply_variant(
+            pending_expected_mains = _pending_expected_mains_for_reply_variant_with_soft_locks(
                 main_candidates,
                 submitted_parent_keys,
+                soft_submitted_keys,
+                reply_text,
             )
             if main_candidates and not pending_expected_mains:
                 variant_result.completed = True
-                variant_result.replies = reported_outcomes or submitted_outcomes or outcomes
+                variant_result.replies = reported_outcomes or submitted_outcomes or soft_submitted_outcomes or outcomes
                 return variant_result
             variant_result.error = "reply_publication_incomplete"
         elif attempt_result.confident_empty_search and attempt_result.saw_comment_rows:
@@ -11390,6 +11760,7 @@ async def execute_user_schema_parallel(
         reply_variants,
         active_mains,
         reply_submitted_parent_keys_by_variant,
+        reply_soft_submitted_keys_by_variant,
     )
     if reply_pending_report and not result.error and result.replies:
         result.error = "reply_publication_incomplete"
@@ -11934,6 +12305,8 @@ async def execute_user_schema_full(
             task_any_account_found_main = bool(result.main_found_by_observer)
             task_confident_empty_misses = 0
             full_reply_submitted_parent_keys_by_variant: Dict[int, set[str]] = {}
+            full_reply_soft_submitted_keys_by_variant: Dict[int, set[str]] = {}
+            full_reply_inflight_keys_by_variant: Dict[int, set[str]] = {}
 
             for variant_idx, reply_text in enumerate(reply_variants, start=1):
                 if not active_mains:
@@ -11953,8 +12326,26 @@ async def execute_user_schema_full(
                     variant_idx,
                     set(),
                 )
+                variant_soft_submitted_keys = full_reply_soft_submitted_keys_by_variant.setdefault(
+                    variant_idx,
+                    set(),
+                )
+                variant_inflight_keys = full_reply_inflight_keys_by_variant.setdefault(
+                    variant_idx,
+                    set(),
+                )
                 variant_reported_outcomes: List[ReplyOutcome] = []
                 variant_found_mains_by_key: Dict[str, PublishedMain] = {}
+
+                def _record_full_soft_submitted_reply(outcome: ReplyOutcome) -> None:
+                    if not _reply_outcome_soft_submitted(outcome):
+                        return
+                    variant_soft_submitted_keys.update(
+                        _reply_outcomes_soft_submitted_reply_keys_for_expected_mains(
+                            [outcome],
+                            active_mains,
+                        )
+                    )
 
                 for reply_attempt in range(1, max_reply_attempts + 1):
                     if _is_stop_requested():
@@ -12026,6 +12417,9 @@ async def execute_user_schema_full(
                             fallback_allowed=fallback_allowed,
                             require_parent_author_match=False,
                             allow_parent_author_fallback=False,
+                            soft_submitted_reply_keys=variant_soft_submitted_keys,
+                            inflight_reply_keys=variant_inflight_keys,
+                            on_soft_submitted_outcome=_record_full_soft_submitted_reply,
                         )
                     finally:
                         try:
@@ -12050,6 +12444,44 @@ async def execute_user_schema_full(
                         )
                         task_any_account_found_main = True
                         task_confident_empty_misses = 0
+                    soft_submitted_outcomes = [
+                        o for o in outcomes if _reply_outcome_soft_submitted(o)
+                    ]
+                    if soft_submitted_outcomes:
+                        for outcome in soft_submitted_outcomes:
+                            key = (
+                                int(getattr(outcome, "variant_index", 0) or 0),
+                                str(getattr(outcome, "text", "") or ""),
+                                str(getattr(outcome, "matched_main_text", "") or ""),
+                                str(getattr(outcome, "parent_comment_id", "") or ""),
+                                str(getattr(outcome, "parent_key", "") or ""),
+                                int(getattr(outcome, "account_id", 0) or 0),
+                                bool(getattr(outcome, "success", False)),
+                                bool(getattr(outcome, "submitted_unconfirmed", False)),
+                                bool(getattr(outcome, "soft_submitted", False)),
+                            )
+                            if not any(
+                                (
+                                    int(getattr(existing, "variant_index", 0) or 0),
+                                    str(getattr(existing, "text", "") or ""),
+                                    str(getattr(existing, "matched_main_text", "") or ""),
+                                    str(getattr(existing, "parent_comment_id", "") or ""),
+                                    str(getattr(existing, "parent_key", "") or ""),
+                                    int(getattr(existing, "account_id", 0) or 0),
+                                    bool(getattr(existing, "success", False)),
+                                    bool(getattr(existing, "submitted_unconfirmed", False)),
+                                    bool(getattr(existing, "soft_submitted", False)),
+                                ) == key
+                                for existing in variant_reported_outcomes
+                            ):
+                                variant_reported_outcomes.append(outcome)
+                        variant_soft_submitted_keys.update(attempt_result.soft_submitted_reply_keys)
+                        variant_soft_submitted_keys.update(
+                            _reply_outcomes_soft_submitted_reply_keys_for_expected_mains(
+                                soft_submitted_outcomes,
+                                active_mains,
+                            )
+                        )
                     if _is_stop_requested():
                         logger.info(
                             "Task %s: user stop detected after reply variant %s attempt %s",
@@ -12067,10 +12499,11 @@ async def execute_user_schema_full(
                                 int(getattr(outcome, "account_id", 0) or 0),
                                 bool(getattr(outcome, "success", False)),
                                 bool(getattr(outcome, "submitted_unconfirmed", False)),
+                                bool(getattr(outcome, "soft_submitted", False)),
                             )
                             for outcome in result.replies
                         }
-                        for outcome in submitted_outcomes:
+                        for outcome in [*submitted_outcomes, *soft_submitted_outcomes]:
                             key = (
                                 int(getattr(outcome, "variant_index", 0) or 0),
                                 str(getattr(outcome, "text", "") or ""),
@@ -12080,6 +12513,7 @@ async def execute_user_schema_full(
                                 int(getattr(outcome, "account_id", 0) or 0),
                                 bool(getattr(outcome, "success", False)),
                                 bool(getattr(outcome, "submitted_unconfirmed", False)),
+                                bool(getattr(outcome, "soft_submitted", False)),
                             )
                             if key not in existing_reply_keys:
                                 result.replies.append(outcome)
@@ -12164,9 +12598,11 @@ async def execute_user_schema_full(
                             result.main_found_by_observer = True
                             task_any_account_found_main = True
                             task_confident_empty_misses = 0
-                        pending_found_mains = _pending_expected_mains_for_reply_variant(
+                        pending_found_mains = _pending_expected_mains_for_reply_variant_with_soft_locks(
                             active_mains,
                             variant_submitted_parent_keys,
+                            variant_soft_submitted_keys,
+                            reply_text,
                         )
                         if active_mains and not pending_found_mains:
                             result.replies.extend(variant_reported_outcomes or outcomes)
@@ -12220,6 +12656,7 @@ async def execute_user_schema_full(
                         reply_variants,
                         active_mains,
                         full_reply_submitted_parent_keys_by_variant,
+                        full_reply_soft_submitted_keys_by_variant,
                     )
                     if pending_report and not any(
                         isinstance(item, dict) and item.get("code") == "reply_incomplete"
