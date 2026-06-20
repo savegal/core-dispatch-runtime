@@ -161,6 +161,10 @@ def _reply_variants_from_task(task: Task) -> List[str]:
 
 # Между двумя reply на одном аккаунте.
 _INTER_REPLY_DELAY_RANGE = (3.0, 6.0)
+_PARALLEL_INTER_REPLY_DELAY_RANGE = (1.0, 2.0)
+_REPLY_VISIBILITY_EMPTY_QUORUM = 2
+_REPLY_VISIBILITY_MIN_UNIQUE_ROWS = 20
+_REPLY_VISIBILITY_MIN_MAX_ROWS = 40
 
 # Между главными вариантами на одном аккаунте.
 _INTER_MAIN_VARIANT_DELAY_RANGE = (4.0, 7.0)
@@ -1580,6 +1584,7 @@ class UserSchemaResult:
     boost_quantity: int = 0
     boost_target_mode: str = BOOST_LIKES_TARGET_SINGLE_TOP
     warnings: List[Dict[str, str]] = field(default_factory=list)
+    reply_visibility: Dict[str, Any] = field(default_factory=dict)
     error: Optional[str] = None
     elapsed_seconds: float = 0.0
 
@@ -1712,6 +1717,7 @@ class UserSchemaResult:
             "error": result_error,
             "warnings": warnings,
             "has_warnings": bool(warnings),
+            "reply_visibility": dict(self.reply_visibility or {}),
             "source": source,
             "mode": mode,
             "engagement": {
@@ -6281,6 +6287,125 @@ async def _verify_reply_visible_near_parent(
     return False
 
 
+async def _reset_reply_page_after_confirmed_submit(
+    page: Page,
+    *,
+    correlation_id: str,
+    expected_video_url: str,
+) -> bool:
+    """Try to safely reuse a reply page after a confirmed/local-confirmed submit."""
+    try:
+        await page.keyboard.press("Escape")
+    except Exception:
+        pass
+
+    last_state: Dict[str, Any] = {}
+    for attempt in range(1, 3):
+        try:
+            last_state = await page.evaluate(
+                r"""
+                () => {
+                    const visible = (el) => {
+                        if (!el || !el.getBoundingClientRect) return false;
+                        const r = el.getBoundingClientRect();
+                        const st = getComputedStyle(el);
+                        return r.width > 0 && r.height > 0 && st.display !== 'none' && st.visibility !== 'hidden';
+                    };
+                    const textOf = (el) => String(
+                        (el && (el.value || el.textContent || el.innerText)) || ''
+                    ).replace(/[\u200b-\u200d\ufeff]/g, '').replace(/\s+/g, ' ').trim();
+                    const replyInputs = [
+                        ...document.querySelectorAll('[data-smart-reply-input="1"]'),
+                        ...document.querySelectorAll('[data-smart-reply-composer="1"] [contenteditable="true"]'),
+                        ...document.querySelectorAll('[data-smart-reply-composer="1"] textarea'),
+                        ...document.querySelectorAll('[data-smart-reply-composer="1"] input'),
+                    ].filter((el, idx, arr) => arr.indexOf(el) === idx && visible(el));
+
+                    const composers = [...document.querySelectorAll('[data-smart-reply-composer="1"]')]
+                        .filter(visible);
+                    const dirtyInputs = replyInputs
+                        .map(el => textOf(el))
+                        .filter(Boolean);
+
+                    for (const composer of composers) {
+                        const buttons = [...composer.querySelectorAll('button, [role="button"], div[tabindex="0"]')]
+                            .filter(visible);
+                        const close = buttons.find(btn => {
+                            const label = textOf(btn).toLowerCase() + ' ' +
+                                String(btn.getAttribute('aria-label') || '').toLowerCase();
+                            return label === 'x' || label.includes('close') || label.includes('cancel');
+                        });
+                        if (close) {
+                            try { close.click(); } catch (_) {}
+                        }
+                    }
+
+                    const list = [
+                        ...document.querySelectorAll(
+                            '[data-smart-comment-list-batch-scroll="1"], ' +
+                            '[data-smart-comment-list-batch-scope="1"], ' +
+                            '[data-smart-comment-surface-opened="1"], ' +
+                            '[data-e2e="comment-list"], [data-e2e="comment-list-container"], ' +
+                            '[class*="CommentList"], [class*="CommentContainer"], [class*="comment-list"]'
+                        )
+                    ].find(visible);
+
+                    const ok = Boolean(list) && dirtyInputs.length === 0;
+                    if (ok) {
+                        document
+                            .querySelectorAll('[data-smart-reply-input], [data-smart-reply-composer], [data-smart-reply-post], [data-smart-reply-anchor-token]')
+                            .forEach(el => {
+                                try { el.removeAttribute('data-smart-reply-input'); } catch (_) {}
+                                try { el.removeAttribute('data-smart-reply-composer'); } catch (_) {}
+                                try { el.removeAttribute('data-smart-reply-post'); } catch (_) {}
+                                try { el.removeAttribute('data-smart-reply-anchor-token'); } catch (_) {}
+                                try { el.removeAttribute('data-smart-reply-strategy'); } catch (_) {}
+                                try { el.removeAttribute('data-smart-reply-score'); } catch (_) {}
+                                try { el.removeAttribute('data-smart-reply-post-strategy'); } catch (_) {}
+                                try { el.removeAttribute('data-smart-reply-post-target'); } catch (_) {}
+                                try { el.removeAttribute('data-smart-reply-post-initial-disabled'); } catch (_) {}
+                            });
+                    }
+
+                    return {
+                        ok,
+                        listVisible: Boolean(list),
+                        replyInputCount: replyInputs.length,
+                        dirtyTextCount: dirtyInputs.length,
+                        dirtyPreview: dirtyInputs.slice(0, 2).map(text => text.slice(0, 80)),
+                    };
+                }
+                """
+            )
+        except Exception as exc:
+            last_state = {"ok": False, "reason": f"exception:{str(exc)[:80]}"}
+
+        if bool(isinstance(last_state, dict) and last_state.get("ok")):
+            _log_user_trace(
+                "reply_page_reset_after_submit",
+                page=page,
+                expected_video_url=expected_video_url,
+                correlation_id=correlation_id,
+                success=True,
+                attempt=attempt,
+                state=last_state,
+                level=logging.INFO,
+            )
+            return True
+        await asyncio.sleep(0.25)
+
+    _log_user_trace(
+        "reply_page_reset_after_submit",
+        page=page,
+        expected_video_url=expected_video_url,
+        correlation_id=correlation_id,
+        success=False,
+        state=last_state,
+        level=logging.INFO,
+    )
+    return False
+
+
 async def _observe_main_texts_with_account(
     db: Session,
     account: Account,
@@ -8399,34 +8524,57 @@ async def _reply_with_variant_on_all_mains(
                         )
 
                 if maybe_submitted and not _publish_result_allows_same_page_reuse(publish_result):
-                    logger.info(
-                        "[USER_SCHEMA] %s reply submit used DOM composer but cleanup was not strictly proven; "
-                        "stopping this reply account/page before the next parent",
-                        sub_corr,
-                    )
-                    _log_user_trace(
-                        "reply_account_stopped_after_unsafe_composer",
-                        page=page,
-                        expected_video_url=target_media_url,
-                        correlation_id=sub_corr,
-                        account_id=account.id,
-                        variant_index=variant_index,
-                        status=publish_result.status,
-                        reason=publish_result.error_reason,
-                        composer_clean_after_submit=getattr(publish_result, "composer_clean_after_submit", None),
-                        dom_strategy=publish_result.dom_strategy,
-                        submitted_unconfirmed=submitted_unconfirmed,
-                        counts_as_submitted=counts_as_submitted,
-                        level=logging.INFO,
-                    )
-                    return await _finish_reply_attempt(
-                        ReplyAttemptResult(
-                            replies=results,
-                            found_mains=list(found_mains_by_key.values()),
-                            attempted_parent_keys=attempted_parent_keys,
-                            searched=True,
+                    reset_ok = False
+                    if success:
+                        reset_ok = await _reset_reply_page_after_confirmed_submit(
+                            page,
+                            correlation_id=sub_corr,
+                            expected_video_url=target_media_url,
                         )
-                    )
+                    if reset_ok:
+                        _log_user_trace(
+                            "reply_account_reused_after_reset",
+                            page=page,
+                            expected_video_url=target_media_url,
+                            correlation_id=sub_corr,
+                            account_id=account.id,
+                            variant_index=variant_index,
+                            status=publish_result.status,
+                            reason=publish_result.error_reason,
+                            composer_clean_after_submit=getattr(publish_result, "composer_clean_after_submit", None),
+                            dom_strategy=publish_result.dom_strategy,
+                            level=logging.INFO,
+                        )
+                    else:
+                        logger.info(
+                            "[USER_SCHEMA] %s reply submit used DOM composer but cleanup was not strictly proven; "
+                            "stopping this reply account/page before the next parent",
+                            sub_corr,
+                        )
+                        _log_user_trace(
+                            "reply_account_stopped_after_unsafe_composer",
+                            page=page,
+                            expected_video_url=target_media_url,
+                            correlation_id=sub_corr,
+                            account_id=account.id,
+                            variant_index=variant_index,
+                            status=publish_result.status,
+                            reason=publish_result.error_reason,
+                            composer_clean_after_submit=getattr(publish_result, "composer_clean_after_submit", None),
+                            dom_strategy=publish_result.dom_strategy,
+                            submitted_unconfirmed=submitted_unconfirmed,
+                            counts_as_submitted=counts_as_submitted,
+                            reset_attempted=success,
+                            level=logging.INFO,
+                        )
+                        return await _finish_reply_attempt(
+                            ReplyAttemptResult(
+                                replies=results,
+                                found_mains=list(found_mains_by_key.values()),
+                                attempted_parent_keys=attempted_parent_keys,
+                                searched=True,
+                            )
+                        )
 
                 if success:
                     try:
@@ -8502,7 +8650,12 @@ async def _reply_with_variant_on_all_mains(
                             str(like_policy_exc)[:120],
                         )
 
-                await asyncio.sleep(random.uniform(*_INTER_REPLY_DELAY_RANGE))
+                delay_range = (
+                    _PARALLEL_INTER_REPLY_DELAY_RANGE
+                    if _is_parallel_reply_correlation(sub_corr)
+                    else _INTER_REPLY_DELAY_RANGE
+                )
+                await asyncio.sleep(random.uniform(*delay_range))
 
             if not found_this_pass and remaining_mains:
                 break
@@ -8887,6 +9040,27 @@ class _ParallelReplyVariantResult:
     parent_search_max_seen_rows: int = 0
     parent_search_last_row_count: int = 0
     parent_search_unique_rows_seen: int = 0
+
+
+def _reply_result_is_confident_visibility_empty(item: _ParallelReplyVariantResult) -> bool:
+    if not bool(getattr(item, "no_main_found", False)):
+        return False
+    if bool(getattr(item, "found_any_main", False)):
+        return False
+    if str(getattr(item, "error", "") or "") != "no_main_found_by_reply_account":
+        return False
+    try:
+        unique_rows = int(getattr(item, "parent_search_unique_rows_seen", 0) or 0)
+    except Exception:
+        unique_rows = 0
+    try:
+        max_rows = int(getattr(item, "parent_search_max_seen_rows", 0) or 0)
+    except Exception:
+        max_rows = 0
+    return (
+        unique_rows >= _REPLY_VISIBILITY_MIN_UNIQUE_ROWS
+        or max_rows >= _REPLY_VISIBILITY_MIN_MAX_ROWS
+    )
 
 
 def _record_main_retry_failure(db: Session, account: Account, dead_reason: Optional[str]) -> None:
@@ -11203,6 +11377,195 @@ async def execute_user_schema_parallel(
     consecutive_reply_surface_unavailable_batches = 0
     max_reply_surface_unavailable_batches = 2
     nonfatal_reply_errors: List[str] = []
+    reply_visibility_stage = "pre_rotation"
+    reply_visibility_pre_accounts: set[int] = set()
+    reply_visibility_post_accounts: set[int] = set()
+    reply_visibility_pre_results: List[_ParallelReplyVariantResult] = []
+    reply_visibility_post_results: List[_ParallelReplyVariantResult] = []
+    reply_visibility_rotation_attempted = False
+    reply_visibility_rotation_success = False
+    reply_visibility_rotation_error: Optional[str] = None
+    reply_visibility_rotation_proxy: Optional[str] = None
+    reply_visibility_rotated_proxies: set[str] = set()
+
+    def _reply_visibility_rows_summary(items: List[_ParallelReplyVariantResult]) -> Dict[str, Any]:
+        return {
+            "accounts": [
+                int(item.account_id)
+                for item in items
+                if item.account_id is not None
+            ],
+            "proxies": [
+                _short_proxy_sig(item.proxy_value)
+                for item in items
+                if (item.proxy_value or "").strip()
+            ],
+            "max_rows_seen": max(
+                [int(item.parent_search_max_seen_rows or 0) for item in items] or [0]
+            ),
+            "unique_rows_seen": max(
+                [int(item.parent_search_unique_rows_seen or 0) for item in items] or [0]
+            ),
+        }
+
+    def _reply_visibility_remaining_main_count() -> int:
+        try:
+            submitted_keys = _reply_outcomes_submitted_parent_keys_for_expected_mains(
+                list(result.replies or []),
+                active_mains,
+            )
+            remaining = 0
+            for main in active_mains:
+                main_keys = _main_submission_keys(main)
+                if main_keys and not main_keys.isdisjoint(submitted_keys):
+                    continue
+                remaining += 1
+            return remaining
+        except Exception:
+            return len(active_mains)
+
+    def _update_reply_visibility_payload() -> None:
+        result.reply_visibility = {
+            "stage": reply_visibility_stage,
+            "pre_rotation_accounts": len(reply_visibility_pre_accounts),
+            "post_rotation_accounts": len(reply_visibility_post_accounts),
+            "rotation_attempted": reply_visibility_rotation_attempted,
+            "rotation_success": reply_visibility_rotation_success,
+            "rotation_proxy": _short_proxy_sig(reply_visibility_rotation_proxy),
+            "rotation_error": reply_visibility_rotation_error,
+            "pre_rotation": _reply_visibility_rows_summary(reply_visibility_pre_results),
+            "post_rotation": _reply_visibility_rows_summary(reply_visibility_post_results),
+            "active_main_count": len(active_mains),
+            "remaining_main_count": _reply_visibility_remaining_main_count(),
+        }
+
+    def _reset_reply_visibility_empty_quorum(reason: str) -> None:
+        nonlocal reply_visibility_pre_accounts
+        nonlocal reply_visibility_post_accounts
+        nonlocal reply_visibility_pre_results
+        nonlocal reply_visibility_post_results
+        if reply_visibility_rotation_attempted:
+            reply_visibility_post_accounts.clear()
+            reply_visibility_post_results.clear()
+        else:
+            reply_visibility_pre_accounts.clear()
+            reply_visibility_pre_results.clear()
+        _update_reply_visibility_payload()
+        logger.info(
+            "Task %s: reply visibility empty quorum reset after %s",
+            task_id,
+            reason,
+        )
+
+    def _record_reply_visibility_empty(item: _ParallelReplyVariantResult) -> Optional[str]:
+        if not _reply_result_is_confident_visibility_empty(item):
+            return None
+        account_id = int(item.account_id or 0)
+        if account_id <= 0:
+            return None
+        if reply_visibility_rotation_attempted:
+            if account_id not in reply_visibility_post_accounts:
+                reply_visibility_post_accounts.add(account_id)
+                reply_visibility_post_results.append(item)
+        else:
+            if account_id not in reply_visibility_pre_accounts:
+                reply_visibility_pre_accounts.add(account_id)
+                reply_visibility_pre_results.append(item)
+        _update_reply_visibility_payload()
+        logger.info(
+            "Task %s: reply visibility confident empty stage=%s account=%s proxy=%s "
+            "pre=%s/%s post=%s/%s rows=%s unique=%s",
+            task_id,
+            reply_visibility_stage,
+            account_id,
+            _short_proxy_sig(item.proxy_value),
+            len(reply_visibility_pre_accounts),
+            _REPLY_VISIBILITY_EMPTY_QUORUM,
+            len(reply_visibility_post_accounts),
+            _REPLY_VISIBILITY_EMPTY_QUORUM,
+            item.parent_search_max_seen_rows,
+            item.parent_search_unique_rows_seen,
+        )
+        if (
+            not reply_visibility_rotation_attempted
+            and len(reply_visibility_pre_accounts) >= _REPLY_VISIBILITY_EMPTY_QUORUM
+        ):
+            return "rotate"
+        if (
+            reply_visibility_rotation_attempted
+            and len(reply_visibility_post_accounts) >= _REPLY_VISIBILITY_EMPTY_QUORUM
+        ):
+            return "exhausted"
+        return None
+
+    async def _attempt_reply_visibility_rotation(
+        attempt_db: Session,
+        trigger: _ParallelReplyVariantResult,
+    ) -> bool:
+        nonlocal reply_visibility_stage
+        nonlocal reply_visibility_rotation_attempted
+        nonlocal reply_visibility_rotation_success
+        nonlocal reply_visibility_rotation_error
+        nonlocal reply_visibility_rotation_proxy
+        proxy_value = (trigger.proxy_value or "").strip()
+        reply_visibility_rotation_attempted = True
+        reply_visibility_rotation_proxy = proxy_value or None
+        reply_visibility_stage = "post_rotation"
+        if not proxy_value:
+            reply_visibility_rotation_error = "missing_proxy_for_visibility_rotation"
+            _update_reply_visibility_payload()
+            logger.warning(
+                "Task %s: reply visibility quorum reached but account=%s has no proxy; "
+                "post-rotation probe will continue only if another proxy/account is available",
+                task_id,
+                trigger.account_id,
+            )
+            return False
+        if active_reply_proxy_counts.get(proxy_value, 0) > 0:
+            pending_reply_proxy_rotations.add(proxy_value)
+            reply_visibility_rotation_error = "rotation_delayed_active_browser"
+            _update_reply_visibility_payload()
+            logger.info(
+                "Task %s: delaying reply visibility mobile rotation for proxy=%s because "
+                "%s active browser(s) still use it",
+                task_id,
+                _short_proxy_sig(proxy_value),
+                active_reply_proxy_counts.get(proxy_value, 0),
+            )
+            return False
+        rotated = await _rotate_mobile_proxy_after_failure(
+            attempt_db,
+            proxy_value,
+            scope="reply_visibility",
+            rotated_set=reply_visibility_rotated_proxies,
+            counts=edge_denied_reply_proxy_counts,
+            cooled_values=edge_denied_reply_proxy_values,
+        )
+        reply_visibility_rotation_success = bool(rotated)
+        if rotated:
+            reply_visibility_rotation_error = None
+            await _sleep_or_stop(2.0)
+        else:
+            reply_visibility_rotation_error = "rotation_failed_or_unavailable"
+            edge_denied_reply_proxy_values.add(proxy_value)
+        _update_reply_visibility_payload()
+        return bool(rotated)
+
+    def _finish_reply_visibility_exhausted(error: str) -> None:
+        result.error = error
+        _update_reply_visibility_payload()
+        if not any(
+            isinstance(item, dict) and item.get("code") == "reply_visibility_exhausted"
+            for item in result.warnings
+        ):
+            result.warnings.append(
+                {
+                    "code": "reply_visibility_exhausted",
+                    "error": error,
+                    "visibility": dict(result.reply_visibility or {}),
+                    "message": "Remaining main comments were not visible after visibility retry/rotation checks",
+                }
+            )
 
     if dynamic_worker_pool_enabled and pending_reply_variants and not result.error:
         if not _ensure_parallel_browser_capacity():
@@ -11391,6 +11754,7 @@ async def execute_user_schema_parallel(
                             consecutive_no_main_attempts = 0
                             recent_surface_unavailable_results = []
                             recent_no_main_results = []
+                            _reset_reply_visibility_empty_quorum("main_found_by_reply_account")
                             if item.found_mains:
                                 active_mains = _merge_parallel_active_mains([*active_mains, *item.found_mains])
 
@@ -11424,38 +11788,49 @@ async def execute_user_schema_parallel(
                             stop_reply_scheduling = True
                             await _cancel_active_dynamic_reply_tasks()
 
-                        if item.no_main_found and not any_reply_account_found_main:
+                        if item.no_main_found:
                             consecutive_no_main_attempts += 1
                             recent_no_main_results.append(item)
+                            visibility_action = _record_reply_visibility_empty(item)
+                            if visibility_action == "rotate":
+                                rotated = await _attempt_reply_visibility_rotation(db, item)
+                                consecutive_no_main_attempts = 0
+                                recent_no_main_results = []
+                                if (
+                                    not rotated
+                                    and reply_visibility_rotation_error
+                                    == "missing_proxy_for_visibility_rotation"
+                                ):
+                                    _finish_reply_visibility_exhausted(
+                                        "reply_visibility_rotation_unavailable"
+                                    )
+                                    for failed_item in reply_visibility_pre_results:
+                                        result.replies.extend(failed_item.replies)
+                                    _append_unresolved_dynamic_reply_failures(
+                                        result.error or "reply_mains_not_found"
+                                    )
+                                    pending_reply_variants = []
+                                    stop_reply_scheduling = True
+                                    await _cancel_active_dynamic_reply_tasks()
+                            elif visibility_action == "exhausted":
+                                _finish_reply_visibility_exhausted(
+                                    "remaining_main_comments_not_visible_after_ip_rotation"
+                                )
+                                for failed_item in reply_visibility_post_results:
+                                    result.replies.extend(failed_item.replies)
+                                _append_unresolved_dynamic_reply_failures(result.error or "reply_mains_not_found")
+                                logger.warning(
+                                    "Task %s: stopping dynamic reply phase after post-rotation visibility quorum; "
+                                    "visibility=%s",
+                                    task_id,
+                                    result.reply_visibility,
+                                )
+                                pending_reply_variants = []
+                                stop_reply_scheduling = True
+                                await _cancel_active_dynamic_reply_tasks()
                         elif item.found_any_main:
                             consecutive_no_main_attempts = 0
                             recent_no_main_results = []
-
-                        if (
-                            consecutive_no_main_attempts >= parallel_worker_target
-                            and not any_reply_account_found_main
-                        ):
-                            result.error = "reply_mains_not_found"
-                            for failed_item in recent_no_main_results:
-                                result.replies.extend(failed_item.replies)
-                            _append_unresolved_dynamic_reply_failures(result.error)
-                            logger.warning(
-                                "Task %s: dynamic parallel reply attempts found no main comments with %d account(s); "
-                                "no fallback mains in parallel mode; rows_seen=%s unique_rows_seen=%s",
-                                task_id,
-                                consecutive_no_main_attempts,
-                                [
-                                    failed_item.parent_search_max_seen_rows
-                                    for failed_item in recent_no_main_results
-                                ],
-                                [
-                                    failed_item.parent_search_unique_rows_seen
-                                    for failed_item in recent_no_main_results
-                                ],
-                            )
-                            pending_reply_variants = []
-                            stop_reply_scheduling = True
-                            await _cancel_active_dynamic_reply_tasks()
 
                         if item.completed:
                             result.replies.extend(item.replies)
@@ -11629,6 +12004,7 @@ async def execute_user_schema_parallel(
             any_reply_account_found_main = True
             result.main_found_by_observer = True
             consecutive_reply_surface_unavailable_batches = 0
+            _reset_reply_visibility_empty_quorum("main_found_by_reply_batch")
             batch_found_mains: List[PublishedMain] = []
             for item in batch_results:
                 batch_found_mains.extend(item.found_mains)
@@ -11665,16 +12041,45 @@ async def execute_user_schema_parallel(
             item.no_main_found and not item.found_any_main
             for item in batch_results
         )
-        if batch_all_no_main and not known_main_before_batch and not batch_found_any:
-            result.error = "reply_mains_not_found"
+        if batch_all_no_main and not batch_found_any:
+            visibility_actions: List[str] = []
             for item in batch_results:
-                result.replies.extend(item.replies)
-            logger.warning(
-                "Task %s: parallel reply batch found no main comments with %d account(s); no fallback mains in parallel mode",
-                task_id,
-                len(batch_results),
-            )
-            break
+                action = _record_reply_visibility_empty(item)
+                if action:
+                    visibility_actions.append(action)
+            if "rotate" in visibility_actions:
+                trigger = next(
+                    (item for item in batch_results if _reply_result_is_confident_visibility_empty(item)),
+                    batch_results[-1],
+                )
+                rotated = await _attempt_reply_visibility_rotation(db, trigger)
+                if (
+                    not rotated
+                    and reply_visibility_rotation_error
+                    == "missing_proxy_for_visibility_rotation"
+                ):
+                    _finish_reply_visibility_exhausted("reply_visibility_rotation_unavailable")
+                    for item in reply_visibility_pre_results:
+                        result.replies.extend(item.replies)
+                    logger.warning(
+                        "Task %s: parallel reply batch stopped because visibility quorum "
+                        "requires mobile rotation but no proxy is available; visibility=%s",
+                        task_id,
+                        result.reply_visibility,
+                    )
+                    break
+            elif "exhausted" in visibility_actions:
+                _finish_reply_visibility_exhausted(
+                    "remaining_main_comments_not_visible_after_ip_rotation"
+                )
+                for item in reply_visibility_post_results:
+                    result.replies.extend(item.replies)
+                logger.warning(
+                    "Task %s: parallel reply batch stopped after post-rotation visibility quorum; visibility=%s",
+                    task_id,
+                    result.reply_visibility,
+                )
+                break
 
         retry_variants: List[Tuple[int, str]] = []
         fatal_reply_error: Optional[_ParallelReplyVariantResult] = None

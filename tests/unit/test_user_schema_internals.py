@@ -6775,8 +6775,51 @@ async def test_parallel_mode_dynamic_disabled_preserves_three_wide_batch_path(mo
 
 
 @pytest.mark.unit
+def test_reply_visibility_empty_requires_real_comment_depth():
+    from executor import user_schema
+
+    base = dict(
+        variant_index=1,
+        text="reply",
+        account_id=10,
+        no_main_found=True,
+        found_any_main=False,
+        error="no_main_found_by_reply_account",
+    )
+
+    assert user_schema._reply_result_is_confident_visibility_empty(
+        user_schema._ParallelReplyVariantResult(
+            **base,
+            parent_search_unique_rows_seen=20,
+            parent_search_max_seen_rows=20,
+        )
+    ) is True
+    assert user_schema._reply_result_is_confident_visibility_empty(
+        user_schema._ParallelReplyVariantResult(
+            **base,
+            parent_search_unique_rows_seen=5,
+            parent_search_max_seen_rows=40,
+        )
+    ) is True
+    assert user_schema._reply_result_is_confident_visibility_empty(
+        user_schema._ParallelReplyVariantResult(
+            **base,
+            parent_search_unique_rows_seen=5,
+            parent_search_max_seen_rows=10,
+        )
+    ) is False
+    assert user_schema._reply_result_is_confident_visibility_empty(
+        user_schema._ParallelReplyVariantResult(
+            **{**base, "found_any_main": True},
+            parent_search_unique_rows_seen=20,
+            parent_search_max_seen_rows=40,
+        )
+    ) is False
+
+
+@pytest.mark.unit
 @pytest.mark.asyncio
-async def test_parallel_mode_all_reply_accounts_missing_mains_fails_without_fallback(monkeypatch):
+async def test_parallel_mode_all_reply_accounts_missing_mains_requires_rotation_or_fails(monkeypatch):
     from db import database as db_database
     from executor import browser_pool, user_schema
 
@@ -6843,8 +6886,9 @@ async def test_parallel_mode_all_reply_accounts_missing_mains_fails_without_fall
             searched=True,
             confident_empty_search=True,
             saw_comment_rows=True,
-            parent_search_max_seen_rows=3,
-            parent_search_last_row_count=3,
+            parent_search_max_seen_rows=40,
+            parent_search_last_row_count=40,
+            parent_search_unique_rows_seen=20,
         )
 
     async def fake_close_pool():
@@ -6876,9 +6920,144 @@ async def test_parallel_mode_all_reply_accounts_missing_mains_fails_without_fall
         boost_quantity=0,
     )
 
-    assert result.error == "reply_mains_not_found"
-    assert fallback_seen == [None, None, None]
+    assert result.error == "reply_visibility_rotation_unavailable"
+    assert result.reply_visibility["rotation_attempted"] is True
+    assert result.reply_visibility["rotation_error"] == "missing_proxy_for_visibility_rotation"
+    assert fallback_seen == [None, None]
     assert close_calls == ["close", "close"]
+
+
+@pytest.mark.unit
+@pytest.mark.asyncio
+async def test_reply_visibility_quorum_still_applies_after_some_mains_were_found(monkeypatch):
+    from db import database as db_database
+    from executor import browser_pool, user_schema
+
+    @contextmanager
+    def fake_db_context():
+        yield SimpleNamespace(no_autoflush=SimpleNamespace())
+
+    main_accounts = [SimpleNamespace(id=301 + i, proxy=None) for i in range(2)]
+    reply_accounts = [SimpleNamespace(id=401 + i, proxy=None) for i in range(4)]
+    selected_main_ids: set[int] = set()
+    select_lock = threading.Lock()
+    reply_calls = []
+
+    def fake_get_main(_db, *, exclude_ids=None, **_kwargs):
+        excluded = set(exclude_ids or [])
+        with select_lock:
+            candidate = next(
+                (
+                    account
+                    for account in main_accounts
+                    if account.id not in excluded and account.id not in selected_main_ids
+                ),
+                None,
+            )
+            if candidate is not None:
+                selected_main_ids.add(candidate.id)
+            return candidate
+
+    async def fake_try_main(_db, account, _video_url, texts, **_kwargs):
+        return [
+            user_schema.PublishedMain(
+                text=text,
+                comment_id=f"main-{idx}",
+                network_confirmed=True,
+                local_confirmed=True,
+                method="hybrid_dom",
+                account_id=account.id,
+                tiktok_username=f"user_{account.id}",
+            )
+            for idx, text in enumerate(texts, start=1)
+        ], None
+
+    def fake_get_reply(_db, exclude_ids=None, **_kwargs):
+        excluded = set(exclude_ids or [])
+        return next((account for account in reply_accounts if account.id not in excluded), None)
+
+    async def fake_reply(_db, account, _video_url, main_candidates, reply_text, **kwargs):
+        reply_calls.append((account.id, kwargs["variant_index"]))
+        if len(reply_calls) == 1:
+            outcomes = [
+                user_schema.ReplyOutcome(
+                    text=reply_text,
+                    variant_index=kwargs["variant_index"],
+                    matched_main_text=main.text,
+                    parent_comment_id=main.comment_id,
+                    success=True,
+                    method="unit_local",
+                    error=None,
+                    account_id=account.id,
+                    attempted=True,
+                    local_confirmed=True,
+                    counts_as_submitted=True,
+                )
+                for main in main_candidates
+            ]
+            return user_schema.ReplyAttemptResult(
+                replies=outcomes,
+                found_mains=list(main_candidates),
+                searched=True,
+                saw_comment_rows=True,
+                parent_search_max_seen_rows=40,
+                parent_search_unique_rows_seen=20,
+            )
+        return user_schema.ReplyAttemptResult(
+            replies=[
+                user_schema.ReplyOutcome(
+                    text=reply_text,
+                    variant_index=kwargs["variant_index"],
+                    matched_main_text=None,
+                    parent_comment_id=None,
+                    success=False,
+                    method=None,
+                    error="no_main_found_by_reply_account",
+                    account_id=account.id,
+                    attempted=False,
+                )
+            ],
+            searched=True,
+            confident_empty_search=True,
+            saw_comment_rows=True,
+            parent_search_max_seen_rows=40,
+            parent_search_last_row_count=40,
+            parent_search_unique_rows_seen=20,
+        )
+
+    monkeypatch.setattr(user_schema._settings, "PARALLEL_DYNAMIC_WORKER_POOL_ENABLED", False, raising=False)
+    monkeypatch.setattr(user_schema._settings, "PARALLEL_COMMENTING_TARGET_BROWSERS", 3, raising=False)
+    monkeypatch.setattr(user_schema._settings, "PARALLEL_COMMENTING_MAX_BROWSERS", 3, raising=False)
+    monkeypatch.setattr(user_schema._settings, "PARALLEL_REPLY_VARIANT_WORKERS", 1, raising=False)
+    monkeypatch.setattr(user_schema._settings, "PARALLEL_REPLY_START_DELAY_MIN_SECONDS", 0, raising=False)
+    monkeypatch.setattr(user_schema._settings, "PARALLEL_REPLY_START_DELAY_MAX_SECONDS", 0, raising=False)
+    monkeypatch.setattr(db_database, "get_sync_db_context", fake_db_context)
+    monkeypatch.setattr(user_schema, "get_free_account_for_main_comment", fake_get_main)
+    monkeypatch.setattr(user_schema, "_try_main_account", fake_try_main)
+    monkeypatch.setattr(user_schema, "release_main_account_reservation", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(user_schema, "get_free_account_for_reply", fake_get_reply)
+    monkeypatch.setattr(user_schema, "_reply_with_variant_on_all_mains", fake_reply)
+    monkeypatch.setattr(user_schema, "_maybe_order_likes", AsyncMock(return_value=None))
+    monkeypatch.setattr(browser_pool, "ensure_thread_browser_pool_capacity", lambda _min_browsers: None)
+    monkeypatch.setattr(browser_pool, "close_browser_pool", AsyncMock(return_value=None))
+    monkeypatch.setattr(user_schema.asyncio, "sleep", AsyncMock(return_value=None))
+
+    task = SimpleNamespace(settings={"replies": ["r1", "r2", "r3"]})
+    result = await user_schema.execute_user_schema_parallel(
+        SimpleNamespace(),
+        task,
+        "https://www.tiktok.com/@demo/video/1234567890123456789",
+        ["m1", "m2"],
+        503,
+        boost_enabled=False,
+        boost_quantity=0,
+    )
+
+    assert result.error == "reply_visibility_rotation_unavailable"
+    assert result.main_found_by_observer is True
+    assert result.reply_visibility["rotation_attempted"] is True
+    assert result.reply_visibility["pre_rotation_accounts"] == 2
+    assert any(outcome.success for outcome in result.replies)
 
 
 @pytest.mark.unit

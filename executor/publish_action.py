@@ -209,6 +209,30 @@ async def _yield_to_publish_listener_tasks(listener_tasks: set) -> None:
         await _asyncio_sleep(0)
     except Exception:
         pass
+    done_tasks = [task for task in tuple(listener_tasks) if task.done()]
+    if not done_tasks:
+        return
+    try:
+        await asyncio.gather(*done_tasks, return_exceptions=True)
+    except Exception:
+        pass
+    for task in done_tasks:
+        listener_tasks.discard(task)
+
+
+async def _cancel_and_drain_publish_listener_tasks(listener_tasks: set) -> None:
+    if not listener_tasks:
+        return
+    tasks = tuple(listener_tasks)
+    for task in tasks:
+        if not task.done():
+            task.cancel()
+    try:
+        await asyncio.gather(*tasks, return_exceptions=True)
+    except Exception:
+        pass
+    for task in tasks:
+        listener_tasks.discard(task)
 
 
 _COMMENT_PLACEHOLDER_MARKERS = (
@@ -3600,6 +3624,7 @@ async def _publish_main_comment_direct_dom(
         )
     finally:
         _detach_listener()
+        await _cancel_and_drain_publish_listener_tasks(listener_tasks)
 
 
 async def _publish_reply_comment_direct_dom(
@@ -3988,6 +4013,7 @@ async def _publish_reply_comment_direct_dom(
         )
     finally:
         _detach_listener()
+        await _cancel_and_drain_publish_listener_tasks(listener_tasks)
 
 
 async def _publish_via_current_input(
@@ -5514,6 +5540,7 @@ async def _publish_via_current_input(
             logger.warning("[PUBLISH] Retry Post click failed: %s", retry_exc)
 
     _detach_listener()
+    await _cancel_and_drain_publish_listener_tasks(listener_tasks)
 
     elapsed = time.monotonic() - started
     request_attempted = bool(captured.get("request_url"))
