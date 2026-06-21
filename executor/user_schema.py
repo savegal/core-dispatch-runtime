@@ -161,7 +161,7 @@ def _reply_variants_from_task(task: Task) -> List[str]:
 
 # Между двумя reply на одном аккаунте.
 _INTER_REPLY_DELAY_RANGE = (3.0, 6.0)
-_PARALLEL_INTER_REPLY_DELAY_RANGE = (1.0, 2.0)
+_PARALLEL_INTER_REPLY_DELAY_RANGE = (0.5, 1.0)
 _REPLY_VISIBILITY_EMPTY_QUORUM = 2
 _REPLY_VISIBILITY_MIN_UNIQUE_ROWS = 20
 _REPLY_VISIBILITY_MIN_MAX_ROWS = 40
@@ -779,7 +779,7 @@ async def _prepare_user_schema_http_session(
             "[USER_SCHEMA_HTTP] %s: strategy lookup failed for account=%s: %s",
             correlation_id,
             getattr(account, "id", None),
-            raw_error[:120],
+            str(exc)[:120],
         )
         return None
 
@@ -1244,6 +1244,247 @@ async def _ensure_page_on_target_media(
     return False
 
 
+def _comment_surface_has_searchable_items(state: Optional[Dict[str, Any]]) -> bool:
+    if not isinstance(state, dict) or not state.get("list_visible"):
+        return False
+    list_source = state.get("list_source") or {}
+    if not isinstance(list_source, dict):
+        list_source = {}
+    try:
+        strong_items = int(list_source.get("strong_items") or 0)
+    except (TypeError, ValueError):
+        strong_items = 0
+    try:
+        visible_items = int(state.get("comment_items_visible") or 0)
+    except (TypeError, ValueError):
+        visible_items = 0
+    return max(strong_items, visible_items) > 0
+
+
+async def _open_comment_list_fast_for_parallel_reply(
+    page: Page,
+    expected_video_url: str,
+    fallback_video_url: str,
+    *,
+    timeout_ms: int,
+    correlation_id: str,
+    phase: str,
+    account_id: Optional[int] = None,
+    variant_index: Optional[int] = None,
+) -> bool:
+    started = time.monotonic()
+    deadline = started + 9.0
+
+    def _remaining() -> float:
+        return max(0.0, deadline - time.monotonic())
+
+    async def _ready_probe(seconds: float, probe_phase: str) -> bool:
+        remaining = _remaining()
+        if remaining <= 0.15:
+            return False
+        try:
+            ready = await _wait_for_searchable_comment_surface(
+                page,
+                expected_video_url=expected_video_url,
+                correlation_id=correlation_id,
+                phase=probe_phase,
+                timeout_seconds=min(seconds, remaining),
+            )
+        except Exception as exc:
+            logger.debug(
+                "[USER_SCHEMA] %s: fast reply comment surface probe failed in %s: %s",
+                correlation_id,
+                probe_phase,
+                str(exc)[:120],
+            )
+            return False
+        if ready:
+            _log_user_trace(
+                "comment_list_fast_open_ready",
+                page=page,
+                expected_video_url=expected_video_url,
+                correlation_id=correlation_id,
+                account_id=account_id,
+                variant_index=variant_index,
+                phase=phase,
+                probe_phase=probe_phase,
+                elapsed=round(time.monotonic() - started, 2),
+            )
+        return ready
+
+    async def _try_open(max_wait: float, attempt: int, label: str) -> bool:
+        remaining = _remaining()
+        if remaining <= 0.25:
+            return False
+        budget = min(max_wait, remaining)
+        try:
+            opened = await asyncio.wait_for(
+                open_comment_section(
+                    page,
+                    max_wait=budget,
+                    require_list_with_items=True,
+                    aggressive=True,
+                ),
+                timeout=max(0.5, min(_remaining(), budget + 0.4)),
+            )
+        except asyncio.TimeoutError:
+            logger.debug(
+                "[USER_SCHEMA] %s: fast reply open comments attempt %s timed out after %.2fs",
+                correlation_id,
+                label,
+                budget,
+            )
+            opened = False
+        except Exception as exc:
+            logger.debug(
+                "[USER_SCHEMA] %s: fast reply open comments attempt %s failed: %s",
+                correlation_id,
+                label,
+                str(exc)[:120],
+            )
+            opened = False
+        _log_user_trace(
+            "comment_list_fast_open_attempt",
+            page=page,
+            expected_video_url=expected_video_url,
+            correlation_id=correlation_id,
+            account_id=account_id,
+            variant_index=variant_index,
+            phase=phase,
+            attempt=attempt,
+            label=label,
+            max_wait_seconds=round(budget, 2),
+            opened=opened,
+            elapsed=round(time.monotonic() - started, 2),
+            level=logging.INFO if opened else logging.DEBUG,
+        )
+        if opened:
+            return True
+        return await _ready_probe(0.45, f"{phase}_{label}_post_probe")
+
+    if await _ready_probe(1.1, f"{phase}_pre_probe"):
+        return True
+
+    if await _try_open(3.2, 1, "initial"):
+        return True
+
+    # One cheap re-click/open pass before any reload. This handles TikTok cases
+    # where the first click only focuses or partially opens the drawer.
+    if await _try_open(1.8, 2, "reclick"):
+        return True
+
+    try:
+        state = await get_comment_surface_state(page)
+    except Exception:
+        state = {}
+    if _comment_surface_has_searchable_items(state):
+        _log_user_trace(
+            "comment_list_fast_open_ready",
+            page=page,
+            expected_video_url=expected_video_url,
+            correlation_id=correlation_id,
+            account_id=account_id,
+            variant_index=variant_index,
+            phase=phase,
+            probe_phase=f"{phase}_final_state",
+            elapsed=round(time.monotonic() - started, 2),
+        )
+        return True
+
+    try:
+        current_url = getattr(page, "url", None)
+    except Exception:
+        current_url = None
+    redirected = not is_on_expected_media_url(current_url, expected_video_url)
+    empty_surface = _empty_comment_surface_summary(state or {})
+    if not redirected and not empty_surface:
+        _log_user_trace(
+            "comment_list_fast_open_no_reload",
+            page=page,
+            expected_video_url=expected_video_url,
+            correlation_id=correlation_id,
+            account_id=account_id,
+            variant_index=variant_index,
+            phase=phase,
+            reason="not_redirected_and_no_empty_surface",
+            elapsed=round(time.monotonic() - started, 2),
+            level=logging.WARNING,
+        )
+        return False
+
+    if _remaining() <= 1.2:
+        _log_user_trace(
+            "comment_list_fast_open_reload_skipped",
+            page=page,
+            expected_video_url=expected_video_url,
+            correlation_id=correlation_id,
+            account_id=account_id,
+            variant_index=variant_index,
+            phase=phase,
+            reason="deadline_exceeded",
+            redirected=redirected,
+            empty_surface=empty_surface,
+            elapsed=round(time.monotonic() - started, 2),
+            level=logging.WARNING,
+        )
+        return False
+
+    _log_user_trace(
+        "comment_list_fast_open_reload_start",
+        page=page,
+        expected_video_url=expected_video_url,
+        correlation_id=correlation_id,
+        account_id=account_id,
+        variant_index=variant_index,
+        phase=phase,
+        redirected=redirected,
+        empty_surface=empty_surface,
+        elapsed=round(time.monotonic() - started, 2),
+        level=logging.WARNING,
+    )
+    targets = [expected_video_url]
+    if fallback_video_url and fallback_video_url not in targets:
+        targets.append(fallback_video_url)
+    for target_url in targets:
+        remaining = _remaining()
+        if remaining <= 1.0:
+            break
+        try:
+            await page.goto(
+                target_url,
+                wait_until="domcontentloaded",
+                timeout=max(500, min(int(timeout_ms), int(remaining * 1000))),
+            )
+            sleep_for = min(0.6, _remaining())
+            if sleep_for > 0:
+                await asyncio.sleep(sleep_for)
+        except Exception as exc:
+            logger.warning(
+                "[USER_SCHEMA] %s: fast reply retry goto target failed via %s: %s",
+                correlation_id,
+                target_url,
+                str(exc)[:120],
+            )
+            continue
+        if not is_on_expected_media_url(getattr(page, "url", None), expected_video_url):
+            continue
+        if await _try_open(2.4, 3, "post_reload"):
+            return True
+
+    _log_user_trace(
+        "comment_list_fast_open_failed",
+        page=page,
+        expected_video_url=expected_video_url,
+        correlation_id=correlation_id,
+        account_id=account_id,
+        variant_index=variant_index,
+        phase=phase,
+        elapsed=round(time.monotonic() - started, 2),
+        level=logging.WARNING,
+    )
+    return False
+
+
 async def _open_comment_list_with_safe_retry(
     page: Page,
     expected_video_url: str,
@@ -1255,6 +1496,18 @@ async def _open_comment_list_with_safe_retry(
     account_id: Optional[int] = None,
     variant_index: Optional[int] = None,
 ) -> bool:
+    if _is_parallel_reply_correlation(correlation_id):
+        return await _open_comment_list_fast_for_parallel_reply(
+            page,
+            expected_video_url,
+            fallback_video_url,
+            timeout_ms=timeout_ms,
+            correlation_id=correlation_id,
+            phase=phase,
+            account_id=account_id,
+            variant_index=variant_index,
+        )
+
     try:
         opened = await open_comment_section(
             page,
@@ -1450,6 +1703,7 @@ class PublishedMain:
     account_id: int
     tiktok_username: Optional[str]  # реальный username автора (для лайков)
     variant_index: Optional[int] = None
+    physical_parent_key: Optional[str] = None
 
 
 @dataclass
@@ -1474,6 +1728,7 @@ class MainAnchor:
     error: Optional[str] = None
     source_main: Optional[PublishedMain] = None
     parent_key: Optional[str] = None
+    physical_parent_key: Optional[str] = None
     requested_author: Optional[str] = None
     matched_author: Optional[str] = None
     author_fallback_used: bool = False
@@ -1544,6 +1799,7 @@ class ReplyOutcome:
     soft_submitted: bool = False
     already_present_local: bool = False
     reply_attempt_key: Optional[str] = None
+    physical_parent_key: Optional[str] = None
 
 
 @dataclass
@@ -1561,6 +1817,8 @@ class ReplyAttemptResult:
     parent_search_max_seen_rows: int = 0
     parent_search_last_row_count: int = 0
     parent_search_unique_rows_seen: int = 0
+    parent_search_exhausted: bool = False
+    parent_search_scroll_container_scrollable: Optional[bool] = None
     soft_submitted_reply_keys: set[str] = field(default_factory=set)
 
 
@@ -1784,6 +2042,7 @@ class UserSchemaResult:
                             "matched_main_text": r.matched_main_text,
                             "parent_comment_id": r.parent_comment_id,
                             "parent_key": getattr(r, "parent_key", None),
+                            "physical_parent_key": getattr(r, "physical_parent_key", None),
                             "success": r.success,
                             "attempted": r.attempted,
                             "submitted_unconfirmed": getattr(r, "submitted_unconfirmed", False),
@@ -3400,6 +3659,19 @@ def _looks_like_closed_page_error(reason: Optional[str]) -> bool:
     )
 
 
+def _looks_like_browser_driver_unavailable(reason: Optional[str]) -> bool:
+    safe = (reason or "").lower()
+    if not safe:
+        return False
+    return (
+        "browser.new_context" in safe
+        and "connection closed while reading from the driver" in safe
+    ) or (
+        "failed to create browser context" in safe
+        and "connection closed while reading from the driver" in safe
+    )
+
+
 def _is_critical_publish_failure(result: "PublishResult") -> bool:
     reason = (result.error_reason or "")
     if result.status == "redirected":
@@ -4493,6 +4765,7 @@ def _normalize_main_candidates(main_candidates: List[Any]) -> List[PublishedMain
                 account_id=int(getattr(item, "account_id", 0) or 0),
                 tiktok_username=getattr(item, "tiktok_username", None),
                 variant_index=getattr(item, "variant_index", None),
+                physical_parent_key=getattr(item, "physical_parent_key", None),
             )
         )
     return normalized
@@ -4530,6 +4803,89 @@ def _main_parent_key(main: PublishedMain) -> str:
     return text_key
 
 
+def _physical_parent_key_from_observed(
+    *,
+    comment_id: Optional[Any] = None,
+    text: Optional[Any] = None,
+    author: Optional[Any] = None,
+) -> Optional[str]:
+    """Stable-enough identity for the actual DOM parent row we found.
+
+    The logical expected main can be account-specific while TikTok may show the
+    same visible comment row for several expected entries with duplicate text.
+    Prefer TikTok's cid; otherwise bind to observed author+text. Text-only is a
+    last-resort safety fallback for rows where TikTok does not expose an author.
+    """
+    cid = str(comment_id or "").strip()
+    if cid:
+        return cid
+    text_key = _dedup_key(text)
+    if not text_key:
+        return None
+    author_key = normalize_author(author) or _dedup_key(author)
+    if author_key:
+        return f"physical:author:{author_key}:text:{text_key}"
+    return f"physical:text:{text_key}"
+
+
+def _main_physical_parent_key(main: PublishedMain) -> Optional[str]:
+    explicit = str(getattr(main, "physical_parent_key", "") or "").strip()
+    if explicit:
+        return explicit
+    return _physical_parent_key_from_observed(
+        comment_id=getattr(main, "comment_id", None),
+        text=getattr(main, "text", None),
+        author=getattr(main, "tiktok_username", None),
+    )
+
+
+def _anchor_physical_parent_key(anchor: MainAnchor, *, fallback_text: Optional[str] = None) -> Optional[str]:
+    explicit = str(getattr(anchor, "physical_parent_key", "") or "").strip()
+    if explicit:
+        return explicit
+    return _physical_parent_key_from_observed(
+        comment_id=getattr(anchor, "parent_comment_id", None),
+        text=getattr(anchor, "raw_text", None)
+        or getattr(anchor, "open_text", None)
+        or fallback_text
+        or getattr(anchor, "matched_text", None),
+        author=getattr(anchor, "matched_author", None),
+    )
+
+
+def _reply_parent_dedup_key_for_anchor(
+    main: PublishedMain,
+    anchor: MainAnchor,
+    *,
+    anchor_text: Optional[str] = None,
+) -> str:
+    physical_key = _anchor_physical_parent_key(anchor, fallback_text=anchor_text)
+    verified_main_id = main.comment_id if anchor.found_by == "id" else None
+    return str(
+        anchor.parent_comment_id
+        or verified_main_id
+        or physical_key
+        or _main_parent_key(main)
+        or _dedup_key(anchor_text or anchor.open_text or anchor.matched_text)
+        or ""
+    ).strip()
+
+
+def _reply_visibility_probe_found(value: Any) -> bool:
+    if isinstance(value, dict):
+        return bool(value.get("found"))
+    return bool(value)
+
+
+def _reply_visibility_probe_count(value: Any) -> int:
+    if isinstance(value, dict):
+        try:
+            return max(0, int(value.get("count") or 0))
+        except Exception:
+            return 0
+    return 1 if bool(value) else 0
+
+
 def _main_parent_keys(main: PublishedMain) -> set[str]:
     keys: set[str] = set()
     cid = str(main.comment_id or "").strip()
@@ -4541,6 +4897,9 @@ def _main_parent_keys(main: PublishedMain) -> set[str]:
     primary = _main_parent_key(main)
     if primary:
         keys.add(primary)
+    physical_key = str(getattr(main, "physical_parent_key", "") or "").strip()
+    if physical_key:
+        keys.add(physical_key)
     return keys
 
 
@@ -4554,6 +4913,9 @@ def _main_submission_keys(main: PublishedMain) -> set[str]:
     cid = str(main.comment_id or "").strip()
     if cid:
         return {cid}
+    physical_key = str(getattr(main, "physical_parent_key", "") or "").strip()
+    if physical_key:
+        return {physical_key}
     parent_key = _main_parent_key(main)
     return {parent_key} if parent_key else set()
 
@@ -4570,6 +4932,9 @@ def _main_exact_identity_keys(main: PublishedMain) -> set[str]:
     primary = _main_parent_key(main)
     if primary:
         keys.add(primary)
+    physical_key = str(getattr(main, "physical_parent_key", "") or "").strip()
+    if physical_key:
+        keys.add(physical_key)
     text_key = _dedup_key(main.text)
     if text_key:
         account_key = str(main.account_id or "").strip()
@@ -4632,7 +4997,22 @@ def _batch_parent_search_should_try_single_fallback(info: Optional[Dict[str, Any
 
 def _published_main_with_cached_parent(main: PublishedMain, cached: PublishedMain) -> PublishedMain:
     cached_cid = str(cached.comment_id or "").strip()
-    if not cached_cid or str(main.comment_id or "").strip() == cached_cid:
+    cached_physical = str(getattr(cached, "physical_parent_key", "") or "").strip()
+    if not cached_cid:
+        if cached_physical and not str(getattr(main, "physical_parent_key", "") or "").strip():
+            return PublishedMain(
+                text=main.text or cached.text,
+                comment_id=main.comment_id,
+                network_confirmed=bool(main.network_confirmed or cached.network_confirmed),
+                local_confirmed=bool(main.local_confirmed or cached.local_confirmed),
+                method=main.method or cached.method,
+                account_id=main.account_id,
+                tiktok_username=main.tiktok_username or cached.tiktok_username,
+                variant_index=main.variant_index or cached.variant_index,
+                physical_parent_key=cached_physical,
+            )
+        return main
+    if str(main.comment_id or "").strip() == cached_cid:
         return main
     return PublishedMain(
         text=main.text or cached.text,
@@ -4643,6 +5023,7 @@ def _published_main_with_cached_parent(main: PublishedMain, cached: PublishedMai
         account_id=main.account_id,
         tiktok_username=main.tiktok_username or cached.tiktok_username,
         variant_index=main.variant_index or cached.variant_index,
+        physical_parent_key=main.physical_parent_key or cached_physical or cached.physical_parent_key,
     )
 
 
@@ -4721,6 +5102,13 @@ def _merge_distinct_main_candidates(candidates: List[PublishedMain]) -> List[Pub
             compound = (int(main.account_id), text_key)
 
         if primary in primary_to_index:
+            existing_index = primary_to_index[primary]
+            existing = active[existing_index]
+            if (
+                getattr(main, "physical_parent_key", None)
+                and not getattr(existing, "physical_parent_key", None)
+            ):
+                active[existing_index] = _published_main_with_cached_parent(existing, main)
             continue
         if compound is not None and compound in compound_to_index:
             existing_index = compound_to_index[compound]
@@ -4731,6 +5119,11 @@ def _merge_distinct_main_candidates(candidates: List[PublishedMain]) -> List[Pub
                     primary_to_index.pop(old_primary, None)
                 active[existing_index] = main
                 primary_to_index[primary] = existing_index
+            elif (
+                getattr(main, "physical_parent_key", None)
+                and not getattr(existing, "physical_parent_key", None)
+            ):
+                active[existing_index] = _published_main_with_cached_parent(existing, main)
             continue
 
         index = len(active)
@@ -4762,10 +5155,12 @@ def _reply_outcome_parent_keys(outcome: ReplyOutcome) -> set[str]:
     if cid:
         keys.add(cid)
         return keys
+    physical_key = str(getattr(outcome, "physical_parent_key", "") or "").strip()
+    if physical_key:
+        keys.add(physical_key)
     parent_key = str(getattr(outcome, "parent_key", "") or "").strip()
     if parent_key:
         keys.add(parent_key)
-        return keys
     return keys
 
 
@@ -4799,7 +5194,10 @@ def _reply_attempt_key_for_outcome(outcome: ReplyOutcome) -> Optional[str]:
     explicit = str(getattr(outcome, "reply_attempt_key", "") or "").strip()
     if explicit:
         return explicit
-    parent_key = _reply_outcome_parent_key(outcome)
+    parent_key = str(getattr(outcome, "physical_parent_key", "") or "").strip()
+    if not parent_key:
+        parent_keys = sorted(_reply_outcome_parent_keys(outcome))
+        parent_key = parent_keys[0] if parent_keys else ""
     if not parent_key:
         parent_key = _dedup_key(getattr(outcome, "matched_main_text", None))
     return _reply_attempt_key(parent_key, getattr(outcome, "text", None))
@@ -4856,6 +5254,23 @@ def _reply_outcomes_soft_submitted_reply_keys_for_expected_mains(
     return keys
 
 
+def _reply_outcomes_submitted_reply_keys_for_expected_mains(
+    outcomes: List[ReplyOutcome],
+    main_candidates: List[PublishedMain],
+) -> set[str]:
+    keys: set[str] = set()
+    for outcome in outcomes or []:
+        if not _reply_outcome_submitted(outcome):
+            continue
+        outcome_key = _reply_attempt_key_for_outcome(outcome)
+        if outcome_key:
+            keys.add(outcome_key)
+        main = _find_expected_main_for_reply_outcome(outcome, main_candidates)
+        if main is not None:
+            keys.update(_reply_attempt_keys_for_main(main, outcome.text))
+    return keys
+
+
 def _reply_outcomes_submitted_parent_keys(outcomes: List[ReplyOutcome]) -> set[str]:
     keys: set[str] = set()
     for outcome in outcomes or []:
@@ -4885,6 +5300,9 @@ def _main_is_submitted_for_reply_variant_with_counts(
 
     cid = str(main.comment_id or "").strip()
     if cid and cid in submitted_keys:
+        return True
+    physical_key = str(getattr(main, "physical_parent_key", "") or "").strip()
+    if physical_key and physical_key in submitted_keys:
         return True
 
     text_key = _dedup_key(main.text)
@@ -4982,9 +5400,12 @@ def _find_expected_main_for_reply_outcome(
     cid_key = str(outcome.parent_comment_id or "").strip()
     if cid_key:
         explicit_keys.add(cid_key)
+    physical_key = str(getattr(outcome, "physical_parent_key", "") or "").strip()
+    if physical_key:
+        explicit_keys.add(physical_key)
     if parent_key and (
         _looks_like_tiktok_comment_id(parent_key)
-        or parent_key.startswith(("account:", "author:"))
+        or parent_key.startswith(("account:", "author:", "physical:"))
     ):
         explicit_keys.add(parent_key)
     if explicit_keys:
@@ -5024,12 +5445,13 @@ def _reply_outcomes_submitted_parent_keys_for_expected_mains(
         # submitted key would make the next retry skip all duplicates.
         for explicit_key in (
             outcome.parent_comment_id,
+            getattr(outcome, "physical_parent_key", None),
             getattr(outcome, "parent_key", None),
         ):
             explicit_key = str(explicit_key or "").strip()
             if explicit_key and (
                 _looks_like_tiktok_comment_id(explicit_key)
-                or explicit_key.startswith(("account:", "author:"))
+                or explicit_key.startswith(("account:", "author:", "physical:"))
             ):
                 keys.add(explicit_key)
     return keys
@@ -5136,6 +5558,8 @@ def _coerce_main_anchor(value: Any, source_main: Optional[PublishedMain] = None)
             value.source_main = source_main
         if value.parent_key is None and value.source_main is not None:
             value.parent_key = _main_parent_key(value.source_main)
+        if value.physical_parent_key is None:
+            value.physical_parent_key = _anchor_physical_parent_key(value)
         return value
     if isinstance(value, (tuple, list)):
         matched = value[0] if len(value) > 0 else None
@@ -5148,6 +5572,11 @@ def _coerce_main_anchor(value: Any, source_main: Optional[PublishedMain] = None)
             id_verified=bool(cid),
             source_main=source_main,
             parent_key=_main_parent_key(source_main) if source_main else None,
+            physical_parent_key=_physical_parent_key_from_observed(
+                comment_id=cid,
+                text=matched,
+                author=getattr(source_main, "tiktok_username", None) if source_main else None,
+            ),
         )
     return MainAnchor(matched_text=None, parent_comment_id=None, source_main=source_main)
 
@@ -5202,6 +5631,7 @@ async def _revalidate_cached_main_anchor(
 
 def _main_from_anchor(main: PublishedMain, anchor: MainAnchor) -> PublishedMain:
     text = main.text or anchor.matched_text or ""
+    physical_key = _anchor_physical_parent_key(anchor, fallback_text=text)
     return PublishedMain(
         text=text,
         comment_id=anchor.parent_comment_id or (main.comment_id if anchor.found_by == "id" else None),
@@ -5211,6 +5641,7 @@ def _main_from_anchor(main: PublishedMain, anchor: MainAnchor) -> PublishedMain:
         account_id=main.account_id,
         tiktok_username=anchor.matched_author or main.tiktok_username,
         variant_index=main.variant_index,
+        physical_parent_key=physical_key,
     )
 
 
@@ -5618,6 +6049,12 @@ async def _find_main_anchor(
                         id_verified=True,
                         anchor_token=anchor_token,
                         source_main=main,
+                        parent_key=_main_parent_key(main),
+                        physical_parent_key=_physical_parent_key_from_observed(
+                            comment_id=cid,
+                            text=main.text,
+                            author=main.tiktok_username,
+                        ),
                     )
             except Exception:
                 continue
@@ -5745,6 +6182,12 @@ async def _find_main_anchor(
             position=info.get("position"),
             anchor_token=info.get("anchor_token"),
             source_main=main,
+            parent_key=_main_parent_key(main),
+            physical_parent_key=_physical_parent_key_from_observed(
+                comment_id=cid,
+                text=raw_text,
+                author=info.get("author") or main.tiktok_username,
+            ),
         )
     return MainAnchor(matched_text=None, parent_comment_id=None)
 
@@ -5839,6 +6282,11 @@ async def _find_main_anchors_batch(
         cid = (hit or {}).get("comment_id")
         matched_by = str((hit or {}).get("matched_by") or "text")
         matched_author = normalize_author((hit or {}).get("author")) or None
+        physical_key = _physical_parent_key_from_observed(
+            comment_id=cid,
+            text=raw_text,
+            author=matched_author,
+        )
         anchors.append(
             MainAnchor(
                 matched_text=main.text,
@@ -5853,6 +6301,7 @@ async def _find_main_anchors_batch(
                 anchor_token=(hit or {}).get("anchor_token"),
                 source_main=main,
                 parent_key=_main_parent_key(main),
+                physical_parent_key=physical_key,
                 requested_author=normalize_author(main.tiktok_username) or None,
                 matched_author=matched_author,
             )
@@ -5916,6 +6365,7 @@ async def _find_main_anchors_batch(
                 continue
             raw_text = str(item.get("raw_text") or "").strip() or main.text
             cid = item.get("comment_id")
+            matched_author = normalize_author(item.get("author")) or None
             anchors.append(
                 MainAnchor(
                     matched_text=main.text,
@@ -5930,8 +6380,13 @@ async def _find_main_anchors_batch(
                     anchor_token=item.get("anchor_token"),
                     source_main=main,
                     parent_key=_main_parent_key(main),
+                    physical_parent_key=_physical_parent_key_from_observed(
+                        comment_id=cid,
+                        text=raw_text,
+                        author=matched_author,
+                    ),
                     requested_author=normalize_author(main.tiktok_username) or None,
-                    matched_author=normalize_author(item.get("author")) or None,
+                    matched_author=matched_author,
                     author_fallback_used=True,
                     author_fallback_reason=str(item.get("fallback_reason") or "requested_author_not_found"),
                 )
@@ -6058,7 +6513,9 @@ async def _verify_reply_visible_near_parent(
     parent_anchor_token: Optional[str] = None,
     fast: bool = False,
     log_negative: bool = False,
-) -> bool:
+    min_count_exclusive: Optional[int] = None,
+    return_state: bool = False,
+) -> Any:
     """Best-effort local check for ambiguous reply submits.
 
     This is intentionally scoped to the already-found parent comment. It is not
@@ -6067,14 +6524,23 @@ async def _verify_reply_visible_near_parent(
     DOM.
     """
     if not (reply_text or "").strip() or not ((parent_text or "").strip() or parent_comment_id):
-        return False
+        state = {"found": False, "count": 0, "reason": "missing_reply_or_parent"}
+        return state if return_state else False
 
+    last_result: Dict[str, Any] = {
+        "found": False,
+        "count": 0,
+        "reason": "reply_not_found_under_parent",
+        "minCountExclusive": min_count_exclusive,
+    }
     for attempt in range(1, 3):
-        await asyncio.sleep((0.25 if attempt == 1 else 0.5) if fast else (0.8 if attempt == 1 else 1.2))
+        delay = (0.0 if attempt == 1 else 0.35) if fast else (0.8 if attempt == 1 else 1.2)
+        if delay > 0:
+            await asyncio.sleep(delay)
         try:
             result = await page.evaluate(
                 r"""
-                ({replyText, parentText, parentId, parentAnchorToken, allowExpand}) => {
+                ({replyText, parentText, parentId, parentAnchorToken, allowExpand, minCountExclusive}) => {
                     const normalize = (value) => String(value || '')
                         .replace(/[\u200b-\u200d\ufeff]/g, '')
                         .replace(/\s+/g, ' ')
@@ -6098,8 +6564,11 @@ async def _verify_reply_visible_near_parent(
                     const parentNeedle = normalize(parentText);
                     const targetId = String(parentId || '').trim();
                     const targetAnchorToken = String(parentAnchorToken || '').trim();
+                    const requiredCount = Number.isFinite(Number(minCountExclusive))
+                        ? Math.max(-1, Number(minCountExclusive))
+                        : -1;
                     if (!replyNeedle || (!parentNeedle && !targetId && !targetAnchorToken)) {
-                        return { found: false, reason: 'missing_needles' };
+                        return { found: false, count: 0, reason: 'missing_needles' };
                     }
 
                     const listSelectors = [
@@ -6160,6 +6629,20 @@ async def _verify_reply_visible_near_parent(
                         if (!haystack || !needle) return false;
                         return haystack === needle;
                     };
+                    const editorArtifactSelector = [
+                        '[data-smart-reply-input="1"]',
+                        '[data-smart-reply-composer="1"]',
+                        '[data-smart-reply-post="1"]',
+                        '[data-smart-id="comment-input"]',
+                        '[contenteditable="true"]',
+                        'textarea',
+                        'input',
+                        '[role="textbox"]',
+                    ].join(', ');
+                    const isEditorArtifact = (node) => {
+                        if (!node || !node.closest) return false;
+                        return Boolean(node.closest(editorArtifactSelector));
+                    };
 
                     let parentRoot = null;
                     if (targetAnchorToken) {
@@ -6184,16 +6667,70 @@ async def _verify_reply_visible_near_parent(
                         parentRoot = roots.find(root => textMatches(rootMainText(root), parentNeedle)) || null;
                     }
                     if (!parentRoot) {
-                        return { found: false, reason: 'parent_not_found' };
+                        return { found: false, count: 0, reason: 'parent_not_found' };
                     }
+
+                    const matches = [];
+                    const matchKeys = new Set();
+                    const replyRowFor = (node) => {
+                        if (!node || !node.closest) return node;
+                        return node.closest(
+                            '[data-cid], [data-comment-id], [data-e2e="comment-item"], ' +
+                            '[class*="CommentItem"], [class*="DivCommentObject"], [class*="DivComment"]'
+                        ) || node;
+                    };
+                    const rowKeyFor = (node) => {
+                        const row = replyRowFor(node);
+                        if (!row || !row.getBoundingClientRect) return '';
+                        const cid = String(
+                            row.getAttribute && (
+                                row.getAttribute('data-cid') ||
+                                row.getAttribute('data-comment-id') ||
+                                ''
+                            )
+                        ).trim();
+                        if (cid) return `cid:${cid}`;
+                        const r = row.getBoundingClientRect();
+                        return [
+                            'row',
+                            Math.round(r.top),
+                            Math.round(r.left),
+                            Math.round(r.width),
+                            Math.round(r.height),
+                            textOf(row).slice(0, 120),
+                        ].join(':');
+                    };
+                    const addMatch = (node, reason) => {
+                        if (!node) return;
+                        if (isEditorArtifact(node)) return;
+                        const text = textOf(node);
+                        if (!replyMatches(text, replyNeedle)) return;
+                        const row = replyRowFor(node);
+                        if (!row || isEditorArtifact(row)) return;
+                        const key = rowKeyFor(node);
+                        if (key && matchKeys.has(key)) return;
+                        if (key) matchKeys.add(key);
+                        matches.push({ node: row, reason, text });
+                    };
+                    const finishIfEnough = () => {
+                        if (matches.length > requiredCount) {
+                            const first = matches[0] || {};
+                            return {
+                                found: true,
+                                count: matches.length,
+                                reason: first.reason || 'reply_visible_near_parent',
+                                text: String(first.text || '').slice(0, 120),
+                            };
+                        }
+                        return null;
+                    };
 
                     const directReplies = [...parentRoot.querySelectorAll(replyTextSelector)].filter(visible);
                     for (const node of directReplies) {
-                        const text = textOf(node);
-                        if (replyMatches(text, replyNeedle)) {
-                            return { found: true, reason: 'reply_inside_parent', text: text.slice(0, 120) };
-                        }
+                        addMatch(node, 'reply_inside_parent');
                     }
+                    const directResult = finishIfEnough();
+                    if (directResult) return directResult;
 
                     const parentTop = parentRoot.getBoundingClientRect().top;
                     let nextMainTop = null;
@@ -6209,11 +6746,10 @@ async def _verify_reply_visible_near_parent(
                         const r = node.getBoundingClientRect();
                         if (r.top < parentTop - 4) continue;
                         if (nextMainTop !== null && r.top >= nextMainTop - 2) continue;
-                        const text = textOf(node);
-                        if (replyMatches(text, replyNeedle)) {
-                            return { found: true, reason: 'reply_between_parent_and_next_main', text: text.slice(0, 120) };
-                        }
+                        addMatch(node, 'reply_between_parent_and_next_main');
                     }
+                    const rangedResult = finishIfEnough();
+                    if (rangedResult) return rangedResult;
                     if (allowExpand) {
                         const parentBottom = parentRoot.getBoundingClientRect().bottom;
                         const controls = [...list.querySelectorAll('button, [role="button"], div[tabindex="0"], span')]
@@ -6245,12 +6781,18 @@ async def _verify_reply_visible_near_parent(
                             try { controls[0].node.click(); } catch (_) {}
                             return {
                                 found: false,
+                                count: matches.length,
                                 reason: 'reply_expander_clicked',
                                 text: controls[0].label.slice(0, 120),
                             };
                         }
                     }
-                    return { found: false, reason: 'reply_not_found_under_parent' };
+                    return {
+                        found: false,
+                        count: matches.length,
+                        reason: matches.length ? 'reply_count_not_increased' : 'reply_not_found_under_parent',
+                        minCountExclusive: requiredCount,
+                    };
                 }
                 """,
                 {
@@ -6259,6 +6801,11 @@ async def _verify_reply_visible_near_parent(
                     "parentId": parent_comment_id or "",
                     "parentAnchorToken": parent_anchor_token or "",
                     "allowExpand": attempt == 1,
+                    "minCountExclusive": (
+                        int(min_count_exclusive)
+                        if min_count_exclusive is not None
+                        else None
+                    ),
                 },
             )
         except Exception as exc:
@@ -6270,6 +6817,8 @@ async def _verify_reply_visible_near_parent(
             )
             continue
 
+        if isinstance(result, dict):
+            last_result = result
         found = bool(isinstance(result, dict) and result.get("found"))
         _log_user_trace(
             "reply_local_verify_result",
@@ -6277,14 +6826,18 @@ async def _verify_reply_visible_near_parent(
             correlation_id=correlation_id,
             variant_index=None,
             found=found,
+            count=(result or {}).get("count") if isinstance(result, dict) else None,
+            min_count_exclusive=min_count_exclusive,
             reason=(result or {}).get("reason") if isinstance(result, dict) else None,
             text_preview=(result or {}).get("text") if isinstance(result, dict) else None,
             parent_anchor_token=parent_anchor_token,
             level=logging.INFO if (found or log_negative) else logging.DEBUG,
         )
         if found:
+            if return_state:
+                return result
             return True
-    return False
+    return last_result if return_state else False
 
 
 async def _reset_reply_page_after_confirmed_submit(
@@ -6294,6 +6847,102 @@ async def _reset_reply_page_after_confirmed_submit(
     expected_video_url: str,
 ) -> bool:
     """Try to safely reuse a reply page after a confirmed/local-confirmed submit."""
+    try:
+        dirty_before_escape = await page.evaluate(
+            r"""
+            () => {
+                const textOf = (el) => String(
+                    (el && (el.value || el.textContent || el.innerText)) || ''
+                ).replace(/[\u200b-\u200d\ufeff]/g, '').replace(/\s+/g, ' ').trim();
+                const visible = (el) => {
+                    if (!el || !el.getBoundingClientRect) return false;
+                    const r = el.getBoundingClientRect();
+                    const st = getComputedStyle(el);
+                    return r.width > 0 && r.height > 0 && st.display !== 'none' && st.visibility !== 'hidden';
+                };
+                const allInputs = [
+                    ...document.querySelectorAll('[data-smart-reply-input="1"]'),
+                    ...document.querySelectorAll('[data-smart-reply-composer="1"] [contenteditable="true"]'),
+                    ...document.querySelectorAll('[data-smart-reply-composer="1"] textarea'),
+                    ...document.querySelectorAll('[data-smart-reply-composer="1"] input'),
+                ].filter((el, idx, arr) => arr.indexOf(el) === idx);
+                const dirty = allInputs
+                    .map(el => ({ el, text: textOf(el), visible: visible(el) }))
+                    .filter(item => item.text);
+                const target = dirty.find(item => item.visible) || dirty[0] || null;
+                if (target && target.el) {
+                    try {
+                        target.el.setAttribute('data-smart-reply-reset-target', '1');
+                        target.el.focus();
+                        const range = document.createRange();
+                        range.selectNodeContents(target.el);
+                        const sel = window.getSelection && window.getSelection();
+                        if (sel) {
+                            sel.removeAllRanges();
+                            sel.addRange(range);
+                        }
+                    } catch (_) {}
+                }
+                return {
+                    dirtyTextCount: dirty.length,
+                    dirtyPreview: dirty.slice(0, 2).map(item => item.text.slice(0, 80)),
+                    targetVisible: Boolean(target && target.visible),
+                };
+            }
+            """
+        )
+    except Exception as exc:
+        dirty_before_escape = {"dirtyTextCount": 0, "reason": f"exception:{str(exc)[:80]}"}
+
+    if int((dirty_before_escape or {}).get("dirtyTextCount") or 0) > 0:
+        try:
+            await page.keyboard.press("Control+A")
+            await page.keyboard.press("Backspace")
+            await page.keyboard.press("Delete")
+        except Exception:
+            pass
+        await asyncio.sleep(0.12)
+        try:
+            clear_state = await page.evaluate(
+                r"""
+                () => {
+                    const textOf = (el) => String(
+                        (el && (el.value || el.textContent || el.innerText)) || ''
+                    ).replace(/[\u200b-\u200d\ufeff]/g, '').replace(/\s+/g, ' ').trim();
+                    const allInputs = [
+                        ...document.querySelectorAll('[data-smart-reply-input="1"]'),
+                        ...document.querySelectorAll('[data-smart-reply-composer="1"] [contenteditable="true"]'),
+                        ...document.querySelectorAll('[data-smart-reply-composer="1"] textarea'),
+                        ...document.querySelectorAll('[data-smart-reply-composer="1"] input'),
+                    ].filter((el, idx, arr) => arr.indexOf(el) === idx);
+                    const dirty = allInputs.map(textOf).filter(Boolean);
+                    document
+                        .querySelectorAll('[data-smart-reply-reset-target]')
+                        .forEach(el => el.removeAttribute('data-smart-reply-reset-target'));
+                    return {
+                        ok: dirty.length === 0,
+                        dirtyTextCount: dirty.length,
+                        dirtyPreview: dirty.slice(0, 2).map(text => text.slice(0, 80)),
+                    };
+                }
+                """
+            )
+        except Exception as exc:
+            clear_state = {"ok": False, "reason": f"exception:{str(exc)[:80]}"}
+        if not bool(isinstance(clear_state, dict) and clear_state.get("ok")):
+            _log_user_trace(
+                "reply_page_reset_after_submit",
+                page=page,
+                expected_video_url=expected_video_url,
+                correlation_id=correlation_id,
+                success=False,
+                reason="dirty_reply_input_not_cleared_before_escape",
+                before_escape=dirty_before_escape,
+                state=clear_state,
+                level=logging.INFO,
+            )
+            return False
+
     try:
         await page.keyboard.press("Escape")
     except Exception:
@@ -6319,7 +6968,7 @@ async def _reset_reply_page_after_confirmed_submit(
                         ...document.querySelectorAll('[data-smart-reply-composer="1"] [contenteditable="true"]'),
                         ...document.querySelectorAll('[data-smart-reply-composer="1"] textarea'),
                         ...document.querySelectorAll('[data-smart-reply-composer="1"] input'),
-                    ].filter((el, idx, arr) => arr.indexOf(el) === idx && visible(el));
+                    ].filter((el, idx, arr) => arr.indexOf(el) === idx);
 
                     const composers = [...document.querySelectorAll('[data-smart-reply-composer="1"]')]
                         .filter(visible);
@@ -6370,7 +7019,8 @@ async def _reset_reply_page_after_confirmed_submit(
                     return {
                         ok,
                         listVisible: Boolean(list),
-                        replyInputCount: replyInputs.length,
+                        replyInputCount: replyInputs.filter(visible).length,
+                        replyInputTotalCount: replyInputs.length,
                         dirtyTextCount: dirtyInputs.length,
                         dirtyPreview: dirtyInputs.slice(0, 2).map(text => text.slice(0, 80)),
                     };
@@ -6925,6 +7575,8 @@ async def _reply_with_variant_on_all_mains(
     parent_search_max_seen_rows = 0
     parent_search_last_row_count = 0
     parent_search_unique_rows_seen = 0
+    parent_search_exhausted = False
+    parent_search_scroll_container_scrollable: Optional[bool] = None
 
     def _parent_search_int(value: Any) -> int:
         try:
@@ -6937,6 +7589,8 @@ async def _reply_with_variant_on_all_mains(
         nonlocal parent_search_max_seen_rows
         nonlocal parent_search_last_row_count
         nonlocal parent_search_unique_rows_seen
+        nonlocal parent_search_exhausted
+        nonlocal parent_search_scroll_container_scrollable
         if not info:
             return
         max_seen_rows = _parent_search_int(info.get("max_seen_rows"))
@@ -6945,6 +7599,14 @@ async def _reply_with_variant_on_all_mains(
         parent_search_max_seen_rows = max(parent_search_max_seen_rows, max_seen_rows)
         parent_search_last_row_count = max(parent_search_last_row_count, last_row_count)
         parent_search_unique_rows_seen = max(parent_search_unique_rows_seen, unique_rows_seen)
+        parent_search_exhausted = parent_search_exhausted or bool(info.get("search_exhausted"))
+        if "scroll_container_scrollable" in info:
+            current_scrollable = bool(info.get("scroll_container_scrollable"))
+            parent_search_scroll_container_scrollable = (
+                current_scrollable
+                if parent_search_scroll_container_scrollable is None
+                else bool(parent_search_scroll_container_scrollable or current_scrollable)
+            )
         if max_seen_rows > 0 or last_row_count > 0 or unique_rows_seen > 0:
             search_saw_rows = True
 
@@ -6970,8 +7632,96 @@ async def _reply_with_variant_on_all_mains(
         inflight_reply_keys = set()
     context = None
     page = None
+    pending_parent_like_jobs: List[Dict[str, Any]] = []
     close_reason = "reply_attempt_done"
     timeout_ms = _settings.PLAYWRIGHT_TIMEOUT * (2 if account.proxy else 1)
+
+    async def _run_parent_like_after_reply(job: Dict[str, Any]) -> None:
+        if page is None:
+            return
+        job_corr = str(job.get("correlation_id") or correlation_id)
+        anchor = job.get("anchor")
+        try:
+            try:
+                await _restore_comment_list_position_for_anchor(
+                    page,
+                    anchor,
+                    correlation_id=f"{job_corr}_before_deferred_reply_like",
+                )
+            except Exception as restore_exc:
+                logger.info(
+                    "[USER_SCHEMA] %s parent anchor restore before deferred after-reply like failed non-blocking: %s",
+                    job_corr,
+                    str(restore_exc)[:120],
+                )
+            try:
+                like_result = await like_parent_comment_if_safe(
+                    page,
+                    parent_comment_text=job.get("parent_text"),
+                    parent_comment_id=job.get("parent_id"),
+                    parent_anchor_token=job.get("anchor_token"),
+                    max_total_seconds=float(job.get("max_total_seconds") or 1.0),
+                )
+                _log_user_trace(
+                    "reply_parent_like_after_reply",
+                    page=page,
+                    expected_video_url=target_media_url,
+                    correlation_id=job_corr,
+                    account_id=account.id,
+                    variant_index=variant_index,
+                    success=like_result.success,
+                    reason=like_result.reason,
+                    strategy=like_result.strategy,
+                    anchor_preview=str(job.get("parent_text") or "")[:80],
+                    deferred=bool(job.get("deferred")),
+                    level=logging.INFO,
+                )
+            except Exception as like_exc:
+                like_reason = f"exception:{str(like_exc)[:80]}"
+                logger.info(
+                    "[USER_SCHEMA] %s parent like after reply failed non-blocking: %s",
+                    job_corr,
+                    like_reason,
+                )
+                _log_user_trace(
+                    "reply_parent_like_after_reply",
+                    page=page,
+                    expected_video_url=target_media_url,
+                    correlation_id=job_corr,
+                    account_id=account.id,
+                    variant_index=variant_index,
+                    success=False,
+                    reason=like_reason,
+                    strategy="best_effort",
+                    anchor_preview=str(job.get("parent_text") or "")[:80],
+                    deferred=bool(job.get("deferred")),
+                    level=logging.INFO,
+                )
+        except Exception as like_policy_exc:
+            logger.info(
+                "[USER_SCHEMA] %s parent like-after-reply policy failed non-blocking: %s",
+                job_corr,
+                str(like_policy_exc)[:120],
+            )
+
+    async def _flush_deferred_parent_likes(reason: str) -> None:
+        if not pending_parent_like_jobs:
+            return
+        jobs = list(pending_parent_like_jobs)
+        pending_parent_like_jobs.clear()
+        _log_user_trace(
+            "reply_parent_like_deferred_flush",
+            page=page,
+            expected_video_url=video_url,
+            correlation_id=correlation_id,
+            account_id=account.id,
+            variant_index=variant_index,
+            count=len(jobs),
+            reason=reason,
+            level=logging.INFO,
+        )
+        for job in jobs:
+            await _run_parent_like_after_reply(job)
     preflight_deny = await _preflight_cookie_http_gate(
         db,
         account,
@@ -7008,7 +7758,17 @@ async def _reply_with_variant_on_all_mains(
             ready=False,
         )
     except Exception as exc:
-        _register_runtime_failure(db, account, f"page_create_failed:{str(exc)[:80]}")
+        page_create_error = f"page_create_failed:{str(exc)[:80]}"
+        if _looks_like_browser_driver_unavailable(page_create_error):
+            page_create_error = f"browser_driver_unavailable:{str(exc)[:80]}"
+            logger.warning(
+                "[USER_SCHEMA] %s browser driver unavailable while creating reply page for account=%s: %s",
+                correlation_id,
+                account.id,
+                str(exc)[:160],
+            )
+        else:
+            _register_runtime_failure(db, account, page_create_error)
         results.append(
             ReplyOutcome(
                 text=reply_text,
@@ -7017,7 +7777,7 @@ async def _reply_with_variant_on_all_mains(
                 parent_comment_id=None,
                 success=False,
                 method=None,
-                error=f"page_create_failed:{str(exc)[:80]}",
+                error=page_create_error,
                 account_id=account.id,
             )
         )
@@ -7374,6 +8134,8 @@ async def _reply_with_variant_on_all_mains(
                 close_reason = "reply_searched_no_submission"
             else:
                 close_reason = "reply_finished_without_search"
+            if pending_parent_like_jobs:
+                await _flush_deferred_parent_likes("finish_reply_attempt")
             if result.fallback_mains or any(_reply_outcome_submitted(outcome) for outcome in result.replies):
                 await _persist_cookies_after_success(
                     db,
@@ -7414,7 +8176,10 @@ async def _reply_with_variant_on_all_mains(
             account_id=account.id,
             variant_index=variant_index,
             main_candidate_count=len(main_candidates),
-            open_comments_max_wait_seconds=12.0,
+            open_comments_max_wait_seconds=9.0
+            if _is_parallel_reply_correlation(correlation_id)
+            else 12.0,
+            fast_parallel_reply_open=_is_parallel_reply_correlation(correlation_id),
             retry_enabled=True,
         )
         comments_ready_for_search = await _open_comment_list_with_safe_retry(
@@ -7611,6 +8376,7 @@ async def _reply_with_variant_on_all_mains(
         reply_http_enabled = _user_schema_http_first_enabled(REPLY_SCOPE)
         reply_dom_first_logged = False
         reply_http_disabled_logged = False
+        short_fresh_search_after_action_used = False
 
         while remaining_mains and time.monotonic() < search_deadline:
             found_this_pass = False
@@ -7802,6 +8568,7 @@ async def _reply_with_variant_on_all_mains(
                     for key in (
                         main_key,
                         getattr(main, "comment_id", None),
+                        getattr(main, "physical_parent_key", None),
                         _dedup_key(main_text),
                     )
                     if str(key or "").strip()
@@ -7967,7 +8734,7 @@ async def _reply_with_variant_on_all_mains(
                             source_main=main,
                             parent_key=main_key,
                         )
-                anchor_text = anchor.matched_text
+                anchor_text = anchor.open_text or anchor.matched_text
                 parent_id = anchor.parent_comment_id
                 if _reply_parent_search_error_is_inconclusive(anchor.error):
                     search_inconclusive = True
@@ -8046,6 +8813,7 @@ async def _reply_with_variant_on_all_mains(
                     )
                     continue
                 found_this_pass = True
+                physical_parent_key = _anchor_physical_parent_key(anchor, fallback_text=anchor_text)
                 _log_user_trace(
                     "reply_parent_found",
                     page=page,
@@ -8054,6 +8822,7 @@ async def _reply_with_variant_on_all_mains(
                     account_id=account.id,
                     variant_index=variant_index,
                     parent_id=parent_id,
+                    physical_parent_key=physical_parent_key,
                     anchor_preview=anchor_text[:80],
                 )
                 found_main = _main_from_anchor(main, anchor)
@@ -8061,6 +8830,7 @@ async def _reply_with_variant_on_all_mains(
                 found_key = str(
                     found_main.comment_id
                     or parent_id
+                    or found_main.physical_parent_key
                     or _main_parent_key(found_main)
                 ).strip()
                 if found_key:
@@ -8069,14 +8839,11 @@ async def _reply_with_variant_on_all_mains(
                     shared_parent_cache,
                     [found_main],
                 )
-                verified_main_id = main.comment_id if anchor.found_by == "id" else None
-                dedup_key = str(
-                    parent_id
-                    or found_main.comment_id
-                    or verified_main_id
-                    or _main_parent_key(found_main)
-                    or anchor_text_key
-                ).strip()
+                dedup_key = _reply_parent_dedup_key_for_anchor(
+                    main,
+                    anchor,
+                    anchor_text=anchor_text,
+                )
                 reply_attempt_key = _reply_attempt_key(
                     dedup_key or _main_parent_key(found_main) or anchor_text_key,
                     reply_text,
@@ -8135,6 +8902,9 @@ async def _reply_with_variant_on_all_mains(
                     )
                 ) else None
                 inflight_key_added = False
+                if reply_attempt_key:
+                    active_inflight_reply_keys.add(reply_attempt_key)
+                    inflight_key_added = True
                 try:
                     if not await _ensure_page_on_target_media(
                         page,
@@ -8187,7 +8957,7 @@ async def _reply_with_variant_on_all_mains(
                                 searched=True,
                             )
                         )
-                    already_present_local = await _verify_reply_visible_near_parent(
+                    already_present_probe = await _verify_reply_visible_near_parent(
                         page,
                         reply_text=reply_text,
                         parent_text=open_parent_text,
@@ -8195,12 +8965,16 @@ async def _reply_with_variant_on_all_mains(
                         parent_anchor_token=anchor.anchor_token,
                         correlation_id=f"{sub_corr}_preflight",
                         fast=True,
+                        return_state=True,
                     )
+                    already_present_local = _reply_visibility_probe_found(already_present_probe)
+                    reply_baseline_count = _reply_visibility_probe_count(already_present_probe)
                     if already_present_local:
                         submitted_keys = {
                             str(key).strip()
                             for key in (
                                 parent_id,
+                                physical_parent_key,
                                 found_main.comment_id,
                                 main.comment_id if anchor.found_by == "id" else None,
                             )
@@ -8240,6 +9014,7 @@ async def _reply_with_variant_on_all_mains(
                             counts_as_submitted=True,
                             already_present_local=True,
                             reply_attempt_key=reply_attempt_key,
+                            physical_parent_key=physical_parent_key,
                         )
                         results.append(outcome)
                         if on_submitted_outcome is not None:
@@ -8260,6 +9035,7 @@ async def _reply_with_variant_on_all_mains(
                             variant_index=variant_index,
                             parent_id=parent_id,
                             parent_key=dedup_key[:80],
+                            physical_parent_key=physical_parent_key,
                             reply_attempt_key=(reply_attempt_key or "")[:120],
                             anchor_preview=anchor_text[:80],
                             level=logging.INFO,
@@ -8267,10 +9043,31 @@ async def _reply_with_variant_on_all_mains(
                         continue
                     if dedup_key:
                         attempted_parent_keys.add(dedup_key)
-                    if reply_attempt_key:
-                        active_inflight_reply_keys.add(reply_attempt_key)
-                        inflight_key_added = True
                     publish_result = None
+                    early_local_reply_probe_holder: Dict[str, Any] = {}
+
+                    async def _early_local_reply_confirmation() -> Any:
+                        try:
+                            probe = await _verify_reply_visible_near_parent(
+                                page,
+                                reply_text=reply_text,
+                                parent_text=open_parent_text,
+                                parent_comment_id=open_parent_id or parent_id,
+                                parent_anchor_token=anchor.anchor_token,
+                                correlation_id=f"{sub_corr}_early_local",
+                                fast=True,
+                                min_count_exclusive=reply_baseline_count,
+                                return_state=True,
+                            )
+                        except Exception as verify_exc:
+                            probe = {
+                                "found": False,
+                                "count": 0,
+                                "reason": f"exception:{str(verify_exc)[:80]}",
+                            }
+                        early_local_reply_probe_holder["probe"] = probe
+                        return probe
+
                     if open_parent_id and not reply_dom_first and reply_http_enabled:
                         if not reply_http_session_prepared:
                             reply_http_session_prepared = True
@@ -8312,6 +9109,11 @@ async def _reply_with_variant_on_all_mains(
                             correlation_id=sub_corr,
                             expected_video_url=target_media_url,
                             comments_already_open=True,
+                            early_submit_confirmation=(
+                                _early_local_reply_confirmation
+                                if _is_parallel_reply_correlation(sub_corr)
+                                else None
+                            ),
                         )
                 except Exception as exc:
                     error = f"publish_exception:{str(exc)[:80]}"
@@ -8350,17 +9152,24 @@ async def _reply_with_variant_on_all_mains(
 
                 network_confirmed = publish_result.status == "success" and bool(publish_result.comment_id)
                 submitted_unconfirmed = _reply_publish_submitted_unconfirmed(publish_result)
-                local_reply_confirmed = False
-                if not network_confirmed and submitted_unconfirmed:
+                local_reply_probe: Any = early_local_reply_probe_holder.get("probe")
+                local_reply_confirmed = _reply_visibility_probe_found(local_reply_probe)
+                if local_reply_confirmed:
+                    submitted_unconfirmed = False
+                if not network_confirmed and not local_reply_confirmed and submitted_unconfirmed:
                     try:
-                        local_reply_confirmed = await _verify_reply_visible_near_parent(
+                        local_reply_probe = await _verify_reply_visible_near_parent(
                             page,
                             reply_text=reply_text,
                             parent_text=open_parent_text,
                             parent_comment_id=open_parent_id or parent_id,
                             parent_anchor_token=anchor.anchor_token,
                             correlation_id=sub_corr,
+                            fast=_is_parallel_reply_correlation(sub_corr),
+                            min_count_exclusive=reply_baseline_count,
+                            return_state=True,
                         )
+                        local_reply_confirmed = _reply_visibility_probe_found(local_reply_probe)
                     except Exception as verify_exc:
                         logger.debug(
                             "[USER_SCHEMA] %s reply local confirmation probe failed: %s",
@@ -8389,11 +9198,21 @@ async def _reply_with_variant_on_all_mains(
                     reply_confirmation = "submitted_unconfirmed"
                 else:
                     reply_confirmation = None
+                effective_status = (
+                    "network_confirmed"
+                    if network_confirmed
+                    else (
+                        "local_confirmed"
+                        if local_reply_confirmed
+                        else ("submitted_unconfirmed" if submitted_unconfirmed else "failed")
+                    )
+                )
                 if counts_as_submitted:
                     submitted_keys = {
                         str(key).strip()
                         for key in (
                             parent_id,
+                            physical_parent_key,
                             found_main.comment_id,
                             main.comment_id if anchor.found_by == "id" else None,
                         )
@@ -8432,6 +9251,7 @@ async def _reply_with_variant_on_all_mains(
                     counts_as_submitted=counts_as_submitted,
                     soft_submitted=soft_submitted,
                     reply_attempt_key=reply_attempt_key,
+                    physical_parent_key=physical_parent_key,
                 )
                 results.append(outcome)
                 if counts_as_submitted and on_submitted_outcome is not None:
@@ -8464,8 +9284,13 @@ async def _reply_with_variant_on_all_mains(
                     reason=publish_result.error_reason,
                     parent_id=parent_id,
                     parent_key=dedup_key[:80],
+                    physical_parent_key=physical_parent_key,
                     anchor_preview=anchor_text[:80],
                     local_confirmed=local_reply_confirmed,
+                    local_reply_count=_reply_visibility_probe_count(local_reply_probe),
+                    local_reply_baseline_count=reply_baseline_count,
+                    transport_status=publish_result.status,
+                    effective_status=effective_status,
                     submitted_unconfirmed=submitted_unconfirmed,
                     counts_as_submitted=counts_as_submitted,
                     soft_submitted=soft_submitted,
@@ -8589,6 +9414,30 @@ async def _reply_with_variant_on_all_mains(
                             # the historical one-argument callable.
                             fast_reply = False
                             should_like_parent = _should_like_parent_before_reply(anchor)
+                        if should_like_parent and fast_reply:
+                            pending_parent_like_jobs.append(
+                                {
+                                    "correlation_id": sub_corr,
+                                    "anchor": anchor,
+                                    "parent_text": open_parent_text,
+                                    "parent_id": open_parent_id,
+                                    "anchor_token": anchor.anchor_token,
+                                    "max_total_seconds": 1.0,
+                                    "deferred": True,
+                                }
+                            )
+                            _log_user_trace(
+                                "reply_parent_like_deferred_after_reply",
+                                page=page,
+                                expected_video_url=target_media_url,
+                                correlation_id=sub_corr,
+                                account_id=account.id,
+                                variant_index=variant_index,
+                                anchor_preview=(open_parent_text or "")[:80],
+                                pending_count=len(pending_parent_like_jobs),
+                                level=logging.INFO,
+                            )
+                            should_like_parent = False
                         if should_like_parent:
                             try:
                                 await _restore_comment_list_position_for_anchor(
@@ -8657,6 +9506,28 @@ async def _reply_with_variant_on_all_mains(
                 )
                 await asyncio.sleep(random.uniform(*delay_range))
 
+            if (
+                found_this_pass
+                and remaining_mains
+                and time.monotonic() >= search_deadline
+                and not short_fresh_search_after_action_used
+            ):
+                short_fresh_search_after_action_used = True
+                extension_seconds = min(4.0, max(2.0, search_pass_seconds))
+                search_deadline = time.monotonic() + extension_seconds
+                _log_user_trace(
+                    "reply_parent_short_fresh_search_after_action",
+                    page=page,
+                    expected_video_url=target_media_url,
+                    correlation_id=correlation_id,
+                    account_id=account.id,
+                    variant_index=variant_index,
+                    remaining_main_count=len(remaining_mains),
+                    extension_seconds=round(extension_seconds, 2),
+                    level=logging.INFO,
+                )
+                continue
+
             if not found_this_pass and remaining_mains:
                 break
 
@@ -8682,6 +9553,8 @@ async def _reply_with_variant_on_all_mains(
                     parent_search_max_seen_rows=parent_search_max_seen_rows,
                     parent_search_last_row_count=parent_search_last_row_count,
                     parent_search_unique_rows_seen=parent_search_unique_rows_seen,
+                    parent_search_exhausted=parent_search_exhausted,
+                    parent_search_scroll_container_scrollable=parent_search_scroll_container_scrollable,
                 )
             )
 
@@ -8695,6 +9568,8 @@ async def _reply_with_variant_on_all_mains(
                 parent_search_max_seen_rows=parent_search_max_seen_rows,
                 parent_search_last_row_count=parent_search_last_row_count,
                 parent_search_unique_rows_seen=parent_search_unique_rows_seen,
+                parent_search_exhausted=parent_search_exhausted,
+                parent_search_scroll_container_scrollable=parent_search_scroll_container_scrollable,
             )
         )
     except asyncio.CancelledError:
@@ -9040,6 +9915,8 @@ class _ParallelReplyVariantResult:
     parent_search_max_seen_rows: int = 0
     parent_search_last_row_count: int = 0
     parent_search_unique_rows_seen: int = 0
+    parent_search_exhausted: bool = False
+    parent_search_scroll_container_scrollable: Optional[bool] = None
 
 
 def _reply_result_is_confident_visibility_empty(item: _ParallelReplyVariantResult) -> bool:
@@ -9057,9 +9934,19 @@ def _reply_result_is_confident_visibility_empty(item: _ParallelReplyVariantResul
         max_rows = int(getattr(item, "parent_search_max_seen_rows", 0) or 0)
     except Exception:
         max_rows = 0
-    return (
-        unique_rows >= _REPLY_VISIBILITY_MIN_UNIQUE_ROWS
-        or max_rows >= _REPLY_VISIBILITY_MIN_MAX_ROWS
+    if unique_rows >= _REPLY_VISIBILITY_MIN_UNIQUE_ROWS or max_rows >= _REPLY_VISIBILITY_MIN_MAX_ROWS:
+        return True
+    try:
+        last_rows = int(getattr(item, "parent_search_last_row_count", 0) or 0)
+    except Exception:
+        last_rows = 0
+    exhausted = bool(getattr(item, "parent_search_exhausted", False))
+    scrollable = getattr(item, "parent_search_scroll_container_scrollable", None)
+    small_real_rows = unique_rows >= 5 or max_rows >= 5 or last_rows >= 5
+    return bool(
+        exhausted
+        and small_real_rows
+        and (scrollable is False or unique_rows >= max(5, last_rows))
     )
 
 
@@ -9158,6 +10045,7 @@ async def execute_user_schema_parallel(
             str(getattr(outcome, "matched_main_text", "") or ""),
             str(getattr(outcome, "parent_comment_id", "") or ""),
             str(getattr(outcome, "parent_key", "") or ""),
+            str(getattr(outcome, "physical_parent_key", "") or ""),
             int(getattr(outcome, "account_id", 0) or 0),
             bool(getattr(outcome, "success", False)),
             bool(getattr(outcome, "submitted_unconfirmed", False)),
@@ -11101,6 +11989,8 @@ async def execute_user_schema_parallel(
     reply_soft_submitted_keys_by_variant: Dict[int, set[str]] = {}
     reply_inflight_keys_by_variant: Dict[int, set[str]] = {}
     reply_found_mains_by_variant: Dict[int, Dict[str, PublishedMain]] = {}
+    reply_task_attempt_locks: set[str] = set()
+    reply_task_inflight_locks: set[str] = set()
 
     async def _run_reply_variant_attempt(
         variant_index: int,
@@ -11108,6 +11998,10 @@ async def execute_user_schema_parallel(
         main_candidates: List[PublishedMain],
         attempt: int,
     ) -> _ParallelReplyVariantResult:
+        nonlocal reply_visibility_stage
+        nonlocal reply_visibility_rotation_attempted
+        nonlocal reply_visibility_rotation_success
+        nonlocal reply_visibility_rotation_error
         variant_result = _ParallelReplyVariantResult(
             variant_index=variant_index,
             text=reply_text,
@@ -11115,6 +12009,8 @@ async def execute_user_schema_parallel(
         submitted_parent_keys = reply_submitted_parent_keys_by_variant.setdefault(variant_index, set())
         soft_submitted_keys = reply_soft_submitted_keys_by_variant.setdefault(variant_index, set())
         inflight_reply_keys = reply_inflight_keys_by_variant.setdefault(variant_index, set())
+        reply_task_attempt_locks.update(soft_submitted_keys)
+        reply_task_inflight_locks.update(inflight_reply_keys)
         reported_outcomes = reply_reported_outcomes_by_variant.setdefault(variant_index, [])
         found_mains_by_key = reply_found_mains_by_variant.setdefault(variant_index, {})
 
@@ -11126,6 +12022,12 @@ async def execute_user_schema_parallel(
                 reported_outcomes.append(outcome)
             submitted_parent_keys.update(
                 _reply_outcomes_submitted_parent_keys_for_expected_mains(
+                    [outcome],
+                    main_candidates,
+                )
+            )
+            reply_task_attempt_locks.update(
+                _reply_outcomes_submitted_reply_keys_for_expected_mains(
                     [outcome],
                     main_candidates,
                 )
@@ -11143,6 +12045,7 @@ async def execute_user_schema_parallel(
                     main_candidates,
                 )
             )
+            reply_task_attempt_locks.update(soft_submitted_keys)
 
         async def _release_selected_reply_account(account: Account) -> None:
             try:
@@ -11205,8 +12108,8 @@ async def execute_user_schema_parallel(
                         allow_parent_author_fallback=False,
                         shared_parent_cache=shared_parent_cache,
                         on_submitted_outcome=_record_incremental_submitted_reply,
-                        soft_submitted_reply_keys=soft_submitted_keys,
-                        inflight_reply_keys=inflight_reply_keys,
+                        soft_submitted_reply_keys=reply_task_attempt_locks,
+                        inflight_reply_keys=reply_task_inflight_locks,
                         on_soft_submitted_outcome=_record_incremental_soft_submitted_reply,
                     ),
                     timeout=reply_worker_attempt_timeout_seconds,
@@ -11272,7 +12175,7 @@ async def execute_user_schema_parallel(
                             pending_reply_proxy_rotations.discard(proxy_value)
                             pending_rotation_proxy = proxy_value
                     if pending_rotation_proxy:
-                        await _rotate_mobile_proxy_after_failure(
+                        pending_rotated = await _rotate_mobile_proxy_after_failure(
                             attempt_db,
                             pending_rotation_proxy,
                             scope="reply",
@@ -11280,12 +12183,28 @@ async def execute_user_schema_parallel(
                             counts=edge_denied_reply_proxy_counts,
                             cooled_values=edge_denied_reply_proxy_values,
                         )
+                        if pending_rotation_proxy == (reply_visibility_rotation_proxy or "").strip():
+                            reply_visibility_rotation_attempted = True
+                            reply_visibility_rotation_success = bool(pending_rotated)
+                            if pending_rotated:
+                                reply_visibility_stage = "post_rotation"
+                                reply_visibility_rotation_error = None
+                                _select_reply_visibility_bucket(
+                                    post_rotation=True,
+                                    proxy_key=_reply_visibility_proxy_key(pending_rotation_proxy),
+                                )
+                            else:
+                                reply_visibility_stage = "rotation_failed"
+                                reply_visibility_rotation_error = "rotation_failed_or_unavailable"
+                            _update_reply_visibility_payload()
 
         outcomes = attempt_result.replies
         variant_result.parent_search_saw_rows = bool(attempt_result.saw_comment_rows)
         variant_result.parent_search_max_seen_rows = attempt_result.parent_search_max_seen_rows
         variant_result.parent_search_last_row_count = attempt_result.parent_search_last_row_count
         variant_result.parent_search_unique_rows_seen = attempt_result.parent_search_unique_rows_seen
+        variant_result.parent_search_exhausted = attempt_result.parent_search_exhausted
+        variant_result.parent_search_scroll_container_scrollable = attempt_result.parent_search_scroll_container_scrollable
         submitted_outcomes = [outcome for outcome in outcomes if _reply_outcome_submitted(outcome)]
         if submitted_outcomes:
             for outcome in submitted_outcomes:
@@ -11294,6 +12213,12 @@ async def execute_user_schema_parallel(
                     reported_outcomes.append(outcome)
             submitted_parent_keys.update(
                 _reply_outcomes_submitted_parent_keys_for_expected_mains(
+                    submitted_outcomes,
+                    main_candidates,
+                )
+            )
+            reply_task_attempt_locks.update(
+                _reply_outcomes_submitted_reply_keys_for_expected_mains(
                     submitted_outcomes,
                     main_candidates,
                 )
@@ -11313,6 +12238,8 @@ async def execute_user_schema_parallel(
                     main_candidates,
                 )
             )
+            reply_task_attempt_locks.update(soft_submitted_keys)
+            reply_task_attempt_locks.update(attempt_result.soft_submitted_reply_keys)
 
         found_mains = attempt_result.found_mains
         if not found_mains and outcomes:
@@ -11329,7 +12256,7 @@ async def execute_user_schema_parallel(
             pending_expected_mains = _pending_expected_mains_for_reply_variant_with_soft_locks(
                 main_candidates,
                 submitted_parent_keys,
-                soft_submitted_keys,
+                reply_task_attempt_locks,
                 reply_text,
             )
             if main_candidates and not pending_expected_mains:
@@ -11382,11 +12309,18 @@ async def execute_user_schema_parallel(
     reply_visibility_post_accounts: set[int] = set()
     reply_visibility_pre_results: List[_ParallelReplyVariantResult] = []
     reply_visibility_post_results: List[_ParallelReplyVariantResult] = []
+    reply_visibility_pre_accounts_by_proxy: Dict[str, set[int]] = {}
+    reply_visibility_post_accounts_by_proxy: Dict[str, set[int]] = {}
+    reply_visibility_pre_results_by_proxy: Dict[str, List[_ParallelReplyVariantResult]] = {}
+    reply_visibility_post_results_by_proxy: Dict[str, List[_ParallelReplyVariantResult]] = {}
     reply_visibility_rotation_attempted = False
     reply_visibility_rotation_success = False
     reply_visibility_rotation_error: Optional[str] = None
     reply_visibility_rotation_proxy: Optional[str] = None
     reply_visibility_rotated_proxies: set[str] = set()
+
+    def _reply_visibility_proxy_key(value: Optional[str]) -> str:
+        return str(value or "").strip()
 
     def _reply_visibility_rows_summary(items: List[_ParallelReplyVariantResult]) -> Dict[str, Any]:
         return {
@@ -11406,7 +12340,43 @@ async def execute_user_schema_parallel(
             "unique_rows_seen": max(
                 [int(item.parent_search_unique_rows_seen or 0) for item in items] or [0]
             ),
+            "search_exhausted": any(bool(item.parent_search_exhausted) for item in items),
+            "scroll_container_scrollable": any(
+                bool(item.parent_search_scroll_container_scrollable) for item in items
+            ),
         }
+
+    def _reply_visibility_proxy_bucket_summary(
+        buckets: Dict[str, List[_ParallelReplyVariantResult]],
+    ) -> List[Dict[str, Any]]:
+        payload: List[Dict[str, Any]] = []
+        for proxy_key, items in sorted(
+            buckets.items(),
+            key=lambda entry: (_short_proxy_sig(entry[0]), len(entry[1])),
+        ):
+            summary = _reply_visibility_rows_summary(items)
+            summary["proxy"] = _short_proxy_sig(proxy_key)
+            summary["account_count"] = len(
+                {
+                    int(item.account_id)
+                    for item in items
+                    if item.account_id is not None
+                }
+            )
+            payload.append(summary)
+        return payload
+
+    def _select_reply_visibility_bucket(*, post_rotation: bool, proxy_key: str) -> None:
+        nonlocal reply_visibility_pre_accounts
+        nonlocal reply_visibility_post_accounts
+        nonlocal reply_visibility_pre_results
+        nonlocal reply_visibility_post_results
+        if post_rotation:
+            reply_visibility_post_accounts = reply_visibility_post_accounts_by_proxy.setdefault(proxy_key, set())
+            reply_visibility_post_results = reply_visibility_post_results_by_proxy.setdefault(proxy_key, [])
+        else:
+            reply_visibility_pre_accounts = reply_visibility_pre_accounts_by_proxy.setdefault(proxy_key, set())
+            reply_visibility_pre_results = reply_visibility_pre_results_by_proxy.setdefault(proxy_key, [])
 
     def _reply_visibility_remaining_main_count() -> int:
         try:
@@ -11435,6 +12405,12 @@ async def execute_user_schema_parallel(
             "rotation_error": reply_visibility_rotation_error,
             "pre_rotation": _reply_visibility_rows_summary(reply_visibility_pre_results),
             "post_rotation": _reply_visibility_rows_summary(reply_visibility_post_results),
+            "pre_rotation_by_proxy": _reply_visibility_proxy_bucket_summary(
+                reply_visibility_pre_results_by_proxy
+            ),
+            "post_rotation_by_proxy": _reply_visibility_proxy_bucket_summary(
+                reply_visibility_post_results_by_proxy
+            ),
             "active_main_count": len(active_mains),
             "remaining_main_count": _reply_visibility_remaining_main_count(),
         }
@@ -11444,12 +12420,23 @@ async def execute_user_schema_parallel(
         nonlocal reply_visibility_post_accounts
         nonlocal reply_visibility_pre_results
         nonlocal reply_visibility_post_results
-        if reply_visibility_rotation_attempted:
-            reply_visibility_post_accounts.clear()
-            reply_visibility_post_results.clear()
-        else:
-            reply_visibility_pre_accounts.clear()
-            reply_visibility_pre_results.clear()
+        nonlocal reply_visibility_stage
+        nonlocal reply_visibility_rotation_attempted
+        nonlocal reply_visibility_rotation_error
+        nonlocal reply_visibility_rotation_proxy
+        reply_visibility_pre_accounts_by_proxy.clear()
+        reply_visibility_post_accounts_by_proxy.clear()
+        reply_visibility_pre_results_by_proxy.clear()
+        reply_visibility_post_results_by_proxy.clear()
+        reply_visibility_pre_accounts = set()
+        reply_visibility_post_accounts = set()
+        reply_visibility_pre_results = []
+        reply_visibility_post_results = []
+        if reply_visibility_stage == "rotation_failed" and not reply_visibility_rotation_success:
+            reply_visibility_stage = "pre_rotation"
+            reply_visibility_rotation_attempted = False
+            reply_visibility_rotation_error = None
+            reply_visibility_rotation_proxy = None
         _update_reply_visibility_payload()
         logger.info(
             "Task %s: reply visibility empty quorum reset after %s",
@@ -11463,11 +12450,35 @@ async def execute_user_schema_parallel(
         account_id = int(item.account_id or 0)
         if account_id <= 0:
             return None
-        if reply_visibility_rotation_attempted:
+        if (
+            reply_visibility_stage == "rotation_failed"
+            and reply_visibility_rotation_error
+            in {"missing_proxy_for_visibility_rotation", "rotation_failed_or_unavailable"}
+        ):
+            _update_reply_visibility_payload()
+            return "rotation_unavailable"
+        proxy_key = _reply_visibility_proxy_key(item.proxy_value)
+        if reply_visibility_rotation_success:
+            rotated_proxy_key = _reply_visibility_proxy_key(reply_visibility_rotation_proxy)
+            if proxy_key != rotated_proxy_key:
+                logger.info(
+                    "Task %s: ignoring post-rotation empty visibility result from proxy=%s; "
+                    "waiting for rotated proxy=%s",
+                    task_id,
+                    _short_proxy_sig(item.proxy_value),
+                    _short_proxy_sig(reply_visibility_rotation_proxy),
+                )
+                _update_reply_visibility_payload()
+                return None
+            _select_reply_visibility_bucket(post_rotation=True, proxy_key=proxy_key)
             if account_id not in reply_visibility_post_accounts:
                 reply_visibility_post_accounts.add(account_id)
                 reply_visibility_post_results.append(item)
         else:
+            if reply_visibility_stage != "pre_rotation":
+                _update_reply_visibility_payload()
+                return None
+            _select_reply_visibility_bucket(post_rotation=False, proxy_key=proxy_key)
             if account_id not in reply_visibility_pre_accounts:
                 reply_visibility_pre_accounts.add(account_id)
                 reply_visibility_pre_results.append(item)
@@ -11487,12 +12498,14 @@ async def execute_user_schema_parallel(
             item.parent_search_unique_rows_seen,
         )
         if (
-            not reply_visibility_rotation_attempted
+            not reply_visibility_rotation_success
+            and not reply_visibility_rotation_attempted
+            and reply_visibility_stage == "pre_rotation"
             and len(reply_visibility_pre_accounts) >= _REPLY_VISIBILITY_EMPTY_QUORUM
         ):
             return "rotate"
         if (
-            reply_visibility_rotation_attempted
+            reply_visibility_rotation_success
             and len(reply_visibility_post_accounts) >= _REPLY_VISIBILITY_EMPTY_QUORUM
         ):
             return "exhausted"
@@ -11510,9 +12523,10 @@ async def execute_user_schema_parallel(
         proxy_value = (trigger.proxy_value or "").strip()
         reply_visibility_rotation_attempted = True
         reply_visibility_rotation_proxy = proxy_value or None
-        reply_visibility_stage = "post_rotation"
+        reply_visibility_stage = "rotation_pending"
         if not proxy_value:
             reply_visibility_rotation_error = "missing_proxy_for_visibility_rotation"
+            reply_visibility_stage = "rotation_failed"
             _update_reply_visibility_payload()
             logger.warning(
                 "Task %s: reply visibility quorum reached but account=%s has no proxy; "
@@ -11524,6 +12538,7 @@ async def execute_user_schema_parallel(
         if active_reply_proxy_counts.get(proxy_value, 0) > 0:
             pending_reply_proxy_rotations.add(proxy_value)
             reply_visibility_rotation_error = "rotation_delayed_active_browser"
+            reply_visibility_rotation_attempted = False
             _update_reply_visibility_payload()
             logger.info(
                 "Task %s: delaying reply visibility mobile rotation for proxy=%s because "
@@ -11543,9 +12558,12 @@ async def execute_user_schema_parallel(
         )
         reply_visibility_rotation_success = bool(rotated)
         if rotated:
+            reply_visibility_stage = "post_rotation"
             reply_visibility_rotation_error = None
+            _select_reply_visibility_bucket(post_rotation=True, proxy_key=proxy_value)
             await _sleep_or_stop(2.0)
         else:
+            reply_visibility_stage = "rotation_failed"
             reply_visibility_rotation_error = "rotation_failed_or_unavailable"
             edge_denied_reply_proxy_values.add(proxy_value)
         _update_reply_visibility_payload()
@@ -11580,6 +12598,7 @@ async def execute_user_schema_parallel(
                 max_reply_surface_unavailable_batches * max(1, parallel_worker_target)
             )
             consecutive_no_main_attempts = 0
+            consecutive_browser_driver_failures = 0
             recent_surface_unavailable_results: List[_ParallelReplyVariantResult] = []
             recent_no_main_results: List[_ParallelReplyVariantResult] = []
 
@@ -11746,6 +12765,38 @@ async def execute_user_schema_parallel(
                         if not item.completed:
                             await _handle_reply_edge_access_denied(db, item)
 
+                        if _looks_like_browser_driver_unavailable(item.error):
+                            consecutive_browser_driver_failures += 1
+                            logger.warning(
+                                "Task %s: reply browser driver unavailable (%s/%s): %s",
+                                task_id,
+                                consecutive_browser_driver_failures,
+                                2,
+                                item.error,
+                            )
+                            if consecutive_browser_driver_failures >= 2:
+                                result.error = "browser_driver_unavailable"
+                                for failed_item in completed_reply_results:
+                                    if failed_item[2].replies:
+                                        result.replies.extend(failed_item[2].replies)
+                                _append_unresolved_dynamic_reply_failures(result.error)
+                                pending_reply_variants = []
+                                stop_reply_scheduling = True
+                                await _cancel_active_dynamic_reply_tasks()
+                                try:
+                                    from executor.browser_pool import close_browser_pool
+
+                                    await close_browser_pool()
+                                except Exception as close_exc:
+                                    logger.info(
+                                        "Task %s: browser pool close after driver failure failed non-blocking: %s",
+                                        task_id,
+                                        str(close_exc)[:120],
+                                    )
+                                continue
+                        else:
+                            consecutive_browser_driver_failures = 0
+
                         if item.found_any_main:
                             any_reply_account_found_main = True
                             result.main_found_by_observer = True
@@ -11772,7 +12823,6 @@ async def execute_user_schema_parallel(
 
                         if (
                             consecutive_surface_unavailable_attempts >= max_surface_unavailable_attempts
-                            and not any_reply_account_found_main
                         ):
                             result.error = "reply_comment_surface_unavailable"
                             for failed_item in recent_surface_unavailable_results:
@@ -11799,7 +12849,10 @@ async def execute_user_schema_parallel(
                                 if (
                                     not rotated
                                     and reply_visibility_rotation_error
-                                    == "missing_proxy_for_visibility_rotation"
+                                    in {
+                                        "missing_proxy_for_visibility_rotation",
+                                        "rotation_failed_or_unavailable",
+                                    }
                                 ):
                                     _finish_reply_visibility_exhausted(
                                         "reply_visibility_rotation_unavailable"
@@ -11812,6 +12865,18 @@ async def execute_user_schema_parallel(
                                     pending_reply_variants = []
                                     stop_reply_scheduling = True
                                     await _cancel_active_dynamic_reply_tasks()
+                            elif visibility_action == "rotation_unavailable":
+                                _finish_reply_visibility_exhausted(
+                                    "reply_visibility_rotation_unavailable"
+                                )
+                                for failed_item in reply_visibility_pre_results:
+                                    result.replies.extend(failed_item.replies)
+                                _append_unresolved_dynamic_reply_failures(
+                                    result.error or "reply_mains_not_found"
+                                )
+                                pending_reply_variants = []
+                                stop_reply_scheduling = True
+                                await _cancel_active_dynamic_reply_tasks()
                             elif visibility_action == "exhausted":
                                 _finish_reply_visibility_exhausted(
                                     "remaining_main_comments_not_visible_after_ip_rotation"
@@ -12042,21 +13107,25 @@ async def execute_user_schema_parallel(
             for item in batch_results
         )
         if batch_all_no_main and not batch_found_any:
-            visibility_actions: List[str] = []
+            visibility_actions: List[Tuple[str, _ParallelReplyVariantResult]] = []
             for item in batch_results:
                 action = _record_reply_visibility_empty(item)
                 if action:
-                    visibility_actions.append(action)
-            if "rotate" in visibility_actions:
+                    visibility_actions.append((action, item))
+            action_names = [action for action, _item in visibility_actions]
+            if "rotate" in action_names:
                 trigger = next(
-                    (item for item in batch_results if _reply_result_is_confident_visibility_empty(item)),
+                    (item for action, item in visibility_actions if action == "rotate"),
                     batch_results[-1],
                 )
                 rotated = await _attempt_reply_visibility_rotation(db, trigger)
                 if (
                     not rotated
                     and reply_visibility_rotation_error
-                    == "missing_proxy_for_visibility_rotation"
+                    in {
+                        "missing_proxy_for_visibility_rotation",
+                        "rotation_failed_or_unavailable",
+                    }
                 ):
                     _finish_reply_visibility_exhausted("reply_visibility_rotation_unavailable")
                     for item in reply_visibility_pre_results:
@@ -12068,7 +13137,18 @@ async def execute_user_schema_parallel(
                         result.reply_visibility,
                     )
                     break
-            elif "exhausted" in visibility_actions:
+            elif "rotation_unavailable" in action_names:
+                _finish_reply_visibility_exhausted("reply_visibility_rotation_unavailable")
+                for item in reply_visibility_pre_results:
+                    result.replies.extend(item.replies)
+                logger.warning(
+                    "Task %s: parallel reply batch stopped because delayed visibility "
+                    "rotation failed; visibility=%s",
+                    task_id,
+                    result.reply_visibility,
+                )
+                break
+            elif "exhausted" in action_names:
                 _finish_reply_visibility_exhausted(
                     "remaining_main_comments_not_visible_after_ip_rotation"
                 )
@@ -12712,6 +13792,8 @@ async def execute_user_schema_full(
             full_reply_submitted_parent_keys_by_variant: Dict[int, set[str]] = {}
             full_reply_soft_submitted_keys_by_variant: Dict[int, set[str]] = {}
             full_reply_inflight_keys_by_variant: Dict[int, set[str]] = {}
+            full_reply_task_attempt_locks: set[str] = set()
+            full_reply_task_inflight_locks: set[str] = set()
 
             for variant_idx, reply_text in enumerate(reply_variants, start=1):
                 if not active_mains:
@@ -12739,6 +13821,8 @@ async def execute_user_schema_full(
                     variant_idx,
                     set(),
                 )
+                full_reply_task_attempt_locks.update(variant_soft_submitted_keys)
+                full_reply_task_inflight_locks.update(variant_inflight_keys)
                 variant_reported_outcomes: List[ReplyOutcome] = []
                 variant_found_mains_by_key: Dict[str, PublishedMain] = {}
 
@@ -12751,6 +13835,7 @@ async def execute_user_schema_full(
                             active_mains,
                         )
                     )
+                    full_reply_task_attempt_locks.update(variant_soft_submitted_keys)
 
                 for reply_attempt in range(1, max_reply_attempts + 1):
                     if _is_stop_requested():
@@ -12822,8 +13907,8 @@ async def execute_user_schema_full(
                             fallback_allowed=fallback_allowed,
                             require_parent_author_match=False,
                             allow_parent_author_fallback=False,
-                            soft_submitted_reply_keys=variant_soft_submitted_keys,
-                            inflight_reply_keys=variant_inflight_keys,
+                            soft_submitted_reply_keys=full_reply_task_attempt_locks,
+                            inflight_reply_keys=full_reply_task_inflight_locks,
                             on_soft_submitted_outcome=_record_full_soft_submitted_reply,
                         )
                     finally:
@@ -12843,6 +13928,12 @@ async def execute_user_schema_full(
                         variant_reported_outcomes.extend(submitted_outcomes)
                         variant_submitted_parent_keys.update(
                             _reply_outcomes_submitted_parent_keys_for_expected_mains(
+                                submitted_outcomes,
+                                active_mains,
+                            )
+                        )
+                        full_reply_task_attempt_locks.update(
+                            _reply_outcomes_submitted_reply_keys_for_expected_mains(
                                 submitted_outcomes,
                                 active_mains,
                             )
@@ -12887,6 +13978,8 @@ async def execute_user_schema_full(
                                 active_mains,
                             )
                         )
+                        full_reply_task_attempt_locks.update(variant_soft_submitted_keys)
+                        full_reply_task_attempt_locks.update(attempt_result.soft_submitted_reply_keys)
                     if _is_stop_requested():
                         logger.info(
                             "Task %s: user stop detected after reply variant %s attempt %s",

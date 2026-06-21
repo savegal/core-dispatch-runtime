@@ -1124,7 +1124,7 @@ async def test_open_reply_box_accepts_bonded_composer_after_click(monkeypatch):
             if script == dom_actions._JS_OPEN_REPLY:
                 return {"clicked": True, "strategy": "parent-anchor-reply", "anchorToken": "anchor-1"}
             if script == dom_actions._JS_FIND_REPLY_INPUT:
-                assert args == ["anchor-1"]
+                assert args == ["anchor-1", "parent", ""]
                 return {
                     "found": True,
                     "strategy": "reply-composer-between_parent_and_next_row",
@@ -1168,7 +1168,7 @@ async def test_find_reply_input_smart_uses_bonded_target_handles(monkeypatch):
         async def evaluate_handle(self, script, args=None):
             calls["handle"] += 1
             if script == dom_actions._JS_FIND_REPLY_INPUT_HANDLE:
-                assert args == ["anchor-1"]
+                assert args == ["anchor-1", "", ""]
                 return _Handle("input")
             if "data-smart-reply-composer" in script:
                 return _Handle("composer")
@@ -1265,10 +1265,17 @@ def test_open_reply_box_prefers_parent_dom_anchor_before_text_search():
 @pytest.mark.unit
 def test_reply_input_finder_requires_live_parent_anchor_scope():
     script = dom_actions._JS_FIND_REPLY_INPUT
+    handle_script = "".join(dom_actions._JS_FIND_REPLY_INPUT_HANDLE)
 
     assert "parent_anchor_token_missing" in script
     assert "reply_composer_triple_not_found" in script
     assert "parent_anchor_not_found" in script
+    assert "parent_anchor_text_mismatch" in script
+    assert "parent_anchor_id_mismatch" in script
+    assert "expectedParentText" in script
+    assert "expectedParentId" in script
+    assert "expectedParentText || ''" in handle_script
+    assert "expectedParentId || ''" in handle_script
     assert "input_without_post" in script
     assert "global_main_composer" in script
     assert "data-smart-reply-anchor-token" in script

@@ -678,7 +678,7 @@ _JS_FIND_POST_BUTTON = r"""
 """
 
 _JS_FIND_REPLY_INPUT = r"""
-([parentAnchorToken]) => {
+([parentAnchorToken, expectedParentText, expectedParentId]) => {
     document
         .querySelectorAll('[data-smart-reply-input], [data-smart-reply-composer], [data-smart-reply-post], [data-smart-reply-anchor-token]')
         .forEach(el => {
@@ -696,6 +696,8 @@ _JS_FIND_REPLY_INPUT = r"""
         });
 
     const targetAnchorToken = String(parentAnchorToken || '').trim();
+    const targetParentText = String(expectedParentText || '');
+    const targetParentId = String(expectedParentId || '').trim();
     const finish = (state) => {
         try { window.__smartReplyInputProbeState = state || null; } catch (_) {}
         try { window.__smartReplyComposerProbeState = state || null; } catch (_) {}
@@ -746,10 +748,50 @@ _JS_FIND_REPLY_INPUT = r"""
         height: Math.round(rect.height),
     }) : null;
     const normalizeText = (value) => String(value || '').replace(/\s+/g, ' ').trim().toLowerCase();
+    const normalizeId = (value) => String(value || '').replace(/^comment-/, '').trim();
     const readText = (el) => {
         if (!el) return '';
         if (el.value !== undefined && el.value !== null && el.value !== '') return String(el.value || '');
         return String(el.textContent || el.innerText || '');
+    };
+    const commentContainerSelector = [
+        '[data-cid]:not([data-cid^="one-column-item"])',
+        '[data-comment-id]',
+        '[data-e2e="comment-item"]',
+        '[class*="DivCommentObject"]',
+        '[class*="CommentItem"]',
+        '[class*="DivComment"]',
+        'article',
+        'li'
+    ].join(', ');
+    const parentRootForAnchor = (anchor) => {
+        if (!anchor) return null;
+        try {
+            const closest = anchor.closest && anchor.closest(commentContainerSelector);
+            if (closest) return closest;
+        } catch (_) {}
+        return anchor;
+    };
+    const commentIdsForAnchor = (anchor, root) => {
+        const ids = [];
+        const seen = new Set();
+        const push = (value) => {
+            const normalized = normalizeId(value);
+            if (!normalized || seen.has(normalized)) return;
+            seen.add(normalized);
+            ids.push(normalized);
+        };
+        for (const start of [anchor, root]) {
+            for (let cur = start, depth = 0; cur && cur !== document.body && cur !== document.documentElement && depth < 8; cur = cur.parentElement, depth++) {
+                if (!cur.getAttribute) continue;
+                push(cur.getAttribute('data-comment-id'));
+                push(cur.getAttribute('data-cid'));
+                const rawId = cur.getAttribute('id') || '';
+                if (rawId.startsWith('comment-')) push(rawId.slice('comment-'.length));
+                else push(rawId);
+            }
+        }
+        return ids;
     };
     const editorRect = (editor, raw) => {
         const rects = [];
@@ -921,6 +963,29 @@ _JS_FIND_REPLY_INPUT = r"""
             anchorToken: targetAnchorToken,
         });
     }
+    const parentRoot = parentRootForAnchor(anchor);
+    const expectedTextNorm = normalizeText(targetParentText);
+    const parentTextNorm = normalizeText(readText(parentRoot) || readText(anchor));
+    if (expectedTextNorm && !parentTextNorm.includes(expectedTextNorm)) {
+        return finish({
+            found: false,
+            reason: 'parent_anchor_text_mismatch',
+            anchorToken: targetAnchorToken,
+            expectedPreview: targetParentText.slice(0, 100),
+            parentPreview: (readText(parentRoot) || readText(anchor)).slice(0, 140),
+        });
+    }
+    const anchorIds = commentIdsForAnchor(anchor, parentRoot);
+    const expectedIdNorm = normalizeId(targetParentId);
+    if (expectedIdNorm && anchorIds.length > 0 && !anchorIds.includes(expectedIdNorm)) {
+        return finish({
+            found: false,
+            reason: 'parent_anchor_id_mismatch',
+            anchorToken: targetAnchorToken,
+            expectedId: expectedIdNorm,
+            anchorIds: anchorIds.slice(0, 6),
+        });
+    }
     const anchorRect = anchor.getBoundingClientRect();
     const nextRowTop = nextTopLevelRowTop(anchor, anchorRect);
     const bottomLimit = nextRowTop !== null
@@ -1057,11 +1122,11 @@ _JS_FIND_REPLY_INPUT = r"""
 """
 
 _JS_FIND_REPLY_INPUT_HANDLE = (
-    "([parentAnchorToken]) => {\n"
+    "([parentAnchorToken, expectedParentText, expectedParentId]) => {\n"
     "    const probe = " + _JS_FIND_REPLY_INPUT.strip() + ";\n"
     "    let result = null;\n"
     "    try {\n"
-    "        result = probe([parentAnchorToken || '']);\n"
+    "        result = probe([parentAnchorToken || '', expectedParentText || '', expectedParentId || '']);\n"
     "    } catch (exc) {\n"
     "        result = { found: false, reason: 'reply_probe_exception', error: String(exc && (exc.message || exc)) };\n"
     "    }\n"
@@ -4535,7 +4600,10 @@ async def open_reply_box(
                 await asyncio.sleep(0.45 if fast_mode else 0.7)
             anchor_token = parent_anchor_token or result.get("anchorToken") or ""
             try:
-                scoped_input = await page.evaluate(_JS_FIND_REPLY_INPUT, [anchor_token])
+                scoped_input = await page.evaluate(
+                    _JS_FIND_REPLY_INPUT,
+                    [anchor_token, parent_comment_text or "", parent_comment_id or ""],
+                )
             except Exception as exc:
                 scoped_input = {"found": False, "reason": f"reply_composer_probe_exception:{str(exc)[:80]}"}
             if not (isinstance(scoped_input, dict) and scoped_input.get("found")):
@@ -6156,7 +6224,7 @@ async def find_reply_composer_for_parent(
         try:
             input_handle_raw = await page.evaluate_handle(
                 _JS_FIND_REPLY_INPUT_HANDLE,
-                [token],
+                [token, expected_parent_text or "", parent_comment_id or ""],
             )
         except Exception as exc:
             await asyncio.sleep(0.2)
@@ -6396,10 +6464,26 @@ async def find_reply_send_candidate_for_optimistic_click(
                     };
 
                     const input = document.querySelector('[data-smart-reply-input="1"]');
-                    const composer = document.querySelector('[data-smart-reply-composer="1"]');
-                    if (!input || !composer || !composer.contains(input) || !visible(composer)) {
+                    let composer = document.querySelector('[data-smart-reply-composer="1"]');
+                    if (!input) {
                         return { found: false, reason: 'reply_composer_not_bound' };
                     }
+                    const scopeCandidates = [];
+                    const addScope = (scope) => {
+                        if (!scope || scopeCandidates.includes(scope) || !scope.contains(input) || !visible(scope)) return;
+                        if (scope === document.body || scope === document.documentElement) return;
+                        const r = scope.getBoundingClientRect();
+                        if (r.width <= 0 || r.height <= 0 || r.width > 900 || r.height > 420) return;
+                        scopeCandidates.push(scope);
+                    };
+                    addScope(composer);
+                    for (let cur = input.parentElement, depth = 0; cur && depth < 10; cur = cur.parentElement, depth++) {
+                        addScope(cur);
+                    }
+                    if (!scopeCandidates.length) {
+                        return { found: false, reason: 'reply_composer_not_bound' };
+                    }
+                    composer = scopeCandidates[0];
                     const editor = resolveInnerEditor(input);
                     const inputText = readEditorText(editor);
                     const expected = normalize(expectedText);
@@ -6481,7 +6565,7 @@ async def find_reply_send_candidate_for_optimistic_click(
                             label.includes('\u043e\u0442\u043f\u0440\u0430\u0432') ||
                             Boolean(iconNearInput);
                     };
-                    const targetFor = (raw) => {
+                    const targetFor = (raw, scope) => {
                         const candidates = [
                             raw && raw.closest && raw.closest('button'),
                             raw && raw.closest && raw.closest('[role="button"]'),
@@ -6492,7 +6576,7 @@ async def find_reply_send_candidate_for_optimistic_click(
                         ].filter(Boolean);
                         const seen = new Set();
                         for (const el of candidates) {
-                            if (!el || seen.has(el) || !composer.contains(el) || !visible(el)) continue;
+                            if (!el || seen.has(el) || !scope.contains(el) || !visible(el)) continue;
                             seen.add(el);
                             const r = el.getBoundingClientRect();
                             if (r.width > 360 || r.height > 160) continue;
@@ -6505,15 +6589,13 @@ async def find_reply_send_candidate_for_optimistic_click(
                     };
 
                     const rawCandidates = [];
-                    const seenRaw = new Set();
-                    const addRaw = (raw) => {
-                        if (!raw || seenRaw.has(raw) || !composer.contains(raw) || !visible(raw)) return;
+                    const addRaw = (raw, scope) => {
+                        if (!raw || !scope.contains(raw) || !visible(raw)) return;
+                        if (rawCandidates.some(item => item.raw === raw && item.scope === scope)) return;
                         if (!looksSend(raw)) return;
-                        seenRaw.add(raw);
-                        rawCandidates.push(raw);
+                        rawCandidates.push({ raw, scope });
                     };
-                    addRaw(document.querySelector('[data-smart-reply-post="1"]'));
-                    for (const selector of [
+                    const selectors = [
                         '[data-e2e="comment-post"]',
                         '[data-e2e*="comment-post"]',
                         '[data-e2e="post-comment-button"]',
@@ -6521,15 +6603,21 @@ async def find_reply_send_candidate_for_optimistic_click(
                         '[role="button"]',
                         'div[tabindex="0"]',
                         'svg',
-                    ]) {
-                        for (const raw of composer.querySelectorAll(selector)) {
-                            addRaw(raw);
-                            if (rawCandidates.length >= 24) break;
+                    ];
+                    for (const scope of scopeCandidates) {
+                        const marked = document.querySelector('[data-smart-reply-post="1"]');
+                        if (marked) addRaw(marked, scope);
+                        for (const selector of selectors) {
+                            for (const raw of scope.querySelectorAll(selector)) {
+                                addRaw(raw, scope);
+                                if (rawCandidates.length >= 32) break;
+                            }
+                            if (rawCandidates.length >= 32) break;
                         }
-                        if (rawCandidates.length >= 24) break;
+                        if (rawCandidates.length >= 32) break;
                     }
                     const candidates = rawCandidates
-                        .map(raw => ({ raw, target: targetFor(raw) }))
+                        .map(item => ({ raw: item.raw, scope: item.scope, target: targetFor(item.raw, item.scope) }))
                         .filter(item => item.target)
                         .sort((a, b) => {
                             const ar = a.target.getBoundingClientRect();
@@ -6545,16 +6633,17 @@ async def find_reply_send_candidate_for_optimistic_click(
                         };
                     }
                     const el = selected.target;
+                    selected.scope.setAttribute('data-smart-reply-composer', '1');
                     el.setAttribute('data-smart-id', 'comment-post-ready');
                     el.setAttribute('data-smart-reply-post', '1');
-                    el.setAttribute('data-smart-reply-post-strategy', 'reply-optimistic-send');
+                    el.setAttribute('data-smart-reply-post-strategy', 'reply-optimistic-send-expanded-scope');
                     el.setAttribute('data-smart-reply-post-target', el.tagName || '');
                     const r = el.getBoundingClientRect();
                     const st = getComputedStyle(el);
                     return {
                         found: true,
                         reason: 'reply_optimistic_send_candidate',
-                        strategy: 'reply-optimistic-send',
+                        strategy: 'reply-optimistic-send-expanded-scope',
                         inputText: inputText.slice(0, 100),
                         tag: el.tagName,
                         opacity: st.opacity,
@@ -6564,6 +6653,7 @@ async def find_reply_send_candidate_for_optimistic_click(
                         w: Math.round(r.width),
                         h: Math.round(r.height),
                         candidateCount: rawCandidates.length,
+                        scopeCount: scopeCandidates.length,
                     };
                 }
                 """,

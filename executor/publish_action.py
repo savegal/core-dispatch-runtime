@@ -9,7 +9,7 @@ import time
 from asyncio import sleep as _asyncio_sleep
 from asyncio import wait_for as _asyncio_wait_for
 from dataclasses import dataclass
-from typing import Any, Dict, Optional, Tuple
+from typing import Any, Awaitable, Callable, Dict, Optional, Tuple
 
 from patchright.async_api import Page, Response
 
@@ -106,6 +106,12 @@ def _is_recoverable_reply_send_reason(reason: Optional[str]) -> bool:
     if safe.startswith("publish_deadline_exceeded:reply_composer_resolve"):
         return True
     return safe.startswith(_REPLY_SEND_RECOVERABLE_RETRY_PREFIXES)
+
+
+def _early_submit_confirmation_found(value: Any) -> bool:
+    if isinstance(value, dict):
+        return bool(value.get("found"))
+    return bool(value)
 
 
 def _reply_post_gate_reason_allows_scoped_recovery(reason: Optional[str]) -> bool:
@@ -4028,6 +4034,8 @@ async def _publish_via_current_input(
     parent_anchor_token: Optional[str] = None,
     reply_target: Optional[Any] = None,
     comment_surface_ready: bool = False,
+    reply_send_deadline_ref: Optional[Dict[str, float]] = None,
+    early_submit_confirmation: Optional[Callable[[], Awaitable[Any]]] = None,
 ) -> PublishResult:
     started = time.monotonic()
     fast_publish = _is_parallel_fast_publish(correlation_id)
@@ -4050,6 +4058,129 @@ async def _publish_via_current_input(
             correlation_id=correlation_id,
             dom_strategy=dom_strategy,
         )
+
+    early_confirmation_result: Any = None
+    early_confirmation_confirmed = False
+    early_confirmation_task: Optional[asyncio.Task] = None
+
+    def _start_early_confirmation_task() -> None:
+        nonlocal early_confirmation_task
+        if early_confirmation_task is not None or early_submit_confirmation is None:
+            return
+        if not (reply_scoped and fast_publish):
+            return
+        try:
+            early_confirmation_task = asyncio.create_task(early_submit_confirmation())
+        except Exception as exc:
+            logger.debug(
+                "[PUBLISH] %s early submit confirmation task creation failed: %s",
+                correlation_id or "unknown",
+                str(exc)[:120],
+            )
+
+    async def _wait_for_publish_or_early_confirmation(
+        timeout_seconds: float,
+        *,
+        require_response_url: bool = False,
+    ) -> None:
+        nonlocal early_confirmation_result, early_confirmation_confirmed, early_confirmation_task
+        wait_timeout = max(0.0, timeout_seconds)
+        if wait_timeout <= 0:
+            return
+        network_wait_task = None if require_response_url else asyncio.create_task(event.wait())
+        deadline = time.monotonic() + wait_timeout
+        try:
+            while time.monotonic() < deadline:
+                if require_response_url:
+                    if captured.get("url"):
+                        break
+                elif event.is_set():
+                    break
+                waiters = set()
+                if network_wait_task is not None:
+                    waiters.add(network_wait_task)
+                if early_confirmation_task is not None:
+                    waiters.add(early_confirmation_task)
+                timeout = max(0.0, deadline - time.monotonic())
+                if timeout <= 0:
+                    break
+                if not waiters:
+                    await asyncio.sleep(min(0.05, timeout))
+                    continue
+                done, _pending = await asyncio.wait(
+                    waiters,
+                    timeout=timeout,
+                    return_when=asyncio.FIRST_COMPLETED,
+                )
+                if not done:
+                    break
+                if network_wait_task in done:
+                    break
+                if early_confirmation_task is not None and early_confirmation_task in done:
+                    try:
+                        early_confirmation_result = early_confirmation_task.result()
+                    except Exception as exc:
+                        early_confirmation_result = {
+                            "found": False,
+                            "reason": f"exception:{str(exc)[:80]}",
+                        }
+                    early_confirmation_confirmed = _early_submit_confirmation_found(early_confirmation_result)
+                    if early_confirmation_confirmed:
+                        _log_publish_trace(
+                            "reply_early_local_confirmation",
+                            page=page,
+                            expected_video_url=expected_video_url,
+                            correlation_id=correlation_id,
+                            result=early_confirmation_result,
+                            level=logging.INFO,
+                        )
+                        break
+                    early_confirmation_task = None
+        finally:
+            if network_wait_task is not None and not network_wait_task.done():
+                network_wait_task.cancel()
+                try:
+                    await network_wait_task
+                except asyncio.CancelledError:
+                    pass
+                except Exception:
+                    pass
+
+    async def _finish_early_confirmation_task() -> None:
+        nonlocal early_confirmation_result, early_confirmation_confirmed
+        if early_confirmation_task is None:
+            return
+        if early_confirmation_task.done():
+            try:
+                early_confirmation_result = early_confirmation_task.result()
+            except Exception as exc:
+                early_confirmation_result = {
+                    "found": False,
+                    "reason": f"exception:{str(exc)[:80]}",
+                }
+            early_confirmation_confirmed = bool(
+                early_confirmation_confirmed
+                or _early_submit_confirmation_found(early_confirmation_result)
+            )
+            return
+        early_confirmation_task.cancel()
+        try:
+            await early_confirmation_task
+        except asyncio.CancelledError:
+            pass
+        except Exception:
+            pass
+
+    reply_send_deadline: Optional[float] = None
+
+    def _send_remaining() -> float:
+        remaining = _remaining()
+        if reply_scoped and reply_send_deadline is not None:
+            return min(remaining, reply_send_deadline - time.monotonic())
+        return remaining
+
+    def _send_deadline_result(phase: str, dom_strategy: Optional[str] = None) -> PublishResult:
+        return _deadline_result(f"reply_send_deadline:{phase}" if reply_scoped else phase, dom_strategy)
 
     def _typing_phase_timeout(*, retry: bool = False) -> float:
         remaining = _remaining()
@@ -4584,16 +4715,69 @@ async def _publish_via_current_input(
         retry_input_search_timeout = min(2.5 if aggressive else 5.0, _remaining())
         if retry_input_search_timeout <= 0:
             return _deadline_result("before_typing_retry_input_search", input_info.strategy)
-        if reply_scoped and reply_target is not None:
-            retry_handle = input_handle
+        if reply_scoped:
+            retry_handle = None
+            retry_rebound = False
+            if parent_anchor_token:
+                try:
+                    retry_target, retry_target_info = await _asyncio_wait_for(
+                        find_reply_composer_for_parent(
+                            page,
+                            parent_anchor_token=parent_anchor_token,
+                            max_total_seconds=retry_input_search_timeout,
+                        ),
+                        timeout=retry_input_search_timeout,
+                    )
+                except asyncio.TimeoutError:
+                    retry_target, retry_target_info = None, DomActionResult(
+                        False,
+                        reason="reply_retry_composer_resolve_timeout",
+                        elapsed_seconds=time.monotonic() - started,
+                        anchor_token=parent_anchor_token,
+                    )
+                except Exception as exc:
+                    retry_target, retry_target_info = None, DomActionResult(
+                        False,
+                        reason=f"reply_retry_composer_resolve_exception:{str(exc)[:80]}",
+                        elapsed_seconds=time.monotonic() - started,
+                        anchor_token=parent_anchor_token,
+                    )
+                if retry_target is not None:
+                    reply_target = retry_target
+                    retry_handle = getattr(retry_target, "input_handle", None)
+                    retry_rebound = bool(retry_handle)
+                    input_info = retry_target_info or input_info
+                    _log_publish_trace(
+                        "typing_retry_reply_target_rebound",
+                        page=page,
+                        expected_video_url=expected_video_url,
+                        correlation_id=correlation_id,
+                        strategy=getattr(retry_target_info, "strategy", None),
+                        reason=getattr(retry_target_info, "reason", None),
+                        level=logging.INFO,
+                    )
+                else:
+                    _log_publish_trace(
+                        "typing_retry_reply_target_rebind_failed",
+                        page=page,
+                        expected_video_url=expected_video_url,
+                        correlation_id=correlation_id,
+                        reason=getattr(retry_target_info, "reason", None),
+                        level=logging.INFO,
+                    )
+            if not retry_rebound:
+                return PublishResult(
+                    status="dom_error",
+                    error_reason="typing_retry_reply_target_not_rebound",
+                    dom_strategy=input_info.strategy,
+                    elapsed_seconds=time.monotonic() - started,
+                    post_was_enabled_at_click=False,
+                    network_request_attempted=False,
+                )
         else:
             try:
                 retry_handle, _ = await _asyncio_wait_for(
-                    find_reply_input_smart(
-                        page,
-                        parent_anchor_token=parent_anchor_token,
-                        max_total_seconds=retry_input_search_timeout,
-                    ) if reply_scoped else find_comment_input_smart(
+                    find_comment_input_smart(
                         page,
                         max_total_seconds=retry_input_search_timeout,
                         aggressive=aggressive,
@@ -4682,6 +4866,15 @@ async def _publish_via_current_input(
 
     if _remaining() <= 0:
         return _deadline_result("after_typing", input_info.strategy)
+    if reply_scoped:
+        if reply_send_deadline_ref is not None:
+            stored_deadline = float(reply_send_deadline_ref.get("deadline") or 0.0)
+            if stored_deadline <= 0:
+                stored_deadline = time.monotonic() + (3.5 if fast_publish else 4.5)
+                reply_send_deadline_ref["deadline"] = stored_deadline
+            reply_send_deadline = stored_deadline
+        else:
+            reply_send_deadline = time.monotonic() + (3.5 if fast_publish else 4.5)
     await asyncio.sleep(0.15 if aggressive else (0.25 if fast_publish else 0.8))  # let TikTok render Post after robust input
 
     # Verify the input actually has text visible to React
@@ -4724,9 +4917,9 @@ async def _publish_via_current_input(
     if drift_result:
         return drift_result
 
-    remaining = max_total_seconds - (time.monotonic() - started)
+    remaining = _send_remaining()
     if remaining <= 0:
-        return _deadline_result("before_post_button_search", input_info.strategy)
+        return _send_deadline_result("before_post_button_search", input_info.strategy)
     if reply_scoped and reply_target is not None and getattr(reply_target, "post_button_handle", None) is not None:
         post_button = getattr(reply_target, "post_button_handle", None)
         post_info = DomActionResult(
@@ -4776,9 +4969,9 @@ async def _publish_via_current_input(
         elapsed=round(getattr(post_info, "elapsed_seconds", 0.0) or 0.0, 2),
     )
 
-    remaining = max_total_seconds - (time.monotonic() - started)
+    remaining = _send_remaining()
     if remaining <= 0:
-        return _deadline_result("before_post_enabled_gate", input_info.strategy or post_info.strategy)
+        return _send_deadline_result("before_post_enabled_gate", input_info.strategy or post_info.strategy)
     post_enabled_wait_seconds = (
         2.8
         if main_comment_aggressive
@@ -4968,7 +5161,7 @@ async def _publish_via_current_input(
             not post_was_enabled
             and reply_scoped
             and _reply_post_gate_reason_allows_scoped_recovery(disabled_reason)
-            and _remaining() > 0.45
+            and _send_remaining() > 0.45
         ):
             exact_state = await _reply_target_input_exact_text_state(page, text)
             if exact_state.get("ok"):
@@ -4979,11 +5172,11 @@ async def _publish_via_current_input(
                     expected_video_url=expected_video_url,
                     correlation_id=correlation_id,
                 )
-                if nudged and _remaining() > 0.25:
+                if nudged and _send_remaining() > 0.25:
                     try:
                         retry_enabled_button, retry_enabled_info = await wait_for_post_button_enabled(
                             page,
-                            max_wait_seconds=min(0.9 if fast_publish else 1.2, max(_remaining(), 0.25)),
+                            max_wait_seconds=min(0.9 if fast_publish else 1.2, max(_send_remaining(), 0.25)),
                             reply_scoped=True,
                             expected_text=text,
                         )
@@ -5001,11 +5194,11 @@ async def _publish_via_current_input(
                             reason=disabled_reason,
                             level=logging.INFO,
                         )
-                if not post_was_enabled and _remaining() > 0.2:
+                if not post_was_enabled and _send_remaining() > 0.2:
                     optimistic_button, optimistic_info = await find_reply_send_candidate_for_optimistic_click(
                         page,
                         expected_text=text,
-                        max_total_seconds=min(0.8 if fast_publish else 1.0, max(_remaining(), 0.2)),
+                        max_total_seconds=min(0.8 if fast_publish else 1.0, max(_send_remaining(), 0.2)),
                     )
                     if optimistic_button:
                         post_button = optimistic_button
@@ -5216,10 +5409,14 @@ async def _publish_via_current_input(
         _detach_listener()
         return _deadline_result("before_click_target_clear", input_info.strategy or post_info.strategy)
     try:
-        await _asyncio_wait_for(ensure_click_target_clear(page, post_button), timeout=max(_remaining(), 0.5))
+        click_target_timeout = _send_remaining()
+        if click_target_timeout <= 0:
+            _detach_listener()
+            return _send_deadline_result("before_click_target_clear", input_info.strategy or post_info.strategy)
+        await _asyncio_wait_for(ensure_click_target_clear(page, post_button), timeout=max(click_target_timeout, 0.5))
     except asyncio.TimeoutError:
         _detach_listener()
-        return _deadline_result("click_target_clear", input_info.strategy or post_info.strategy)
+        return _send_deadline_result("click_target_clear", input_info.strategy or post_info.strategy)
     captcha_result = await _captcha_result_if_present(
         page,
         started,
@@ -5230,7 +5427,7 @@ async def _publish_via_current_input(
         return captcha_result
 
     try:
-        await post_button.scroll_into_view_if_needed(timeout=1500)
+        await post_button.scroll_into_view_if_needed(timeout=800 if reply_scoped and fast_publish else 1500)
     except Exception:
         pass
 
@@ -5243,9 +5440,9 @@ async def _publish_via_current_input(
         and not reply_scoped
     )
     try:
-        if _remaining() <= 0:
+        if _send_remaining() <= 0:
             _detach_listener()
-            return _deadline_result("before_clear_post_click_blockers", input_info.strategy or post_info.strategy)
+            return _send_deadline_result("before_clear_post_click_blockers", input_info.strategy or post_info.strategy)
         post_button, point_diag, click_point_clear = await _asyncio_wait_for(
             _clear_post_click_blockers(
                 page,
@@ -5255,7 +5452,7 @@ async def _publish_via_current_input(
                 expected_text=text,
                 reply_scoped=reply_scoped,
             ),
-            timeout=max(_remaining(), 0.5),
+            timeout=max(_send_remaining(), 0.5),
         )
         if not click_point_clear:
             if _point_diag_looks_like_challenge(point_diag):
@@ -5282,9 +5479,12 @@ async def _publish_via_current_input(
             # the persistent killer should make it pointer-events:none/remove it before the click.
             await suppress_keyboard_shortcuts_overlay(page)
             await asyncio.sleep(0.15 if fast_publish else 0.35)
+            if reply_scoped and _send_remaining() <= 0:
+                _detach_listener()
+                return _send_deadline_result("before_final_post_refind", input_info.strategy or post_info.strategy)
             retry_fresh, retry_fresh_info = await wait_for_post_button_enabled(
                 page,
-                max_wait_seconds=0.8 if fast_publish else 2.0,
+                max_wait_seconds=min(0.8 if fast_publish else 2.0, max(_send_remaining(), 0.25)),
                 reply_scoped=reply_scoped,
                 expected_text=text,
             )
@@ -5301,9 +5501,12 @@ async def _publish_via_current_input(
     # publish result will be classified as unverified (see below).
     if not fast_main_click_path:
         try:
+            if reply_scoped and _send_remaining() <= 0:
+                _detach_listener()
+                return _send_deadline_result("before_final_post_gate", input_info.strategy or post_info.strategy)
             _gate_button, _gate_info = await wait_for_post_button_enabled(
                 page,
-                max_wait_seconds=0.5,
+                max_wait_seconds=min(0.5, max(_send_remaining(), 0.2)),
                 reply_scoped=reply_scoped,
                 expected_text=text,
             )
@@ -5323,6 +5526,9 @@ async def _publish_via_current_input(
     if drift_result:
         _detach_listener()
         return drift_result
+    if reply_scoped and _send_remaining() <= 0:
+        _detach_listener()
+        return _send_deadline_result("before_post_click", input_info.strategy or post_info.strategy)
 
     # If elementFromPoint at button center returns BODY, the button itself has pointer-events:none.
     # TikTok sets this when it considers the session not authorized enough. Mouse clicks won't land.
@@ -5388,7 +5594,7 @@ async def _publish_via_current_input(
                 await page.mouse.up()
                 logger.info("[PUBLISH] Post button mouse-clicked, waiting for /api/comment/publish/")
         else:
-            await post_button.click(timeout=5000, force=True)
+            await post_button.click(timeout=1000 if reply_scoped and fast_publish else 5000, force=True)
             logger.info("[PUBLISH] Post button clicked by Playwright fallback, waiting for /api/comment/publish/")
     except Exception as exc:
         logger.warning("[PUBLISH] Normal/mouse post click failed: %s", exc)
@@ -5400,11 +5606,11 @@ async def _publish_via_current_input(
             # top-level comment by mistake.
             locator_selector = _post_click_fallback_selector(reply_scoped=reply_scoped)
             locator = page.locator(locator_selector).last
-            await locator.click(timeout=3000, force=True)
+            await locator.click(timeout=1000 if reply_scoped and fast_publish else 3000, force=True)
             logger.info("[PUBLISH] Used fresh locator click fallback, waiting for /api/comment/publish/")
         except Exception as locator_exc:
             try:
-                await post_button.click(timeout=5000, force=False)
+                await post_button.click(timeout=1000 if reply_scoped and fast_publish else 5000, force=False)
                 logger.info("[PUBLISH] Used non-force Playwright click fallback, waiting for /api/comment/publish/")
             except Exception as pw_exc:
                 try:
@@ -5434,18 +5640,34 @@ async def _publish_via_current_input(
     wait_remaining = max_total_seconds - (time.monotonic() - started)
     if wait_remaining <= 0:
         _detach_listener()
+        await _finish_early_confirmation_task()
         return _deadline_result("after_post_click", input_info.strategy or post_info.strategy)
+    if post_was_enabled:
+        _start_early_confirmation_task()
     try:
-        publish_wait = _PARALLEL_POST_RESPONSE_WAIT_SECONDS if fast_publish else 6.0
-        await asyncio.wait_for(event.wait(), timeout=min(publish_wait, max(wait_remaining, 0.5)))
+        publish_wait = (
+            min(_PARALLEL_POST_RESPONSE_WAIT_SECONDS, 1.4)
+            if fast_publish and reply_scoped
+            else (_PARALLEL_POST_RESPONSE_WAIT_SECONDS if fast_publish else 6.0)
+        )
+        await _wait_for_publish_or_early_confirmation(min(publish_wait, max(wait_remaining, 0.5)))
     except asyncio.TimeoutError:
         pass
     await _yield_to_publish_listener_tasks(listener_tasks)
 
-    if fast_publish and captured.get("request_url") and not captured.get("url"):
-        grace = min(_PARALLEL_POST_RESPONSE_GRACE_SECONDS, max(_remaining(), 0.0))
+    if (
+        fast_publish
+        and captured.get("request_url")
+        and not captured.get("url")
+        and not early_confirmation_confirmed
+    ):
+        local_or_response_grace = max(
+            _PARALLEL_POST_RESPONSE_GRACE_SECONDS,
+            0.8 if reply_scoped and fast_publish else 0.0,
+        )
+        grace = min(local_or_response_grace, max(_remaining(), 0.0))
         if grace > 0:
-            await asyncio.sleep(grace)
+            await _wait_for_publish_or_early_confirmation(grace, require_response_url=True)
             await _yield_to_publish_listener_tasks(listener_tasks)
 
     if not captured and synthetic_dispatch_attempted:
@@ -5453,6 +5675,11 @@ async def _publish_via_current_input(
             "[PUBLISH] Synthetic Post dispatch produced no network confirmation; "
             "skipping immediate second click to avoid duplicate comments. "
             "Caller should verify DOM before retrying another account."
+        )
+    elif early_confirmation_confirmed:
+        logger.info(
+            "[PUBLISH] Skipping second Post click after early local confirmation "
+            "to avoid duplicate replies."
         )
     elif not captured.get("url") and fast_publish and captured.get("request_url"):
         logger.info(
@@ -5539,6 +5766,7 @@ async def _publish_via_current_input(
         except Exception as retry_exc:
             logger.warning("[PUBLISH] Retry Post click failed: %s", retry_exc)
 
+    await _finish_early_confirmation_task()
     _detach_listener()
     await _cancel_and_drain_publish_listener_tasks(listener_tasks)
 
@@ -6161,6 +6389,7 @@ async def publish_reply_hybrid(
     correlation_id: Optional[str] = None,
     expected_video_url: Optional[str] = None,
     comments_already_open: bool = False,
+    early_submit_confirmation: Optional[Callable[[], Awaitable[Any]]] = None,
 ) -> PublishResult:
     started = time.monotonic()
     fast_publish = _is_parallel_fast_publish(correlation_id)
@@ -6558,6 +6787,7 @@ async def publish_reply_hybrid(
             else _REPLY_INPUT_MIN_SECONDS
         )
         input_budget = max(remaining, min_input_budget)
+    reply_send_deadline_ref: Dict[str, float] = {}
     result = await _publish_via_current_input(
         page,
         text,
@@ -6568,6 +6798,8 @@ async def publish_reply_hybrid(
         reply_scoped=True,
         parent_anchor_token=resolved_parent_anchor_token,
         reply_target=reply_target,
+        reply_send_deadline_ref=reply_send_deadline_ref,
+        early_submit_confirmation=early_submit_confirmation,
     )
     if (
         result.status in {"dom_error", "timeout"}
@@ -6599,8 +6831,20 @@ async def publish_reply_hybrid(
         except Exception:
             recovered_target, recovered_info = None, None
         if recovered_target is not None:
-            retry_budget = max_total_seconds - (time.monotonic() - started)
+            retry_budget = min(
+                max_total_seconds - (time.monotonic() - started),
+                3.5 if fast_publish else 4.5,
+            )
             if retry_budget > 0.5:
+                _log_publish_trace(
+                    "reply_send_recover_retry",
+                    page=page,
+                    expected_video_url=expected_video_url,
+                    correlation_id=correlation_id,
+                    retry_budget=round(retry_budget, 2),
+                    strategy=getattr(recovered_info, "strategy", None),
+                    level=logging.INFO,
+                )
                 result = await _publish_via_current_input(
                     page,
                     text,
@@ -6611,6 +6855,8 @@ async def publish_reply_hybrid(
                     reply_scoped=True,
                     parent_anchor_token=resolved_parent_anchor_token,
                     reply_target=recovered_target,
+                    reply_send_deadline_ref=reply_send_deadline_ref,
+                    early_submit_confirmation=early_submit_confirmation,
                 )
         else:
             _log_publish_trace(

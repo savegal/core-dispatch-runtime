@@ -1726,6 +1726,12 @@ async def find_comments_in_list_batch(
                     await page.query_selector('[data-smart-comment-list-batch-scroll="1"]')
                 ) or candidate
                 matched_list_selector = str(selected_list.get("selector") or "")
+                selected_scroll_container_scrollable = bool(
+                    selected_list.get("scroll_container_scrollable")
+                )
+                selected_scroll_container_tag = str(
+                    selected_list.get("scroll_container_tag") or ""
+                ) or None
                 try:
                     selected_scope_strong_items = int(selected_list.get("strong_items") or 0)
                 except (TypeError, ValueError):
@@ -1842,6 +1848,8 @@ async def find_comments_in_list_batch(
     seen_row_signatures: set[str] = set()
     last_new_row_count = 0
     stagnant_row_steps = 0
+    scroll_exhausted = False
+    scroll_stop_reason: Optional[str] = None
     partial_returned = False
     author_fallback_candidates: Dict[int, list[Dict[str, Any]]] = {}
     author_fallback_keys: Dict[int, set[str]] = {}
@@ -1880,6 +1888,14 @@ async def find_comments_in_list_batch(
             "missing_indexes": _missing_target_indexes(),
             "missing_previews": _missing_target_previews(),
         }
+        if selected_scroll_container_scrollable is not None:
+            payload["scroll_container_scrollable"] = selected_scroll_container_scrollable
+        if selected_scroll_container_tag:
+            payload["scroll_container_tag"] = selected_scroll_container_tag
+        if scroll_exhausted or (completed_scrolls >= max_scrolls and max_scrolls > 0):
+            payload["search_exhausted"] = True
+        if scroll_stop_reason:
+            payload["scroll_stop_reason"] = scroll_stop_reason
         if partial_returned:
             payload["partial_returned"] = True
         payload.update(extra)
@@ -2330,6 +2346,8 @@ async def find_comments_in_list_batch(
                         )
                         await asyncio.sleep(scroll_delay_ms / 1000)
                         continue
+                    scroll_exhausted = True
+                    scroll_stop_reason = "no_comment_list_scroll_progress"
                     _log_batch_trace(
                         "scroll_stopped",
                         scroll=scroll_i,

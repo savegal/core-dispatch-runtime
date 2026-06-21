@@ -520,6 +520,150 @@ async def test_publish_via_current_input_uses_reply_scoped_helpers(monkeypatch):
 
 @pytest.mark.unit
 @pytest.mark.asyncio
+async def test_reply_fast_publish_stops_network_wait_on_early_local_confirmation(monkeypatch):
+    page = _FakePage()
+    page.mouse = _RequestOnlyMouse(page)
+    button = _FakeButton()
+    calls = {"early": 0, "sleep": []}
+
+    async def _fake_sleep(seconds):
+        calls["sleep"].append(seconds)
+
+    async def _fake_none(*args, **kwargs):
+        return None
+
+    async def _fake_find_reply_input_smart(*args, **kwargs):
+        return _FakeInput(), SimpleNamespace(strategy="reply-input", elapsed_seconds=0.1, reason=None)
+
+    async def _unexpected_find_comment_input_smart(*args, **kwargs):
+        raise AssertionError("reply_scoped path must not use main input search")
+
+    async def _fake_find_reply_post_button_smart(*args, **kwargs):
+        return button, SimpleNamespace(strategy="reply-post", reason=None)
+
+    async def _fake_wait_for_post_button_enabled(*args, **kwargs):
+        return button, SimpleNamespace(strategy="reply-post-ready", reason=None)
+
+    async def _fake_clear_post_click_blockers(*args, **kwargs):
+        return button, {"tag": "BUTTON", "e2e": "comment-post"}, True
+
+    async def _fake_suppress_keyboard_shortcuts_overlay(*args, **kwargs):
+        return 0
+
+    async def _fake_ensure_click_target_clear(*args, **kwargs):
+        return None
+
+    async def _fake_type_into_comment(*args, **kwargs):
+        return {"ok": True, "strategy": "reply-test-type", "text": "reply text", "anchor_bound": True}
+
+    async def _early_confirm():
+        calls["early"] += 1
+        return {"found": True, "count": 1, "reason": "reply_inside_parent"}
+
+    monkeypatch.setattr(publish_action.asyncio, "sleep", _fake_sleep)
+    monkeypatch.setattr(publish_action, "_captcha_result_if_present", _fake_none)
+    monkeypatch.setattr(publish_action, "_logged_out_publish_result_if_visible", _fake_none)
+    monkeypatch.setattr(publish_action, "_publish_url_guard_result", lambda *args, **kwargs: None)
+    monkeypatch.setattr(publish_action, "suppress_keyboard_shortcuts_overlay", _fake_suppress_keyboard_shortcuts_overlay)
+    monkeypatch.setattr(publish_action, "find_reply_input_smart", _fake_find_reply_input_smart)
+    monkeypatch.setattr(publish_action, "find_comment_input_smart", _unexpected_find_comment_input_smart)
+    monkeypatch.setattr(publish_action, "find_reply_post_button_smart", _fake_find_reply_post_button_smart)
+    monkeypatch.setattr(publish_action, "wait_for_post_button_enabled", _fake_wait_for_post_button_enabled)
+    monkeypatch.setattr(publish_action, "_clear_post_click_blockers", _fake_clear_post_click_blockers)
+    monkeypatch.setattr(publish_action, "ensure_click_target_clear", _fake_ensure_click_target_clear)
+    monkeypatch.setattr(publish_action, "type_into_comment", _fake_type_into_comment)
+
+    result = await publish_action._publish_via_current_input(
+        page,
+        "reply text",
+        max_total_seconds=12.0,
+        correlation_id="task_1_parallel_reply_v1_a1_acc1_to_text",
+        reply_scoped=True,
+        parent_anchor_token="anchor-1",
+        early_submit_confirmation=_early_confirm,
+    )
+
+    assert calls["early"] == 1
+    assert result.status == "failed"
+    assert result.error_reason == "composer_cleared_after_submit"
+    assert result.network_request_attempted is True
+    assert result.post_was_enabled_at_click is True
+    assert all(seconds != publish_action._PARALLEL_POST_RESPONSE_GRACE_SECONDS for seconds in calls["sleep"])
+
+
+@pytest.mark.unit
+@pytest.mark.asyncio
+async def test_reply_early_local_confirmation_skips_second_post_click_without_network(monkeypatch):
+    page = _FakePage()
+    button = _FakeButton()
+    calls = {"early": 0}
+
+    async def _fake_none(*args, **kwargs):
+        return None
+
+    async def _fake_sleep(_seconds):
+        return None
+
+    async def _fake_find_reply_input_smart(*args, **kwargs):
+        return _FakeInput(), SimpleNamespace(strategy="reply-input", elapsed_seconds=0.1, reason=None)
+
+    async def _unexpected_find_comment_input_smart(*args, **kwargs):
+        raise AssertionError("reply_scoped path must not use main input search")
+
+    async def _fake_find_reply_post_button_smart(*args, **kwargs):
+        return button, SimpleNamespace(strategy="reply-post", reason=None)
+
+    async def _fake_wait_for_post_button_enabled(*args, **kwargs):
+        return button, SimpleNamespace(strategy="reply-post-ready", reason=None)
+
+    async def _fake_clear_post_click_blockers(*args, **kwargs):
+        return button, {"tag": "BUTTON", "e2e": "comment-post"}, True
+
+    async def _fake_suppress_keyboard_shortcuts_overlay(*args, **kwargs):
+        return 0
+
+    async def _fake_ensure_click_target_clear(*args, **kwargs):
+        return None
+
+    async def _fake_type_into_comment(*args, **kwargs):
+        return {"ok": True, "strategy": "reply-test-type", "text": "reply text", "anchor_bound": True}
+
+    async def _early_confirm():
+        calls["early"] += 1
+        return {"found": True, "count": 1, "reason": "reply_inside_parent"}
+
+    monkeypatch.setattr(publish_action.asyncio, "sleep", _fake_sleep)
+    monkeypatch.setattr(publish_action, "_captcha_result_if_present", _fake_none)
+    monkeypatch.setattr(publish_action, "_logged_out_publish_result_if_visible", _fake_none)
+    monkeypatch.setattr(publish_action, "_publish_url_guard_result", lambda *args, **kwargs: None)
+    monkeypatch.setattr(publish_action, "suppress_keyboard_shortcuts_overlay", _fake_suppress_keyboard_shortcuts_overlay)
+    monkeypatch.setattr(publish_action, "find_reply_input_smart", _fake_find_reply_input_smart)
+    monkeypatch.setattr(publish_action, "find_comment_input_smart", _unexpected_find_comment_input_smart)
+    monkeypatch.setattr(publish_action, "find_reply_post_button_smart", _fake_find_reply_post_button_smart)
+    monkeypatch.setattr(publish_action, "wait_for_post_button_enabled", _fake_wait_for_post_button_enabled)
+    monkeypatch.setattr(publish_action, "_clear_post_click_blockers", _fake_clear_post_click_blockers)
+    monkeypatch.setattr(publish_action, "ensure_click_target_clear", _fake_ensure_click_target_clear)
+    monkeypatch.setattr(publish_action, "type_into_comment", _fake_type_into_comment)
+
+    result = await publish_action._publish_via_current_input(
+        page,
+        "reply text",
+        max_total_seconds=12.0,
+        correlation_id="task_1_parallel_reply_v1_a1_acc1_to_text",
+        reply_scoped=True,
+        parent_anchor_token="anchor-1",
+        early_submit_confirmation=_early_confirm,
+    )
+
+    assert calls["early"] == 1
+    assert page.click_count == 1
+    assert result.status == "failed"
+    assert result.error_reason == "composer_cleared_after_submit"
+    assert result.post_was_enabled_at_click is True
+
+
+@pytest.mark.unit
+@pytest.mark.asyncio
 async def test_publish_reply_hybrid_uses_fresh_anchor_from_open_reply_box(monkeypatch):
     page = _FakePage()
     captured = {}
@@ -539,6 +683,7 @@ async def test_publish_reply_hybrid_uses_fresh_anchor_from_open_reply_box(monkey
         captured["parent_anchor_token"] = kwargs.get("parent_anchor_token")
         captured["reply_scoped"] = kwargs.get("reply_scoped")
         captured["reply_target_anchor"] = getattr(kwargs.get("reply_target"), "anchor_token", None)
+        captured["early_submit_confirmation"] = kwargs.get("early_submit_confirmation")
         return publish_action.PublishResult(
             status="success",
             comment_id="reply_cid",
@@ -559,6 +704,9 @@ async def test_publish_reply_hybrid_uses_fresh_anchor_from_open_reply_box(monkey
     )
     monkeypatch.setattr(publish_action, "_publish_via_current_input", _fake_publish_via_current_input)
 
+    async def _early_submit_confirmation():
+        return {"found": True}
+
     result = await publish_action.publish_reply_hybrid(
         page,
         "reply text",
@@ -569,14 +717,14 @@ async def test_publish_reply_hybrid_uses_fresh_anchor_from_open_reply_box(monkey
         correlation_id="task_1_parallel_reply_v1_a1_acc1_to_text",
         expected_video_url=page.url,
         comments_already_open=True,
+        early_submit_confirmation=_early_submit_confirmation,
     )
 
     assert result.status == "success"
-    assert captured == {
-        "parent_anchor_token": "fresh-anchor-token",
-        "reply_scoped": True,
-        "reply_target_anchor": "fresh-anchor-token",
-    }
+    assert captured["parent_anchor_token"] == "fresh-anchor-token"
+    assert captured["reply_scoped"] is True
+    assert captured["reply_target_anchor"] == "fresh-anchor-token"
+    assert captured["early_submit_confirmation"] is _early_submit_confirmation
 
 
 @pytest.mark.unit

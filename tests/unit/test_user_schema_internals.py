@@ -246,6 +246,19 @@ def test_is_critical_publish_failure(status, reason, expected):
 
 
 @pytest.mark.unit
+def test_browser_driver_unavailable_detection_is_specific():
+    from executor import user_schema
+
+    assert user_schema._looks_like_browser_driver_unavailable(
+        "page_create_failed:Failed to create browser context: "
+        "Browser.new_context: Connection closed while reading from the driver"
+    )
+    assert not user_schema._looks_like_browser_driver_unavailable(
+        "page_create_failed:proxy timeout while creating browser context"
+    )
+
+
+@pytest.mark.unit
 @pytest.mark.parametrize(
     "status,reason,expected",
     [
@@ -1180,6 +1193,253 @@ async def test_wait_for_searchable_comment_surface_requires_two_stable_samples(m
     assert ok is True
     assert [stage for stage, _ in traces] == ["comment_surface_search_ready"]
     assert len(sleeps) == 2
+
+
+@pytest.mark.unit
+@pytest.mark.asyncio
+async def test_parallel_reply_open_comments_short_circuits_existing_surface(monkeypatch):
+    from executor import user_schema
+
+    calls = {"open": 0, "goto": 0, "waits": []}
+    target_url = "https://www.tiktok.com/@u/video/1234567890123456789"
+
+    class _Page:
+        url = target_url
+
+        async def goto(self, *_args, **_kwargs):
+            calls["goto"] += 1
+
+    async def fake_wait(_page, **kwargs):
+        calls["waits"].append(kwargs.get("timeout_seconds"))
+        return True
+
+    async def fail_open(*_args, **_kwargs):
+        calls["open"] += 1
+        raise AssertionError("ready reply surface should not be reopened")
+
+    monkeypatch.setattr(user_schema, "_wait_for_searchable_comment_surface", fake_wait)
+    monkeypatch.setattr(user_schema, "open_comment_section", fail_open)
+
+    ok = await user_schema._open_comment_list_with_safe_retry(
+        _Page(),
+        target_url,
+        target_url,
+        timeout_ms=30000,
+        correlation_id="task_1015_parallel_reply_v1_a1_acc1",
+        phase="reply_open_comments",
+        account_id=1,
+        variant_index=1,
+    )
+
+    assert ok is True
+    assert calls["open"] == 0
+    assert calls["goto"] == 0
+    assert calls["waits"] == [pytest.approx(1.1)]
+
+
+@pytest.mark.unit
+@pytest.mark.asyncio
+async def test_parallel_reply_open_comments_uses_short_reclick_without_reload(monkeypatch):
+    from executor import user_schema
+
+    calls = {"open_waits": [], "goto": 0}
+    target_url = "https://www.tiktok.com/@u/video/1234567890123456789"
+
+    class _Page:
+        url = target_url
+
+        async def goto(self, *_args, **_kwargs):
+            calls["goto"] += 1
+
+    async def fake_wait(*_args, **_kwargs):
+        return False
+
+    async def fake_open(*_args, **kwargs):
+        calls["open_waits"].append(kwargs.get("max_wait"))
+        return len(calls["open_waits"]) == 2
+
+    monkeypatch.setattr(user_schema, "_wait_for_searchable_comment_surface", fake_wait)
+    monkeypatch.setattr(user_schema, "open_comment_section", fake_open)
+
+    ok = await user_schema._open_comment_list_with_safe_retry(
+        _Page(),
+        target_url,
+        target_url,
+        timeout_ms=30000,
+        correlation_id="task_1015_parallel_reply_v1_a1_acc1",
+        phase="reply_open_comments",
+        account_id=1,
+        variant_index=1,
+    )
+
+    assert ok is True
+    assert calls["goto"] == 0
+    assert len(calls["open_waits"]) == 2
+    assert calls["open_waits"][0] <= 3.2
+    assert calls["open_waits"][1] <= 1.8
+
+
+@pytest.mark.unit
+@pytest.mark.asyncio
+async def test_parallel_reply_open_comments_skips_reload_without_empty_or_redirect(monkeypatch):
+    from executor import user_schema
+
+    calls = {"open": 0, "goto": 0}
+    target_url = "https://www.tiktok.com/@u/video/1234567890123456789"
+
+    class _Page:
+        url = target_url
+
+        async def goto(self, *_args, **_kwargs):
+            calls["goto"] += 1
+
+    async def fake_wait(*_args, **_kwargs):
+        return False
+
+    async def fake_open(*_args, **_kwargs):
+        calls["open"] += 1
+        return False
+
+    async def fake_surface(_page):
+        return {
+            "input_visible": False,
+            "comment_input_visible": False,
+            "list_visible": False,
+            "comment_items_visible": 0,
+            "list_source": None,
+        }
+
+    monkeypatch.setattr(user_schema, "_wait_for_searchable_comment_surface", fake_wait)
+    monkeypatch.setattr(user_schema, "open_comment_section", fake_open)
+    monkeypatch.setattr(user_schema, "get_comment_surface_state", fake_surface)
+
+    ok = await user_schema._open_comment_list_with_safe_retry(
+        _Page(),
+        target_url,
+        target_url,
+        timeout_ms=30000,
+        correlation_id="task_1015_parallel_reply_v1_a1_acc1",
+        phase="reply_open_comments",
+        account_id=1,
+        variant_index=1,
+    )
+
+    assert ok is False
+    assert calls["open"] == 2
+    assert calls["goto"] == 0
+
+
+@pytest.mark.unit
+@pytest.mark.asyncio
+async def test_parallel_reply_open_comments_reloads_only_after_empty_surface(monkeypatch):
+    from executor import user_schema
+
+    calls = {"open_waits": [], "goto": 0, "sleep": []}
+    target_url = "https://www.tiktok.com/@u/video/1234567890123456789"
+
+    class _Page:
+        url = target_url
+
+        async def goto(self, *_args, **_kwargs):
+            calls["goto"] += 1
+
+    async def fake_wait(*_args, **_kwargs):
+        return False
+
+    async def fake_open(*_args, **kwargs):
+        calls["open_waits"].append(kwargs.get("max_wait"))
+        return len(calls["open_waits"]) == 3
+
+    async def fake_surface(_page):
+        return {
+            "input_visible": False,
+            "comment_input_visible": True,
+            "list_visible": True,
+            "comment_items_visible": 0,
+            "list_source": {"items": 0, "strong_items": 0},
+        }
+
+    async def fake_sleep(seconds):
+        calls["sleep"].append(seconds)
+
+    monkeypatch.setattr(user_schema, "_wait_for_searchable_comment_surface", fake_wait)
+    monkeypatch.setattr(user_schema, "open_comment_section", fake_open)
+    monkeypatch.setattr(user_schema, "get_comment_surface_state", fake_surface)
+    monkeypatch.setattr(user_schema.asyncio, "sleep", fake_sleep)
+
+    ok = await user_schema._open_comment_list_with_safe_retry(
+        _Page(),
+        target_url,
+        target_url,
+        timeout_ms=30000,
+        correlation_id="task_1015_parallel_reply_v1_a1_acc1",
+        phase="reply_open_comments",
+        account_id=1,
+        variant_index=1,
+    )
+
+    assert ok is True
+    assert calls["goto"] == 1
+    assert len(calls["open_waits"]) == 3
+    assert calls["open_waits"][0] <= 3.2
+    assert calls["open_waits"][1] <= 1.8
+    assert calls["open_waits"][2] <= 2.4
+    assert calls["sleep"] and max(calls["sleep"]) <= 0.6
+
+
+@pytest.mark.unit
+@pytest.mark.asyncio
+async def test_non_parallel_open_comments_keeps_legacy_retry_budget(monkeypatch):
+    from executor import user_schema
+
+    calls = {"open_waits": [], "goto": 0, "sleep": []}
+    target_url = "https://www.tiktok.com/@u/video/1234567890123456789"
+
+    class _Page:
+        url = target_url
+
+        async def goto(self, *_args, **_kwargs):
+            calls["goto"] += 1
+
+    async def fake_open(*_args, **kwargs):
+        calls["open_waits"].append(kwargs.get("max_wait"))
+        return len(calls["open_waits"]) == 2
+
+    async def fake_ensure(*_args, **_kwargs):
+        return True
+
+    async def fake_sleep(seconds):
+        calls["sleep"].append(seconds)
+
+    monkeypatch.setattr(user_schema, "open_comment_section", fake_open)
+    monkeypatch.setattr(user_schema, "_ensure_page_on_target_media", fake_ensure)
+    monkeypatch.setattr(user_schema.asyncio, "sleep", fake_sleep)
+
+    ok = await user_schema._open_comment_list_with_safe_retry(
+        _Page(),
+        target_url,
+        target_url,
+        timeout_ms=30000,
+        correlation_id="observer_task_1015_acc1",
+        phase="observer_open_comments",
+        account_id=1,
+    )
+
+    assert ok is True
+    assert calls["open_waits"] == [12.0, 12.0]
+    assert calls["goto"] == 1
+    assert calls["sleep"] == [1.8]
+
+
+@pytest.mark.unit
+def test_parallel_reply_fast_open_wraps_open_section_in_outer_timeout():
+    from executor import user_schema
+    import inspect
+
+    source = inspect.getsource(user_schema._open_comment_list_fast_for_parallel_reply)
+
+    assert "opened = await asyncio.wait_for(" in source
+    assert "timeout=max(0.5, min(_remaining(), budget + 0.4))" in source
 
 
 @pytest.mark.unit
@@ -4580,6 +4840,126 @@ async def test_reply_does_not_like_parent_before_failed_publish(monkeypatch):
 
 @pytest.mark.unit
 @pytest.mark.asyncio
+async def test_parallel_reply_defers_parent_likes_until_after_cached_parent_pass(monkeypatch):
+    from executor import user_schema
+    from executor.publish_action import PublishResult
+
+    class FakePage:
+        url = "https://www.tiktok.com/@demo/video/1234567890123456789"
+
+        def is_closed(self):
+            return False
+
+        async def close(self):
+            return None
+
+    class FakeContext:
+        async def close(self):
+            return None
+
+    mains = [
+        user_schema.PublishedMain(
+            text="main one",
+            comment_id="cid-1",
+            network_confirmed=True,
+            local_confirmed=True,
+            method="hybrid_dom",
+            account_id=10,
+            tiktok_username=None,
+        ),
+        user_schema.PublishedMain(
+            text="main two",
+            comment_id="cid-2",
+            network_confirmed=True,
+            local_confirmed=True,
+            method="hybrid_dom",
+            account_id=10,
+            tiktok_username=None,
+        ),
+    ]
+    sequence = []
+
+    async def fake_create_page_for_account(_account):
+        return FakeContext(), FakePage()
+
+    async def fake_login_ready(*_args, **_kwargs):
+        return True, None
+
+    async def fake_batch(_page, main_candidates, **_kwargs):
+        return [
+            user_schema.MainAnchor(
+                matched_text="main one",
+                parent_comment_id="cid-1",
+                open_text="main one visible",
+                found_by="text",
+                anchor_token="anchor-1",
+                source_main=main_candidates[0],
+            ),
+            user_schema.MainAnchor(
+                matched_text="main two",
+                parent_comment_id="cid-2",
+                open_text="main two visible",
+                found_by="text",
+                anchor_token="anchor-2",
+                source_main=main_candidates[1],
+            ),
+        ], {}
+
+    async def fake_publish_reply(*_args, **kwargs):
+        sequence.append(f"publish:{kwargs.get('parent_comment_text')}")
+        return PublishResult(
+            status="success",
+            comment_id=f"reply-{len(sequence)}",
+            network_captured=True,
+            network_request_attempted=True,
+            dom_strategy="reply-dom",
+            post_was_enabled_at_click=True,
+            composer_clean_after_submit=True,
+        )
+
+    async def fake_like(*_args, **kwargs):
+        sequence.append(f"like:{kwargs.get('parent_comment_text')}")
+        return SimpleNamespace(success=True, reason=None, strategy="test-like")
+
+    async def fake_sleep(_seconds):
+        return None
+
+    monkeypatch.setattr(user_schema, "create_page_for_account", fake_create_page_for_account)
+    monkeypatch.setattr(user_schema, "_ensure_account_login_ready", fake_login_ready)
+    monkeypatch.setattr(user_schema, "needs_enrichment", lambda _account: False)
+    monkeypatch.setattr(user_schema, "_ensure_page_on_target_media", AsyncMock(return_value=True))
+    monkeypatch.setattr(user_schema, "_open_comment_list_with_safe_retry", AsyncMock(return_value=True))
+    monkeypatch.setattr(user_schema, "_wait_for_searchable_comment_surface", AsyncMock(return_value=True))
+    monkeypatch.setattr(user_schema, "_find_main_anchors_batch", fake_batch)
+    monkeypatch.setattr(user_schema, "_find_main_anchor", AsyncMock(side_effect=AssertionError("single search should not run")))
+    monkeypatch.setattr(user_schema, "_restore_comment_list_position_for_anchor", AsyncMock(return_value=None))
+    monkeypatch.setattr(user_schema, "_should_like_parent_before_reply", lambda _anchor, **_kwargs: True)
+    monkeypatch.setattr(user_schema, "like_parent_comment_if_safe", fake_like)
+    monkeypatch.setattr(user_schema, "publish_reply_hybrid", fake_publish_reply)
+    monkeypatch.setattr(user_schema.asyncio, "sleep", fake_sleep)
+    monkeypatch.setattr(user_schema, "_register_runtime_success", lambda *_args, **_kwargs: None)
+
+    result = await user_schema._reply_with_variant_on_all_mains(
+        SimpleNamespace(),
+        SimpleNamespace(id=77, proxy=None),
+        "https://www.tiktok.com/@demo/video/1234567890123456789",
+        mains,
+        "reply text",
+        variant_index=1,
+        correlation_id="task_1_parallel_reply_v1_a1_acc77",
+    )
+
+    assert [out.parent_comment_id for out in result.replies] == ["cid-1", "cid-2"]
+    assert sequence == [
+        "publish:main one visible",
+        "publish:main two visible",
+        "like:main one visible",
+        "like:main two visible",
+    ]
+
+
+@pytest.mark.unit
+@pytest.mark.asyncio
 async def test_reply_publishes_cached_batch_anchors_after_search_deadline(monkeypatch):
     from executor import user_schema
     from executor.publish_action import PublishResult
@@ -6810,11 +7190,79 @@ def test_reply_visibility_empty_requires_real_comment_depth():
     ) is False
     assert user_schema._reply_result_is_confident_visibility_empty(
         user_schema._ParallelReplyVariantResult(
+            **base,
+            parent_search_unique_rows_seen=8,
+            parent_search_max_seen_rows=8,
+            parent_search_last_row_count=8,
+            parent_search_exhausted=True,
+            parent_search_scroll_container_scrollable=False,
+        )
+    ) is True
+    assert user_schema._reply_result_is_confident_visibility_empty(
+        user_schema._ParallelReplyVariantResult(
+            **base,
+            parent_search_unique_rows_seen=8,
+            parent_search_max_seen_rows=8,
+            parent_search_last_row_count=8,
+            parent_search_exhausted=False,
+            parent_search_scroll_container_scrollable=False,
+        )
+    ) is False
+    assert user_schema._reply_result_is_confident_visibility_empty(
+        user_schema._ParallelReplyVariantResult(
             **{**base, "found_any_main": True},
             parent_search_unique_rows_seen=20,
             parent_search_max_seen_rows=40,
         )
     ) is False
+
+
+@pytest.mark.unit
+def test_reply_visibility_quorum_is_proxy_scoped_and_handles_delayed_failure():
+    from executor import user_schema
+    import inspect
+
+    source = inspect.getsource(user_schema.execute_user_schema_parallel)
+
+    assert "reply_visibility_pre_accounts_by_proxy" in source
+    assert "reply_visibility_post_accounts_by_proxy" in source
+    assert "pre_rotation_by_proxy" in source
+    assert "post_rotation_by_proxy" in source
+    assert "proxy_key != rotated_proxy_key" in source
+    assert "ignoring post-rotation empty visibility result" in source
+    assert "return \"rotation_unavailable\"" in source
+    assert "elif visibility_action == \"rotation_unavailable\"" in source
+    assert "visibility_actions: List[Tuple[str, _ParallelReplyVariantResult]]" in source
+    assert "action_names = [action for action, _item in visibility_actions]" in source
+    assert "elif \"rotation_unavailable\" in action_names" in source
+    assert "(item for action, item in visibility_actions if action == \"rotate\")" in source
+
+
+@pytest.mark.unit
+def test_reply_local_verifier_excludes_open_reply_editor_artifacts():
+    from executor import user_schema
+    import inspect
+
+    source = inspect.getsource(user_schema._verify_reply_visible_near_parent)
+
+    assert "editorArtifactSelector" in source
+    assert "'[data-smart-reply-input=\"1\"]'" in source
+    assert "'[data-smart-reply-composer=\"1\"]'" in source
+    assert "'[contenteditable=\"true\"]'" in source
+    assert "if (isEditorArtifact(node)) return;" in source
+    assert "if (!row || isEditorArtifact(row)) return;" in source
+
+
+@pytest.mark.unit
+def test_dynamic_reply_surface_unavailable_breaker_not_blocked_by_historical_main_found():
+    from executor import user_schema
+    import inspect
+
+    source = inspect.getsource(user_schema.execute_user_schema_parallel)
+    marker = "consecutive_surface_unavailable_attempts >= max_surface_unavailable_attempts"
+    block = source.split(marker, 1)[1].split("if item.no_main_found:", 1)[0]
+
+    assert "not any_reply_account_found_main" not in block
 
 
 @pytest.mark.unit
@@ -9776,6 +10224,301 @@ def test_reply_outcome_inference_does_not_expand_duplicate_text_only():
         [outcome],
         [first, second],
     ) == set()
+
+
+@pytest.mark.unit
+def test_reply_parent_dedup_key_uses_observed_physical_parent_before_expected_account():
+    from executor import user_schema
+
+    first = user_schema.PublishedMain(
+        text="same text",
+        comment_id=None,
+        network_confirmed=False,
+        local_confirmed=True,
+        method="hybrid_dom",
+        account_id=101,
+        tiktok_username="expected_101",
+    )
+    second = user_schema.PublishedMain(
+        text="same text",
+        comment_id=None,
+        network_confirmed=False,
+        local_confirmed=True,
+        method="hybrid_dom",
+        account_id=102,
+        tiktok_username="expected_102",
+    )
+    physical_key = user_schema._physical_parent_key_from_observed(
+        text="same text",
+        author="visible_parent_author",
+    )
+
+    first_anchor = user_schema.MainAnchor(
+        matched_text=first.text,
+        parent_comment_id=None,
+        open_text="same text",
+        found_by="text",
+        source_main=first,
+        parent_key=user_schema._main_parent_key(first),
+        matched_author="visible_parent_author",
+        physical_parent_key=physical_key,
+    )
+    second_anchor = user_schema.MainAnchor(
+        matched_text=second.text,
+        parent_comment_id=None,
+        open_text="same text",
+        found_by="text",
+        source_main=second,
+        parent_key=user_schema._main_parent_key(second),
+        matched_author="visible_parent_author",
+        physical_parent_key=physical_key,
+    )
+
+    first_key = user_schema._reply_parent_dedup_key_for_anchor(first, first_anchor, anchor_text="same text")
+    second_key = user_schema._reply_parent_dedup_key_for_anchor(second, second_anchor, anchor_text="same text")
+
+    assert first_key == physical_key
+    assert second_key == physical_key
+    assert first_key != user_schema._main_parent_key(first)
+    assert second_key != user_schema._main_parent_key(second)
+    assert user_schema._reply_attempt_key(first_key, "reply text") == user_schema._reply_attempt_key(second_key, "reply text")
+
+
+@pytest.mark.unit
+def test_reply_parent_dedup_key_prefers_verified_id_over_physical_parent():
+    from executor import user_schema
+
+    main = user_schema.PublishedMain(
+        text="same text",
+        comment_id="cid-main",
+        network_confirmed=True,
+        local_confirmed=False,
+        method="hybrid_dom",
+        account_id=101,
+        tiktok_username="expected_101",
+    )
+    anchor = user_schema.MainAnchor(
+        matched_text=main.text,
+        parent_comment_id=None,
+        open_text="same text",
+        found_by="id",
+        source_main=main,
+        parent_key=user_schema._main_parent_key(main),
+        physical_parent_key=user_schema._physical_parent_key_from_observed(
+            text="same text",
+            author="visible_parent_author",
+        ),
+    )
+
+    assert user_schema._reply_parent_dedup_key_for_anchor(main, anchor, anchor_text="same text") == "cid-main"
+
+
+@pytest.mark.unit
+def test_reply_visibility_probe_helpers_keep_baseline_count():
+    from executor import user_schema
+
+    assert user_schema._reply_visibility_probe_found({"found": True, "count": 2})
+    assert user_schema._reply_visibility_probe_count({"found": False, "count": 2}) == 2
+    assert user_schema._reply_visibility_probe_count(True) == 1
+    assert user_schema._reply_visibility_probe_count(False) == 0
+
+
+@pytest.mark.unit
+def test_reply_attempt_key_for_outcome_never_stringifies_parent_key_set():
+    from executor import user_schema
+
+    outcome = user_schema.ReplyOutcome(
+        text="reply text",
+        variant_index=1,
+        matched_main_text="main text",
+        parent_comment_id="1234567890123",
+        success=True,
+        method="hybrid_dom",
+        error=None,
+        account_id=77,
+        attempted=True,
+    )
+
+    assert user_schema._reply_attempt_key_for_outcome(outcome) == (
+        "parent:1234567890123:reply:reply text"
+    )
+
+
+@pytest.mark.unit
+def test_submitted_reply_attempt_keys_use_parent_and_reply_text():
+    from executor import user_schema
+
+    physical_key = user_schema._physical_parent_key_from_observed(
+        text="main text",
+        author="visible_author",
+    )
+    main = user_schema.PublishedMain(
+        text="main text",
+        comment_id=None,
+        network_confirmed=False,
+        local_confirmed=True,
+        method="hybrid_dom",
+        account_id=101,
+        tiktok_username="visible_author",
+        physical_parent_key=physical_key,
+    )
+    outcome = user_schema.ReplyOutcome(
+        text="same reply",
+        variant_index=1,
+        matched_main_text="main text",
+        parent_comment_id=None,
+        success=True,
+        method="hybrid_dom",
+        error=None,
+        account_id=201,
+        attempted=True,
+        physical_parent_key=physical_key,
+    )
+
+    keys = user_schema._reply_outcomes_submitted_reply_keys_for_expected_mains(
+        [outcome],
+        [main],
+    )
+
+    assert user_schema._reply_attempt_key(physical_key, "same reply") in keys
+    assert all(key.endswith(":reply:same reply") for key in keys)
+
+
+@pytest.mark.unit
+def test_reply_local_confirmation_uses_fast_baseline_probe():
+    from executor import user_schema
+    import inspect
+
+    source = inspect.getsource(user_schema._reply_with_variant_on_all_mains)
+
+    assert "return_state=True" in source
+    assert "reply_baseline_count = _reply_visibility_probe_count(already_present_probe)" in source
+    assert "min_count_exclusive=reply_baseline_count" in source
+    assert "fast=_is_parallel_reply_correlation(sub_corr)" in source
+
+
+@pytest.mark.unit
+def test_reply_loop_has_short_fresh_search_after_action_and_effective_status_trace():
+    from executor import user_schema
+    import inspect
+
+    source = inspect.getsource(user_schema._reply_with_variant_on_all_mains)
+
+    assert "short_fresh_search_after_action_used = False" in source
+    assert "reply_parent_short_fresh_search_after_action" in source
+    assert "transport_status=publish_result.status" in source
+    assert "effective_status=effective_status" in source
+
+
+@pytest.mark.unit
+def test_parallel_reply_uses_task_global_attempt_locks_for_same_reply_text():
+    from executor import user_schema
+    import inspect
+
+    parallel_source = inspect.getsource(user_schema.execute_user_schema_parallel)
+    module_source = inspect.getsource(user_schema)
+
+    assert "reply_task_attempt_locks: set[str] = set()" in parallel_source
+    assert "reply_task_inflight_locks: set[str] = set()" in parallel_source
+    assert "soft_submitted_reply_keys=reply_task_attempt_locks" in parallel_source
+    assert "inflight_reply_keys=reply_task_inflight_locks" in parallel_source
+    assert "_reply_outcomes_submitted_reply_keys_for_expected_mains" in parallel_source
+    assert "full_reply_task_attempt_locks: set[str] = set()" in module_source
+    assert "soft_submitted_reply_keys=full_reply_task_attempt_locks" in module_source
+    assert "inflight_reply_keys=full_reply_task_inflight_locks" in module_source
+
+
+@pytest.mark.unit
+def test_publish_reply_retry_rebinds_target_and_caps_send_recovery():
+    from executor import publish_action
+    import inspect
+
+    source = inspect.getsource(publish_action._publish_via_current_input)
+    reply_source = inspect.getsource(publish_action.publish_reply_hybrid)
+
+    assert "typing_retry_reply_target_rebound" in source
+    assert "find_reply_composer_for_parent(" in source
+    assert "reply_send_deadline = time.monotonic() + (3.5 if fast_publish else 4.5)" in source
+    assert "min(_PARALLEL_POST_RESPONSE_WAIT_SECONDS, 1.4)" in source
+    assert "1000 if reply_scoped and fast_publish else 3000" in source
+    assert "1000 if reply_scoped and fast_publish else 5000" in source
+    assert "3.5 if fast_publish else 4.5" in reply_source
+    assert "reply_send_recover_retry" in reply_source
+
+
+@pytest.mark.unit
+def test_reply_outcome_physical_parent_key_carries_submitted_state():
+    from executor import user_schema
+
+    physical_key = user_schema._physical_parent_key_from_observed(
+        text="same text",
+        author="visible_parent_author",
+    )
+    found_main = user_schema.PublishedMain(
+        text="same text",
+        comment_id=None,
+        network_confirmed=False,
+        local_confirmed=True,
+        method="hybrid_dom",
+        account_id=101,
+        tiktok_username="expected_101",
+        physical_parent_key=physical_key,
+    )
+    outcome = user_schema.ReplyOutcome(
+        text="reply",
+        variant_index=1,
+        matched_main_text="same text",
+        parent_comment_id=None,
+        success=True,
+        method="hybrid_dom",
+        error=None,
+        account_id=201,
+        attempted=True,
+        parent_key=physical_key,
+        physical_parent_key=physical_key,
+    )
+
+    submitted = user_schema._reply_outcomes_submitted_parent_keys_for_expected_mains(
+        [outcome],
+        [found_main],
+    )
+
+    assert submitted == {physical_key}
+    assert user_schema._pending_expected_mains_for_reply_variant([found_main], submitted) == []
+
+
+@pytest.mark.unit
+def test_merge_distinct_main_candidates_preserves_new_physical_parent_key():
+    from executor import user_schema
+
+    physical_key = user_schema._physical_parent_key_from_observed(
+        text="same text",
+        author="visible_parent_author",
+    )
+    original = user_schema.PublishedMain(
+        text="same text",
+        comment_id=None,
+        network_confirmed=False,
+        local_confirmed=True,
+        method="hybrid_dom",
+        account_id=101,
+        tiktok_username="expected_101",
+    )
+    found = user_schema.PublishedMain(
+        text="same text",
+        comment_id=None,
+        network_confirmed=False,
+        local_confirmed=True,
+        method="hybrid_dom",
+        account_id=101,
+        tiktok_username="visible_parent_author",
+        physical_parent_key=physical_key,
+    )
+
+    merged = user_schema._merge_distinct_main_candidates([original, found])
+
+    assert len(merged) == 1
+    assert merged[0].physical_parent_key == physical_key
 
 
 @pytest.mark.unit
