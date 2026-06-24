@@ -125,6 +125,14 @@ def _reply_post_gate_reason_allows_scoped_recovery(reason: Optional[str]) -> boo
     ))
 
 
+def _reply_send_recovery_reason_needs_nudge_first(reason: Optional[str]) -> bool:
+    safe = str(reason or "")
+    return (
+        safe.startswith("no_network_request_after_optimistic_reply_send")
+        or _reply_post_gate_reason_allows_scoped_recovery(safe)
+    )
+
+
 def _post_click_fallback_selector(*, reply_scoped: bool) -> str:
     if reply_scoped:
         return '[data-smart-reply-post="1"]'
@@ -4654,9 +4662,27 @@ async def _recover_reply_send_only(
         )
         return button, info
 
-    force_nudge_first = str(recovery_reason or "").startswith(
-        "no_network_request_after_optimistic_reply_send"
-    )
+    async def _wait_enabled_candidate(stage: str) -> tuple[Optional[Any], DomActionResult]:
+        button, info = await wait_for_post_button_enabled(
+            page,
+            max_wait_seconds=min(0.55 if fast_publish else 0.85, max(_remaining(), 0.2)),
+            reply_scoped=True,
+            expected_text=text,
+        )
+        _log_publish_trace(
+            "reply_send_rebind_result",
+            page=page,
+            expected_video_url=expected_video_url,
+            correlation_id=correlation_id,
+            rebind_stage=stage,
+            found=bool(button),
+            reason=getattr(info, "reason", None),
+            strategy=getattr(info, "strategy", None),
+            level=logging.INFO if button else logging.WARNING,
+        )
+        return button, info
+
+    force_nudge_first = _reply_send_recovery_reason_needs_nudge_first(recovery_reason)
 
     post_button = None
     post_info = DomActionResult(False, reason="not_started")
@@ -4671,25 +4697,35 @@ async def _recover_reply_send_only(
             correlation_id=correlation_id,
         )
         if not nudged:
+            nudge_reason = (
+                "reply_send_recovery_nudge_failed_after_optimistic_no_request"
+                if str(recovery_reason or "").startswith("no_network_request_after_optimistic_reply_send")
+                else "reply_send_recovery_nudge_failed_after_disabled_gate"
+            )
             return PublishResult(
                 status="dom_error",
-                error_reason="reply_send_recovery_nudge_failed_after_optimistic_no_request",
+                error_reason=nudge_reason,
                 elapsed_seconds=time.monotonic() - started,
                 network_request_attempted=False,
                 post_was_enabled_at_click=False,
             )
-        post_button, post_info = await _find_candidate("after_forced_nudge")
+        post_button, post_info = await _wait_enabled_candidate("after_forced_nudge_enabled")
+        if not post_button:
+            post_button, post_info = await _find_candidate("after_forced_nudge")
     else:
         post_button, post_info = await _find_candidate("before_nudge")
     if not post_button and _remaining() > 0.45:
-        await _nudge_reply_comment_post_state(
+        nudged = await _nudge_reply_comment_post_state(
             page,
             text,
             reply_target=reply_target,
             expected_video_url=expected_video_url,
             correlation_id=correlation_id,
         )
-        post_button, post_info = await _find_candidate("after_nudge")
+        if nudged:
+            post_button, post_info = await _wait_enabled_candidate("after_nudge_enabled")
+        if not post_button:
+            post_button, post_info = await _find_candidate("after_nudge")
     if not post_button:
         return PublishResult(
             status="dom_error",
@@ -4698,6 +4734,7 @@ async def _recover_reply_send_only(
             network_request_attempted=False,
             post_was_enabled_at_click=False,
         )
+    post_was_enabled = getattr(post_info, "strategy", None) == "enabled-check"
 
     captured: Dict[str, Any] = {}
     event = asyncio.Event()
@@ -4790,6 +4827,7 @@ async def _recover_reply_send_only(
         box = await post_button.bounding_box()
         if not box:
             post_button, post_info = await _find_candidate("after_missing_box")
+            post_was_enabled = getattr(post_info, "strategy", None) == "enabled-check"
             box = await post_button.bounding_box() if post_button else None
         if not box:
             return PublishResult(
@@ -4859,7 +4897,7 @@ async def _recover_reply_send_only(
             network_response_json=response_json,
             elapsed_seconds=elapsed,
             dom_strategy=getattr(post_info, "strategy", None) or "reply-send-only-recovery",
-            post_was_enabled_at_click=True,
+            post_was_enabled_at_click=post_was_enabled,
             composer_clean_after_submit=composer_clean_after_submit,
         )
 
@@ -4882,7 +4920,7 @@ async def _recover_reply_send_only(
             network_response_json=response_json,
             elapsed_seconds=elapsed,
             dom_strategy=getattr(post_info, "strategy", None) or "reply-send-only-recovery",
-            post_was_enabled_at_click=True,
+            post_was_enabled_at_click=post_was_enabled,
             composer_clean_after_submit=True,
         )
     return PublishResult(
@@ -4899,7 +4937,7 @@ async def _recover_reply_send_only(
         network_response_json=response_json,
         elapsed_seconds=elapsed,
         dom_strategy=getattr(post_info, "strategy", None) or "reply-send-only-recovery",
-        post_was_enabled_at_click=True,
+        post_was_enabled_at_click=post_was_enabled,
         composer_clean_after_submit=None,
     )
 
@@ -6074,27 +6112,7 @@ async def _publish_via_current_input(
                     remaining=round(_send_remaining(), 2),
                     level=logging.INFO,
                 )
-                if _send_remaining() > 0.2:
-                    optimistic_button, optimistic_info = await find_reply_send_candidate_for_optimistic_click(
-                        page,
-                        expected_text=text,
-                        max_total_seconds=min(0.55 if fast_publish else 0.8, max(_send_remaining(), 0.2)),
-                    )
-                    if optimistic_button:
-                        post_button = optimistic_button
-                        enabled_info = optimistic_info
-                        post_was_enabled = True
-                        reply_optimistic_send_click = True
-                        _log_publish_trace(
-                            "reply_optimistic_send_selected",
-                            page=page,
-                            expected_video_url=expected_video_url,
-                            correlation_id=correlation_id,
-                            previous_reason=disabled_reason,
-                            strategy=getattr(optimistic_info, "strategy", None),
-                            level=logging.INFO,
-                        )
-                if not post_was_enabled and _send_remaining() > 0.25:
+                if _send_remaining() > 0.25:
                     nudged = await _nudge_reply_comment_post_state(
                         page,
                         text,
@@ -6108,7 +6126,7 @@ async def _publish_via_current_input(
                     try:
                         retry_enabled_button, retry_enabled_info = await wait_for_post_button_enabled(
                             page,
-                            max_wait_seconds=min(0.45 if fast_publish else 0.7, max(_send_remaining(), 0.2)),
+                            max_wait_seconds=min(0.9 if fast_publish else 1.2, max(_send_remaining(), 0.2)),
                             reply_scoped=True,
                             expected_text=text,
                         )
@@ -6135,7 +6153,6 @@ async def _publish_via_current_input(
                     if optimistic_button:
                         post_button = optimistic_button
                         enabled_info = optimistic_info
-                        post_was_enabled = True
                         reply_optimistic_send_click = True
                         _log_publish_trace(
                             "reply_optimistic_send_selected",
@@ -6167,7 +6184,7 @@ async def _publish_via_current_input(
                     level=logging.INFO,
                 )
 
-        if not post_was_enabled and reply_scoped:
+        if not post_was_enabled and reply_scoped and not reply_optimistic_send_click:
             safe_reason = disabled_reason or "reply_post_not_enabled"
             _log_publish_trace(
                 "publish_result",
@@ -7083,14 +7100,16 @@ async def _publish_via_current_input(
     except Exception as diag_err:
         logger.warning("[PUBLISH_DIAG] failed: %s", diag_err)
 
-    # No network response after click. Two distinct cases:
+    # No network response after click. Distinct cases:
     #   A) Post button was enabled — real timeout. Caller can attempt local DOM check.
     #   B) Post button was disabled and we went through synthetic dispatch — the
     #      click may or may not have triggered React's handler. We classify this
     #      as `submitted_unverified_disabled_post` (treated as ambiguous in
     #      AMBIGUOUS_POST_SUBMIT_ERRORS) so downstream logic does NOT consider
     #      a local DOM match alone as proof of publication.
-    if not post_was_enabled and not request_attempted:
+    #   C) Reply optimistic send clicked a strict candidate but no request fired -
+    #      keep the reply-specific no-request reason so send-only recovery can nudge.
+    if not post_was_enabled and not request_attempted and not (reply_scoped and reply_optimistic_send_click):
         composer_clean_after_submit: Optional[bool] = None
         if not reply_scoped:
             composer_clean_after_submit = await _clear_main_comment_composer_best_effort(

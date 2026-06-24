@@ -91,12 +91,16 @@ async def _fake_find_reply_composer_for_parent(*args, **kwargs):
 def test_reply_publish_tries_scoped_recovery_before_disabled_gate_failure():
     source = inspect.getsource(publish_action._publish_via_current_input)
 
-    reply_guard = "if not post_was_enabled and reply_scoped:"
+    reply_guard = "if not post_was_enabled and reply_scoped and not reply_optimistic_send_click:"
     scoped_recovery = "reply_optimistic_send_selected"
+    nudge_recovery = "_nudge_reply_comment_post_state"
     legacy_force_click = "Trying legacy force-click anyway"
     assert reply_guard in source
     assert scoped_recovery in source
+    assert nudge_recovery in source
     assert legacy_force_click in source
+    gate_block = source[source.index("reply_send_gate_diag"):]
+    assert gate_block.index(nudge_recovery) < gate_block.index(scoped_recovery)
     assert source.index(scoped_recovery) < source.index(reply_guard) < source.index(legacy_force_click)
     guarded_block = source.split(reply_guard, 1)[1].split(legacy_force_click, 1)[0]
     assert 'status="dom_error"' in guarded_block
@@ -2808,7 +2812,6 @@ async def test_publish_tries_legacy_click_when_post_button_stays_disabled(monkey
 )
 async def test_reply_publish_uses_nudge_and_optimistic_send_for_recoverable_gate_reason(monkeypatch, gate_reason):
     page = _FakePage()
-    page.mouse = _RequestOnlyMouse(page)
     button = _FakeButton()
     calls = {"nudge": 0, "optimistic": 0}
 
@@ -2863,20 +2866,17 @@ async def test_reply_publish_uses_nudge_and_optimistic_send_for_recoverable_gate
         reply_target=_fake_reply_target("anchor-1"),
     )
 
-    assert calls == {"nudge": 0, "optimistic": 1}
+    assert calls == {"nudge": 1, "optimistic": 1}
     assert page.click_count == 1
-    assert result.status == "failed"
-    assert result.error_reason == "composer_cleared_after_submit"
-    assert result.post_was_enabled_at_click is True
-    assert result.composer_clean_after_submit is True
+    assert result.status == "timeout"
+    assert result.error_reason == "no_network_request_after_optimistic_reply_send"
+    assert result.post_was_enabled_at_click is False
 
 
 @pytest.mark.unit
 @pytest.mark.asyncio
-async def test_reply_publish_uses_nudge_when_initial_optimistic_send_missing(monkeypatch):
+async def test_reply_publish_stops_when_nudge_and_optimistic_send_missing(monkeypatch):
     page = _FakePage()
-    page.mouse = _RequestOnlyMouse(page)
-    button = _FakeButton()
     calls = {"nudge": 0, "optimistic": 0}
 
     async def _fake_sleep(_seconds):
@@ -2897,9 +2897,7 @@ async def test_reply_publish_uses_nudge_when_initial_optimistic_send_missing(mon
 
     async def _fake_optimistic(*args, **kwargs):
         calls["optimistic"] += 1
-        if calls["optimistic"] == 1:
-            return None, SimpleNamespace(strategy=None, reason="reply_send_candidate_not_found")
-        return button, SimpleNamespace(strategy="reply-optimistic-send", reason="reply_optimistic_send_candidate")
+        return None, SimpleNamespace(strategy=None, reason="reply_send_candidate_not_found")
 
     async def _fake_ensure_click_target_clear(*args, **kwargs):
         return None
@@ -2932,16 +2930,23 @@ async def test_reply_publish_uses_nudge_when_initial_optimistic_send_missing(mon
         reply_target=_fake_reply_target("anchor-1"),
     )
 
-    assert calls == {"nudge": 1, "optimistic": 2}
-    assert page.click_count == 1
-    assert result.status == "failed"
-    assert result.error_reason == "composer_cleared_after_submit"
-    assert result.post_was_enabled_at_click is True
+    assert calls == {"nudge": 1, "optimistic": 1}
+    assert page.click_count == 0
+    assert result.status == "dom_error"
+    assert result.error_reason == "post_button_stayed_disabled"
+    assert result.post_was_enabled_at_click is False
 
 
 @pytest.mark.unit
 @pytest.mark.asyncio
-async def test_reply_send_recovery_for_optimistic_no_request_nudges_before_candidate(monkeypatch):
+@pytest.mark.parametrize(
+    "recovery_reason",
+    [
+        "no_network_request_after_optimistic_reply_send",
+        "post_button_stayed_disabled",
+    ],
+)
+async def test_reply_send_recovery_nudges_before_candidate_for_disabled_send_reasons(monkeypatch, recovery_reason):
     page = _FakePage()
     page.mouse = _RequestOnlyMouse(page)
     button = _FakeButton()
@@ -2957,6 +2962,10 @@ async def test_reply_send_recovery_for_optimistic_no_request_nudges_before_candi
         calls.append("nudge")
         return True
 
+    async def _fake_wait_enabled(*args, **kwargs):
+        calls.append("wait_enabled")
+        return None, publish_action.DomActionResult(False, reason="post_button_stayed_disabled")
+
     async def _fake_optimistic(*args, **kwargs):
         calls.append("find")
         return button, publish_action.DomActionResult(
@@ -2971,6 +2980,7 @@ async def test_reply_send_recovery_for_optimistic_no_request_nudges_before_candi
     monkeypatch.setattr(publish_action.asyncio, "sleep", _fake_sleep)
     monkeypatch.setattr(publish_action, "_reply_target_input_exact_text_state", _fake_reply_exact)
     monkeypatch.setattr(publish_action, "_nudge_reply_comment_post_state", _fake_nudge)
+    monkeypatch.setattr(publish_action, "wait_for_post_button_enabled", _fake_wait_enabled)
     monkeypatch.setattr(publish_action, "find_reply_send_candidate_for_optimistic_click", _fake_optimistic)
     monkeypatch.setattr(publish_action, "ensure_click_target_clear", _fake_ensure_click_target_clear)
 
@@ -2983,12 +2993,13 @@ async def test_reply_send_recovery_for_optimistic_no_request_nudges_before_candi
         correlation_id="task_1_parallel_reply_v1_a1_acc10_to_text",
         reply_target=_fake_reply_target("anchor-1"),
         fast_publish=True,
-        recovery_reason="no_network_request_after_optimistic_reply_send",
+        recovery_reason=recovery_reason,
     )
 
-    assert calls[:2] == ["nudge", "find"]
+    assert calls[:3] == ["nudge", "wait_enabled", "find"]
     assert result is not None
     assert result.network_request_attempted is True
+    assert result.post_was_enabled_at_click is False
     assert page.click_count == 1
 
 

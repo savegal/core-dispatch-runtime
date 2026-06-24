@@ -6563,19 +6563,13 @@ async def find_reply_send_candidate_for_optimistic_click(
                     const looksSend = (raw) => {
                         if (!raw || isAccessory(raw)) return false;
                         if (raw.getAttribute && raw.getAttribute('data-smart-reply-post') === '1') return true;
-                        const r = raw.getBoundingClientRect ? raw.getBoundingClientRect() : null;
                         const label = buttonLabel(raw);
-                        const iconNearInput = r &&
-                            r.bottom >= inputRect.top - 24 &&
-                            r.top <= inputRect.bottom + 24 &&
-                            r.left >= inputRect.left + Math.max(45, inputRect.width * 0.45);
                         return label.includes('comment-post') ||
                             label.includes('post') ||
                             label.includes('send') ||
                             label.includes('submit') ||
                             label.includes('\u043e\u043f\u0443\u0431\u043b') ||
-                            label.includes('\u043e\u0442\u043f\u0440\u0430\u0432') ||
-                            Boolean(iconNearInput);
+                            label.includes('\u043e\u0442\u043f\u0440\u0430\u0432');
                     };
                     const targetFor = (raw, scope) => {
                         if (!raw) return null;
@@ -6588,12 +6582,21 @@ async def find_reply_send_candidate_for_optimistic_click(
                             if (el.hasAttribute('disabled') || el.getAttribute('aria-disabled') === 'true') return false;
                             return true;
                         };
-                        const interactive = raw.closest && raw.closest('button, [role="button"], div[tabindex="0"]');
+                        const strictSendMarker = (el) => {
+                            if (!el || !el.getAttribute) return false;
+                            const e2e = String(el.getAttribute('data-e2e') || '').toLowerCase();
+                            return el.getAttribute('data-smart-reply-post') === '1' ||
+                                e2e.includes('comment-post') ||
+                                e2e.includes('send');
+                        };
+                        const interactive = raw.closest && raw.closest(
+                            'button, [role="button"], [data-e2e*="comment-post"], [data-e2e*="send"], [data-smart-reply-post="1"], div[tabindex="0"]'
+                        );
                         if (interactive) return usable(interactive) ? interactive : null;
-                        if (usable(raw)) return raw;
-                        if (usable(raw.parentElement)) return raw.parentElement;
+                        if (strictSendMarker(raw) && usable(raw)) return raw;
+                        if (strictSendMarker(raw.parentElement) && usable(raw.parentElement)) return raw.parentElement;
                         const grandparent = raw.parentElement && raw.parentElement.parentElement;
-                        if (usable(grandparent)) return grandparent;
+                        if (strictSendMarker(grandparent) && usable(grandparent)) return grandparent;
                         return null;
                     };
 
@@ -6616,7 +6619,6 @@ async def find_reply_send_candidate_for_optimistic_click(
                         '[role="button"]',
                         'div[tabindex="0"]',
                         'svg',
-                        'path',
                     ];
                     for (const scope of scopeCandidates) {
                         const marked = document.querySelector('[data-smart-reply-post="1"]');
@@ -6660,6 +6662,12 @@ async def find_reply_send_candidate_for_optimistic_click(
                         strategy: 'reply-optimistic-send-expanded-scope',
                         inputText: inputText.slice(0, 100),
                         tag: el.tagName,
+                        role: el.getAttribute && el.getAttribute('role'),
+                        ariaLabel: el.getAttribute && el.getAttribute('aria-label'),
+                        dataE2e: el.getAttribute && el.getAttribute('data-e2e'),
+                        className: el.getAttribute && el.getAttribute('class'),
+                        disabled: el.hasAttribute && el.hasAttribute('disabled'),
+                        ariaDisabled: el.getAttribute && el.getAttribute('aria-disabled'),
                         opacity: st.opacity,
                         pointerEvents: st.pointerEvents,
                         x: Math.round(r.x),
@@ -6679,6 +6687,22 @@ async def find_reply_send_candidate_for_optimistic_click(
             continue
 
         if isinstance(result, dict) and result.get("found"):
+            logger.info(
+                "[DOM] Reply optimistic send candidate: tag=%s role=%s ariaLabel=%s dataE2e=%s class=%s pointerEvents=%s opacity=%s rect=%s,%s %sx%s disabled=%s ariaDisabled=%s",
+                result.get("tag"),
+                result.get("role"),
+                result.get("ariaLabel"),
+                result.get("dataE2e"),
+                result.get("className"),
+                result.get("pointerEvents"),
+                result.get("opacity"),
+                result.get("x"),
+                result.get("y"),
+                result.get("w"),
+                result.get("h"),
+                result.get("disabled"),
+                result.get("ariaDisabled"),
+            )
             element = await page.query_selector('[data-smart-id="comment-post-ready"]')
             if element:
                 return element, DomActionResult(

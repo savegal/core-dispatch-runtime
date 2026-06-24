@@ -1332,8 +1332,16 @@ def test_reply_post_finder_does_not_fallback_to_global_comment_markers():
     assert "label.includes('gif')" in optimistic_source
     assert "label.includes('photo')" in optimistic_source
     assert "st.pointerEvents === 'none'" in optimistic_source
-    assert "const interactive = raw.closest && raw.closest('button, [role=\"button\"], div[tabindex=\"0\"]')" in optimistic_source
+    assert "Boolean(iconNearInput)" not in optimistic_source
+    assert "'path'," not in optimistic_source
+    assert "const strictSendMarker = (el) =>" in optimistic_source
+    assert "'button, [role=\"button\"], [data-e2e*=\"comment-post\"], [data-e2e*=\"send\"], [data-smart-reply-post=\"1\"], div[tabindex=\"0\"]'" in optimistic_source
     assert "if (interactive) return usable(interactive) ? interactive : null" in optimistic_source
+    assert "if (strictSendMarker(raw) && usable(raw)) return raw" in optimistic_source
+    assert "role: el.getAttribute && el.getAttribute('role')" in optimistic_source
+    assert "ariaLabel: el.getAttribute && el.getAttribute('aria-label')" in optimistic_source
+    assert "dataE2e: el.getAttribute && el.getAttribute('data-e2e')" in optimistic_source
+    assert "disabled: el.hasAttribute && el.hasAttribute('disabled')" in optimistic_source
 
 
 # ---------------------------------------------------------------------------
