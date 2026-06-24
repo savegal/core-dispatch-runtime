@@ -632,6 +632,7 @@ async def find_comment_in_list(
     min_match_ratio: float = 0.7,
     top_level_only: bool = False,
     expected_author: Optional[str] = None,
+    require_author_match: bool = False,
 ) -> Tuple[bool, Dict[str, Any]]:
     """
     Find a comment by text inside the TikTok comment list.
@@ -652,6 +653,9 @@ async def find_comment_in_list(
             Default False preserves legacy publish-flow behaviour.
         top_level_only: When True, reject nested reply rows while searching
             for a parent/main comment. Keep False for reply visibility checks.
+        require_author_match: When True and expected_author is known, rows
+            without a readable matching author are rejected instead of falling
+            back to text-only confirmation.
 
     Returns:
         (found, info_dict). When strict_scope=True and the container is not
@@ -674,6 +678,7 @@ async def find_comment_in_list(
             "ensure_open": ensure_open,
             "max_scrolls": max_scrolls,
             "min_match_ratio": min_match_ratio,
+            "require_author_match": require_author_match,
             "url": getattr(page, "url", None),
         }
         payload.update({k: v for k, v in fields.items() if v is not None})
@@ -1200,14 +1205,22 @@ async def find_comment_in_list(
                             author = None
                         # Author-scoped match (parallel safety): when an
                         # expected_author is supplied, identical comment text
-                        # posted by a DIFFERENT account must not count. We only
-                        # reject when the row exposes a non-empty author that
-                        # clearly differs; if the row author cannot be read we
-                        # fall back to the legacy text-only match so replies can
-                        # still recover a comment_id.
+                        # posted by a DIFFERENT account must not count. Legacy
+                        # callers may still allow text-only fallback when the
+                        # row author is unreadable; main local confirmation
+                        # sets require_author_match=True and rejects unknown
+                        # authors instead of confirming a possibly foreign row.
                         if expected_author:
                             exp_author_norm = normalize_author(expected_author)
                             row_author_norm = normalize_author(author) if author else ""
+                            if exp_author_norm and require_author_match and not row_author_norm:
+                                _log_parent_search_trace(
+                                    "author_missing_skip",
+                                    scroll=scroll_i,
+                                    position=idx,
+                                    requested_author=exp_author_norm,
+                                )
+                                continue
                             if exp_author_norm and row_author_norm and row_author_norm != exp_author_norm:
                                 _log_parent_search_trace(
                                     "author_mismatch_skip",

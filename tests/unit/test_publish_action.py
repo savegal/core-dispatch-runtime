@@ -26,8 +26,30 @@ class _FakePublishResponseForRequest:
 
 
 class _FakeInput:
+    def __init__(self, text="hello"):
+        self.text = text
+        self._clear_reads_remaining = 0
+
     async def evaluate(self, _script):
+        script = str(_script)
+        if "editor.focus" in script or "setAttribute('data-smart-main-input'" in script:
+            self._clear_reads_remaining = 2
+            return {"ok": True, "reason": "focused", "activeTag": "DIV"}
+        if "placeholderMarkers" in script or "postDisabled" in script:
+            text = "" if self._clear_reads_remaining > 0 else self.text
+            if self._clear_reads_remaining > 0:
+                self._clear_reads_remaining -= 1
+            return {
+                "exists": True,
+                "empty": not bool(text),
+                "text": text,
+                "focusOk": True,
+                "postDisabled": False,
+            }
         return "hello"
+
+    async def bounding_box(self):
+        return {"x": 80, "y": 184, "width": 160, "height": 32}
 
 
 class _FakeButton:
@@ -177,10 +199,18 @@ class _RequestOnlyMouse:
 
 
 class _FakeKeyboard:
+    def __init__(self):
+        self.presses = []
+        self.inserted = []
+
     async def press(self, *_args, **_kwargs):
+        if _args:
+            self.presses.append(_args[0])
         return None
 
     async def insert_text(self, *_args, **_kwargs):
+        if _args:
+            self.inserted.append(_args[0])
         return None
 
     async def type(self, *_args, **_kwargs):
@@ -234,6 +264,280 @@ class _FakePage:
                 "postDisabled": False,
             }
         return {}
+
+
+class _NoGlobalEvaluatePage:
+    def __init__(self):
+        self.keyboard = _FakeKeyboard()
+        self.mouse = SimpleNamespace(click=AsyncMock())
+        self.url = "https://www.tiktok.com/@demo/video/7635267329407913230"
+
+    async def evaluate(self, *_args, **_kwargs):
+        raise AssertionError("scoped main clear must not use global page.evaluate")
+
+
+class _MainHandleFocusMissing:
+    async def evaluate(self, *_args, **_kwargs):
+        return {"ok": False, "reason": "focus_not_verified", "activeTag": "BODY"}
+
+    async def bounding_box(self):
+        return None
+
+
+class _MainHandleFocusOk:
+    def __init__(self):
+        self.calls = 0
+
+    async def evaluate(self, *_args, **_kwargs):
+        self.calls += 1
+        if self.calls == 1:
+            return {"ok": True, "reason": "focused", "activeTag": "DIV"}
+        return {
+            "exists": True,
+            "empty": True,
+            "text": "",
+            "focusOk": True,
+            "postDisabled": True,
+        }
+
+    async def bounding_box(self):
+        return {"x": 20, "y": 30, "width": 200, "height": 40}
+
+
+class _MainHandleSelectionOnlyAfterClick:
+    def __init__(self):
+        self.calls = 0
+
+    async def evaluate(self, *_args, **_kwargs):
+        self.calls += 1
+        if self.calls == 1:
+            return {
+                "ok": False,
+                "reason": "active_element_not_editor",
+                "activeInside": False,
+                "selectionInside": True,
+                "activeTag": "BODY",
+            }
+        return {
+            "exists": True,
+            "empty": False,
+            "text": "old text",
+            "focusOk": True,
+            "activeInside": False,
+            "selectionInside": True,
+            "activeTag": "BODY",
+            "postDisabled": False,
+        }
+
+    async def bounding_box(self):
+        return {"x": 20, "y": 30, "width": 200, "height": 40}
+
+
+class _MainHandleNudgeOk:
+    async def evaluate(self, _script):
+        script = str(_script)
+        if "editor.focus" in script:
+            return {
+                "ok": True,
+                "reason": "focused",
+                "activeInside": True,
+                "selectionInside": True,
+                "activeTag": "DIV",
+            }
+        return {
+            "exists": True,
+            "empty": False,
+            "text": "hello",
+            "focusOk": True,
+            "activeInside": True,
+            "selectionInside": True,
+            "visible": True,
+            "postDisabled": True,
+        }
+
+    async def bounding_box(self):
+        return {"x": 20, "y": 30, "width": 200, "height": 40}
+
+
+class _ReplyNudgeInputOk:
+    async def scroll_into_view_if_needed(self, timeout=1000):
+        return None
+
+    async def evaluate(self, _script):
+        return {
+            "ok": True,
+            "reason": "focused",
+            "activeTag": "DIV",
+            "editorTag": "DIV",
+        }
+
+
+class _ReplyNudgeInputFocusMissing:
+    async def scroll_into_view_if_needed(self, timeout=1000):
+        return None
+
+    async def evaluate(self, _script):
+        return {
+            "ok": False,
+            "reason": "active_element_not_editor",
+            "activeTag": "BODY",
+            "editorTag": "DIV",
+        }
+
+
+@pytest.mark.unit
+def test_main_scoped_focus_scripts_do_not_treat_body_as_focused():
+    source = inspect.getsource(publish_action._main_comment_handle_state)
+    source += inspect.getsource(publish_action._focus_main_comment_handle_for_keyboard)
+
+    assert "active.contains(editor)" not in source
+    assert "el.contains(root)" not in source
+
+
+@pytest.mark.unit
+@pytest.mark.asyncio
+async def test_main_scoped_clear_does_not_press_ctrl_a_when_focus_not_verified():
+    page = _NoGlobalEvaluatePage()
+    ok = await publish_action._clear_main_comment_composer_best_effort(
+        page,
+        reason="unit_focus_missing",
+        expected_video_url=page.url,
+        correlation_id="task_1_parallel_main_v1_a1_acc44_v1",
+        input_handle=_MainHandleFocusMissing(),
+    )
+
+    assert ok is False
+    assert page.keyboard.presses == []
+
+
+@pytest.mark.unit
+@pytest.mark.asyncio
+async def test_main_scoped_clear_does_not_press_ctrl_a_when_only_selection_inside():
+    page = _NoGlobalEvaluatePage()
+    ok = await publish_action._clear_main_comment_composer_best_effort(
+        page,
+        reason="unit_selection_only",
+        expected_video_url=page.url,
+        correlation_id="task_1_parallel_main_v1_a1_acc44_v1",
+        input_handle=_MainHandleSelectionOnlyAfterClick(),
+    )
+
+    assert ok is False
+    assert page.keyboard.presses == []
+
+
+@pytest.mark.unit
+@pytest.mark.asyncio
+async def test_main_scoped_clear_uses_exact_handle_without_global_probe():
+    page = _NoGlobalEvaluatePage()
+    handle = _MainHandleFocusOk()
+
+    ok = await publish_action._clear_main_comment_composer_best_effort(
+        page,
+        reason="unit_focus_ok",
+        expected_video_url=page.url,
+        correlation_id="task_1_parallel_main_v1_a1_acc44_v1",
+        input_handle=handle,
+    )
+
+    assert ok is True
+    assert page.keyboard.presses == ["Control+A", "Backspace"]
+    assert handle.calls >= 2
+
+
+@pytest.mark.unit
+@pytest.mark.asyncio
+async def test_main_post_state_nudge_uses_exact_handle_without_global_probe():
+    page = _NoGlobalEvaluatePage()
+
+    ok = await publish_action._nudge_main_comment_post_state(
+        page,
+        "hello",
+        input_handle=_MainHandleNudgeOk(),
+        expected_video_url=page.url,
+        correlation_id="task_1_parallel_main_v1_a1_acc44_v1",
+    )
+
+    assert ok is True
+    assert page.keyboard.presses == ["End", "Backspace"]
+    assert page.keyboard.inserted == [" "]
+
+
+@pytest.mark.unit
+@pytest.mark.asyncio
+async def test_reply_post_state_nudge_verifies_focus_and_uses_space_press(monkeypatch):
+    page = _FakePage()
+
+    async def _fake_exact(*args, **kwargs):
+        return {"ok": True, "reason": "exact", "text": "reply text", "textLen": len("reply text")}
+
+    monkeypatch.setattr(publish_action, "_reply_target_input_exact_text_state", _fake_exact)
+
+    ok = await publish_action._nudge_reply_comment_post_state(
+        page,
+        "reply text",
+        reply_target=SimpleNamespace(input_handle=_ReplyNudgeInputOk()),
+        expected_video_url=page.url,
+        correlation_id="task_1_parallel_reply_v1_a1_acc10_to_text",
+    )
+
+    assert ok is True
+    assert page.keyboard.presses == ["End", "Space", "Backspace"]
+    assert page.keyboard.inserted == []
+
+
+@pytest.mark.unit
+@pytest.mark.asyncio
+async def test_reply_post_state_nudge_does_not_press_keys_without_verified_focus(monkeypatch):
+    page = _FakePage()
+
+    async def _fake_exact(*args, **kwargs):
+        return {"ok": True, "reason": "exact", "text": "reply text", "textLen": len("reply text")}
+
+    monkeypatch.setattr(publish_action, "_reply_target_input_exact_text_state", _fake_exact)
+
+    ok = await publish_action._nudge_reply_comment_post_state(
+        page,
+        "reply text",
+        reply_target=SimpleNamespace(input_handle=_ReplyNudgeInputFocusMissing()),
+        expected_video_url=page.url,
+        correlation_id="task_1_parallel_reply_v1_a1_acc10_to_text",
+    )
+
+    assert ok is False
+    assert page.keyboard.presses == []
+    assert page.keyboard.inserted == []
+
+
+@pytest.mark.unit
+@pytest.mark.asyncio
+async def test_main_series_reset_retries_short_rebind_before_failing(monkeypatch):
+    page = _NoGlobalEvaluatePage()
+    calls = {"find": 0}
+
+    async def _fake_find_comment_input_smart(*args, **kwargs):
+        calls["find"] += 1
+        if calls["find"] == 1:
+            return None, SimpleNamespace(reason="first_probe_empty", strategy=None)
+        return _MainHandleFocusOk(), SimpleNamespace(reason=None, strategy="second-probe")
+
+    async def _fake_sleep(_seconds):
+        return None
+
+    monkeypatch.setattr(publish_action, "find_comment_input_smart", _fake_find_comment_input_smart)
+    monkeypatch.setattr(publish_action.asyncio, "sleep", _fake_sleep)
+
+    ok = await publish_action.reset_main_comment_composer_for_next_variant(
+        page,
+        expected_video_url=page.url,
+        correlation_id="task_1_parallel_main_v1_a1_acc44_v1",
+        timeout_seconds=2.2,
+        comment_surface_ready=True,
+    )
+
+    assert ok is True
+    assert calls["find"] == 2
+    assert page.keyboard.presses == ["Control+A", "Backspace"]
 
 
 @pytest.mark.unit
@@ -515,7 +819,7 @@ async def test_publish_via_current_input_uses_reply_scoped_helpers(monkeypatch):
 
     assert result.status == "success", result.error_reason
     assert result.comment_id == "cid_retry_123"
-    assert calls == {"reply_input": 1, "reply_post": 1}
+    assert calls == {"reply_input": 1, "reply_post": 0}
 
 
 @pytest.mark.unit
@@ -588,6 +892,7 @@ async def test_reply_fast_publish_stops_network_wait_on_early_local_confirmation
     assert result.error_reason == "composer_cleared_after_submit"
     assert result.network_request_attempted is True
     assert result.post_was_enabled_at_click is True
+    assert result.composer_clean_after_submit is True
     assert all(seconds != publish_action._PARALLEL_POST_RESPONSE_GRACE_SECONDS for seconds in calls["sleep"])
 
 
@@ -660,6 +965,7 @@ async def test_reply_early_local_confirmation_skips_second_post_click_without_ne
     assert result.status == "failed"
     assert result.error_reason == "composer_cleared_after_submit"
     assert result.post_was_enabled_at_click is True
+    assert result.composer_clean_after_submit is True
 
 
 @pytest.mark.unit
@@ -856,7 +1162,7 @@ async def test_publish_reply_hybrid_recovers_open_timeout_when_scoped_input_visi
 @pytest.mark.asyncio
 async def test_publish_reply_hybrid_recovers_reply_send_soft_failure(monkeypatch):
     page = _FakePage()
-    captured = {"publish_calls": 0, "target_resolves": 0}
+    captured = {"publish_calls": 0, "target_resolves": 0, "send_only_calls": 0}
 
     async def _fake_none(*args, **kwargs):
         return None
@@ -880,12 +1186,16 @@ async def test_publish_reply_hybrid_recovers_reply_send_soft_failure(monkeypatch
     async def _fake_publish_via_current_input(*args, **kwargs):
         captured["publish_calls"] += 1
         assert getattr(kwargs.get("reply_target"), "anchor_token", None) == "anchor-1"
-        if captured["publish_calls"] == 1:
-            return publish_action.PublishResult(
-                status="dom_error",
-                error_reason="post_button_stayed_disabled",
-                dom_strategy="reply-direct-smart-type",
-            )
+        return publish_action.PublishResult(
+            status="dom_error",
+            error_reason="post_button_stayed_disabled",
+            dom_strategy="reply-direct-smart-type",
+        )
+
+    async def _fake_recover_reply_send_only(*args, **kwargs):
+        captured["send_only_calls"] += 1
+        assert getattr(kwargs.get("reply_target"), "anchor_token", None) == "anchor-1"
+        assert kwargs.get("fast_publish") is True
         return publish_action.PublishResult(
             status="success",
             comment_id="reply_cid",
@@ -901,6 +1211,7 @@ async def test_publish_reply_hybrid_recovers_reply_send_soft_failure(monkeypatch
     monkeypatch.setattr(publish_action, "open_reply_box", _fake_open_reply_box)
     monkeypatch.setattr(publish_action, "find_reply_composer_for_parent", _fake_find_reply_composer_for_parent)
     monkeypatch.setattr(publish_action, "_publish_via_current_input", _fake_publish_via_current_input)
+    monkeypatch.setattr(publish_action, "_recover_reply_send_only", _fake_recover_reply_send_only)
 
     result = await publish_action.publish_reply_hybrid(
         page,
@@ -914,7 +1225,68 @@ async def test_publish_reply_hybrid_recovers_reply_send_soft_failure(monkeypatch
     )
 
     assert result.status == "success"
-    assert captured == {"publish_calls": 2, "target_resolves": 2}
+    assert captured == {"publish_calls": 1, "target_resolves": 2, "send_only_calls": 1}
+
+
+@pytest.mark.unit
+@pytest.mark.asyncio
+async def test_publish_reply_hybrid_recovers_failed_optimistic_send_without_request(monkeypatch):
+    page = _FakePage()
+    captured = {"send_only_calls": 0, "recovery_reason": None}
+
+    async def _fake_none(*args, **kwargs):
+        return None
+
+    async def _fake_open_reply_box(*args, **kwargs):
+        return SimpleNamespace(success=True, strategy="parent-anchor-reply", anchor_token="anchor-1")
+
+    async def _fake_find_reply_composer_for_parent(*args, **kwargs):
+        return _fake_reply_target("anchor-1"), SimpleNamespace(success=True, strategy="reply-composer-test")
+
+    async def _fake_publish_via_current_input(*args, **kwargs):
+        return publish_action.PublishResult(
+            status="timeout",
+            error_reason="no_network_request_after_optimistic_reply_send",
+            dom_strategy="reply-optimistic-send-expanded-scope",
+            post_was_enabled_at_click=True,
+            network_request_attempted=False,
+        )
+
+    async def _fake_recover_reply_send_only(*args, **kwargs):
+        captured["send_only_calls"] += 1
+        captured["recovery_reason"] = kwargs.get("recovery_reason")
+        return publish_action.PublishResult(
+            status="success",
+            comment_id="reply_cid",
+            network_captured=True,
+            network_request_attempted=True,
+            post_was_enabled_at_click=True,
+        )
+
+    monkeypatch.setattr(publish_action, "_publish_url_guard_result", lambda *args, **kwargs: None)
+    monkeypatch.setattr(publish_action, "_captcha_result_if_present", _fake_none)
+    monkeypatch.setattr(publish_action, "_logged_out_publish_result_if_visible", _fake_none)
+    monkeypatch.setattr(publish_action, "open_reply_box", _fake_open_reply_box)
+    monkeypatch.setattr(publish_action, "find_reply_composer_for_parent", _fake_find_reply_composer_for_parent)
+    monkeypatch.setattr(publish_action, "_publish_via_current_input", _fake_publish_via_current_input)
+    monkeypatch.setattr(publish_action, "_recover_reply_send_only", _fake_recover_reply_send_only)
+
+    result = await publish_action.publish_reply_hybrid(
+        page,
+        "reply text",
+        parent_comment_text="parent",
+        parent_anchor_token="anchor-1",
+        max_total_seconds=20.0,
+        correlation_id="task_1_parallel_reply_v1_a1_acc10_to_text",
+        expected_video_url=page.url,
+        comments_already_open=True,
+    )
+
+    assert result.status == "success"
+    assert captured == {
+        "send_only_calls": 1,
+        "recovery_reason": "no_network_request_after_optimistic_reply_send",
+    }
 
 
 @pytest.mark.unit
@@ -1452,8 +1824,8 @@ async def test_parallel_publish_returns_after_request_without_slow_retry(monkeyp
         correlation_id="task_1_parallel_reply_v1_a1_acc10",
     )
 
-    assert result.status == "failed"
-    assert result.error_reason == "composer_cleared_after_submit"
+    assert result.status == "timeout"
+    assert result.error_reason == "no_network_response_after_publish_request"
     assert result.network_request_attempted is True
     assert result.post_was_enabled_at_click is True
     assert result.composer_clean_after_submit is True
@@ -1590,7 +1962,7 @@ async def test_parallel_main_empty_body_cleans_dirty_composer_and_reports_state(
 
     dirty_probe_count = {"count": 0}
 
-    async def _fake_composer_cleared_state(*args, **kwargs):
+    async def _fake_main_handle_state(*args, **kwargs):
         dirty_probe_count["count"] += 1
         return {"exists": True, "empty": False, "text": "hello"}
 
@@ -1607,7 +1979,7 @@ async def test_parallel_main_empty_body_cleans_dirty_composer_and_reports_state(
     monkeypatch.setattr(publish_action, "_clear_post_click_blockers", _fake_clear_post_click_blockers)
     monkeypatch.setattr(publish_action, "ensure_click_target_clear", _fake_ensure_click_target_clear)
     monkeypatch.setattr(publish_action, "type_into_comment", _fake_type_into_comment)
-    monkeypatch.setattr(publish_action, "_composer_cleared_state", _fake_composer_cleared_state)
+    monkeypatch.setattr(publish_action, "_main_comment_handle_state", _fake_main_handle_state)
     monkeypatch.setattr(
         publish_action,
         "_clear_main_comment_composer_best_effort",
@@ -1936,9 +2308,9 @@ async def test_parallel_main_publish_continues_when_typing_timeout_has_committed
 
     assert result.status == "success", result.error_reason
     assert result.comment_id == "cid_retry_123"
-    # loose_probe runs twice now: once for the typing-timeout text check and once
-    # for the strict pre-Post exact-text gate that guards against doubled comments.
-    assert calls == {"strict_probe": 1, "loose_probe": 2}
+    # The typing-timeout text check still uses the broad committed-text probe,
+    # while the strict pre-Post gate now reads the exact input handle.
+    assert calls == {"strict_probe": 1, "loose_probe": 1}
     assert page.click_count == 1
     assert page.removed == ["request", "response"]
 
@@ -2349,8 +2721,8 @@ async def test_publish_does_not_retry_click_after_synthetic_dispatch_without_net
     # because point_diag.tag == "BODY" forces it; when the composer is proven
     # cleared afterwards, the result is an ambiguous submitted state instead of
     # a retryable timeout.
-    assert result.status == "failed"
-    assert result.error_reason == "composer_cleared_after_submit"
+    assert result.status == "timeout"
+    assert result.error_reason == "no_network_request_after_post_click"
     assert result.post_was_enabled_at_click is True
     assert result.composer_clean_after_submit is True
     assert page.synthetic_dispatch_count == 1
@@ -2491,12 +2863,231 @@ async def test_reply_publish_uses_nudge_and_optimistic_send_for_recoverable_gate
         reply_target=_fake_reply_target("anchor-1"),
     )
 
-    assert calls == {"nudge": 1, "optimistic": 1}
+    assert calls == {"nudge": 0, "optimistic": 1}
     assert page.click_count == 1
     assert result.status == "failed"
     assert result.error_reason == "composer_cleared_after_submit"
     assert result.post_was_enabled_at_click is True
     assert result.composer_clean_after_submit is True
+
+
+@pytest.mark.unit
+@pytest.mark.asyncio
+async def test_reply_publish_uses_nudge_when_initial_optimistic_send_missing(monkeypatch):
+    page = _FakePage()
+    page.mouse = _RequestOnlyMouse(page)
+    button = _FakeButton()
+    calls = {"nudge": 0, "optimistic": 0}
+
+    async def _fake_sleep(_seconds):
+        return None
+
+    async def _fake_detect_captcha(*args, **kwargs):
+        return False, None
+
+    async def _fake_wait_for_post_button_enabled(*args, **kwargs):
+        return None, SimpleNamespace(strategy=None, reason="post_button_stayed_disabled")
+
+    async def _fake_reply_exact(*args, **kwargs):
+        return {"ok": True, "reason": "exact", "text": "reply text", "textLen": len("reply text")}
+
+    async def _fake_nudge(*args, **kwargs):
+        calls["nudge"] += 1
+        return True
+
+    async def _fake_optimistic(*args, **kwargs):
+        calls["optimistic"] += 1
+        if calls["optimistic"] == 1:
+            return None, SimpleNamespace(strategy=None, reason="reply_send_candidate_not_found")
+        return button, SimpleNamespace(strategy="reply-optimistic-send", reason="reply_optimistic_send_candidate")
+
+    async def _fake_ensure_click_target_clear(*args, **kwargs):
+        return None
+
+    async def _fake_clear_post_click_blockers(*args, **kwargs):
+        return button, {"tag": "BUTTON", "e2e": "comment-post"}, True
+
+    async def _fake_type_into_comment(*args, **kwargs):
+        return {"ok": True, "strategy": "reply-test-type", "text": "reply text", "anchor_bound": True}
+
+    monkeypatch.setattr(publish_action.asyncio, "sleep", _fake_sleep)
+    monkeypatch.setattr(publish_action, "detect_captcha", _fake_detect_captcha)
+    monkeypatch.setattr(publish_action, "suppress_keyboard_shortcuts_overlay", AsyncMock(return_value=0))
+    monkeypatch.setattr(publish_action, "wait_for_post_button_enabled", _fake_wait_for_post_button_enabled)
+    monkeypatch.setattr(publish_action, "_reply_target_input_exact_text_state", _fake_reply_exact)
+    monkeypatch.setattr(publish_action, "_nudge_reply_comment_post_state", _fake_nudge)
+    monkeypatch.setattr(publish_action, "find_reply_send_candidate_for_optimistic_click", _fake_optimistic)
+    monkeypatch.setattr(publish_action, "ensure_click_target_clear", _fake_ensure_click_target_clear)
+    monkeypatch.setattr(publish_action, "_clear_post_click_blockers", _fake_clear_post_click_blockers)
+    monkeypatch.setattr(publish_action, "type_into_comment", _fake_type_into_comment)
+    monkeypatch.setattr(publish_action, "_composer_cleared_state", AsyncMock(return_value={"exists": True, "empty": True}))
+
+    result = await publish_action._publish_via_current_input(
+        page,
+        "reply text",
+        max_total_seconds=10.0,
+        correlation_id="task_1_parallel_reply_v1_a1_acc10_to_text",
+        reply_scoped=True,
+        parent_anchor_token="anchor-1",
+        reply_target=_fake_reply_target("anchor-1"),
+    )
+
+    assert calls == {"nudge": 1, "optimistic": 2}
+    assert page.click_count == 1
+    assert result.status == "failed"
+    assert result.error_reason == "composer_cleared_after_submit"
+    assert result.post_was_enabled_at_click is True
+
+
+@pytest.mark.unit
+@pytest.mark.asyncio
+async def test_reply_send_recovery_for_optimistic_no_request_nudges_before_candidate(monkeypatch):
+    page = _FakePage()
+    page.mouse = _RequestOnlyMouse(page)
+    button = _FakeButton()
+    calls = []
+
+    async def _fake_sleep(_seconds):
+        return None
+
+    async def _fake_reply_exact(*args, **kwargs):
+        return {"ok": True, "reason": "exact", "text": "reply text", "textLen": len("reply text")}
+
+    async def _fake_nudge(*args, **kwargs):
+        calls.append("nudge")
+        return True
+
+    async def _fake_optimistic(*args, **kwargs):
+        calls.append("find")
+        return button, publish_action.DomActionResult(
+            True,
+            strategy="reply-optimistic-send",
+            reason="reply_optimistic_send_candidate",
+        )
+
+    async def _fake_ensure_click_target_clear(*args, **kwargs):
+        return True
+
+    monkeypatch.setattr(publish_action.asyncio, "sleep", _fake_sleep)
+    monkeypatch.setattr(publish_action, "_reply_target_input_exact_text_state", _fake_reply_exact)
+    monkeypatch.setattr(publish_action, "_nudge_reply_comment_post_state", _fake_nudge)
+    monkeypatch.setattr(publish_action, "find_reply_send_candidate_for_optimistic_click", _fake_optimistic)
+    monkeypatch.setattr(publish_action, "ensure_click_target_clear", _fake_ensure_click_target_clear)
+
+    result = await publish_action._recover_reply_send_only(
+        page,
+        "reply text",
+        started=time.monotonic(),
+        max_total_seconds=3.0,
+        expected_video_url=page.url,
+        correlation_id="task_1_parallel_reply_v1_a1_acc10_to_text",
+        reply_target=_fake_reply_target("anchor-1"),
+        fast_publish=True,
+        recovery_reason="no_network_request_after_optimistic_reply_send",
+    )
+
+    assert calls[:2] == ["nudge", "find"]
+    assert result is not None
+    assert result.network_request_attempted is True
+    assert page.click_count == 1
+
+
+@pytest.mark.unit
+@pytest.mark.asyncio
+async def test_reply_send_recovery_stops_when_click_target_blocked(monkeypatch):
+    page = _FakePage()
+    button = _FakeButton()
+
+    async def _fake_reply_exact(*args, **kwargs):
+        return {"ok": True, "reason": "exact", "text": "reply text", "textLen": len("reply text")}
+
+    async def _fake_optimistic(*args, **kwargs):
+        return button, publish_action.DomActionResult(
+            True,
+            strategy="reply-optimistic-send",
+            reason="reply_optimistic_send_candidate",
+        )
+
+    async def _fake_ensure_click_target_clear(*args, **kwargs):
+        return False
+
+    monkeypatch.setattr(publish_action, "_reply_target_input_exact_text_state", _fake_reply_exact)
+    monkeypatch.setattr(publish_action, "find_reply_send_candidate_for_optimistic_click", _fake_optimistic)
+    monkeypatch.setattr(publish_action, "ensure_click_target_clear", _fake_ensure_click_target_clear)
+
+    result = await publish_action._recover_reply_send_only(
+        page,
+        "reply text",
+        started=time.monotonic(),
+        max_total_seconds=3.0,
+        expected_video_url=page.url,
+        correlation_id="task_1_parallel_reply_v1_a1_acc10_to_text",
+        reply_target=_fake_reply_target("anchor-1"),
+        fast_publish=True,
+    )
+
+    assert result is not None
+    assert result.status == "dom_error"
+    assert result.error_reason == "reply_send_click_target_blocked"
+    assert page.click_count == 0
+
+
+@pytest.mark.unit
+@pytest.mark.asyncio
+async def test_reply_send_recovery_rebinds_when_candidate_has_no_box(monkeypatch):
+    page = _FakePage()
+    page.mouse = _RequestOnlyMouse(page)
+    first_button = _FakeButton()
+    second_button = _FakeButton()
+    calls = {"find": 0}
+
+    async def _missing_box():
+        return None
+
+    async def _unexpected_click(*args, **kwargs):
+        raise AssertionError("stale no-box handle must not be force-clicked")
+
+    first_button.bounding_box = _missing_box
+    first_button.click = _unexpected_click
+
+    async def _fake_sleep(_seconds):
+        return None
+
+    async def _fake_reply_exact(*args, **kwargs):
+        return {"ok": True, "reason": "exact", "text": "reply text", "textLen": len("reply text")}
+
+    async def _fake_optimistic(*args, **kwargs):
+        calls["find"] += 1
+        button = first_button if calls["find"] == 1 else second_button
+        return button, publish_action.DomActionResult(
+            True,
+            strategy=f"reply-optimistic-send-{calls['find']}",
+            reason="reply_optimistic_send_candidate",
+        )
+
+    async def _fake_ensure_click_target_clear(*args, **kwargs):
+        return True
+
+    monkeypatch.setattr(publish_action.asyncio, "sleep", _fake_sleep)
+    monkeypatch.setattr(publish_action, "_reply_target_input_exact_text_state", _fake_reply_exact)
+    monkeypatch.setattr(publish_action, "find_reply_send_candidate_for_optimistic_click", _fake_optimistic)
+    monkeypatch.setattr(publish_action, "ensure_click_target_clear", _fake_ensure_click_target_clear)
+
+    result = await publish_action._recover_reply_send_only(
+        page,
+        "reply text",
+        started=time.monotonic(),
+        max_total_seconds=3.0,
+        expected_video_url=page.url,
+        correlation_id="task_1_parallel_reply_v1_a1_acc10_to_text",
+        reply_target=_fake_reply_target("anchor-1"),
+        fast_publish=True,
+    )
+
+    assert calls["find"] == 2
+    assert result is not None
+    assert result.network_request_attempted is True
+    assert page.click_count == 1
 
 
 @pytest.mark.unit
@@ -2907,8 +3498,8 @@ async def test_publish_current_input_gives_parallel_main_extra_hydration_time(mo
         return None, SimpleNamespace(reason="comment_input_open_deadline", redirected_to=None)
 
     async def _fake_publish_main_comment_direct_dom(*args, **kwargs):
-        calls["direct_previous_reason"] = kwargs.get("previous_reason")
-        return None
+        calls["direct"] = calls.get("direct", 0) + 1
+        raise AssertionError("main production publish must not use no-handle direct fallback")
 
     monkeypatch.setattr(publish_action, "suppress_keyboard_shortcuts_overlay", AsyncMock(return_value=0))
     monkeypatch.setattr(publish_action, "_captcha_result_if_present", AsyncMock(return_value=None))
@@ -2930,7 +3521,7 @@ async def test_publish_current_input_gives_parallel_main_extra_hydration_time(mo
     assert calls["aggressive"] is True
     assert calls["main_comment_aggressive"] is True
     assert 6.8 <= calls["max_total_seconds"] <= 7.1
-    assert calls["direct_previous_reason"] == "comment_input_open_deadline"
+    assert calls.get("direct", 0) == 0
 
 
 @pytest.mark.unit
@@ -2945,13 +3536,8 @@ async def test_publish_current_input_prefers_normal_search_when_surface_ready(mo
         return None, SimpleNamespace(reason="comment_input_open_deadline", redirected_to=None, strategy=None)
 
     async def _fake_publish_main_comment_direct_dom(*args, **kwargs):
-        calls["previous_reason"] = kwargs.get("previous_reason")
-        calls["text"] = args[1]
-        return publish_action.PublishResult(
-            status="success",
-            comment_id="cid_direct_fast",
-            dom_strategy="main-direct-fast-test",
-        )
+        calls["direct"] = calls.get("direct", 0) + 1
+        raise AssertionError("main production publish must not use no-handle direct fallback")
 
     monkeypatch.setattr(publish_action, "suppress_keyboard_shortcuts_overlay", AsyncMock(return_value=0))
     monkeypatch.setattr(publish_action, "_captcha_result_if_present", AsyncMock(return_value=None))
@@ -2969,33 +3555,26 @@ async def test_publish_current_input_prefers_normal_search_when_surface_ready(mo
         comment_surface_ready=True,
     )
 
-    assert result.status == "success"
-    assert result.comment_id == "cid_direct_fast"
+    assert result.status == "dom_error"
+    assert result.error_reason == "input_not_found: comment_input_open_deadline"
     assert calls == {
         "find": 1,
         "skip_initial_open": True,
-        "previous_reason": "comment_input_open_deadline",
-        "text": "hello",
     }
 
 
 @pytest.mark.unit
 @pytest.mark.asyncio
-async def test_publish_current_input_uses_main_direct_dom_fallback_after_input_not_found(monkeypatch):
+async def test_publish_current_input_does_not_use_main_direct_dom_fallback_after_input_not_found(monkeypatch):
     page = _FakePage()
-    calls = {}
+    calls = {"direct": 0}
 
     async def _fake_find_comment_input_smart(*args, **kwargs):
         return None, SimpleNamespace(reason="timeout", redirected_to=None, strategy=None)
 
     async def _fake_publish_main_comment_direct_dom(*args, **kwargs):
-        calls["previous_reason"] = kwargs.get("previous_reason")
-        calls["text"] = args[1]
-        return publish_action.PublishResult(
-            status="success",
-            comment_id="cid_direct",
-            dom_strategy="main-direct-test",
-        )
+        calls["direct"] += 1
+        raise AssertionError("main production publish must not use no-handle direct fallback")
 
     monkeypatch.setattr(publish_action, "suppress_keyboard_shortcuts_overlay", AsyncMock(return_value=0))
     monkeypatch.setattr(publish_action, "_captcha_result_if_present", AsyncMock(return_value=None))
@@ -3013,16 +3592,16 @@ async def test_publish_current_input_uses_main_direct_dom_fallback_after_input_n
         comment_surface_ready=False,
     )
 
-    assert result.status == "success"
-    assert result.comment_id == "cid_direct"
-    assert calls == {"previous_reason": "timeout", "text": "hello"}
+    assert result.status == "dom_error"
+    assert result.error_reason == "input_not_found: timeout"
+    assert calls == {"direct": 0}
 
 
 @pytest.mark.unit
 @pytest.mark.asyncio
-async def test_publish_current_input_uses_main_direct_dom_fallback_after_input_search_timeout(monkeypatch):
+async def test_publish_current_input_does_not_use_main_direct_dom_fallback_after_input_search_timeout(monkeypatch):
     page = _FakePage()
-    calls = {}
+    calls = {"direct": 0}
 
     async def _fake_find_comment_input_smart(*args, **kwargs):
         raise AssertionError("fake wait_for should time this coroutine out")
@@ -3034,8 +3613,8 @@ async def test_publish_current_input_uses_main_direct_dom_fallback_after_input_s
         raise asyncio.TimeoutError()
 
     async def _fake_publish_main_comment_direct_dom(*args, **kwargs):
-        calls["previous_reason"] = kwargs.get("previous_reason")
-        return publish_action.PublishResult(status="success", comment_id="cid_direct_timeout")
+        calls["direct"] += 1
+        raise AssertionError("main production publish must not use no-handle direct fallback")
 
     monkeypatch.setattr(publish_action, "suppress_keyboard_shortcuts_overlay", AsyncMock(return_value=0))
     monkeypatch.setattr(publish_action, "_captcha_result_if_present", AsyncMock(return_value=None))
@@ -3053,9 +3632,9 @@ async def test_publish_current_input_uses_main_direct_dom_fallback_after_input_s
         comment_surface_ready=False,
     )
 
-    assert result.status == "success"
-    assert result.comment_id == "cid_direct_timeout"
-    assert calls["previous_reason"] == "input_search_timeout"
+    assert result.status == "timeout"
+    assert result.error_reason == "publish_deadline_exceeded:input_search"
+    assert calls == {"direct": 0}
 
 
 @pytest.mark.unit

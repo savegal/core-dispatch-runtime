@@ -4683,7 +4683,7 @@ async def like_parent_comment_if_safe(
     return DomActionResult(False, reason="parent_like_unknown_result", elapsed_seconds=elapsed)
 
 
-async def ensure_click_target_clear(page: Page, element: Any) -> None:
+async def ensure_click_target_clear(page: Page, element: Any) -> bool:
     """
     Surgical blocker cleanup for a specific clickable/editable element.
 
@@ -4692,7 +4692,7 @@ async def ensure_click_target_clear(page: Page, element: Any) -> None:
     click-through if it is clearly not the comment UI itself.
     """
     if element is None:
-        return
+        return False
     try:
         await suppress_keyboard_shortcuts_overlay(page)
 
@@ -4789,10 +4789,14 @@ async def ensure_click_target_clear(page: Page, element: Any) -> None:
         if isinstance(result, dict) and result.get("blocked"):
             if result.get("fixed"):
                 logger.info("[DOM] Cleared blocker over target: %s", result)
+                return True
             else:
                 logger.debug("[DOM] Target blocked but not modified: %s", result)
+                return False
+        return True
     except Exception as exc:
         logger.debug("[DOM] ensure_click_target_clear failed: %s", exc)
+        return True
 
 
 async def dismiss_cookie_banners(page: Page) -> int:
@@ -6544,6 +6548,14 @@ async def find_reply_send_candidate_for_optimistic_click(
                             label.includes('smile') ||
                             label.includes('sticker') ||
                             label.includes('mention') ||
+                            label.includes('gif') ||
+                            label.includes('image') ||
+                            label.includes('photo') ||
+                            label.includes('upload') ||
+                            label.includes('attach') ||
+                            label.includes('media') ||
+                            label.includes('cancel') ||
+                            label.includes('close') ||
                             label.includes('tag people') ||
                             label.includes('add mention') ||
                             compact === '@';
@@ -6566,25 +6578,22 @@ async def find_reply_send_candidate_for_optimistic_click(
                             Boolean(iconNearInput);
                     };
                     const targetFor = (raw, scope) => {
-                        const candidates = [
-                            raw && raw.closest && raw.closest('button'),
-                            raw && raw.closest && raw.closest('[role="button"]'),
-                            raw && raw.closest && raw.closest('div[tabindex="0"]'),
-                            raw,
-                            raw && raw.parentElement,
-                            raw && raw.parentElement && raw.parentElement.parentElement,
-                        ].filter(Boolean);
-                        const seen = new Set();
-                        for (const el of candidates) {
-                            if (!el || seen.has(el) || !scope.contains(el) || !visible(el)) continue;
-                            seen.add(el);
+                        if (!raw) return null;
+                        const usable = (el) => {
+                            if (!el || !scope.contains(el) || !visible(el)) return false;
                             const r = el.getBoundingClientRect();
-                            if (r.width > 360 || r.height > 160) continue;
+                            if (r.width > 360 || r.height > 160) return false;
                             const st = getComputedStyle(el);
-                            if (st.pointerEvents === 'none') continue;
-                            if (el.hasAttribute('disabled') || el.getAttribute('aria-disabled') === 'true' || el.classList.contains('disabled')) continue;
-                            return el;
-                        }
+                            if (st.pointerEvents === 'none') return false;
+                            if (el.hasAttribute('disabled') || el.getAttribute('aria-disabled') === 'true') return false;
+                            return true;
+                        };
+                        const interactive = raw.closest && raw.closest('button, [role="button"], div[tabindex="0"]');
+                        if (interactive) return usable(interactive) ? interactive : null;
+                        if (usable(raw)) return raw;
+                        if (usable(raw.parentElement)) return raw.parentElement;
+                        const grandparent = raw.parentElement && raw.parentElement.parentElement;
+                        if (usable(grandparent)) return grandparent;
                         return null;
                     };
 
@@ -6599,10 +6608,15 @@ async def find_reply_send_candidate_for_optimistic_click(
                         '[data-e2e="comment-post"]',
                         '[data-e2e*="comment-post"]',
                         '[data-e2e="post-comment-button"]',
+                        '[data-e2e*="send"]',
+                        '[data-e2e*="submit"]',
+                        '[aria-label*="send" i]',
+                        '[aria-label*="post" i]',
                         'button',
                         '[role="button"]',
                         'div[tabindex="0"]',
                         'svg',
+                        'path',
                     ];
                     for (const scope of scopeCandidates) {
                         const marked = document.querySelector('[data-smart-reply-post="1"]');
@@ -6753,25 +6767,20 @@ async def wait_for_post_button_enabled(
 
                     const clickTargetFor = (raw) => {
                         if (!raw) return null;
-                        const candidates = [
-                            raw.closest('button'),
-                            raw.closest('[role="button"]'),
-                            raw.closest('div[tabindex="0"]'),
-                            raw,
-                            raw.parentElement,
-                            raw.parentElement && raw.parentElement.parentElement,
-                        ].filter(Boolean);
-                        const seen = new Set();
-                        for (const el of candidates) {
-                            if (seen.has(el)) continue;
-                            seen.add(el);
-                            if (!visible(el)) continue;
+                        const usable = (el) => {
+                            if (!el || !visible(el)) return false;
                             const r = el.getBoundingClientRect();
-                            if (r.width > 360 || r.height > 140) continue;
-                            if (getComputedStyle(el).pointerEvents === 'none') continue;
-                            if (hardDisabled(el)) continue;
-                            return el;
-                        }
+                            if (r.width > 360 || r.height > 140) return false;
+                            if (getComputedStyle(el).pointerEvents === 'none') return false;
+                            if (hardDisabled(el)) return false;
+                            return true;
+                        };
+                        const interactive = raw.closest && raw.closest('button, [role="button"], div[tabindex="0"]');
+                        if (interactive) return usable(interactive) ? interactive : null;
+                        if (usable(raw)) return raw;
+                        if (usable(raw.parentElement)) return raw.parentElement;
+                        const grandparent = raw.parentElement && raw.parentElement.parentElement;
+                        if (usable(grandparent)) return grandparent;
                         return null;
                     };
 
@@ -6812,6 +6821,14 @@ async def wait_for_post_button_enabled(
                             label.includes('smile') ||
                             label.includes('sticker') ||
                             label.includes('mention') ||
+                            label.includes('gif') ||
+                            label.includes('image') ||
+                            label.includes('photo') ||
+                            label.includes('upload') ||
+                            label.includes('attach') ||
+                            label.includes('media') ||
+                            label.includes('cancel') ||
+                            label.includes('close') ||
                             label.includes('tag people') ||
                             label.includes('add mention') ||
                             compact === '@';

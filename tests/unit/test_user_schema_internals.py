@@ -1493,6 +1493,130 @@ async def test_input_retry_recovery_keeps_ready_surface_without_reopen_or_reload
 
 @pytest.mark.unit
 @pytest.mark.asyncio
+async def test_input_retry_recovery_cleans_main_via_exact_reset(monkeypatch):
+    from executor import user_schema
+
+    calls = {"reset": []}
+
+    class _Page:
+        url = "https://www.tiktok.com/@demo/video/1234567890123456789"
+
+    async def fake_surface(_page):
+        return {
+            "comment_input_visible": True,
+            "list_visible": True,
+            "comment_items_visible": 4,
+        }
+
+    async def fake_reset(_page, **kwargs):
+        calls["reset"].append(kwargs)
+        return True
+
+    async def fail_open(*_args, **_kwargs):
+        raise AssertionError("ready comment surface should not be reopened")
+
+    monkeypatch.setattr(user_schema, "get_comment_surface_state", fake_surface)
+    monkeypatch.setattr(user_schema, "reset_main_comment_composer_for_next_variant", fake_reset)
+    monkeypatch.setattr(user_schema, "open_comment_section", fail_open)
+    monkeypatch.setattr(user_schema, "suppress_keyboard_shortcuts_overlay", AsyncMock(return_value=0))
+    monkeypatch.setattr(user_schema, "dismiss_cookie_banners", AsyncMock(return_value=0))
+
+    ready = await user_schema._recover_page_before_input_retry(
+        _Page(),
+        correlation_id="recover_clean_surface",
+        expected_video_url="https://www.tiktok.com/@demo/video/1234567890123456789",
+        require_clean_composer=True,
+    )
+
+    assert ready is True
+    assert calls["reset"] == [
+        {
+            "expected_video_url": "https://www.tiktok.com/@demo/video/1234567890123456789",
+            "correlation_id": "recover_clean_surface",
+            "timeout_seconds": 2.2,
+            "comment_surface_ready": True,
+        }
+    ]
+
+
+@pytest.mark.unit
+def test_input_retry_recovery_no_longer_uses_global_main_clear():
+    from executor import user_schema
+
+    source = inspect.getsource(user_schema._recover_page_before_input_retry)
+
+    assert "reset_main_comment_composer_for_next_variant" in source
+    assert "_clear_main_comment_composer_best_effort" not in source
+
+
+@pytest.mark.unit
+def test_main_local_confirmation_requires_author_in_comment_finder():
+    from executor import comment_outcome
+
+    source = inspect.getsource(comment_outcome.find_comment_in_list)
+
+    assert "require_author_match: bool = False" in source
+    assert "author_missing_skip" in source
+    assert "if exp_author_norm and require_author_match and not row_author_norm:" in source
+
+
+@pytest.mark.unit
+def test_reply_inflight_lock_survives_until_publish_classification_callbacks():
+    from executor import user_schema
+
+    source = inspect.getsource(user_schema._reply_with_variant_on_all_mains)
+
+    assert "publish_ready_for_classification = False" in source
+    assert "and not publish_ready_for_classification" in source
+    callbacks_block = source.split("if soft_submitted and on_soft_submitted_outcome is not None:", 1)[1]
+    release_index = callbacks_block.index("active_inflight_reply_keys.discard(reply_attempt_key)")
+    trace_index = callbacks_block.index('_log_user_trace(\n                    "reply_publish_result"')
+    assert release_index < trace_index
+
+
+@pytest.mark.unit
+@pytest.mark.asyncio
+async def test_reply_reset_does_not_press_ctrl_a_without_verified_focus():
+    from executor import user_schema
+
+    class Keyboard:
+        def __init__(self):
+            self.presses = []
+
+        async def press(self, key):
+            self.presses.append(key)
+
+    class Page:
+        url = "https://www.tiktok.com/@demo/video/1234567890123456789"
+
+        def __init__(self):
+            self.keyboard = Keyboard()
+            self.evaluates = 0
+
+        async def evaluate(self, *_args, **_kwargs):
+            self.evaluates += 1
+            return {
+                "dirtyTextCount": 1,
+                "dirtyPreview": ["stale reply"],
+                "targetVisible": True,
+                "focusOk": False,
+            }
+
+    page = Page()
+
+    ok = await user_schema._reset_reply_page_after_confirmed_submit(
+        page,
+        correlation_id="reply_reset_focus_guard",
+        expected_video_url="https://www.tiktok.com/@demo/video/1234567890123456789",
+    )
+
+    assert ok is False
+    assert page.keyboard.presses == []
+    assert page.evaluates == 1
+
+
+@pytest.mark.unit
+@pytest.mark.asyncio
 async def test_publish_all_variants_retries_input_not_found_on_same_account(monkeypatch):
     from executor import user_schema
     from executor.publish_action import PublishResult
@@ -1511,9 +1635,16 @@ async def test_publish_all_variants_retries_input_not_found_on_same_account(monk
             dom_strategy="data-e2e",
         )
 
-    async def fake_recover(_page, *, correlation_id, require_clean_composer=False):
+    async def fake_recover(
+        _page,
+        *,
+        correlation_id,
+        expected_video_url=None,
+        require_clean_composer=False,
+    ):
         recovered["count"] += 1
         assert correlation_id == "task_1_v1"
+        assert expected_video_url is None
         assert require_clean_composer is True
         return True
 
@@ -1557,8 +1688,15 @@ async def test_publish_all_variants_stops_after_composer_retry_failure(monkeypat
         calls.append((text, kwargs.get("correlation_id"), kwargs.get("comments_already_open")))
         return PublishResult(status="timeout", error_reason="publish_deadline_exceeded:open_comments")
 
-    async def fake_recover(_page, *, correlation_id, require_clean_composer=False):
+    async def fake_recover(
+        _page,
+        *,
+        correlation_id,
+        expected_video_url=None,
+        require_clean_composer=False,
+    ):
         assert correlation_id == "task_1_v1"
+        assert expected_video_url is None
         assert require_clean_composer is True
         return False
 
@@ -1985,7 +2123,7 @@ async def test_parallel_main_direct_response_without_comment_id_counts_as_submit
 
 @pytest.mark.unit
 @pytest.mark.asyncio
-async def test_parallel_main_submit_without_response_stops_after_unconfirmed_even_when_composer_clean(monkeypatch):
+async def test_parallel_main_submit_without_response_continues_when_composer_clean(monkeypatch):
     from executor import user_schema
     from executor.publish_action import PublishResult
 
@@ -2005,13 +2143,8 @@ async def test_parallel_main_submit_without_response_stops_after_unconfirmed_eve
     async def fake_username(_page):
         return "main_user"
 
-    async def fake_recover(_page, **_kwargs):
-        assert _kwargs["require_clean_composer"] is True
-        return True
-
     monkeypatch.setattr(user_schema, "publish_comment_hybrid", fake_publish)
     monkeypatch.setattr(user_schema, "extract_tiktok_username", fake_username)
-    monkeypatch.setattr(user_schema, "_recover_page_before_input_retry", fake_recover)
     monkeypatch.setattr(user_schema, "find_comment_in_list", AsyncMock(return_value=(False, {})))
     monkeypatch.setattr(user_schema, "_deny_if_visible_logged_out", AsyncMock(return_value=None))
     monkeypatch.setattr(user_schema, "_register_runtime_success", lambda *_args, **_kwargs: None)
@@ -2025,74 +2158,25 @@ async def test_parallel_main_submit_without_response_stops_after_unconfirmed_eve
         expected_video_url="https://www.tiktok.com/@demo/video/1234567890123456789",
     )
 
-    assert calls == [("first", "task_1_parallel_main_v1_a1_acc44_v1")]
-    assert failure_reason == (
-        "main_partial:published=1/2;remaining=1;"
-        "reason=account_series_stopped_after_unconfirmed"
-    )
-    assert len(published) == 1
+    assert calls == [
+        ("first", "task_1_parallel_main_v1_a1_acc44_v1"),
+        ("second", "task_1_parallel_main_v1_a1_acc44_v2"),
+    ]
+    assert failure_reason is None
+    assert len(published) == 2
     assert published[0].text == "first"
     assert published[0].comment_id is None
     assert published[0].local_confirmed is False
+    assert published[1].text == "second"
 
 
 @pytest.mark.unit
 @pytest.mark.asyncio
-async def test_parallel_main_submit_without_response_stops_after_unconfirmed_without_recovery(monkeypatch):
+async def test_parallel_main_submit_without_response_stops_after_unconfirmed_when_reset_fails(monkeypatch):
     from executor import user_schema
     from executor.publish_action import PublishResult
 
     calls = []
-
-    async def fake_publish(_page, text, **kwargs):
-        calls.append((text, kwargs["correlation_id"]))
-        return PublishResult(
-            status="timeout",
-            error_reason="no_network_response_after_main_direct_post_click",
-            network_request_attempted=True,
-            dom_strategy="main-direct-test",
-            post_was_enabled_at_click=True,
-            composer_clean_after_submit=True,
-        )
-
-    async def fake_username(_page):
-        return "main_user"
-
-    async def fake_recover(_page, **_kwargs):
-        return False
-
-    monkeypatch.setattr(user_schema, "publish_comment_hybrid", fake_publish)
-    monkeypatch.setattr(user_schema, "extract_tiktok_username", fake_username)
-    monkeypatch.setattr(user_schema, "_recover_page_before_input_retry", fake_recover)
-    monkeypatch.setattr(user_schema, "find_comment_in_list", AsyncMock(return_value=(False, {})))
-    monkeypatch.setattr(user_schema, "_deny_if_visible_logged_out", AsyncMock(return_value=None))
-
-    published, failure_reason = await user_schema._publish_all_variants_on_account(
-        SimpleNamespace(),
-        SimpleNamespace(url="https://www.tiktok.com/@demo/video/1234567890123456789"),
-        SimpleNamespace(id=44),
-        ["first", "second"],
-        correlation_id="task_1_parallel_main_v1_a1_acc44",
-        expected_video_url="https://www.tiktok.com/@demo/video/1234567890123456789",
-    )
-
-    assert calls == [("first", "task_1_parallel_main_v1_a1_acc44_v1")]
-    assert failure_reason == (
-        "main_partial:published=1/2;remaining=1;"
-        "reason=account_series_stopped_after_unconfirmed"
-    )
-    assert len(published) == 1
-    assert published[0].text == "first"
-
-
-@pytest.mark.unit
-@pytest.mark.asyncio
-async def test_parallel_main_submit_without_clean_composer_stops_after_unconfirmed(monkeypatch):
-    from executor import user_schema
-    from executor.publish_action import PublishResult
-
-    calls = []
-    recovered = {"count": 0}
 
     async def fake_publish(_page, text, **kwargs):
         calls.append((text, kwargs["correlation_id"]))
@@ -2108,13 +2192,12 @@ async def test_parallel_main_submit_without_clean_composer_stops_after_unconfirm
     async def fake_username(_page):
         return "main_user"
 
-    async def fake_recover(_page, **_kwargs):
-        recovered["count"] += 1
-        return True
+    async def fake_reset(_page, **_kwargs):
+        return False
 
     monkeypatch.setattr(user_schema, "publish_comment_hybrid", fake_publish)
     monkeypatch.setattr(user_schema, "extract_tiktok_username", fake_username)
-    monkeypatch.setattr(user_schema, "_recover_page_before_input_retry", fake_recover)
+    monkeypatch.setattr(user_schema, "reset_main_comment_composer_for_next_variant", fake_reset)
     monkeypatch.setattr(user_schema, "find_comment_in_list", AsyncMock(return_value=(False, {})))
     monkeypatch.setattr(user_schema, "_deny_if_visible_logged_out", AsyncMock(return_value=None))
 
@@ -2128,13 +2211,65 @@ async def test_parallel_main_submit_without_clean_composer_stops_after_unconfirm
     )
 
     assert calls == [("first", "task_1_parallel_main_v1_a1_acc44_v1")]
-    assert recovered["count"] == 0
     assert failure_reason == (
         "main_partial:published=1/2;remaining=1;"
-        "reason=account_series_stopped_after_unconfirmed"
+        "reason=account_series_stopped_after_unconfirmed_unsafe_composer"
     )
     assert len(published) == 1
     assert published[0].text == "first"
+
+
+@pytest.mark.unit
+@pytest.mark.asyncio
+async def test_parallel_main_submit_without_clean_composer_continues_after_late_reset(monkeypatch):
+    from executor import user_schema
+    from executor.publish_action import PublishResult
+
+    calls = []
+    resets = {"count": 0}
+
+    async def fake_publish(_page, text, **kwargs):
+        calls.append((text, kwargs["correlation_id"]))
+        return PublishResult(
+            status="timeout",
+            error_reason="no_network_response_after_main_direct_post_click",
+            network_request_attempted=True,
+            dom_strategy="main-direct-test",
+            post_was_enabled_at_click=True,
+            composer_clean_after_submit=False,
+        )
+
+    async def fake_username(_page):
+        return "main_user"
+
+    async def fake_reset(_page, **_kwargs):
+        resets["count"] += 1
+        return True
+
+    monkeypatch.setattr(user_schema, "publish_comment_hybrid", fake_publish)
+    monkeypatch.setattr(user_schema, "extract_tiktok_username", fake_username)
+    monkeypatch.setattr(user_schema, "reset_main_comment_composer_for_next_variant", fake_reset)
+    monkeypatch.setattr(user_schema, "find_comment_in_list", AsyncMock(return_value=(False, {})))
+    monkeypatch.setattr(user_schema, "_deny_if_visible_logged_out", AsyncMock(return_value=None))
+
+    published, failure_reason = await user_schema._publish_all_variants_on_account(
+        SimpleNamespace(),
+        SimpleNamespace(url="https://www.tiktok.com/@demo/video/1234567890123456789"),
+        SimpleNamespace(id=44),
+        ["first", "second"],
+        correlation_id="task_1_parallel_main_v1_a1_acc44",
+        expected_video_url="https://www.tiktok.com/@demo/video/1234567890123456789",
+    )
+
+    assert calls == [
+        ("first", "task_1_parallel_main_v1_a1_acc44_v1"),
+        ("second", "task_1_parallel_main_v1_a1_acc44_v2"),
+    ]
+    assert resets["count"] == 1
+    assert failure_reason is None
+    assert len(published) == 2
+    assert published[0].text == "first"
+    assert published[1].text == "second"
 
 
 @pytest.mark.unit
@@ -2144,7 +2279,7 @@ async def test_parallel_main_submit_without_clean_composer_does_not_recover_same
     from executor.publish_action import PublishResult
 
     calls = []
-    recovered = {"count": 0}
+    resets = {"count": 0}
 
     async def fake_publish(_page, text, **kwargs):
         calls.append((text, kwargs["correlation_id"]))
@@ -2160,13 +2295,13 @@ async def test_parallel_main_submit_without_clean_composer_does_not_recover_same
     async def fake_username(_page):
         return "main_user"
 
-    async def fake_recover(_page, **_kwargs):
-        recovered["count"] += 1
+    async def fake_reset(_page, **_kwargs):
+        resets["count"] += 1
         return False
 
     monkeypatch.setattr(user_schema, "publish_comment_hybrid", fake_publish)
     monkeypatch.setattr(user_schema, "extract_tiktok_username", fake_username)
-    monkeypatch.setattr(user_schema, "_recover_page_before_input_retry", fake_recover)
+    monkeypatch.setattr(user_schema, "reset_main_comment_composer_for_next_variant", fake_reset)
     monkeypatch.setattr(user_schema, "find_comment_in_list", AsyncMock(return_value=(False, {})))
     monkeypatch.setattr(user_schema, "_deny_if_visible_logged_out", AsyncMock(return_value=None))
 
@@ -2180,10 +2315,10 @@ async def test_parallel_main_submit_without_clean_composer_does_not_recover_same
     )
 
     assert calls == [("first", "task_1_parallel_main_v1_a1_acc44_v1")]
-    assert recovered["count"] == 0
+    assert resets["count"] == 1
     assert failure_reason == (
         "main_partial:published=1/2;remaining=1;"
-        "reason=account_series_stopped_after_unconfirmed"
+        "reason=account_series_stopped_after_unconfirmed_unsafe_composer"
     )
     assert len(published) == 1
     assert published[0].text == "first"
@@ -2210,14 +2345,10 @@ async def test_parallel_main_direct_no_response_accepts_author_scoped_local_matc
     async def fake_username(_page):
         return "main_user"
 
-    async def fake_recover(_page, **_kwargs):
-        return True
-
     finder = AsyncMock(return_value=(True, {"comment_id": "author-scoped-cid"}))
 
     monkeypatch.setattr(user_schema, "publish_comment_hybrid", fake_publish)
     monkeypatch.setattr(user_schema, "extract_tiktok_username", fake_username)
-    monkeypatch.setattr(user_schema, "_recover_page_before_input_retry", fake_recover)
     monkeypatch.setattr(user_schema, "find_comment_in_list", finder)
     monkeypatch.setattr(user_schema, "_deny_if_visible_logged_out", AsyncMock(return_value=None))
 
@@ -2232,6 +2363,11 @@ async def test_parallel_main_direct_no_response_accepts_author_scoped_local_matc
 
     assert finder.await_count == 2
     assert all(call.kwargs.get("expected_author") == "main_user" for call in finder.await_args_list)
+    assert all(call.kwargs.get("require_author_match") is True for call in finder.await_args_list)
+    assert all(call.kwargs.get("strict_scope") is True for call in finder.await_args_list)
+    assert all(call.kwargs.get("top_level_only") is True for call in finder.await_args_list)
+    assert all(call.kwargs.get("min_match_ratio") == 1.0 for call in finder.await_args_list)
+    assert all(call.kwargs.get("ensure_open") is False for call in finder.await_args_list)
     assert failure_reason is None
     assert len(published) == 2
     assert published[0].text == "first"
@@ -2264,10 +2400,12 @@ async def test_parallel_main_local_only_dirty_composer_stops_account_series(monk
     async def fake_username(_page):
         return "main_user"
 
+    reset = AsyncMock(return_value=False)
     finder = AsyncMock(return_value=(True, {"comment_id": "cid-first"}))
 
     monkeypatch.setattr(user_schema, "publish_comment_hybrid", fake_publish)
     monkeypatch.setattr(user_schema, "extract_tiktok_username", fake_username)
+    monkeypatch.setattr(user_schema, "reset_main_comment_composer_for_next_variant", reset)
     monkeypatch.setattr(user_schema, "find_comment_in_list", finder)
     monkeypatch.setattr(user_schema, "_deny_if_visible_logged_out", AsyncMock(return_value=None))
 
@@ -2281,6 +2419,7 @@ async def test_parallel_main_local_only_dirty_composer_stops_account_series(monk
     )
 
     assert calls == [("first", "task_1_parallel_main_v1_a1_acc44_v1")]
+    assert reset.await_count == 1
     assert failure_reason == (
         "main_partial:published=1/2;remaining=1;"
         "reason=account_series_stopped_after_local_unsafe_composer"
@@ -2293,7 +2432,7 @@ async def test_parallel_main_local_only_dirty_composer_stops_account_series(monk
 
 @pytest.mark.unit
 @pytest.mark.asyncio
-async def test_parallel_main_local_confirmation_timeout_stops_after_unconfirmed(monkeypatch):
+async def test_parallel_main_local_confirmation_timeout_continues_when_composer_clean(monkeypatch):
     from executor import user_schema
     from executor.publish_action import PublishResult
 
@@ -2316,12 +2455,8 @@ async def test_parallel_main_local_confirmation_timeout_stops_after_unconfirmed(
         await asyncio.sleep(60)
         return True, {"comment_id": "late-cid"}
 
-    async def fake_recover(_page, **_kwargs):
-        return True
-
     monkeypatch.setattr(user_schema, "publish_comment_hybrid", fake_publish)
     monkeypatch.setattr(user_schema, "extract_tiktok_username", fake_username)
-    monkeypatch.setattr(user_schema, "_recover_page_before_input_retry", fake_recover)
     monkeypatch.setattr(user_schema, "find_comment_in_list", slow_find_comment)
     monkeypatch.setattr(user_schema, "_main_local_confirmation_timeout_seconds", lambda: 0.01)
     monkeypatch.setattr(user_schema, "_deny_if_visible_logged_out", AsyncMock(return_value=None))
@@ -2335,14 +2470,12 @@ async def test_parallel_main_local_confirmation_timeout_stops_after_unconfirmed(
         expected_video_url="https://www.tiktok.com/@demo/video/1234567890123456789",
     )
 
-    assert failure_reason == (
-        "main_partial:published=1/2;remaining=1;"
-        "reason=account_series_stopped_after_unconfirmed"
-    )
-    assert len(published) == 1
+    assert failure_reason is None
+    assert len(published) == 2
     assert published[0].text == "first"
     assert published[0].comment_id is None
     assert published[0].local_confirmed is False
+    assert published[1].text == "second"
 
 
 @pytest.mark.unit
@@ -2387,8 +2520,15 @@ async def test_publish_all_variants_returns_comment_ui_failure_reason(monkeypatc
     async def fake_publish(_page, _text, **_kwargs):
         return PublishResult(status="dom_error", error_reason="input_not_found: comment_ui_not_found")
 
-    async def fake_recover(_page, *, correlation_id, require_clean_composer=False):
+    async def fake_recover(
+        _page,
+        *,
+        correlation_id,
+        expected_video_url=None,
+        require_clean_composer=False,
+    ):
         assert correlation_id == "task_2_v1"
+        assert expected_video_url is None
         assert require_clean_composer is True
         return False
 
@@ -7239,6 +7379,30 @@ def test_reply_visibility_quorum_is_proxy_scoped_and_handles_delayed_failure():
 
 
 @pytest.mark.unit
+def test_reply_planned_rotation_counts_only_current_attempt_submissions():
+    from executor import user_schema
+    import inspect
+
+    result_source = inspect.getsource(user_schema._ParallelReplyVariantResult)
+    source = inspect.getsource(user_schema.execute_user_schema_parallel)
+    helper_source = source.split(
+        "async def _record_successful_reply_proxy_completion", 1
+    )[1].split("    def _reply_visibility_proxy_key", 1)[0]
+
+    assert "submitted_this_attempt: bool = False" in result_source
+    assert "submitted_this_attempt = False" in source
+    assert "nonlocal submitted_this_attempt" in source
+    assert "submitted_this_attempt = True" in source
+    assert (
+        "variant_result.submitted_this_attempt = bool(submitted_outcomes) or submitted_this_attempt"
+        in source
+    )
+    assert 'bool(getattr(item, "submitted_this_attempt", False))' in source
+    assert "submitted_this_attempt: bool" in helper_source
+    assert "any(_reply_outcome_submitted" not in helper_source
+
+
+@pytest.mark.unit
 def test_reply_local_verifier_excludes_open_reply_editor_artifacts():
     from executor import user_schema
     import inspect
@@ -8845,6 +9009,495 @@ async def test_parallel_mode_limits_main_proxy_to_three_active_browsers(monkeypa
 
 @pytest.mark.unit
 @pytest.mark.asyncio
+async def test_parallel_mode_rotates_mobile_proxy_before_third_main_browser(monkeypatch):
+    from db import database as db_database
+    from executor import browser_pool, user_schema
+
+    shared_proxy = "http://mobile-proxy:1000"
+
+    class FakeQuery:
+        def filter(self, *_args, **_kwargs):
+            return self
+
+        def first(self):
+            return SimpleNamespace(
+                proxy=shared_proxy,
+                is_mobile="Y",
+                rotation_url="http://rotate.local",
+            )
+
+    class FakeDb:
+        no_autoflush = SimpleNamespace()
+
+        def query(self, *_args, **_kwargs):
+            return FakeQuery()
+
+    @contextmanager
+    def fake_db_context():
+        yield FakeDb()
+
+    main_accounts = [
+        SimpleNamespace(id=101 + i, proxy=shared_proxy)
+        for i in range(3)
+    ]
+    selected_ids: set[int] = set()
+    select_lock = threading.Lock()
+    events = []
+    started_accounts: set[int] = set()
+    first_two_started = asyncio.Event()
+    release_first_two = asyncio.Event()
+    real_sleep = asyncio.sleep
+
+    def fake_get_main(_db, *, exclude_ids=None, exclude_proxies=None, **_kwargs):
+        excluded = set(exclude_ids or [])
+        excluded_proxies = {str(proxy).strip() for proxy in (exclude_proxies or []) if proxy}
+        with select_lock:
+            candidate = next(
+                (
+                    account
+                    for account in main_accounts
+                    if account.id not in excluded
+                    and account.id not in selected_ids
+                    and str(account.proxy or "").strip() not in excluded_proxies
+                ),
+                None,
+            )
+            if candidate is not None:
+                selected_ids.add(candidate.id)
+            return candidate
+
+    async def fake_try_main(_db, account, _video_url, texts, **_kwargs):
+        events.append(("start", account.id))
+        started_accounts.add(account.id)
+        if {101, 102}.issubset(started_accounts):
+            first_two_started.set()
+        if account.id in {101, 102}:
+            await release_first_two.wait()
+        await real_sleep(0.01)
+        events.append(("finish", account.id))
+        return [
+            user_schema.PublishedMain(
+                text=text,
+                comment_id=f"cid-{account.id}-{text}",
+                network_confirmed=True,
+                local_confirmed=True,
+                method="hybrid_dom",
+                account_id=account.id,
+                tiktok_username=f"user_{account.id}",
+            )
+            for text in texts
+        ], None
+
+    async def fake_rotate(proxy_obj, _db):
+        events.append(("rotate", proxy_obj.proxy))
+        await real_sleep(0)
+        return "203.0.113.10"
+
+    monkeypatch.setattr(user_schema._settings, "PARALLEL_COMMENTING_TARGET_BROWSERS", 3, raising=False)
+    monkeypatch.setattr(user_schema._settings, "PARALLEL_COMMENTING_MAX_BROWSERS", 3, raising=False)
+    monkeypatch.setattr(user_schema._settings, "PARALLEL_MAIN_WORKERS", 3, raising=False)
+    monkeypatch.setattr(user_schema._settings, "PARALLEL_MAIN_MAX_ACTIVE_BROWSERS_PER_PROXY", 3, raising=False)
+    monkeypatch.setattr(user_schema._settings, "PARALLEL_MAIN_ROTATE_MOBILE_PROXY_AFTER_ACCOUNTS", 2, raising=False)
+    monkeypatch.setattr(user_schema._settings, "PARALLEL_COMMENTING_MAX_MAIN_ATTEMPTS", 6, raising=False)
+    monkeypatch.setattr(user_schema._settings, "PARALLEL_MAIN_REFILL_POLL_SECONDS", 0.05, raising=False)
+    monkeypatch.setattr(user_schema._settings, "PARALLEL_PROXY_SLOT_REFILL_BACKOFF_SECONDS", 0.05, raising=False)
+    monkeypatch.setattr(db_database, "get_sync_db_context", fake_db_context)
+    monkeypatch.setattr(user_schema, "get_free_account_for_main_comment", fake_get_main)
+    monkeypatch.setattr(user_schema, "_try_main_account", fake_try_main)
+    monkeypatch.setattr(user_schema, "_record_main_retry_failure", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(
+        user_schema,
+        "release_main_account_reservation",
+        lambda account_id, *_args, **_kwargs: selected_ids.discard(int(account_id or 0)),
+    )
+    monkeypatch.setattr(user_schema, "ensure_proxy_ip_rotated", fake_rotate)
+    monkeypatch.setattr(user_schema, "_maybe_order_likes", AsyncMock(return_value=None))
+    monkeypatch.setattr(browser_pool, "ensure_thread_browser_pool_capacity", lambda _min_browsers: None)
+    monkeypatch.setattr(browser_pool, "close_browser_pool", AsyncMock(return_value=None))
+
+    run_task = asyncio.create_task(
+        user_schema.execute_user_schema_parallel(
+            SimpleNamespace(),
+            SimpleNamespace(settings={"replies": [], "reply_count": 0}),
+            "https://www.tiktok.com/@demo/video/1234567890123456789",
+            ["m1", "m2", "m3"],
+            510,
+            boost_enabled=False,
+            boost_quantity=0,
+        )
+    )
+
+    await asyncio.wait_for(first_two_started.wait(), timeout=1.0)
+    await real_sleep(0.15)
+    assert ("start", 103) not in events
+
+    release_first_two.set()
+    result = await asyncio.wait_for(run_task, timeout=3.0)
+
+    assert result.error is None
+    assert events.index(("rotate", shared_proxy)) < events.index(("start", 103))
+    assert [event for event in events if event[0] == "start"] == [
+        ("start", 101),
+        ("start", 102),
+        ("start", 103),
+    ]
+    assert sorted(main.account_id for main in result.published_mains) == [101, 101, 101, 102, 102, 102, 103, 103, 103]
+
+
+@pytest.mark.unit
+@pytest.mark.asyncio
+async def test_parallel_mode_keeps_main_proxy_blocked_while_planned_rotation_is_in_flight(monkeypatch):
+    from db import database as db_database
+    from executor import browser_pool, user_schema
+
+    shared_proxy = "http://mobile-proxy-race:1000"
+    other_proxy = "http://other-proxy-race:1000"
+    main_accounts = [
+        SimpleNamespace(id=101, proxy=shared_proxy),
+        SimpleNamespace(id=201, proxy=other_proxy),
+        SimpleNamespace(id=102, proxy=shared_proxy),
+        SimpleNamespace(id=103, proxy=shared_proxy),
+        SimpleNamespace(id=202, proxy=other_proxy),
+    ]
+
+    class FakeQuery:
+        def filter(self, *_args, **_kwargs):
+            return self
+
+        def first(self):
+            return SimpleNamespace(
+                proxy=shared_proxy,
+                is_mobile="Y",
+                rotation_url="http://rotate.local",
+            )
+
+    class FakeDb:
+        no_autoflush = SimpleNamespace()
+
+        def query(self, *_args, **_kwargs):
+            return FakeQuery()
+
+    @contextmanager
+    def fake_db_context():
+        yield FakeDb()
+
+    selected_ids: set[int] = set()
+    select_lock = threading.Lock()
+    events = []
+    release_shared = asyncio.Event()
+    shared_pair_started = asyncio.Event()
+    rotation_started = asyncio.Event()
+    finish_rotation = asyncio.Event()
+    real_sleep = asyncio.sleep
+
+    def fake_get_main(_db, *, exclude_ids=None, exclude_proxies=None, **_kwargs):
+        excluded = {int(item) for item in (exclude_ids or [])}
+        excluded_proxies = {str(proxy).strip() for proxy in (exclude_proxies or []) if proxy}
+        with select_lock:
+            candidate = next(
+                (
+                    account
+                    for account in main_accounts
+                    if account.id not in excluded
+                    and account.id not in selected_ids
+                    and str(account.proxy or "").strip() not in excluded_proxies
+                ),
+                None,
+            )
+            if candidate is not None:
+                selected_ids.add(candidate.id)
+            return candidate
+
+    async def fake_try_main(_db, account, _video_url, texts, **_kwargs):
+        events.append(("start", account.id))
+        shared_started = [event for event in events if event in {("start", 101), ("start", 102)}]
+        if len(shared_started) == 2:
+            shared_pair_started.set()
+        if account.id in {101, 102}:
+            await release_shared.wait()
+        if account.id == 201:
+            await rotation_started.wait()
+            events.append(("fail", account.id))
+            return [], "transient_other_proxy_failure"
+        await real_sleep(0.01)
+        events.append(("finish", account.id))
+        return [
+            user_schema.PublishedMain(
+                text=text,
+                comment_id=f"cid-{account.id}-{text}",
+                network_confirmed=True,
+                local_confirmed=True,
+                method="hybrid_dom",
+                account_id=account.id,
+                tiktok_username=f"user_{account.id}",
+            )
+            for text in texts
+        ], None
+
+    async def fake_rotate(proxy_obj, _db):
+        events.append(("rotate_start", proxy_obj.proxy))
+        rotation_started.set()
+        await finish_rotation.wait()
+        events.append(("rotate_finish", proxy_obj.proxy))
+        return "203.0.113.11"
+
+    monkeypatch.setattr(user_schema._settings, "PARALLEL_MAIN_ACCOUNT_SLOTS", 4, raising=False)
+    monkeypatch.setattr(user_schema._settings, "PARALLEL_COMMENTING_TARGET_BROWSERS", 3, raising=False)
+    monkeypatch.setattr(user_schema._settings, "PARALLEL_COMMENTING_MAX_BROWSERS", 3, raising=False)
+    monkeypatch.setattr(user_schema._settings, "PARALLEL_MAIN_WORKERS", 3, raising=False)
+    monkeypatch.setattr(user_schema._settings, "PARALLEL_MAIN_MAX_ACTIVE_BROWSERS_PER_PROXY", 3, raising=False)
+    monkeypatch.setattr(user_schema._settings, "PARALLEL_MAIN_ROTATE_MOBILE_PROXY_AFTER_ACCOUNTS", 2, raising=False)
+    monkeypatch.setattr(user_schema._settings, "PARALLEL_COMMENTING_MAX_MAIN_ATTEMPTS", 6, raising=False)
+    monkeypatch.setattr(user_schema._settings, "PARALLEL_MAIN_REFILL_POLL_SECONDS", 0.03, raising=False)
+    monkeypatch.setattr(user_schema._settings, "PARALLEL_PROXY_SLOT_REFILL_BACKOFF_SECONDS", 0.03, raising=False)
+    monkeypatch.setattr(db_database, "get_sync_db_context", fake_db_context)
+    monkeypatch.setattr(user_schema, "get_free_account_for_main_comment", fake_get_main)
+    monkeypatch.setattr(
+        user_schema,
+        "_proxy_is_rotatable_mobile_for_main",
+        lambda _db, proxy_value: str(proxy_value or "").strip() == shared_proxy,
+    )
+    monkeypatch.setattr(user_schema, "_try_main_account", fake_try_main)
+    monkeypatch.setattr(user_schema, "_record_main_retry_failure", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(
+        user_schema,
+        "release_main_account_reservation",
+        lambda account_id, *_args, **_kwargs: selected_ids.discard(int(account_id or 0)),
+    )
+    monkeypatch.setattr(user_schema, "ensure_proxy_ip_rotated", fake_rotate)
+    monkeypatch.setattr(user_schema, "_maybe_order_likes", AsyncMock(return_value=None))
+    monkeypatch.setattr(browser_pool, "ensure_thread_browser_pool_capacity", lambda _min_browsers: None)
+    monkeypatch.setattr(browser_pool, "close_browser_pool", AsyncMock(return_value=None))
+
+    run_task = asyncio.create_task(
+        user_schema.execute_user_schema_parallel(
+            SimpleNamespace(),
+            SimpleNamespace(settings={"replies": [], "reply_count": 0}),
+            "https://www.tiktok.com/@demo/video/1234567890123456789",
+            ["m1", "m2", "m3"],
+            511,
+            boost_enabled=False,
+            boost_quantity=0,
+        )
+    )
+
+    await asyncio.wait_for(shared_pair_started.wait(), timeout=1.0)
+    release_shared.set()
+    await asyncio.wait_for(rotation_started.wait(), timeout=1.0)
+    await real_sleep(0.15)
+    assert ("start", 103) not in events
+
+    finish_rotation.set()
+    result = await asyncio.wait_for(run_task, timeout=3.0)
+
+    assert result.error is None
+    assert events.index(("rotate_finish", shared_proxy)) < events.index(("start", 103))
+    assert ("start", 202) in events
+
+
+@pytest.mark.unit
+@pytest.mark.asyncio
+async def test_parallel_mode_rotates_mobile_proxy_after_three_reply_browsers(monkeypatch):
+    from db import database as db_database
+    from executor import browser_pool, user_schema
+
+    shared_proxy = "http://reply-mobile-proxy:1000"
+
+    class FakeQuery:
+        def filter(self, *_args, **_kwargs):
+            return self
+
+        def first(self):
+            return SimpleNamespace(
+                proxy=shared_proxy,
+                is_mobile="Y",
+                rotation_url="http://rotate-reply.local",
+            )
+
+    class FakeDb:
+        no_autoflush = SimpleNamespace()
+
+        def query(self, *_args, **_kwargs):
+            return FakeQuery()
+
+    @contextmanager
+    def fake_db_context():
+        yield FakeDb()
+
+    main_account = SimpleNamespace(id=101, proxy=None)
+    reply_accounts = [
+        SimpleNamespace(id=201 + i, proxy=shared_proxy)
+        for i in range(4)
+    ]
+    selected_main = False
+    selected_reply_ids: set[int] = set()
+    select_lock = threading.Lock()
+    events = []
+    first_two_started = asyncio.Event()
+    release_first_two = asyncio.Event()
+    third_started = asyncio.Event()
+    release_third = asyncio.Event()
+    rotation_started = asyncio.Event()
+    finish_rotation = asyncio.Event()
+    real_sleep = asyncio.sleep
+
+    def fake_get_main(_db, *, exclude_ids=None, **_kwargs):
+        nonlocal selected_main
+        if selected_main or main_account.id in set(exclude_ids or []):
+            return None
+        selected_main = True
+        return main_account
+
+    async def fake_try_main(_db, account, _video_url, texts, **_kwargs):
+        return [
+            user_schema.PublishedMain(
+                text=text,
+                comment_id=f"main-{idx}",
+                network_confirmed=True,
+                local_confirmed=True,
+                method="hybrid_dom",
+                account_id=account.id,
+                tiktok_username=f"user_{account.id}",
+            )
+            for idx, text in enumerate(texts, start=1)
+        ], None
+
+    def fake_get_reply(_db, exclude_ids=None, exclude_proxies=None, **_kwargs):
+        excluded = {int(item) for item in (exclude_ids or [])}
+        excluded_proxies = {str(proxy).strip() for proxy in (exclude_proxies or []) if proxy}
+        with select_lock:
+            candidate = next(
+                (
+                    account
+                    for account in reply_accounts
+                    if account.id not in excluded
+                    and account.id not in selected_reply_ids
+                    and str(account.proxy or "").strip() not in excluded_proxies
+                ),
+                None,
+            )
+            if candidate is not None:
+                selected_reply_ids.add(candidate.id)
+            return candidate
+
+    async def fake_reply(_db, account, _video_url, main_candidates, reply_text, **kwargs):
+        events.append(("start", account.id))
+        started_reply_ids = [event[1] for event in events if event[0] == "start"]
+        if {201, 202}.issubset(started_reply_ids):
+            first_two_started.set()
+        if account.id in {201, 202}:
+            await release_first_two.wait()
+        if account.id == 203:
+            third_started.set()
+            await release_third.wait()
+        await real_sleep(0.01)
+        events.append(("finish", account.id))
+        outcomes = [
+            user_schema.ReplyOutcome(
+                text=reply_text,
+                variant_index=kwargs["variant_index"],
+                matched_main_text=main.text,
+                parent_comment_id=main.comment_id,
+                parent_key=user_schema._main_parent_key(main),
+                success=True,
+                method="unit_local",
+                error=None,
+                account_id=account.id,
+                attempted=True,
+                local_confirmed=True,
+                counts_as_submitted=True,
+            )
+            for main in main_candidates
+        ]
+        return user_schema.ReplyAttemptResult(
+            replies=outcomes,
+            found_mains=list(main_candidates),
+            searched=True,
+            saw_comment_rows=True,
+            parent_search_max_seen_rows=10,
+            parent_search_unique_rows_seen=10,
+        )
+
+    async def fake_rotate(proxy_obj, _db):
+        events.append(("rotate_start", proxy_obj.proxy))
+        rotation_started.set()
+        await finish_rotation.wait()
+        events.append(("rotate_finish", proxy_obj.proxy))
+        return "203.0.113.21"
+
+    monkeypatch.setattr(user_schema._settings, "PARALLEL_MAIN_ACCOUNT_SLOTS", 1, raising=False)
+    monkeypatch.setattr(user_schema._settings, "PARALLEL_COMMENTING_TARGET_BROWSERS", 2, raising=False)
+    monkeypatch.setattr(user_schema._settings, "PARALLEL_COMMENTING_MAX_BROWSERS", 2, raising=False)
+    monkeypatch.setattr(user_schema._settings, "PARALLEL_MAIN_WORKERS", 1, raising=False)
+    monkeypatch.setattr(user_schema._settings, "PARALLEL_REPLY_VARIANT_WORKERS", 2, raising=False)
+    monkeypatch.setattr(user_schema._settings, "PARALLEL_REPLY_MAX_ACTIVE_BROWSERS_PER_PROXY", 3, raising=False)
+    monkeypatch.setattr(user_schema._settings, "PARALLEL_REPLY_ROTATE_MOBILE_PROXY_AFTER_ACCOUNTS", 3, raising=False)
+    monkeypatch.setattr(user_schema._settings, "PARALLEL_COMMENTING_MAX_REPLY_ATTEMPTS", 6, raising=False)
+    monkeypatch.setattr(user_schema._settings, "PARALLEL_REPLY_REFILL_POLL_SECONDS", 0.03, raising=False)
+    monkeypatch.setattr(user_schema._settings, "PARALLEL_PROXY_SLOT_REFILL_BACKOFF_SECONDS", 0.03, raising=False)
+    monkeypatch.setattr(user_schema._settings, "PARALLEL_REPLY_START_DELAY_MIN_SECONDS", 0, raising=False)
+    monkeypatch.setattr(user_schema._settings, "PARALLEL_REPLY_START_DELAY_MAX_SECONDS", 0, raising=False)
+    monkeypatch.setattr(db_database, "get_sync_db_context", fake_db_context)
+    monkeypatch.setattr(user_schema, "get_free_account_for_main_comment", fake_get_main)
+    monkeypatch.setattr(user_schema, "_try_main_account", fake_try_main)
+    monkeypatch.setattr(user_schema, "get_free_account_for_reply", fake_get_reply)
+    monkeypatch.setattr(user_schema, "_reply_with_variant_on_all_mains", fake_reply)
+    monkeypatch.setattr(user_schema, "_record_main_retry_failure", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(
+        user_schema,
+        "release_reply_account_reservation",
+        lambda account_id, *_args, **_kwargs: selected_reply_ids.discard(int(account_id or 0)),
+    )
+    monkeypatch.setattr(user_schema, "release_main_account_reservation", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(user_schema, "ensure_proxy_ip_rotated", fake_rotate)
+    monkeypatch.setattr(user_schema, "_maybe_order_likes", AsyncMock(return_value=None))
+    monkeypatch.setattr(browser_pool, "ensure_thread_browser_pool_capacity", lambda _min_browsers: None)
+    monkeypatch.setattr(browser_pool, "close_browser_pool", AsyncMock(return_value=None))
+
+    run_task = asyncio.create_task(
+        user_schema.execute_user_schema_parallel(
+            FakeDb(),
+            SimpleNamespace(settings={"replies": ["r1", "r2", "r3", "r4"], "reply_count": 4}),
+            "https://www.tiktok.com/@demo/video/1234567890123456789",
+            ["m1"],
+            512,
+            boost_enabled=False,
+            boost_quantity=0,
+        )
+    )
+
+    await asyncio.wait_for(first_two_started.wait(), timeout=1.0)
+    release_first_two.set()
+    await asyncio.wait_for(third_started.wait(), timeout=1.0)
+    await real_sleep(0.15)
+    assert ("start", 204) not in events
+
+    release_third.set()
+    await asyncio.wait_for(rotation_started.wait(), timeout=1.0)
+    await real_sleep(0.15)
+    assert ("start", 204) not in events
+
+    finish_rotation.set()
+    result = await asyncio.wait_for(run_task, timeout=3.0)
+
+    assert result.error is None
+    assert events.index(("rotate_finish", shared_proxy)) < events.index(("start", 204))
+    assert [event for event in events if event[0] == "start"] == [
+        ("start", 201),
+        ("start", 202),
+        ("start", 203),
+        ("start", 204),
+    ]
+    assert sorted(outcome.account_id for outcome in result.replies if outcome.counts_as_submitted) == [
+        201,
+        202,
+        203,
+        204,
+    ]
+
+
+@pytest.mark.unit
+@pytest.mark.asyncio
 async def test_parallel_mode_does_not_spin_main_selection_while_proxy_slots_are_full(monkeypatch):
     from db import database as db_database
     from executor import browser_pool, user_schema
@@ -10442,8 +11095,9 @@ def test_publish_reply_retry_rebinds_target_and_caps_send_recovery():
     assert "min(_PARALLEL_POST_RESPONSE_WAIT_SECONDS, 1.4)" in source
     assert "1000 if reply_scoped and fast_publish else 3000" in source
     assert "1000 if reply_scoped and fast_publish else 5000" in source
-    assert "3.5 if fast_publish else 4.5" in reply_source
-    assert "reply_send_recover_retry" in reply_source
+    assert "2.2 if fast_publish else 3.0" in reply_source
+    assert "reply_send_recover_send_only" in reply_source
+    assert "_recover_reply_send_only(" in reply_source
 
 
 @pytest.mark.unit

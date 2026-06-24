@@ -73,11 +73,11 @@ from executor.session_bootstrap import (
 )
 from executor.publish_action import (
     PublishResult,
-    _clear_main_comment_composer_best_effort,
     extract_tiktok_media_id,
     is_on_expected_media_url,
     publish_comment_hybrid,
     publish_reply_hybrid,
+    reset_main_comment_composer_for_next_variant,
 )
 from executor.http.playwright_http_client import PlaywrightHttpClient
 from executor.dom_actions import (
@@ -299,6 +299,22 @@ def _parallel_main_refill_poll_seconds() -> float:
         minimum=0.05,
         maximum=1.0,
     )
+
+
+def _proxy_is_rotatable_mobile_for_main(db: Session, proxy_value: Optional[str]) -> bool:
+    proxy_value = str(proxy_value or "").strip()
+    if not proxy_value:
+        return False
+    proxy_obj = db.query(Proxy).filter(Proxy.proxy == proxy_value).first()
+    return bool(
+        proxy_obj is not None
+        and getattr(proxy_obj, "is_mobile", None) == "Y"
+        and str(getattr(proxy_obj, "rotation_url", "") or "").strip()
+    )
+
+
+def _proxy_is_rotatable_mobile_for_reply(db: Session, proxy_value: Optional[str]) -> bool:
+    return _proxy_is_rotatable_mobile_for_main(db, proxy_value)
 
 
 def _parallel_reply_worker_attempt_timeout_seconds() -> float:
@@ -3839,6 +3855,7 @@ async def _recover_page_before_input_retry(
     page: Page,
     *,
     correlation_id: str,
+    expected_video_url: Optional[str] = None,
     require_clean_composer: bool = False,
 ) -> bool:
     logger.warning(
@@ -3899,14 +3916,17 @@ async def _recover_page_before_input_retry(
                 surface_has_input = False
         if surface_has_input:
             if require_clean_composer:
-                cleaned = await _clear_main_comment_composer_best_effort(
+                cleaned = await reset_main_comment_composer_for_next_variant(
                     page,
-                    reason="input_retry_recover_clean_composer",
+                    expected_video_url=expected_video_url,
                     correlation_id=correlation_id,
+                    timeout_seconds=2.2,
+                    comment_surface_ready=True,
                 )
                 if not cleaned:
                     logger.warning(
-                        "[USER_SCHEMA] %s input retry recovery found composer but could not prove it clean",
+                        "[USER_SCHEMA] %s input retry recovery found composer surface but could not rebind "
+                        "and prove exact main editor clean",
                         correlation_id,
                     )
                     return False
@@ -4037,6 +4057,7 @@ async def _publish_all_variants_on_account(
             comments_already_open = await _recover_page_before_input_retry(
                 page,
                 correlation_id=sub_corr,
+                expected_video_url=expected_video_url,
                 require_clean_composer=True,
             )
             if comments_already_open:
@@ -4119,6 +4140,11 @@ async def _publish_all_variants_on_account(
                             max_scrolls=2,
                             scroll_delay_ms=300,
                             expected_author=tiktok_username,
+                            require_author_match=bool(normalize_author(tiktok_username)),
+                            strict_scope=True,
+                            top_level_only=True,
+                            min_match_ratio=1.0,
+                            ensure_open=False,
                         ),
                         timeout=local_confirm_timeout,
                     )
@@ -4299,31 +4325,11 @@ async def _publish_all_variants_on_account(
         )
         if network_confirmed:
             _register_runtime_success(db, account, scope="main")
-            if local_idx < len(text_variants) and not _publish_result_allows_same_page_reuse(result):
-                last_failure_reason = "account_series_stopped_after_network_unknown_composer"
-                logger.info(
-                    "[USER_SCHEMA] main publish %s network-confirmed through DOM, but composer cleanup "
-                    "was not strictly proven; stopping this account series so the next variant starts "
-                    "in a fresh browser",
-                    sub_corr,
-                )
-                break
         elif local_confirmed:
             logger.info(
                 "[USER_SCHEMA] main publish %s is local-only; not resetting account health counters yet",
                 sub_corr,
             )
-            if (
-                local_idx < len(text_variants)
-                and getattr(result, "composer_clean_after_submit", None) is not True
-            ):
-                last_failure_reason = "account_series_stopped_after_local_unsafe_composer"
-                logger.info(
-                    "[USER_SCHEMA] main publish %s is local-only and composer cleanup was not strictly proven; "
-                    "stopping this account series so the next variant starts in a fresh browser",
-                    sub_corr,
-                )
-                break
         elif submitted_unconfirmed:
             logger.info(
                 "[USER_SCHEMA] main publish %s is submitted-unconfirmed; not resetting account health counters yet",
@@ -4350,22 +4356,32 @@ async def _publish_all_variants_on_account(
             last_failure_reason = logged_out_after_variant
             break
 
-        # Ambiguous submit (Post clicked, but the comment could not be confirmed
-        # in the list): treat it as SENT and STOP this account's series. We must
-        # never re-type/re-post into the same composer — that is exactly what
-        # produced duplicates and "two variants in one comment", because TikTok
-        # often accepts the comment without returning a response and the dirty
-        # DraftEditor cannot be reliably cleared. Remaining variants are picked
-        # up by fresh accounts via the scheduler (and the per-task idempotency
-        # guard prevents the same text from being re-posted elsewhere).
-        if submitted_unconfirmed and local_idx < len(text_variants):
-            last_failure_reason = "account_series_stopped_after_unconfirmed"
-            logger.info(
-                "[USER_SCHEMA] main publish %s submitted-unconfirmed; treating as sent and "
-                "stopping this account series without reusing the composer (no re-type to avoid duplicates)",
-                sub_corr,
+        # Reuse the same main composer only when the publish result already
+        # proves cleanup, or when a scoped trusted reset proves the exact input
+        # is safe. Otherwise stop before the next variant; re-typing into a dirty
+        # TikTok editor is what produced doubled/merged main comments.
+        if local_idx < len(text_variants):
+            can_continue = await _main_series_can_continue_after_publish(
+                page,
+                result,
+                expected_video_url=expected_video_url,
+                correlation_id=sub_corr,
             )
-            break
+            if not can_continue:
+                if submitted_unconfirmed:
+                    last_failure_reason = "account_series_stopped_after_unconfirmed_unsafe_composer"
+                elif local_confirmed:
+                    last_failure_reason = "account_series_stopped_after_local_unsafe_composer"
+                elif network_confirmed:
+                    last_failure_reason = "account_series_stopped_after_network_unknown_composer"
+                else:
+                    last_failure_reason = "account_series_stopped_after_unsafe_composer"
+                logger.info(
+                    "[USER_SCHEMA] main publish %s recorded, but same-page reset was not proven; "
+                    "stopping account series before next variant",
+                    sub_corr,
+                )
+                break
 
         if local_idx < len(text_variants):
             delay = _next_inter_publish_delay(len(published))
@@ -5550,6 +5566,50 @@ def _publish_result_allows_same_page_reuse(result: PublishResult) -> bool:
     if not _publish_result_used_dom_composer(result):
         return True
     return bool(getattr(result, "composer_clean_after_submit", None) is True)
+
+
+async def _main_series_can_continue_after_publish(
+    page: Page,
+    result: PublishResult,
+    *,
+    expected_video_url: Optional[str],
+    correlation_id: Optional[str],
+) -> bool:
+    if _publish_result_allows_same_page_reuse(result):
+        _log_user_trace(
+            "main_series_continue_after_trusted_reset",
+            page=page,
+            expected_video_url=expected_video_url,
+            correlation_id=correlation_id,
+            reset_source="publish_result",
+        )
+        return True
+    reset_ok = await reset_main_comment_composer_for_next_variant(
+        page,
+        expected_video_url=expected_video_url,
+        correlation_id=correlation_id,
+        timeout_seconds=2.2,
+        comment_surface_ready=True,
+    )
+    if reset_ok:
+        _log_user_trace(
+            "main_series_continue_after_trusted_reset",
+            page=page,
+            expected_video_url=expected_video_url,
+            correlation_id=correlation_id,
+            reset_source="late_reset",
+        )
+        return True
+    _log_user_trace(
+        "main_series_stop_reset_failed",
+        page=page,
+        expected_video_url=expected_video_url,
+        correlation_id=correlation_id,
+        reason=getattr(result, "error_reason", None) or getattr(result, "status", None),
+        composer_clean_after_submit=getattr(result, "composer_clean_after_submit", None),
+        level=logging.WARNING,
+    )
+    return False
 
 
 def _coerce_main_anchor(value: Any, source_main: Optional[PublishedMain] = None) -> MainAnchor:
@@ -6847,6 +6907,18 @@ async def _reset_reply_page_after_confirmed_submit(
     expected_video_url: str,
 ) -> bool:
     """Try to safely reuse a reply page after a confirmed/local-confirmed submit."""
+    if expected_video_url and not is_on_expected_media_url(getattr(page, "url", None), expected_video_url):
+        _log_user_trace(
+            "reply_page_reset_after_submit",
+            page=page,
+            expected_video_url=expected_video_url,
+            correlation_id=correlation_id,
+            success=False,
+            reason="url_drift_before_reset",
+            level=logging.INFO,
+        )
+        return False
+
     try:
         dirty_before_escape = await page.evaluate(
             r"""
@@ -6870,6 +6942,7 @@ async def _reset_reply_page_after_confirmed_submit(
                     .map(el => ({ el, text: textOf(el), visible: visible(el) }))
                     .filter(item => item.text);
                 const target = dirty.find(item => item.visible) || dirty[0] || null;
+                let focusOk = false;
                 if (target && target.el) {
                     try {
                         target.el.setAttribute('data-smart-reply-reset-target', '1');
@@ -6881,12 +6954,15 @@ async def _reset_reply_page_after_confirmed_submit(
                             sel.removeAllRanges();
                             sel.addRange(range);
                         }
+                        const active = document.activeElement;
+                        focusOk = active === target.el || target.el.contains(active);
                     } catch (_) {}
                 }
                 return {
                     dirtyTextCount: dirty.length,
                     dirtyPreview: dirty.slice(0, 2).map(item => item.text.slice(0, 80)),
                     targetVisible: Boolean(target && target.visible),
+                    focusOk,
                 };
             }
             """
@@ -6895,6 +6971,18 @@ async def _reset_reply_page_after_confirmed_submit(
         dirty_before_escape = {"dirtyTextCount": 0, "reason": f"exception:{str(exc)[:80]}"}
 
     if int((dirty_before_escape or {}).get("dirtyTextCount") or 0) > 0:
+        if not bool((dirty_before_escape or {}).get("focusOk")):
+            _log_user_trace(
+                "reply_page_reset_after_submit",
+                page=page,
+                expected_video_url=expected_video_url,
+                correlation_id=correlation_id,
+                success=False,
+                reason="dirty_reply_input_focus_not_verified",
+                before_escape=dirty_before_escape,
+                level=logging.INFO,
+            )
+            return False
         try:
             await page.keyboard.press("Control+A")
             await page.keyboard.press("Backspace")
@@ -6902,6 +6990,18 @@ async def _reset_reply_page_after_confirmed_submit(
         except Exception:
             pass
         await asyncio.sleep(0.12)
+        if expected_video_url and not is_on_expected_media_url(getattr(page, "url", None), expected_video_url):
+            _log_user_trace(
+                "reply_page_reset_after_submit",
+                page=page,
+                expected_video_url=expected_video_url,
+                correlation_id=correlation_id,
+                success=False,
+                reason="url_drift_after_keyboard_clear",
+                before_escape=dirty_before_escape,
+                level=logging.INFO,
+            )
+            return False
         try:
             clear_state = await page.evaluate(
                 r"""
@@ -8905,6 +9005,8 @@ async def _reply_with_variant_on_all_mains(
                 if reply_attempt_key:
                     active_inflight_reply_keys.add(reply_attempt_key)
                     inflight_key_added = True
+                publish_result = None
+                publish_ready_for_classification = False
                 try:
                     if not await _ensure_page_on_target_media(
                         page,
@@ -9043,7 +9145,6 @@ async def _reply_with_variant_on_all_mains(
                         continue
                     if dedup_key:
                         attempted_parent_keys.add(dedup_key)
-                    publish_result = None
                     early_local_reply_probe_holder: Dict[str, Any] = {}
 
                     async def _early_local_reply_confirmation() -> Any:
@@ -9115,6 +9216,7 @@ async def _reply_with_variant_on_all_mains(
                                 else None
                             ),
                         )
+                    publish_ready_for_classification = publish_result is not None
                 except Exception as exc:
                     error = f"publish_exception:{str(exc)[:80]}"
                     _register_runtime_failure(db, account, error)
@@ -9147,8 +9249,13 @@ async def _reply_with_variant_on_all_mains(
                         )
                     continue
                 finally:
-                    if inflight_key_added and reply_attempt_key:
+                    if (
+                        inflight_key_added
+                        and reply_attempt_key
+                        and not publish_ready_for_classification
+                    ):
                         active_inflight_reply_keys.discard(reply_attempt_key)
+                        inflight_key_added = False
 
                 network_confirmed = publish_result.status == "success" and bool(publish_result.comment_id)
                 submitted_unconfirmed = _reply_publish_submitted_unconfirmed(publish_result)
@@ -9272,6 +9379,9 @@ async def _reply_with_variant_on_all_mains(
                             sub_corr,
                             str(callback_exc)[:120],
                         )
+                if inflight_key_added and reply_attempt_key:
+                    active_inflight_reply_keys.discard(reply_attempt_key)
+                    inflight_key_added = False
                 _log_user_trace(
                     "reply_publish_result",
                     page=page,
@@ -9904,6 +10014,7 @@ class _ParallelReplyVariantResult:
     variant_index: int
     text: str
     replies: List[ReplyOutcome] = field(default_factory=list)
+    submitted_this_attempt: bool = False
     found_mains: List[PublishedMain] = field(default_factory=list)
     completed: bool = False
     found_any_main: bool = False
@@ -10169,12 +10280,20 @@ async def execute_user_schema_parallel(
             legacy_max_active_browsers_per_proxy,
         ),
     )
+    main_rotate_mobile_proxy_after_accounts = _positive_int_setting(
+        "PARALLEL_MAIN_ROTATE_MOBILE_PROXY_AFTER_ACCOUNTS",
+        2,
+    )
     max_active_reply_browsers_per_proxy = min(
         parallel_browser_capacity,
         _positive_int_setting(
             "PARALLEL_REPLY_MAX_ACTIVE_BROWSERS_PER_PROXY",
             2,
         ),
+    )
+    reply_rotate_mobile_proxy_after_accounts = _positive_int_setting(
+        "PARALLEL_REPLY_ROTATE_MOBILE_PROXY_AFTER_ACCOUNTS",
+        3,
     )
     proxy_diversify_by_source_host = _bool_setting(
         "PARALLEL_PROXY_DIVERSIFY_BY_SOURCE_HOST",
@@ -10201,7 +10320,7 @@ async def execute_user_schema_parallel(
         else min(parallel_main_account_slots, parallel_worker_target)
     )
     logger.info(
-        "Task %s: parallel commenting limits main_attempts=%s reply_attempts=%s retry_account_limit=%s dynamic_pool=%s target_browsers=%s main_workers=%s reply_variant_workers=%s browser_capacity=%s main_per_proxy=%s reply_per_proxy=%s source_host_diversify=%s proxy_refill_backoff=%.2fs main_worker_timeout=%.1fs main_refill_poll=%.2fs reply_worker_timeout=%.1fs reply_refill_poll=%.2fs",
+        "Task %s: parallel commenting limits main_attempts=%s reply_attempts=%s retry_account_limit=%s dynamic_pool=%s target_browsers=%s main_workers=%s reply_variant_workers=%s browser_capacity=%s main_per_proxy=%s main_mobile_rotate_after=%s reply_per_proxy=%s reply_mobile_rotate_after=%s source_host_diversify=%s proxy_refill_backoff=%.2fs main_worker_timeout=%.1fs main_refill_poll=%.2fs reply_worker_timeout=%.1fs reply_refill_poll=%.2fs",
         task_id,
         max_main_attempts,
         max_reply_attempts,
@@ -10212,7 +10331,9 @@ async def execute_user_schema_parallel(
         reply_variant_worker_target,
         parallel_browser_capacity,
         max_active_main_browsers_per_proxy,
+        main_rotate_mobile_proxy_after_accounts,
         max_active_reply_browsers_per_proxy,
+        reply_rotate_mobile_proxy_after_accounts,
         proxy_diversify_by_source_host,
         proxy_slot_refill_backoff_seconds,
         main_worker_attempt_timeout_seconds,
@@ -10235,10 +10356,20 @@ async def execute_user_schema_parallel(
     edge_denied_main_proxy_values: set[str] = set()
     edge_denied_main_proxy_rotated: set[str] = set()
     pending_main_proxy_rotations: set[str] = set()
+    pending_main_planned_proxy_rotations: set[str] = set()
+    successful_main_proxy_completions: Dict[str, int] = {}
+    main_rotatable_mobile_proxy_values: set[str] = set()
+    main_non_rotatable_proxy_values: set[str] = set()
+    main_planned_rotation_failed_proxy_values: set[str] = set()
     edge_denied_reply_proxy_counts: Dict[str, int] = {}
     edge_denied_reply_proxy_values: set[str] = set()
     edge_denied_reply_proxy_rotated: set[str] = set()
     pending_reply_proxy_rotations: set[str] = set()
+    pending_reply_planned_proxy_rotations: set[str] = set()
+    successful_reply_proxy_completions: Dict[str, int] = {}
+    reply_rotatable_mobile_proxy_values: set[str] = set()
+    reply_non_rotatable_proxy_values: set[str] = set()
+    reply_planned_rotation_failed_proxy_values: set[str] = set()
     temporary_main_selection_error = "main_account_temporarily_unavailable"
     temporary_reply_selection_error = "reply_account_temporarily_unavailable"
 
@@ -10281,6 +10412,65 @@ async def execute_user_schema_parallel(
             for proxy, count in counts.items()
             if count > min_uses or count >= limit
         }
+
+    async def _ensure_main_proxy_rotation_capability(proxy_value: Optional[str]) -> bool:
+        proxy_value = str(proxy_value or "").strip()
+        if not proxy_value:
+            return False
+        if proxy_value in main_rotatable_mobile_proxy_values:
+            return True
+        if proxy_value in main_non_rotatable_proxy_values or proxy_value in main_planned_rotation_failed_proxy_values:
+            return False
+
+        def _load_capability() -> bool:
+            try:
+                with get_sync_db_context() as capability_db:
+                    return _proxy_is_rotatable_mobile_for_main(capability_db, proxy_value)
+            except Exception as exc:
+                logger.debug(
+                    "Task %s: failed to inspect main proxy rotation capability for %s: %s",
+                    task_id,
+                    _short_proxy_sig(proxy_value),
+                    str(exc)[:120],
+                )
+                return False
+
+        rotatable = await asyncio.to_thread(_load_capability)
+        async with main_selection_lock:
+            if rotatable:
+                main_rotatable_mobile_proxy_values.add(proxy_value)
+                main_non_rotatable_proxy_values.discard(proxy_value)
+            else:
+                main_non_rotatable_proxy_values.add(proxy_value)
+        return rotatable
+
+    def _main_planned_rotation_blocks_proxy_locked(
+        proxy_value: Optional[str],
+        active_on_proxy: int,
+    ) -> bool:
+        proxy_value = str(proxy_value or "").strip()
+        if (
+            not proxy_value
+            or proxy_value in main_planned_rotation_failed_proxy_values
+            or proxy_value not in main_rotatable_mobile_proxy_values
+        ):
+            return False
+        if proxy_value in pending_main_planned_proxy_rotations:
+            return True
+        return (
+            successful_main_proxy_completions.get(proxy_value, 0) + max(0, int(active_on_proxy or 0))
+            >= main_rotate_mobile_proxy_after_accounts
+        )
+
+    def _main_planned_rotation_blocked_proxies_locked(active_snapshot: Dict[str, int]) -> set[str]:
+        blocked = set(pending_main_planned_proxy_rotations)
+        for proxy_value in main_rotatable_mobile_proxy_values:
+            if _main_planned_rotation_blocks_proxy_locked(
+                proxy_value,
+                active_snapshot.get(proxy_value, 0),
+            ):
+                blocked.add(proxy_value)
+        return blocked
 
     async def _sleep_or_stop(seconds: float) -> bool:
         deadline = time.monotonic() + max(0.0, seconds)
@@ -10412,6 +10602,329 @@ async def execute_user_schema_parallel(
             cooled_values=cooled_values,
         )
         return False
+
+    async def _rotate_main_mobile_proxy_for_planned_reuse(
+        attempt_db: Session,
+        proxy_value: str,
+    ) -> bool:
+        proxy_value = (proxy_value or "").strip()
+        if not proxy_value:
+            return False
+        async with main_selection_lock:
+            if active_main_proxy_counts.get(proxy_value, 0) > 0:
+                pending_main_planned_proxy_rotations.add(proxy_value)
+                logger.info(
+                    "Task %s: delaying planned main mobile proxy rotation for %s because another main browser is active on it",
+                    task_id,
+                    _short_proxy_sig(proxy_value),
+                )
+                return False
+            # Keep the proxy excluded from main account selection while the
+            # rotation request is in flight.  Otherwise another completed slot
+            # on a different proxy can trigger a refill before the mobile IP
+            # actually changes.
+            pending_main_planned_proxy_rotations.add(proxy_value)
+
+        try:
+            proxy_obj = (
+                attempt_db.query(Proxy)
+                .filter(Proxy.proxy == proxy_value)
+                .first()
+            )
+        except Exception as exc:
+            proxy_obj = None
+            logger.debug(
+                "Task %s: failed to load main proxy for planned rotation: %s",
+                task_id,
+                str(exc)[:120],
+            )
+        if not (
+            proxy_obj is not None
+            and getattr(proxy_obj, "is_mobile", None) == "Y"
+            and str(getattr(proxy_obj, "rotation_url", "") or "").strip()
+        ):
+            async with main_selection_lock:
+                main_non_rotatable_proxy_values.add(proxy_value)
+                main_planned_rotation_failed_proxy_values.add(proxy_value)
+                pending_main_planned_proxy_rotations.discard(proxy_value)
+                successful_main_proxy_completions.pop(proxy_value, None)
+            logger.info(
+                "Task %s: planned main proxy rotation skipped because proxy is not rotatable mobile proxy=%s",
+                task_id,
+                _short_proxy_sig(proxy_value),
+            )
+            return False
+
+        try:
+            new_ip = await asyncio.wait_for(
+                ensure_proxy_ip_rotated(proxy_obj, attempt_db),
+                timeout=35.0,
+            )
+            async with main_selection_lock:
+                pending_main_planned_proxy_rotations.discard(proxy_value)
+                successful_main_proxy_completions[proxy_value] = 0
+                main_rotatable_mobile_proxy_values.add(proxy_value)
+                main_non_rotatable_proxy_values.discard(proxy_value)
+                main_planned_rotation_failed_proxy_values.discard(proxy_value)
+            try:
+                clear_proxy_bad(proxy_value)
+            except Exception:
+                logger.debug("clear_proxy_bad after planned main rotation failed", exc_info=True)
+            logger.info(
+                "Task %s: rotated mobile proxy before next main browser proxy=%s new_ip=%s",
+                task_id,
+                _short_proxy_sig(proxy_value),
+                new_ip,
+            )
+            return True
+        except (asyncio.TimeoutError, ProxyRotationError) as exc:
+            rotation_error = str(exc)
+        except Exception as exc:
+            rotation_error = str(exc)
+        async with main_selection_lock:
+            pending_main_planned_proxy_rotations.discard(proxy_value)
+            main_planned_rotation_failed_proxy_values.add(proxy_value)
+            successful_main_proxy_completions.pop(proxy_value, None)
+        logger.warning(
+            "Task %s: planned main mobile proxy rotation failed for %s; allowing later main browsers without planned rotation for this proxy in this task: %s",
+            task_id,
+            _short_proxy_sig(proxy_value),
+            rotation_error[:160],
+        )
+        return False
+
+    async def _record_successful_main_proxy_completion(
+        attempt_db: Session,
+        proxy_value: Optional[str],
+    ) -> None:
+        proxy_value = (proxy_value or "").strip()
+        if not proxy_value or proxy_value in main_planned_rotation_failed_proxy_values:
+            return
+        if not await _ensure_main_proxy_rotation_capability(proxy_value):
+            return
+        rotate_now = False
+        async with main_selection_lock:
+            if proxy_value in main_planned_rotation_failed_proxy_values:
+                return
+            completed = successful_main_proxy_completions.get(proxy_value, 0) + 1
+            successful_main_proxy_completions[proxy_value] = completed
+            active_on_proxy = active_main_proxy_counts.get(proxy_value, 0)
+            if completed < main_rotate_mobile_proxy_after_accounts:
+                logger.debug(
+                    "Task %s: main mobile proxy generation progress proxy=%s completed=%s/%s active=%s",
+                    task_id,
+                    _short_proxy_sig(proxy_value),
+                    completed,
+                    main_rotate_mobile_proxy_after_accounts,
+                    active_on_proxy,
+                )
+                return
+            if active_on_proxy > 0:
+                pending_main_planned_proxy_rotations.add(proxy_value)
+                logger.info(
+                    "Task %s: queued planned main mobile proxy rotation proxy=%s completed=%s active=%s",
+                    task_id,
+                    _short_proxy_sig(proxy_value),
+                    completed,
+                    active_on_proxy,
+                )
+                return
+            pending_main_planned_proxy_rotations.discard(proxy_value)
+            rotate_now = True
+        if rotate_now:
+            await _rotate_main_mobile_proxy_for_planned_reuse(attempt_db, proxy_value)
+
+    def _ensure_reply_proxy_rotation_capability_locked(
+        attempt_db: Session,
+        proxy_value: Optional[str],
+    ) -> bool:
+        proxy_value = str(proxy_value or "").strip()
+        if not proxy_value:
+            return False
+        if proxy_value in reply_rotatable_mobile_proxy_values:
+            return True
+        if (
+            proxy_value in reply_non_rotatable_proxy_values
+            or proxy_value in reply_planned_rotation_failed_proxy_values
+        ):
+            return False
+        try:
+            rotatable = _proxy_is_rotatable_mobile_for_reply(attempt_db, proxy_value)
+        except Exception as exc:
+            logger.debug(
+                "Task %s: failed to inspect reply proxy rotation capability for %s: %s",
+                task_id,
+                _short_proxy_sig(proxy_value),
+                str(exc)[:120],
+            )
+            rotatable = False
+        if rotatable:
+            reply_rotatable_mobile_proxy_values.add(proxy_value)
+            reply_non_rotatable_proxy_values.discard(proxy_value)
+        else:
+            reply_non_rotatable_proxy_values.add(proxy_value)
+        return bool(rotatable)
+
+    def _reply_planned_rotation_blocks_proxy_locked(
+        proxy_value: Optional[str],
+        active_on_proxy: int,
+    ) -> bool:
+        proxy_value = str(proxy_value or "").strip()
+        if (
+            not proxy_value
+            or proxy_value in reply_planned_rotation_failed_proxy_values
+            or proxy_value not in reply_rotatable_mobile_proxy_values
+        ):
+            return False
+        if proxy_value in pending_reply_planned_proxy_rotations:
+            return True
+        return (
+            successful_reply_proxy_completions.get(proxy_value, 0)
+            + max(0, int(active_on_proxy or 0))
+            >= reply_rotate_mobile_proxy_after_accounts
+        )
+
+    def _reply_planned_rotation_blocked_proxies_locked(active_snapshot: Dict[str, int]) -> set[str]:
+        blocked = set(pending_reply_planned_proxy_rotations)
+        for proxy_value in reply_rotatable_mobile_proxy_values:
+            if _reply_planned_rotation_blocks_proxy_locked(
+                proxy_value,
+                active_snapshot.get(proxy_value, 0),
+            ):
+                blocked.add(proxy_value)
+        return blocked
+
+    async def _rotate_reply_mobile_proxy_for_planned_reuse(
+        attempt_db: Session,
+        proxy_value: str,
+    ) -> bool:
+        proxy_value = (proxy_value or "").strip()
+        if not proxy_value:
+            return False
+        async with reply_selection_lock:
+            if active_reply_proxy_counts.get(proxy_value, 0) > 0:
+                pending_reply_planned_proxy_rotations.add(proxy_value)
+                logger.info(
+                    "Task %s: delaying planned reply mobile proxy rotation for %s because another reply browser is active on it",
+                    task_id,
+                    _short_proxy_sig(proxy_value),
+                )
+                return False
+            # Keep the proxy excluded from reply account selection until the
+            # rotation request completes. Otherwise a refill can start the next
+            # reply browser on the old mobile IP while rotation is in flight.
+            pending_reply_planned_proxy_rotations.add(proxy_value)
+
+        try:
+            proxy_obj = (
+                attempt_db.query(Proxy)
+                .filter(Proxy.proxy == proxy_value)
+                .first()
+            )
+        except Exception as exc:
+            proxy_obj = None
+            logger.debug(
+                "Task %s: failed to load reply proxy for planned rotation: %s",
+                task_id,
+                str(exc)[:120],
+            )
+        if not (
+            proxy_obj is not None
+            and getattr(proxy_obj, "is_mobile", None) == "Y"
+            and str(getattr(proxy_obj, "rotation_url", "") or "").strip()
+        ):
+            async with reply_selection_lock:
+                reply_non_rotatable_proxy_values.add(proxy_value)
+                reply_planned_rotation_failed_proxy_values.add(proxy_value)
+                pending_reply_planned_proxy_rotations.discard(proxy_value)
+                successful_reply_proxy_completions.pop(proxy_value, None)
+            logger.info(
+                "Task %s: planned reply proxy rotation skipped because proxy is not rotatable mobile proxy=%s",
+                task_id,
+                _short_proxy_sig(proxy_value),
+            )
+            return False
+
+        try:
+            new_ip = await asyncio.wait_for(
+                ensure_proxy_ip_rotated(proxy_obj, attempt_db),
+                timeout=35.0,
+            )
+            async with reply_selection_lock:
+                pending_reply_planned_proxy_rotations.discard(proxy_value)
+                successful_reply_proxy_completions[proxy_value] = 0
+                reply_rotatable_mobile_proxy_values.add(proxy_value)
+                reply_non_rotatable_proxy_values.discard(proxy_value)
+                reply_planned_rotation_failed_proxy_values.discard(proxy_value)
+            try:
+                clear_proxy_bad(proxy_value)
+            except Exception:
+                logger.debug("clear_proxy_bad after planned reply rotation failed", exc_info=True)
+            logger.info(
+                "Task %s: rotated mobile proxy before next reply browser proxy=%s new_ip=%s",
+                task_id,
+                _short_proxy_sig(proxy_value),
+                new_ip,
+            )
+            return True
+        except (asyncio.TimeoutError, ProxyRotationError) as exc:
+            rotation_error = str(exc)
+        except Exception as exc:
+            rotation_error = str(exc)
+        async with reply_selection_lock:
+            pending_reply_planned_proxy_rotations.discard(proxy_value)
+            reply_planned_rotation_failed_proxy_values.add(proxy_value)
+            successful_reply_proxy_completions.pop(proxy_value, None)
+        logger.warning(
+            "Task %s: planned reply mobile proxy rotation failed for %s; allowing later reply browsers without planned rotation for this proxy in this task: %s",
+            task_id,
+            _short_proxy_sig(proxy_value),
+            rotation_error[:160],
+        )
+        return False
+
+    async def _record_successful_reply_proxy_completion(
+        attempt_db: Session,
+        proxy_value: Optional[str],
+        submitted_this_attempt: bool,
+    ) -> None:
+        proxy_value = (proxy_value or "").strip()
+        if not proxy_value or proxy_value in reply_planned_rotation_failed_proxy_values:
+            return
+        if not submitted_this_attempt:
+            return
+        rotate_now = False
+        async with reply_selection_lock:
+            if proxy_value in reply_planned_rotation_failed_proxy_values:
+                return
+            if not _ensure_reply_proxy_rotation_capability_locked(attempt_db, proxy_value):
+                return
+            completed = successful_reply_proxy_completions.get(proxy_value, 0) + 1
+            successful_reply_proxy_completions[proxy_value] = completed
+            active_on_proxy = active_reply_proxy_counts.get(proxy_value, 0)
+            if completed < reply_rotate_mobile_proxy_after_accounts:
+                logger.debug(
+                    "Task %s: reply mobile proxy generation progress proxy=%s completed=%s/%s active=%s",
+                    task_id,
+                    _short_proxy_sig(proxy_value),
+                    completed,
+                    reply_rotate_mobile_proxy_after_accounts,
+                    active_on_proxy,
+                )
+                return
+            if active_on_proxy > 0:
+                pending_reply_planned_proxy_rotations.add(proxy_value)
+                logger.info(
+                    "Task %s: queued planned reply mobile proxy rotation proxy=%s completed=%s active=%s",
+                    task_id,
+                    _short_proxy_sig(proxy_value),
+                    completed,
+                    active_on_proxy,
+                )
+                return
+            rotate_now = True
+        if rotate_now:
+            await _rotate_reply_mobile_proxy_for_planned_reuse(attempt_db, proxy_value)
 
     async def _handle_main_edge_access_denied(
         attempt_db: Session,
@@ -10636,7 +11149,10 @@ async def execute_user_schema_parallel(
                 active_proxy_snapshot = dict(active_main_proxy_counts)
                 used_proxy_snapshot = set(used_main_proxy_values)
                 edge_denied_snapshot = set(edge_denied_main_proxy_values)
-                pending_rotation_snapshot = set(pending_main_proxy_rotations)
+                pending_rotation_snapshot = (
+                    set(pending_main_proxy_rotations)
+                    | _main_planned_rotation_blocked_proxies_locked(active_proxy_snapshot)
+                )
                 tried_ids_snapshot = set(tried_main_ids) | set(local_rejected_ids)
 
             exclude_proxies = (
@@ -10680,13 +11196,13 @@ async def execute_user_schema_parallel(
             if candidate is None:
                 if dynamic_worker_pool_enabled and (active_proxy_snapshot or pending_rotation_snapshot):
                     async with main_selection_lock:
-                        if active_main_proxy_counts or pending_main_proxy_rotations:
+                        if active_main_proxy_counts or pending_main_proxy_rotations or pending_main_planned_proxy_rotations:
                             logger.info(
                                 "Task %s: no main account below per-proxy capacity while %s main browser(s) are active "
                                 "or %s proxy rotation(s) are pending; deferring slot instead of opening another browser",
                                 task_id,
                                 sum(active_main_proxy_counts.values()),
-                                len(pending_main_proxy_rotations),
+                                len(pending_main_proxy_rotations) + len(pending_main_planned_proxy_rotations),
                             )
                             return None, temporary_main_selection_error
                     continue
@@ -10708,18 +11224,26 @@ async def execute_user_schema_parallel(
 
             candidate_id = int(getattr(candidate, "id", 0) or 0)
             proxy_value = _account_proxy_value(candidate)
+            if proxy_value:
+                await _ensure_main_proxy_rotation_capability(proxy_value)
             reject_reason: Optional[str] = None
 
             async with main_selection_lock:
                 current_edge_denied = set(edge_denied_main_proxy_values)
-                current_pending_rotation = set(pending_main_proxy_rotations)
+                current_pending_rotation = set(pending_main_proxy_rotations) | set(pending_main_planned_proxy_rotations)
                 active_on_proxy = active_main_proxy_counts.get(proxy_value or "", 0)
+                planned_rotation_blocked = _main_planned_rotation_blocks_proxy_locked(
+                    proxy_value,
+                    active_on_proxy,
+                )
                 if candidate_id in tried_main_ids:
                     reject_reason = "already_tried"
                 elif proxy_value and proxy_value in current_edge_denied:
                     reject_reason = "edge_denied_proxy"
                 elif proxy_value and proxy_value in current_pending_rotation:
                     reject_reason = "pending_proxy_rotation"
+                elif planned_rotation_blocked:
+                    reject_reason = "planned_proxy_rotation"
                 elif (
                     dynamic_worker_pool_enabled
                     and proxy_value
@@ -10749,6 +11273,7 @@ async def execute_user_schema_parallel(
                 "proxy_capacity",
                 "pending_proxy_rotation",
                 "edge_denied_proxy",
+                "planned_proxy_rotation",
             }:
                 local_rejected_proxies.add(proxy_value)
             logger.info(
@@ -10910,6 +11435,7 @@ async def execute_user_schema_parallel(
                     )
                 if dynamic_worker_pool_enabled:
                     pending_rotation_proxy = None
+                    pending_planned_rotation_proxy = None
                     async with main_selection_lock:
                         _dec_proxy_count(active_main_proxy_counts, slot_result.proxy_value)
                         proxy_value = (slot_result.proxy_value or "").strip()
@@ -10920,6 +11446,12 @@ async def execute_user_schema_parallel(
                         ):
                             pending_main_proxy_rotations.discard(proxy_value)
                             pending_rotation_proxy = proxy_value
+                        if (
+                            proxy_value
+                            and active_main_proxy_counts.get(proxy_value, 0) <= 0
+                            and proxy_value in pending_main_planned_proxy_rotations
+                        ):
+                            pending_planned_rotation_proxy = proxy_value
                     if pending_rotation_proxy:
                         await _rotate_mobile_proxy_after_failure(
                             attempt_db,
@@ -10928,6 +11460,11 @@ async def execute_user_schema_parallel(
                             rotated_set=edge_denied_main_proxy_rotated,
                             counts=edge_denied_main_proxy_counts,
                             cooled_values=edge_denied_main_proxy_values,
+                        )
+                    if pending_planned_rotation_proxy:
+                        await _rotate_main_mobile_proxy_for_planned_reuse(
+                            attempt_db,
+                            pending_planned_rotation_proxy,
                         )
             if not published:
                 streamed = list(main_published_by_slot.get(slot_index, []))
@@ -10944,6 +11481,7 @@ async def execute_user_schema_parallel(
                     reason=dead_reason,
                 )
             if published:
+                await _record_successful_main_proxy_completion(attempt_db, slot_result.proxy_value)
                 slot_result.published = published
                 published_text_keys = {_dedup_key(item.text) for item in published if (item.text or "").strip()}
                 slot_result.remaining_texts = [
@@ -11822,7 +12360,10 @@ async def execute_user_schema_parallel(
             strict_degraded_categories = {"captcha", "page_blocked"}
             capacity_blocked_proxies: set[str] = set()
             for _ in range(max(1, parallel_browser_capacity + 2)):
-                pending_rotation_snapshot = set(pending_reply_proxy_rotations)
+                pending_rotation_snapshot = (
+                    set(pending_reply_proxy_rotations)
+                    | _reply_planned_rotation_blocked_proxies_locked(active_reply_proxy_counts)
+                )
                 exclude_proxies = (
                     set(active_reply_proxy_counts)
                     if dynamic_worker_pool_enabled
@@ -11928,6 +12469,7 @@ async def execute_user_schema_parallel(
                         active_reply_proxy_counts
                         or capacity_blocked_proxies
                         or pending_reply_proxy_rotations
+                        or pending_reply_planned_proxy_rotations
                     ):
                         logger.info(
                             "Task %s: reply account selection deferred because proxy capacity/rotation is still active "
@@ -11937,12 +12479,49 @@ async def execute_user_schema_parallel(
                                 _short_proxy_sig(proxy): count
                                 for proxy, count in active_reply_proxy_counts.items()
                             },
-                            [_short_proxy_sig(proxy) for proxy in pending_reply_proxy_rotations],
+                            [
+                                _short_proxy_sig(proxy)
+                                for proxy in (
+                                    set(pending_reply_proxy_rotations)
+                                    | set(pending_reply_planned_proxy_rotations)
+                                )
+                            ],
                             [_short_proxy_sig(proxy) for proxy in capacity_blocked_proxies],
                         )
                         return None, temporary_reply_selection_error
                     return None, None
                 proxy_value = _account_proxy_value(candidate)
+                if proxy_value:
+                    _ensure_reply_proxy_rotation_capability_locked(attempt_db, proxy_value)
+                planned_rotation_blocked = _reply_planned_rotation_blocks_proxy_locked(
+                    proxy_value,
+                    active_reply_proxy_counts.get(proxy_value or "", 0),
+                )
+                if (
+                    proxy_value
+                    and (
+                        proxy_value in pending_reply_proxy_rotations
+                        or proxy_value in pending_reply_planned_proxy_rotations
+                        or planned_rotation_blocked
+                    )
+                ):
+                    try:
+                        release_reply_account_reservation(candidate.id)
+                    except Exception as exc:
+                        logger.warning(
+                            "Task %s: failed to release rotation-blocked reply account reservation for account=%s: %s",
+                            task_id,
+                            candidate.id,
+                            str(exc)[:120],
+                        )
+                    capacity_blocked_proxies.add(proxy_value)
+                    logger.info(
+                        "Task %s: reply account %s skipped because proxy %s is waiting for reply mobile rotation",
+                        task_id,
+                        candidate.id,
+                        _short_proxy_sig(proxy_value),
+                    )
+                    continue
                 if (
                     dynamic_worker_pool_enabled
                     and proxy_value
@@ -11978,6 +12557,7 @@ async def execute_user_schema_parallel(
                 active_reply_proxy_counts
                 or capacity_blocked_proxies
                 or pending_reply_proxy_rotations
+                or pending_reply_planned_proxy_rotations
             ):
                 return None, temporary_reply_selection_error
             return None, None
@@ -12013,10 +12593,13 @@ async def execute_user_schema_parallel(
         reply_task_inflight_locks.update(inflight_reply_keys)
         reported_outcomes = reply_reported_outcomes_by_variant.setdefault(variant_index, [])
         found_mains_by_key = reply_found_mains_by_variant.setdefault(variant_index, {})
+        submitted_this_attempt = False
 
         def _record_incremental_submitted_reply(outcome: ReplyOutcome) -> None:
+            nonlocal submitted_this_attempt
             if not _reply_outcome_submitted(outcome):
                 return
+            submitted_this_attempt = True
             key = _reply_outcome_report_key(outcome)
             if not any(_reply_outcome_report_key(existing) == key for existing in reported_outcomes):
                 reported_outcomes.append(outcome)
@@ -12164,6 +12747,7 @@ async def execute_user_schema_parallel(
                     )
                 if dynamic_worker_pool_enabled:
                     pending_rotation_proxy = None
+                    pending_planned_rotation_proxy = None
                     async with reply_selection_lock:
                         _dec_proxy_count(active_reply_proxy_counts, variant_result.proxy_value)
                         proxy_value = (variant_result.proxy_value or "").strip()
@@ -12174,6 +12758,12 @@ async def execute_user_schema_parallel(
                         ):
                             pending_reply_proxy_rotations.discard(proxy_value)
                             pending_rotation_proxy = proxy_value
+                        if (
+                            proxy_value
+                            and active_reply_proxy_counts.get(proxy_value, 0) <= 0
+                            and proxy_value in pending_reply_planned_proxy_rotations
+                        ):
+                            pending_planned_rotation_proxy = proxy_value
                     if pending_rotation_proxy:
                         pending_rotated = await _rotate_mobile_proxy_after_failure(
                             attempt_db,
@@ -12197,6 +12787,16 @@ async def execute_user_schema_parallel(
                                 reply_visibility_stage = "rotation_failed"
                                 reply_visibility_rotation_error = "rotation_failed_or_unavailable"
                             _update_reply_visibility_payload()
+                        if pending_rotated and pending_rotation_proxy == pending_planned_rotation_proxy:
+                            async with reply_selection_lock:
+                                pending_reply_planned_proxy_rotations.discard(pending_rotation_proxy)
+                                successful_reply_proxy_completions[pending_rotation_proxy] = 0
+                            pending_planned_rotation_proxy = None
+                    if pending_planned_rotation_proxy:
+                        await _rotate_reply_mobile_proxy_for_planned_reuse(
+                            attempt_db,
+                            pending_planned_rotation_proxy,
+                        )
 
         outcomes = attempt_result.replies
         variant_result.parent_search_saw_rows = bool(attempt_result.saw_comment_rows)
@@ -12206,6 +12806,7 @@ async def execute_user_schema_parallel(
         variant_result.parent_search_exhausted = attempt_result.parent_search_exhausted
         variant_result.parent_search_scroll_container_scrollable = attempt_result.parent_search_scroll_container_scrollable
         submitted_outcomes = [outcome for outcome in outcomes if _reply_outcome_submitted(outcome)]
+        variant_result.submitted_this_attempt = bool(submitted_outcomes) or submitted_this_attempt
         if submitted_outcomes:
             for outcome in submitted_outcomes:
                 key = _reply_outcome_report_key(outcome)
@@ -12765,6 +13366,12 @@ async def execute_user_schema_parallel(
                         if not item.completed:
                             await _handle_reply_edge_access_denied(db, item)
 
+                        await _record_successful_reply_proxy_completion(
+                            db,
+                            item.proxy_value,
+                            bool(getattr(item, "submitted_this_attempt", False)),
+                        )
+
                         if _looks_like_browser_driver_unavailable(item.error):
                             consecutive_browser_driver_failures += 1
                             logger.warning(
@@ -13179,6 +13786,12 @@ async def execute_user_schema_parallel(
 
             if not item.completed:
                 await _handle_reply_edge_access_denied(db, item)
+
+            await _record_successful_reply_proxy_completion(
+                db,
+                item.proxy_value,
+                bool(getattr(item, "submitted_this_attempt", False)),
+            )
 
             if item.completed:
                 result.replies.extend(item.replies)

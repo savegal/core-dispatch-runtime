@@ -1316,18 +1316,24 @@ def test_reply_post_finder_does_not_fallback_to_global_comment_markers():
     assert "const isAccessoryReplyIcon = (raw) =>" in enabled_source
     assert "label.includes('emoji')" in enabled_source
     assert "label.includes('mention')" in enabled_source
+    assert "label.includes('gif')" in enabled_source
+    assert "label.includes('photo')" in enabled_source
     assert "compact === '@'" in enabled_source
     assert "const usableInputRect = (input) =>" in enabled_source
     assert "const inputRect = usableInputRect(input)" in enabled_source
-    assert enabled_source.index("raw.closest('button')") < enabled_source.index("raw,")
+    assert "const interactive = raw.closest && raw.closest('button, [role=\"button\"], div[tabindex=\"0\"]')" in enabled_source
+    assert "if (interactive) return usable(interactive) ? interactive : null" in enabled_source
     assert "document.querySelector('[data-smart-reply-input=\"1\"]')" in optimistic_source
     assert "document.querySelector('[data-smart-reply-composer=\"1\"]')" in optimistic_source
     assert "inputText !== expected" in optimistic_source
     assert "reply-optimistic-send" in optimistic_source
     assert "compact === '@'" in optimistic_source
     assert "label.includes('mention')" in optimistic_source
+    assert "label.includes('gif')" in optimistic_source
+    assert "label.includes('photo')" in optimistic_source
     assert "st.pointerEvents === 'none'" in optimistic_source
-    assert "raw.closest && raw.closest('button')" in optimistic_source
+    assert "const interactive = raw.closest && raw.closest('button, [role=\"button\"], div[tabindex=\"0\"]')" in optimistic_source
+    assert "if (interactive) return usable(interactive) ? interactive : null" in optimistic_source
 
 
 # ---------------------------------------------------------------------------
