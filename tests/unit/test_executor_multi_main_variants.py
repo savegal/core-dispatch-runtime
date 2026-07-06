@@ -105,7 +105,49 @@ def test_process_task_counts_submitted_unconfirmed_as_successful_url_with_warnin
     assert executor._URL_SUCCESS_STATUSES == {"success", "submitted_unconfirmed"}
     assert executor._URL_UNCONFIRMED_STATUSES == {"submitted_unconfirmed"}
     assert "if result_status in _URL_SUCCESS_STATUSES" in source
+
+
+def test_reply_visibility_exhaustion_is_fatal_for_remaining_order_urls():
+    assert executor._reply_visibility_exhausted(
+        {"error": "remaining_main_comments_not_visible_after_four_accounts"}
+    ) is True
+    assert executor._reply_visibility_exhausted(
+        {"error": "reply_publication_incomplete"}
+    ) is False
+
+    source = inspect.getsource(executor.process_task)
+    assert source.count("if _reply_visibility_exhausted(result_dict):") == 2
     assert "unconfirmed_urls.append(video_url)" in source
+
+
+def test_merge_full_results_preserves_fatal_reply_visibility_after_shadowed_variant():
+    fatal_error = "remaining_main_comments_not_visible_after_four_accounts"
+    merged = executor._merge_full_variant_results(
+        [
+            {
+                "status": "fail",
+                "core_status": "fail",
+                "error": "text_variant_shadowed",
+                "warnings": [],
+                "engagement": {"main": {"success": False}},
+            },
+            {
+                "status": "fail",
+                "core_status": "fail",
+                "error": fatal_error,
+                "warnings": [],
+                "engagement": {
+                    "main": {"success": True, "posted": True},
+                    "replies": {"ok": 0, "total": 1},
+                },
+            },
+        ]
+    )
+
+    assert merged["status"] == "fail"
+    assert merged["core_status"] == "fail"
+    assert merged["error"] == fatal_error
+    assert executor._reply_visibility_exhausted(merged) is True
 
 
 @pytest.mark.unit
@@ -115,4 +157,6 @@ def test_process_task_engagement_only_does_not_fall_through_to_full_flow():
     full_start = source.index("HYBRID FULL", engagement_start)
     engagement_block = source[engagement_start:full_start]
 
-    assert "db.commit()\n                    continue" in engagement_block
+    assert "db.commit()" in engagement_block
+    assert "if _reply_visibility_exhausted(result_dict):" in engagement_block
+    assert "break\n                    continue" in engagement_block

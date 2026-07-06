@@ -420,7 +420,9 @@ async def rotate_proxy_ip(proxy: Proxy) -> Tuple[bool, Optional[str]]:
 async def ensure_proxy_ip_rotated(
     proxy: Proxy,
     db: Session,
-    previous_ip: Optional[str] = None
+    previous_ip: Optional[str] = None,
+    *,
+    force_rotation: bool = False,
 ) -> str:
     """
     Обеспечивает ротацию IP прокси с проверкой (Double Check).
@@ -435,6 +437,7 @@ async def ensure_proxy_ip_rotated(
         proxy: Объект Proxy из БД
         db: SQLAlchemy сессия (для обновления данных если нужно)
         previous_ip: Предыдущий IP (из Redis или None)
+        force_rotation: Игнорировать cooldown и обязательно вызвать rotation URL
     
     Returns:
         str: Новый IP адрес
@@ -467,7 +470,7 @@ async def ensure_proxy_ip_rotated(
     # ротацию нет смысла, она лишь даст 25–30 секунд простоя для других воркеров. Особенно
     # критично, когда мобильный прокси один и concurrency > 1.
     cooldown_seconds = _adaptive_rotation_cooldown_seconds()
-    if cooldown_seconds > 0:
+    if cooldown_seconds > 0 and not force_rotation:
         rotation_age = await _get_proxy_last_rotation_age_seconds(proxy.id)
         if rotation_age is not None and rotation_age < cooldown_seconds:
             reusable_ip = current_ip_before or previous_ip

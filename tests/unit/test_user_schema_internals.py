@@ -3346,6 +3346,66 @@ async def test_reply_account_does_not_publish_fallback_when_comment_list_unavail
 
 @pytest.mark.unit
 @pytest.mark.asyncio
+async def test_reply_zero_comment_count_is_confident_empty_without_open_list(monkeypatch):
+    from executor import user_schema
+
+    class FakePage:
+        url = "https://www.tiktok.com/@demo/video/1234567890123456789"
+
+        def is_closed(self):
+            return False
+
+        async def close(self):
+            return None
+
+    class FakeContext:
+        async def close(self):
+            return None
+
+    async def fake_create_page_for_account(_account):
+        return FakeContext(), FakePage()
+
+    async def fake_login_ready(*_args, **_kwargs):
+        return True, None
+
+    async def fail_find_main_anchor(*_args, **_kwargs):
+        raise AssertionError("zero-comment video must not start parent scrolling")
+
+    monkeypatch.setattr(user_schema._settings, "TIKTOK_NETWORK_FIRST", True, raising=False)
+    monkeypatch.setattr(user_schema._settings, "TIKTOK_NETWORK_IMPL_READY", True, raising=False)
+    monkeypatch.setattr(user_schema, "create_page_for_account", fake_create_page_for_account)
+    monkeypatch.setattr(user_schema, "_ensure_account_login_ready", fake_login_ready)
+    monkeypatch.setattr(user_schema, "needs_enrichment", lambda _account: False)
+    monkeypatch.setattr(user_schema, "_ensure_page_on_target_media", AsyncMock(return_value=True))
+    monkeypatch.setattr(user_schema, "_read_tiktok_total_comment_count", AsyncMock(return_value=0))
+    monkeypatch.setattr(user_schema, "_open_comment_list_with_safe_retry", AsyncMock(return_value=False))
+    monkeypatch.setattr(user_schema, "_visible_captcha_reason", AsyncMock(return_value=None))
+    monkeypatch.setattr(user_schema, "_find_main_anchor", fail_find_main_anchor)
+    monkeypatch.setattr(user_schema.asyncio, "sleep", AsyncMock(return_value=None))
+
+    result = await user_schema._reply_with_variant_on_all_mains(
+        SimpleNamespace(),
+        SimpleNamespace(id=77, proxy=None),
+        "https://www.tiktok.com/@demo/video/1234567890123456789",
+        ["old local main"],
+        "reply text",
+        variant_index=1,
+        correlation_id="task_zero_comments_reply",
+        fallback_main_texts=None,
+    )
+
+    assert result.searched is True
+    assert result.confident_empty_search is True
+    assert result.saw_comment_rows is False
+    assert result.parent_search_exhausted is True
+    assert result.parent_search_scroll_container_scrollable is False
+    assert result.parent_search_total_comment_count == 0
+    assert result.parent_search_scroll_budget == user_schema._REPLY_MAIN_SEARCH_TO_END_MAX_SCROLLS
+    assert result.replies == []
+
+
+@pytest.mark.unit
+@pytest.mark.asyncio
 async def test_reply_single_search_comment_list_loss_does_not_publish_fallback(monkeypatch):
     from executor import user_schema
 
@@ -7355,10 +7415,75 @@ def test_reply_visibility_empty_requires_real_comment_depth():
             parent_search_max_seen_rows=40,
         )
     ) is False
+    assert user_schema._reply_result_is_confident_visibility_empty(
+        user_schema._ParallelReplyVariantResult(
+            **base,
+            parent_search_unique_rows_seen=3,
+            parent_search_max_seen_rows=3,
+            parent_search_last_row_count=3,
+            parent_search_exhausted=True,
+            parent_search_scroll_container_scrollable=False,
+            parent_search_total_comment_count=3,
+            parent_search_scroll_budget=120,
+        )
+    ) is True
+    assert user_schema._reply_result_is_confident_visibility_empty(
+        user_schema._ParallelReplyVariantResult(
+            **base,
+            parent_search_exhausted=True,
+            parent_search_scroll_container_scrollable=False,
+            parent_search_total_comment_count=0,
+            parent_search_scroll_budget=120,
+        )
+    ) is True
+    assert user_schema._reply_result_is_confident_visibility_empty(
+        user_schema._ParallelReplyVariantResult(
+            **base,
+            parent_search_unique_rows_seen=3,
+            parent_search_max_seen_rows=3,
+            parent_search_last_row_count=3,
+            parent_search_exhausted=True,
+            parent_search_scroll_container_scrollable=True,
+            parent_search_total_comment_count=900,
+            parent_search_scroll_budget=25,
+        )
+    ) is True
+    assert user_schema._reply_result_is_confident_visibility_empty(
+        user_schema._ParallelReplyVariantResult(
+            **base,
+            parent_search_unique_rows_seen=3,
+            parent_search_max_seen_rows=3,
+            parent_search_last_row_count=3,
+            parent_search_exhausted=True,
+            parent_search_scroll_container_scrollable=False,
+            parent_search_total_comment_count=None,
+            parent_search_scroll_budget=10,
+        )
+    ) is True
 
 
 @pytest.mark.unit
-def test_reply_visibility_quorum_is_proxy_scoped_and_handles_delayed_failure():
+def test_completed_batch_parent_search_does_not_restart_single_full_scan():
+    from executor import user_schema
+
+    completed_scan = {
+        "missing_count": 1,
+        "target_count": 1,
+        "found_count": 0,
+        "max_seen_rows": 20,
+        "last_row_count": 10,
+        "unique_rows_seen": 20,
+        "search_exhausted": True,
+    }
+
+    assert user_schema._batch_parent_search_should_try_single_fallback(completed_scan) is False
+    assert user_schema._batch_parent_search_should_try_single_fallback(
+        {**completed_scan, "search_exhausted": False}
+    ) is True
+
+
+@pytest.mark.unit
+def test_reply_visibility_quorum_tracks_four_accounts_across_proxies():
     from executor import user_schema
     import inspect
 
@@ -7368,13 +7493,12 @@ def test_reply_visibility_quorum_is_proxy_scoped_and_handles_delayed_failure():
     assert "reply_visibility_post_accounts_by_proxy" in source
     assert "pre_rotation_by_proxy" in source
     assert "post_rotation_by_proxy" in source
-    assert "proxy_key != rotated_proxy_key" in source
-    assert "ignoring post-rotation empty visibility result" in source
-    assert "return \"rotation_unavailable\"" in source
-    assert "elif visibility_action == \"rotation_unavailable\"" in source
+    assert "reply_visibility_empty_accounts" in source
+    assert "_REPLY_VISIBILITY_EMPTY_STOP_QUORUM" in source
+    assert "len(reply_visibility_empty_accounts) >= _REPLY_VISIBILITY_EMPTY_STOP_QUORUM" in source
+    assert "remaining_main_comments_not_visible_after_four_accounts" in source
     assert "visibility_actions: List[Tuple[str, _ParallelReplyVariantResult]]" in source
     assert "action_names = [action for action, _item in visibility_actions]" in source
-    assert "elif \"rotation_unavailable\" in action_names" in source
     assert "(item for action, item in visibility_actions if action == \"rotate\")" in source
 
 
@@ -7440,7 +7564,7 @@ async def test_parallel_mode_all_reply_accounts_missing_mains_requires_rotation_
         yield SimpleNamespace(no_autoflush=SimpleNamespace())
 
     main_accounts = [SimpleNamespace(id=101 + i, proxy=None) for i in range(3)]
-    reply_accounts = [SimpleNamespace(id=201 + i, proxy=None) for i in range(3)]
+    reply_accounts = [SimpleNamespace(id=201 + i, proxy=None) for i in range(4)]
     fallback_seen = []
     close_calls = []
     selected_main_ids: set[int] = set()
@@ -7497,10 +7621,14 @@ async def test_parallel_mode_all_reply_accounts_missing_mains_requires_rotation_
             ],
             searched=True,
             confident_empty_search=True,
-            saw_comment_rows=True,
-            parent_search_max_seen_rows=40,
-            parent_search_last_row_count=40,
-            parent_search_unique_rows_seen=20,
+            saw_comment_rows=False,
+            parent_search_max_seen_rows=0,
+            parent_search_last_row_count=0,
+            parent_search_unique_rows_seen=0,
+            parent_search_exhausted=True,
+            parent_search_scroll_container_scrollable=False,
+            parent_search_total_comment_count=0,
+            parent_search_scroll_budget=120,
         )
 
     async def fake_close_pool():
@@ -7532,10 +7660,11 @@ async def test_parallel_mode_all_reply_accounts_missing_mains_requires_rotation_
         boost_quantity=0,
     )
 
-    assert result.error == "reply_visibility_rotation_unavailable"
+    assert result.error == "remaining_main_comments_not_visible_after_four_accounts"
     assert result.reply_visibility["rotation_attempted"] is True
     assert result.reply_visibility["rotation_error"] == "missing_proxy_for_visibility_rotation"
-    assert fallback_seen == [None, None]
+    assert result.reply_visibility["confident_empty_accounts"] == 4
+    assert fallback_seen == [None, None, None, None]
     assert close_calls == ["close", "close"]
 
 
@@ -7550,7 +7679,7 @@ async def test_reply_visibility_quorum_still_applies_after_some_mains_were_found
         yield SimpleNamespace(no_autoflush=SimpleNamespace())
 
     main_accounts = [SimpleNamespace(id=301 + i, proxy=None) for i in range(2)]
-    reply_accounts = [SimpleNamespace(id=401 + i, proxy=None) for i in range(4)]
+    reply_accounts = [SimpleNamespace(id=401 + i, proxy=None) for i in range(5)]
     selected_main_ids: set[int] = set()
     select_lock = threading.Lock()
     reply_calls = []
@@ -7665,10 +7794,10 @@ async def test_reply_visibility_quorum_still_applies_after_some_mains_were_found
         boost_quantity=0,
     )
 
-    assert result.error == "reply_visibility_rotation_unavailable"
+    assert result.error == "remaining_main_comments_not_visible_after_four_accounts"
     assert result.main_found_by_observer is True
     assert result.reply_visibility["rotation_attempted"] is True
-    assert result.reply_visibility["pre_rotation_accounts"] == 2
+    assert result.reply_visibility["confident_empty_accounts"] == 4
     assert any(outcome.success for outcome in result.replies)
 
 
@@ -9962,6 +10091,115 @@ async def test_parallel_mode_balances_four_reply_workers_across_two_proxies(monk
 
 @pytest.mark.unit
 @pytest.mark.asyncio
+async def test_parallel_mode_stops_after_four_empty_reply_accounts_across_two_proxies(monkeypatch):
+    from db import database as db_database
+    from executor import browser_pool, user_schema
+
+    @contextmanager
+    def fake_db_context():
+        yield SimpleNamespace(no_autoflush=SimpleNamespace())
+
+    main_accounts = [SimpleNamespace(id=101 + i, proxy=f"http://main-proxy-{i}:1000") for i in range(3)]
+    reply_accounts = [
+        SimpleNamespace(id=201, proxy="http://proxy-a:1000"),
+        SimpleNamespace(id=202, proxy="http://proxy-a:1000"),
+        SimpleNamespace(id=203, proxy="http://proxy-b:1000"),
+        SimpleNamespace(id=204, proxy="http://proxy-b:1000"),
+    ]
+    reply_attempts: list[tuple[int, str]] = []
+
+    def fake_get_main(_db, *, exclude_ids=None, **_kwargs):
+        excluded = set(exclude_ids or [])
+        return next((account for account in main_accounts if account.id not in excluded), None)
+
+    async def fake_try_main(_db, account, _video_url, texts, **_kwargs):
+        return [
+            user_schema.PublishedMain(
+                text=text,
+                comment_id=f"cid-{account.id}-{text}",
+                network_confirmed=True,
+                local_confirmed=True,
+                method="hybrid_dom",
+                account_id=account.id,
+                tiktok_username=f"user_{account.id}",
+            )
+            for text in texts
+        ], None
+
+    def fake_get_reply(_db, exclude_ids=None, exclude_proxies=None, **_kwargs):
+        excluded = set(exclude_ids or [])
+        excluded_proxies = set(exclude_proxies or [])
+        return next(
+            (
+                account
+                for account in reply_accounts
+                if account.id not in excluded
+                and str(account.proxy or "").strip() not in excluded_proxies
+            ),
+            None,
+        )
+
+    async def fake_reply(_db, account, _video_url, _main_candidates, reply_text, **kwargs):
+        reply_attempts.append((account.id, str(account.proxy or "")))
+        return user_schema.ReplyAttemptResult(
+            replies=[
+                user_schema.ReplyOutcome(
+                    text=reply_text,
+                    variant_index=kwargs["variant_index"],
+                    matched_main_text=None,
+                    parent_comment_id=None,
+                    success=False,
+                    method=None,
+                    error="no_main_found_by_reply_account",
+                    account_id=account.id,
+                    attempted=False,
+                )
+            ],
+            searched=True,
+            confident_empty_search=True,
+            saw_comment_rows=True,
+            parent_search_max_seen_rows=40,
+            parent_search_last_row_count=40,
+            parent_search_unique_rows_seen=20,
+        )
+
+    monkeypatch.setattr(user_schema._settings, "PARALLEL_COMMENTING_TARGET_BROWSERS", 3, raising=False)
+    monkeypatch.setattr(user_schema._settings, "PARALLEL_COMMENTING_MAX_BROWSERS", 3, raising=False)
+    monkeypatch.setattr(user_schema._settings, "PARALLEL_REPLY_VARIANT_WORKERS", 2, raising=False)
+    monkeypatch.setattr(user_schema._settings, "PARALLEL_REPLY_START_DELAY_MIN_SECONDS", 0, raising=False)
+    monkeypatch.setattr(user_schema._settings, "PARALLEL_REPLY_START_DELAY_MAX_SECONDS", 0, raising=False)
+    monkeypatch.setattr(db_database, "get_sync_db_context", fake_db_context)
+    monkeypatch.setattr(user_schema, "get_free_account_for_main_comment", fake_get_main)
+    monkeypatch.setattr(user_schema, "_try_main_account", fake_try_main)
+    monkeypatch.setattr(user_schema, "release_main_account_reservation", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(user_schema, "get_free_account_for_reply", fake_get_reply)
+    monkeypatch.setattr(user_schema, "_reply_with_variant_on_all_mains", fake_reply)
+    monkeypatch.setattr(user_schema, "_maybe_order_likes", AsyncMock(return_value=None))
+    monkeypatch.setattr(browser_pool, "ensure_thread_browser_pool_capacity", lambda _value: None)
+    monkeypatch.setattr(browser_pool, "close_browser_pool", AsyncMock(return_value=None))
+    monkeypatch.setattr(user_schema.asyncio, "sleep", AsyncMock(return_value=None))
+
+    result = await user_schema.execute_user_schema_parallel(
+        SimpleNamespace(),
+        SimpleNamespace(settings={"replies": ["r1"]}),
+        "https://www.tiktok.com/@demo/video/1234567890123456789",
+        ["m1", "m2", "m3"],
+        516,
+        boost_enabled=False,
+        boost_quantity=0,
+    )
+
+    assert result.error == "remaining_main_comments_not_visible_after_four_accounts"
+    assert len(reply_attempts) == 4
+    assert len({account_id for account_id, _proxy in reply_attempts}) == 4
+    assert [proxy for _account_id, proxy in reply_attempts].count("http://proxy-a:1000") == 2
+    assert [proxy for _account_id, proxy in reply_attempts].count("http://proxy-b:1000") == 2
+    assert result.reply_visibility["confident_empty_accounts"] == 4
+    assert result.to_dict()["status"] == "fail"
+
+
+@pytest.mark.unit
+@pytest.mark.asyncio
 async def test_parallel_mode_stop_cancels_dynamic_reply_workers(monkeypatch):
     from db import database as db_database
     from executor import browser_pool, user_schema
@@ -11970,30 +12208,102 @@ def test_reply_parent_search_budget_stays_default_for_small_candidate_set():
 
 
 @pytest.mark.unit
-def test_reply_parent_search_budget_deepens_for_parallel_mains():
+def test_reply_parent_batch_uses_the_total_remaining_search_deadline():
     from executor import user_schema
 
-    mains = [
-        user_schema.PublishedMain(
-            text=f"main {idx}",
-            comment_id=f"cid-{idx}",
-            network_confirmed=True,
-            local_confirmed=True,
-            method="hybrid_dom",
-            account_id=idx,
-            tiktok_username=None,
-        )
-        for idx in range(8)
-    ]
+    source = inspect.getsource(user_schema._reply_with_variant_on_all_mains)
 
-    total_seconds, pass_seconds, scrolls = user_schema._reply_parent_search_budget(mains)
+    assert "batch_timeout_seconds = max(1.0, batch_remaining_seconds)" in source
+    assert "batch_timeout_seconds = min(\n                        search_pass_seconds" not in source
 
-    assert total_seconds == user_schema._REPLY_MAIN_SEARCH_DEEP_TIMEOUT_SECONDS
-    assert pass_seconds == user_schema._REPLY_MAIN_SEARCH_DEEP_PER_TEXT_SECONDS
-    assert scrolls == user_schema._REPLY_MAIN_SEARCH_DEEP_SCROLLS
-    assert total_seconds > user_schema._REPLY_MAIN_SEARCH_TIMEOUT_SECONDS
-    assert pass_seconds > user_schema._REPLY_MAIN_SEARCH_PER_TEXT_SECONDS
-    assert scrolls > user_schema._REPLY_MAIN_SEARCH_SCROLLS
+
+@pytest.mark.unit
+@pytest.mark.parametrize(
+    ("total_comment_count", "expected_scrolls"),
+    [
+        (0, 140),
+        (99, 140),
+        (100, 24),
+        (500, 24),
+        (501, 32),
+        (1000, 32),
+        (25_000, 32),
+    ],
+)
+def test_reply_parent_search_budget_uses_video_comment_count_tiers(
+    total_comment_count,
+    expected_scrolls,
+):
+    from executor import user_schema
+
+    total_seconds, pass_seconds, scrolls = user_schema._reply_parent_search_budget(
+        [],
+        total_comment_count,
+    )
+
+    assert scrolls == expected_scrolls
+    assert total_seconds >= pass_seconds
+    if total_comment_count < 100:
+        assert total_seconds == user_schema._REPLY_MAIN_SEARCH_TO_END_TIMEOUT_SECONDS
+    elif total_comment_count <= 500:
+        assert total_seconds == user_schema._REPLY_MAIN_SEARCH_DEEP_TIMEOUT_SECONDS
+    else:
+        assert total_seconds == user_schema._REPLY_MAIN_SEARCH_LARGE_TIMEOUT_SECONDS
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize(
+    ("raw_value", "expected"),
+    [
+        ("98 comments", 98),
+        ("1,234 comments", 1234),
+        ("1.2K", 1200),
+        ("1,2 \u0442\u044b\u0441. \u043a\u043e\u043c\u043c\u0435\u043d\u0442\u0430\u0440\u0438\u0435\u0432", 1200),
+        ("2M", 2_000_000),
+        ("comments", None),
+    ],
+)
+def test_parse_tiktok_comment_count(raw_value, expected):
+    from executor import user_schema
+
+    assert user_schema._parse_tiktok_comment_count(raw_value) == expected
+
+
+@pytest.mark.unit
+@pytest.mark.asyncio
+async def test_read_tiktok_total_comment_count_uses_first_scoped_valid_dom_counter():
+    from executor import user_schema
+
+    page = SimpleNamespace(
+        evaluate=AsyncMock(return_value=["comments", "98 comments", "1.2K comments"]),
+    )
+
+    assert await user_schema._read_tiktok_total_comment_count(page) == 98
+
+
+@pytest.mark.unit
+def test_read_tiktok_total_comment_count_ranks_against_active_comment_surface():
+    from executor import user_schema
+
+    source = inspect.getsource(user_schema._read_tiktok_total_comment_count)
+
+    assert 'data-smart-comment-surface-opened="1"' in source
+    assert "document.querySelectorAll('video')" in source
+    assert "left.distance - right.distance" in source
+    assert "return max(parsed)" not in source
+
+
+@pytest.mark.unit
+def test_reply_comment_count_is_read_after_comment_list_open_attempt():
+    from executor import user_schema
+
+    source = inspect.getsource(user_schema._reply_with_variant_on_all_mains)
+    open_call = source.index("comments_ready_for_search = await _open_comment_list_with_safe_retry(")
+    count_read = source.index(
+        "parent_search_total_comment_count = await _read_tiktok_total_comment_count(page)"
+    )
+
+    assert open_call < count_read
 
 
 @pytest.mark.unit

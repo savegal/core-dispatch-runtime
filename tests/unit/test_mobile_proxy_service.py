@@ -1,4 +1,5 @@
 from types import SimpleNamespace
+from unittest.mock import AsyncMock
 
 import pytest
 
@@ -109,3 +110,45 @@ async def test_recent_mobile_rotation_reuses_previous_ip_when_probe_fails(monkey
     )
 
     assert result == "37.47.100.10"
+
+
+@pytest.mark.unit
+@pytest.mark.asyncio
+async def test_forced_mobile_rotation_bypasses_recent_rotation_cooldown(monkeypatch):
+    proxy = SimpleNamespace(
+        id=9,
+        is_mobile="Y",
+        proxy="http://proxy.example:8080",
+        rotation_url="https://rotate.example",
+    )
+    rotate_calls = []
+
+    async def fake_get_current_ip(_proxy):
+        return "37.47.100.10"
+
+    async def fake_rotation_age(_proxy_id):
+        return 20
+
+    async def fake_rotate(_proxy):
+        rotate_calls.append(_proxy.id)
+        return True, "37.47.100.11"
+
+    monkeypatch.setattr(mobile_proxy_service, "get_current_ip", fake_get_current_ip)
+    monkeypatch.setattr(mobile_proxy_service, "_get_proxy_last_rotation_age_seconds", fake_rotation_age)
+    monkeypatch.setattr(mobile_proxy_service, "_adaptive_rotation_cooldown_seconds", lambda: 90)
+    monkeypatch.setattr(mobile_proxy_service, "rotate_proxy_ip", fake_rotate)
+    monkeypatch.setattr(
+        mobile_proxy_service,
+        "_mark_proxy_rotated_now",
+        AsyncMock(return_value=None),
+    )
+
+    result = await mobile_proxy_service.ensure_proxy_ip_rotated(
+        proxy,
+        db=None,
+        previous_ip="37.47.100.10",
+        force_rotation=True,
+    )
+
+    assert result == "37.47.100.11"
+    assert rotate_calls == [9]

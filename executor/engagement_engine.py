@@ -20,7 +20,7 @@ from typing import Optional, Dict, Any, List, Tuple, Callable
 from urllib.parse import urlparse
 import httpx
 from sqlalchemy.orm import Session
-from db.models import Task, Account
+from db.models import Task, Account, Proxy
 from executor.tiktok_client_async import create_page_for_account
 from patchright.async_api import Page
 from executor.comment_verification import verify_with_retries
@@ -50,6 +50,7 @@ from services.account_service import (
     release_main_account_reservation,
 )
 from services.proxy_health_service import clear_proxy_bad, mark_proxy_bad
+from services.mobile_proxy_service import ensure_proxy_ip_rotated
 from services.log_service import log
 from config.settings import get_settings
 from services.app_settings_service import get_setting
@@ -1246,6 +1247,16 @@ class EngagementResult:
         error_message = None
         if not core_success and not submitted_unconfirmed:
             error_message = self.main_comment.get("error")
+            if not error_message:
+                error_message = next(
+                    (
+                        reply.get("error")
+                        for reply in self.replies
+                        if reply.get("error")
+                        == "remaining_main_comments_not_visible_after_four_accounts"
+                    ),
+                    None,
+                )
             if not error_message:
                 error_message = next(
                     (reply.get("error") for reply in self.replies if reply.get("error")),
@@ -2773,9 +2784,13 @@ async def execute_engagement_only_replies_via_full_flow(
     # reply phase.
     from executor.user_schema import (
         PublishedMain,
+        _infer_found_mains_from_reply_outcomes,
         _main_parent_keys,
         _reply_outcome_parent_key,
         _reply_outcome_submitted,
+        _REPLY_VISIBILITY_EMPTY_QUORUM,
+        _REPLY_VISIBILITY_EMPTY_STOP_QUORUM,
+        _reply_search_is_confident_visibility_empty,
         _reply_with_variant_on_all_mains,
     )
 
@@ -2812,6 +2827,10 @@ async def execute_engagement_only_replies_via_full_flow(
     submitted_parent_keys_by_variant: Dict[int, set[str]] = {}
     last_outcomes_by_variant: Dict[int, List[Any]] = {}
     last_reply_account_by_variant: Dict[int, Optional[int]] = {}
+    confident_empty_reply_account_ids: set[int] = set()
+    reply_visibility_rotation_attempted = False
+    reply_visibility_rotation_success = False
+    reply_visibility_rotation_proxy: Optional[str] = None
     active_reply_proxy_counts: Dict[str, int] = {}
     temporary_reply_selection_error = "reply_account_temporarily_unavailable"
     scheduler_stats: Dict[str, int] = {
@@ -3193,6 +3212,114 @@ async def execute_engagement_only_replies_via_full_flow(
                 return False
             await asyncio.sleep(min(0.5, remaining))
 
+    def _reset_reply_visibility_sequence(reason: str) -> None:
+        nonlocal reply_visibility_rotation_attempted
+        nonlocal reply_visibility_rotation_success
+        nonlocal reply_visibility_rotation_proxy
+        confident_empty_reply_account_ids.clear()
+        reply_visibility_rotation_attempted = False
+        reply_visibility_rotation_success = False
+        reply_visibility_rotation_proxy = None
+        logger.info(
+            "Task %s: engagement_only reply visibility sequence reset after %s",
+            task_id,
+            reason,
+        )
+
+    async def _force_reply_visibility_rotation(proxy_value: Optional[str]) -> bool:
+        nonlocal reply_visibility_rotation_attempted
+        nonlocal reply_visibility_rotation_success
+        nonlocal reply_visibility_rotation_proxy
+        proxy_value = str(proxy_value or "").strip()
+        reply_visibility_rotation_attempted = True
+        reply_visibility_rotation_proxy = proxy_value or None
+        if not proxy_value:
+            logger.warning(
+                "Task %s: engagement_only cannot rotate after two empty searches: proxy is missing",
+                task_id,
+            )
+            return False
+
+        from db.database import get_sync_db_context
+
+        try:
+            with get_sync_db_context() as rotation_db:
+                proxy_obj = (
+                    rotation_db.query(Proxy)
+                    .filter(Proxy.proxy == proxy_value)
+                    .first()
+                )
+                if not (
+                    proxy_obj is not None
+                    and getattr(proxy_obj, "is_mobile", None) == "Y"
+                    and str(getattr(proxy_obj, "rotation_url", "") or "").strip()
+                ):
+                    logger.warning(
+                        "Task %s: engagement_only visibility rotation unavailable for proxy=%s",
+                        task_id,
+                        proxy_value.rsplit("@", 1)[-1],
+                    )
+                    return False
+                new_ip = await asyncio.wait_for(
+                    ensure_proxy_ip_rotated(
+                        proxy_obj,
+                        rotation_db,
+                        force_rotation=True,
+                    ),
+                    timeout=35.0,
+                )
+            reply_visibility_rotation_success = True
+            try:
+                clear_proxy_bad(proxy_value)
+            except Exception:
+                logger.debug(
+                    "clear_proxy_bad after engagement_only visibility rotation failed",
+                    exc_info=True,
+                )
+            logger.info(
+                "Task %s: engagement_only rotated mobile proxy after two empty searches "
+                "proxy=%s new_ip=%s",
+                task_id,
+                proxy_value.rsplit("@", 1)[-1],
+                new_ip,
+            )
+            return True
+        except Exception as exc:
+            logger.warning(
+                "Task %s: engagement_only visibility rotation failed for proxy=%s: %s",
+                task_id,
+                proxy_value.rsplit("@", 1)[-1],
+                str(exc)[:160],
+            )
+            return False
+
+    async def _record_confident_empty_reply(raw_result: Dict[str, Any]) -> int:
+        empty_account_id = int(raw_result.get("account_id") or 0)
+        if empty_account_id <= 0:
+            return 0
+        is_new_account = empty_account_id not in confident_empty_reply_account_ids
+        confident_empty_reply_account_ids.add(empty_account_id)
+        logger.info(
+            "Task %s: engagement_only confident empty parent search account=%s "
+            "proxy=%s total=%s/%s rows=%s unique=%s rotation=%s/%s",
+            task_id,
+            empty_account_id,
+            str(raw_result.get("proxy_value") or "").rsplit("@", 1)[-1],
+            len(confident_empty_reply_account_ids),
+            _REPLY_VISIBILITY_EMPTY_STOP_QUORUM,
+            raw_result.get("parent_search_max_seen_rows", 0),
+            raw_result.get("parent_search_unique_rows_seen", 0),
+            reply_visibility_rotation_attempted,
+            reply_visibility_rotation_success,
+        )
+        if (
+            is_new_account
+            and len(confident_empty_reply_account_ids) >= _REPLY_VISIBILITY_EMPTY_QUORUM
+            and not reply_visibility_rotation_attempted
+        ):
+            await _force_reply_visibility_rotation(raw_result.get("proxy_value"))
+        return empty_account_id
+
     async def _run_reply_variant_attempt(
         variant_idx: int,
         reply_text: str,
@@ -3211,6 +3338,12 @@ async def execute_engagement_only_replies_via_full_flow(
             "resolved_author": None,
             "matched_text": None,
             "proxy_value": None,
+            "found_any_main": False,
+            "confident_visibility_empty": False,
+            "parent_search_max_seen_rows": 0,
+            "parent_search_unique_rows_seen": 0,
+            "parent_search_total_comment_count": None,
+            "parent_search_scroll_budget": 0,
         }
 
         if _is_stop_requested():
@@ -3318,6 +3451,56 @@ async def execute_engagement_only_replies_via_full_flow(
                         reply_selection_state["capacity_cooldown_until"] = 0.0
 
         outcomes = list(attempt_result.replies or [])
+        found_mains = list(getattr(attempt_result, "found_mains", None) or [])
+        if not found_mains and outcomes:
+            found_mains = _infer_found_mains_from_reply_outcomes(outcomes, [main_candidate])
+
+        attempt_info["parent_search_max_seen_rows"] = int(
+            getattr(attempt_result, "parent_search_max_seen_rows", 0) or 0
+        )
+        attempt_info["parent_search_unique_rows_seen"] = int(
+            getattr(attempt_result, "parent_search_unique_rows_seen", 0) or 0
+        )
+        attempt_info["parent_search_total_comment_count"] = getattr(
+            attempt_result,
+            "parent_search_total_comment_count",
+            None,
+        )
+        attempt_info["parent_search_scroll_budget"] = int(
+            getattr(attempt_result, "parent_search_scroll_budget", 0) or 0
+        )
+        attempt_info["found_any_main"] = bool(found_mains)
+        attempt_info["confident_visibility_empty"] = _reply_search_is_confident_visibility_empty(
+            no_main_found=bool(
+                getattr(attempt_result, "confident_empty_search", False)
+                and (
+                    getattr(attempt_result, "saw_comment_rows", False)
+                    or getattr(
+                        attempt_result,
+                        "parent_search_total_comment_count",
+                        None,
+                    )
+                    == 0
+                )
+            ),
+            found_any_main=bool(found_mains),
+            error="no_main_found_by_reply_account",
+            unique_rows_seen=getattr(attempt_result, "parent_search_unique_rows_seen", 0),
+            max_seen_rows=getattr(attempt_result, "parent_search_max_seen_rows", 0),
+            last_row_count=getattr(attempt_result, "parent_search_last_row_count", 0),
+            search_exhausted=bool(getattr(attempt_result, "parent_search_exhausted", False)),
+            scroll_container_scrollable=getattr(
+                attempt_result,
+                "parent_search_scroll_container_scrollable",
+                None,
+            ),
+            total_comment_count=getattr(
+                attempt_result,
+                "parent_search_total_comment_count",
+                None,
+            ),
+        )
+
         attempt_info["outcomes"] = outcomes
         if outcomes:
             last_outcomes_by_variant[variant_idx] = outcomes
@@ -3348,6 +3531,10 @@ async def execute_engagement_only_replies_via_full_flow(
                 for outcome in submitted_outcomes
             ]
             attempt_info["completed"] = True
+            return attempt_info
+
+        if attempt_info["confident_visibility_empty"]:
+            attempt_info["error"] = "no_main_found_by_reply_account"
             return attempt_info
 
         attempt_info["error"] = (
@@ -3535,7 +3722,9 @@ async def execute_engagement_only_replies_via_full_flow(
                         completed_reply_results.append((variant_idx, reply_text, raw_result))
 
                     completed_reply_results.sort(
-                        key=lambda row: 0 if row[2].get("completed") else 1
+                        key=lambda row: 0
+                        if row[2].get("completed") or row[2].get("found_any_main")
+                        else 1
                     )
                     for variant_idx, reply_text, raw_result in completed_reply_results:
                         if raw_result.get("error") == temporary_reply_selection_error:
@@ -3586,9 +3775,42 @@ async def execute_engagement_only_replies_via_full_flow(
                         if raw_result.get("matched_text"):
                             anchor_text = str(raw_result["matched_text"])
 
+                        if raw_result.get("found_any_main"):
+                            _reset_reply_visibility_sequence("main_found_by_reply_account")
+
                         if raw_result.get("completed"):
                             results.extend(raw_result.get("replies") or [])
                             continue
+
+                        if raw_result.get("confident_visibility_empty"):
+                            empty_account_id = await _record_confident_empty_reply(raw_result)
+                            if (
+                                len(confident_empty_reply_account_ids)
+                                >= _REPLY_VISIBILITY_EMPTY_STOP_QUORUM
+                            ):
+                                fatal_visibility_error = (
+                                    "remaining_main_comments_not_visible_after_four_accounts"
+                                )
+                                results.append(
+                                    _failure_reply_row(
+                                        reply_text,
+                                        variant_idx,
+                                        attempts=max(1, reply_rounds.get(variant_idx, 0)),
+                                        account_id=empty_account_id or None,
+                                        error=fatal_visibility_error,
+                                    )
+                                )
+                                _append_unresolved_dynamic_reply_rows(fatal_visibility_error)
+                                logger.warning(
+                                    "Task %s: stopping engagement_only replies after %s distinct "
+                                    "accounts confidently failed to find the parent comment",
+                                    task_id,
+                                    len(confident_empty_reply_account_ids),
+                                )
+                                pending_reply_variants = []
+                                stop_after_dynamic = True
+                                await _cancel_active_dynamic_reply_tasks()
+                                continue
 
                         if raw_result.get("stopped"):
                             _record_attempt_reason(raw_result.get("error"))
@@ -3746,8 +3968,16 @@ async def execute_engagement_only_replies_via_full_flow(
 
         retry_variants: List[Tuple[int, str]] = []
         stop_after_batch = False
+        visibility_exhausted_batch = False
         batch_surface_unavailable_flags: List[bool] = []
-        for (variant_idx, reply_text), raw_result in zip(batch, raw_batch_results):
+        paired_batch_results = list(zip(batch, raw_batch_results))
+        paired_batch_results.sort(
+            key=lambda row: 0
+            if isinstance(row[1], dict)
+            and (row[1].get("completed") or row[1].get("found_any_main"))
+            else 1
+        )
+        for (variant_idx, reply_text), raw_result in paired_batch_results:
             if isinstance(raw_result, BaseException):
                 if isinstance(raw_result, (KeyboardInterrupt, SystemExit)):
                     raise raw_result
@@ -3805,9 +4035,25 @@ async def execute_engagement_only_replies_via_full_flow(
             if raw_result.get("matched_text"):
                 anchor_text = str(raw_result["matched_text"])
 
+            if raw_result.get("found_any_main"):
+                _reset_reply_visibility_sequence("main_found_by_reply_account")
+
             if raw_result.get("completed"):
                 results.extend(raw_result.get("replies") or [])
                 continue
+
+            if raw_result.get("confident_visibility_empty"):
+                empty_account_id = await _record_confident_empty_reply(raw_result)
+                if (
+                    len(confident_empty_reply_account_ids)
+                    >= _REPLY_VISIBILITY_EMPTY_STOP_QUORUM
+                ):
+                    raw_result["error"] = (
+                        "remaining_main_comments_not_visible_after_four_accounts"
+                    )
+                    last_outcomes_by_variant.pop(variant_idx, None)
+                    visibility_exhausted_batch = True
+                    stop_after_batch = True
 
             if raw_result.get("error") == temporary_reply_selection_error:
                 reply_rounds[variant_idx] = max(0, reply_rounds.get(variant_idx, 0) - 1)
@@ -3834,7 +4080,9 @@ async def execute_engagement_only_replies_via_full_flow(
                 continue
 
             can_retry = (
-                raw_result.get("error") not in {"no_free_reply_accounts", "stopped_by_user"}
+                not visibility_exhausted_batch
+                and not stop_after_batch
+                and raw_result.get("error") not in {"no_free_reply_accounts", "stopped_by_user"}
                 and reply_rounds.get(variant_idx, 0) < max_attempts
             )
             if can_retry:
@@ -3864,6 +4112,35 @@ async def execute_engagement_only_replies_via_full_flow(
                         or "engagement_reply_parent_not_found_or_comment_list_not_open",
                     )
                 )
+
+        if visibility_exhausted_batch:
+            fatal_visibility_error = "remaining_main_comments_not_visible_after_four_accounts"
+            reported_variants = {
+                int(row.get("variant_index") or 0)
+                for row in results
+                if isinstance(row, dict)
+            }
+            for pending_variant_idx, pending_reply_text in [*retry_variants, *pending_reply_variants]:
+                if pending_variant_idx in reported_variants:
+                    continue
+                results.append(
+                    _failure_reply_row(
+                        pending_reply_text,
+                        pending_variant_idx,
+                        attempts=reply_rounds.get(pending_variant_idx, 0),
+                        account_id=last_reply_account_by_variant.get(pending_variant_idx),
+                        error=fatal_visibility_error,
+                    )
+                )
+                reported_variants.add(pending_variant_idx)
+            logger.warning(
+                "Task %s: stopping engagement_only batch replies after %s distinct accounts "
+                "confidently failed to find the parent comment",
+                task_id,
+                len(confident_empty_reply_account_ids),
+            )
+            pending_reply_variants = []
+            break
 
         if batch_surface_unavailable_flags and all(batch_surface_unavailable_flags):
             consecutive_surface_unavailable_batches += 1

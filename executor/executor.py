@@ -148,6 +148,17 @@ _executor_activity_lock = threading.Lock()
 _executor_activity_payload: dict[str, Any] = {"status": "ok"}
 _URL_SUCCESS_STATUSES = {"success", "submitted_unconfirmed"}
 _URL_UNCONFIRMED_STATUSES = {"submitted_unconfirmed"}
+_REPLY_VISIBILITY_EXHAUSTED_ERRORS = {
+    "remaining_main_comments_not_visible_after_four_accounts",
+    "remaining_main_comments_not_visible_after_ip_rotation",
+    "reply_visibility_rotation_unavailable",
+}
+
+
+def _reply_visibility_exhausted(result: dict | None) -> bool:
+    if not isinstance(result, dict):
+        return False
+    return str(result.get("error") or "") in _REPLY_VISIBILITY_EXHAUSTED_ERRORS
 _GLOBAL_TASK_LOCK_WAIT_LOG_INTERVAL = 30.0
 _last_global_task_lock_wait_log_at = 0.0
 
@@ -591,7 +602,11 @@ def _merge_full_variant_results(variant_results: list[dict]) -> dict:
 
     accepted_statuses = {"success", "submitted_unconfirmed"}
     accepted = [item for item in variant_results if item.get("status") in accepted_statuses]
-    primary = accepted[0] if accepted else variant_results[0]
+    fatal_reply_visibility_result = next(
+        (item for item in variant_results if _reply_visibility_exhausted(item)),
+        None,
+    )
+    primary = fatal_reply_visibility_result or (accepted[0] if accepted else variant_results[0])
     merged = copy.deepcopy(primary)
 
     summaries = []
@@ -617,7 +632,11 @@ def _merge_full_variant_results(variant_results: list[dict]) -> dict:
     failed_count = total - accepted_count
     all_success = accepted_count == total and all(item.get("status") == "success" for item in accepted)
 
-    if accepted_count:
+    if fatal_reply_visibility_result is not None:
+        merged["status"] = "fail"
+        merged["core_status"] = "fail"
+        merged["error"] = fatal_reply_visibility_result.get("error")
+    elif accepted_count:
         merged["status"] = "success" if all_success else "submitted_unconfirmed"
         merged["core_status"] = merged["status"]
         if failed_count:
@@ -1547,6 +1566,13 @@ def process_task(task_id: int) -> None:
                         _mark_task_settings_dirty(task)
                     task.progress = idx + 1
                     db.commit()
+                    if _reply_visibility_exhausted(result_dict):
+                        logger.warning(
+                            "Task %s: stopping remaining URLs after four reply accounts "
+                            "could not find the parent comment",
+                            task_id,
+                        )
+                        break
                     continue
 
                 except Exception as e:
@@ -1929,6 +1955,13 @@ def process_task(task_id: int) -> None:
                     _mark_task_settings_dirty(task)
                 task.progress = idx + 1
                 db.commit()
+                if _reply_visibility_exhausted(result_dict):
+                    logger.warning(
+                        "Task %s: stopping remaining URLs after four reply accounts "
+                        "could not find the published main comments",
+                        task_id,
+                    )
+                    break
                 
             except Exception as e:
                 logger.error(f"Task {task_id}, URL {idx+1}: HYBRID FULL error: {e}", exc_info=True)

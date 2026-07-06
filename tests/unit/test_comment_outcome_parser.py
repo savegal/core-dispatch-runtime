@@ -96,6 +96,15 @@ def test_parent_search_scans_bounded_comment_containers_before_broad_roots():
 
 
 @pytest.mark.unit
+def test_parent_search_collapses_nested_wrappers_for_one_top_level_comment():
+    joined = inspect.getsource(comment_outcome.find_comments_in_list_batch)
+
+    assert "const nestedContainerAlreadySeen = topLevelOnly" in joined
+    assert "existing.contains(container) || container.contains(existing)" in joined
+    assert "if (nestedContainerAlreadySeen) continue;" in joined
+
+
+@pytest.mark.unit
 def test_batch_search_trace_reports_top_level_only_mode():
     joined = inspect.getsource(comment_outcome.find_comments_in_list_batch)
 

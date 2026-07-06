@@ -47,6 +47,7 @@ import json
 import logging
 import os
 import random
+import re
 import threading
 import time
 import uuid
@@ -163,20 +164,32 @@ def _reply_variants_from_task(task: Task) -> List[str]:
 _INTER_REPLY_DELAY_RANGE = (3.0, 6.0)
 _PARALLEL_INTER_REPLY_DELAY_RANGE = (0.5, 1.0)
 _REPLY_VISIBILITY_EMPTY_QUORUM = 2
+_REPLY_VISIBILITY_EMPTY_STOP_QUORUM = 4
 _REPLY_VISIBILITY_MIN_UNIQUE_ROWS = 20
 _REPLY_VISIBILITY_MIN_MAX_ROWS = 40
+_REPLY_VISIBILITY_FATAL_ERRORS = {
+    "remaining_main_comments_not_visible_after_four_accounts",
+    "remaining_main_comments_not_visible_after_ip_rotation",
+    "reply_visibility_rotation_unavailable",
+}
 
 # Между главными вариантами на одном аккаунте.
 _INTER_MAIN_VARIANT_DELAY_RANGE = (4.0, 7.0)
 
 # Сколько один reply-аккаунт ищет главные комменты по текстам перед тем,
 # как считаем этот reply-вариант не найденным и переходим к следующему аккаунту.
-_REPLY_MAIN_SEARCH_TIMEOUT_SECONDS = 18.0
-_REPLY_MAIN_SEARCH_PER_TEXT_SECONDS = 4.0
-_REPLY_MAIN_SEARCH_SCROLLS = 6
-_REPLY_MAIN_SEARCH_DEEP_TIMEOUT_SECONDS = 36.0
-_REPLY_MAIN_SEARCH_DEEP_PER_TEXT_SECONDS = 10.0
-_REPLY_MAIN_SEARCH_DEEP_SCROLLS = 10
+_REPLY_MAIN_SEARCH_TIMEOUT_SECONDS = 22.0
+_REPLY_MAIN_SEARCH_PER_TEXT_SECONDS = 6.0
+_REPLY_MAIN_SEARCH_SCROLLS = 12
+_REPLY_MAIN_SEARCH_DEEP_TIMEOUT_SECONDS = 42.0
+_REPLY_MAIN_SEARCH_DEEP_PER_TEXT_SECONDS = 14.0
+_REPLY_MAIN_SEARCH_DEEP_SCROLLS = 24
+_REPLY_MAIN_SEARCH_LARGE_TIMEOUT_SECONDS = 55.0
+_REPLY_MAIN_SEARCH_LARGE_PER_TEXT_SECONDS = 22.0
+_REPLY_MAIN_SEARCH_LARGE_SCROLLS = 32
+_REPLY_MAIN_SEARCH_TO_END_TIMEOUT_SECONDS = 85.0
+_REPLY_MAIN_SEARCH_TO_END_PER_TEXT_SECONDS = 80.0
+_REPLY_MAIN_SEARCH_TO_END_MAX_SCROLLS = 140
 _REPLY_MAIN_SEARCH_SCROLL_DELAY_MS = 350
 _REPLY_PARENT_SEARCH_EMPTY_COMPATIBLE_ERRORS: set[str] = {
     "batch_confident_miss",
@@ -1835,6 +1848,8 @@ class ReplyAttemptResult:
     parent_search_unique_rows_seen: int = 0
     parent_search_exhausted: bool = False
     parent_search_scroll_container_scrollable: Optional[bool] = None
+    parent_search_total_comment_count: Optional[int] = None
+    parent_search_scroll_budget: int = 0
     soft_submitted_reply_keys: set[str] = field(default_factory=set)
 
 
@@ -1940,7 +1955,11 @@ class UserSchemaResult:
         )
         result_error = self.error
         warnings = list(self.warnings)
-        if main_success and self.main_found_by_observer and replies_success:
+        fatal_reply_visibility_error = result_error in _REPLY_VISIBILITY_FATAL_ERRORS
+        if fatal_reply_visibility_error:
+            status = "fail"
+            core_status = "fail"
+        elif main_success and self.main_found_by_observer and replies_success:
             status = "success"
             core_status = "success"
         elif main_success:
@@ -4787,14 +4806,190 @@ def _normalize_main_candidates(main_candidates: List[Any]) -> List[PublishedMain
     return normalized
 
 
-def _reply_parent_search_budget(main_candidates: List[Any]) -> Tuple[float, float, int]:
-    """Return total timeout, per-pass timeout, and scroll depth for reply parent search."""
-    candidates = _normalize_main_candidates(main_candidates)
-    if len(candidates) >= 6:
+def _parse_tiktok_comment_count(value: Any) -> Optional[int]:
+    """Parse TikTok compact counters such as ``1,234``, ``1.2K`` or ``1,2 тыс.``."""
+    text = str(value or "").strip().lower()
+    if not text:
+        return None
+    text = text.replace("\u00a0", " ").replace("\u202f", " ")
+    compact_match = re.search(
+        r"(?<!\d)(\d+(?:[.,]\d+)?)\s*(k|m|b|тыс(?:\.|яч(?:а|и)?)?|млн\.?|миллион(?:а|ов)?|млрд\.?)",
+        text,
+        flags=re.IGNORECASE,
+    )
+    if compact_match:
+        number = float(compact_match.group(1).replace(",", "."))
+        suffix = compact_match.group(2).lower().rstrip(".")
+        if suffix.startswith(("k", "тыс")):
+            multiplier = 1_000
+        elif suffix.startswith(("m", "млн", "миллион")):
+            multiplier = 1_000_000
+        else:
+            multiplier = 1_000_000_000
+        return max(0, int(round(number * multiplier)))
+
+    integer_match = re.search(
+        r"(?<!\d)(\d{1,3}(?:[\s.,]\d{3})+|\d+)(?!\d)",
+        text,
+    )
+    if not integer_match:
+        return None
+    digits = re.sub(r"\D", "", integer_match.group(1))
+    return int(digits) if digits else None
+
+
+async def _read_tiktok_total_comment_count(page: Page) -> Optional[int]:
+    """Read the active video's displayed total comment count."""
+    try:
+        raw_values = await page.evaluate(
+            """
+            () => {
+                const visible = (node) => {
+                    if (!node || !(node instanceof Element)) return false;
+                    const style = getComputedStyle(node);
+                    const rect = node.getBoundingClientRect();
+                    return style.display !== 'none' &&
+                        style.visibility !== 'hidden' &&
+                        Number(style.opacity || '1') > 0 &&
+                        rect.width > 0 && rect.height > 0;
+                };
+                const rectGap = (left, right) => {
+                    if (!left || !right) return Number.POSITIVE_INFINITY;
+                    const dx = left.right < right.left
+                        ? right.left - left.right
+                        : (right.right < left.left ? left.left - right.right : 0);
+                    const dy = left.bottom < right.top
+                        ? right.top - left.bottom
+                        : (right.bottom < left.top ? left.top - right.bottom : 0);
+                    return Math.hypot(dx, dy);
+                };
+
+                const surfaceSelectors = [
+                    '[data-smart-comment-surface-opened="1"]',
+                    '[data-smart-comment-scroll-opened="1"]',
+                    '[data-e2e="comment-list"]',
+                    '[data-e2e="comment-list-container"]',
+                    '[class*="CommentList"]',
+                    '[class*="CommentContainer"]'
+                ];
+                let anchor = null;
+                for (const selector of surfaceSelectors) {
+                    anchor = [...document.querySelectorAll(selector)].find(visible) || null;
+                    if (anchor) break;
+                }
+                if (!anchor) {
+                    const visibleVideos = [...document.querySelectorAll('video')].filter(visible);
+                    anchor = visibleVideos.sort((left, right) => {
+                        const leftRect = left.getBoundingClientRect();
+                        const rightRect = right.getBoundingClientRect();
+                        return (rightRect.width * rightRect.height) -
+                            (leftRect.width * leftRect.height);
+                    })[0] || null;
+                }
+
+                const selectorSpecs = [
+                    ['[data-e2e="comment-count"]', 5],
+                    ['button[data-e2e="comments"]', 4],
+                    ['[data-e2e="comments"]', 3],
+                    ['[itemprop="commentCount"]:not(meta)', 2],
+                    ['meta[itemprop="commentCount"]', 1]
+                ];
+                const anchorRect = anchor ? anchor.getBoundingClientRect() : null;
+                const candidates = [];
+                const seenNodes = new Set();
+                let domOrder = 0;
+                for (const [selector, selectorRank] of selectorSpecs) {
+                    for (const node of document.querySelectorAll(selector)) {
+                        if (seenNodes.has(node)) continue;
+                        seenNodes.add(node);
+                        const isMeta = node.tagName === 'META';
+                        if (!isMeta && !visible(node)) continue;
+                        const nodeRect = isMeta ? null : node.getBoundingClientRect();
+                        const contained = Boolean(
+                            anchor && !isMeta &&
+                            (anchor.contains(node) || node.contains(anchor))
+                        );
+                        candidates.push({
+                            node,
+                            contained: contained ? 1 : 0,
+                            distance: contained ? 0 : rectGap(anchorRect, nodeRect),
+                            selectorRank,
+                            domOrder: domOrder++
+                        });
+                    }
+                }
+
+                candidates.sort((left, right) =>
+                    (right.contained - left.contained) ||
+                    (left.distance - right.distance) ||
+                    (right.selectorRank - left.selectorRank) ||
+                    (left.domOrder - right.domOrder)
+                );
+
+                const values = [];
+                const seenValues = new Set();
+                for (const candidate of candidates) {
+                    const node = candidate.node;
+                    for (const value of [
+                        node.getAttribute && node.getAttribute('content'),
+                        node.getAttribute && node.getAttribute('aria-label'),
+                        node.getAttribute && node.getAttribute('title'),
+                        node.innerText,
+                        node.textContent
+                    ]) {
+                        const normalized = String(value || '').trim();
+                        if (!normalized || seenValues.has(normalized)) continue;
+                        seenValues.add(normalized);
+                        values.push(normalized);
+                    }
+                }
+                return values;
+            }
+            """
+        )
+    except Exception as exc:
+        logger.debug("Failed to read TikTok total comment count: %s", str(exc)[:120])
+        return None
+
+    if isinstance(raw_values, str):
+        candidate_values = [raw_values]
+    elif isinstance(raw_values, (list, tuple, set)):
+        candidate_values = list(raw_values)
+    else:
+        return None
+
+    for value in candidate_values:
+        count = _parse_tiktok_comment_count(value)
+        if count is not None:
+            return count
+    return None
+
+
+def _reply_parent_search_budget(
+    main_candidates: List[Any],
+    total_comment_count: Optional[int] = None,
+) -> Tuple[float, float, int]:
+    """Return timeout and scroll depth based on the video's displayed comment count."""
+    del main_candidates  # Kept in the signature for compatibility with callers/extensions.
+    if total_comment_count is not None:
+        total_comment_count = max(0, int(total_comment_count))
+        if total_comment_count < 100:
+            # The scanner exits naturally when scrolling stops; 120 is only a hard safety guard.
+            return (
+                _REPLY_MAIN_SEARCH_TO_END_TIMEOUT_SECONDS,
+                _REPLY_MAIN_SEARCH_TO_END_PER_TEXT_SECONDS,
+                _REPLY_MAIN_SEARCH_TO_END_MAX_SCROLLS,
+            )
+        if total_comment_count <= 500:
+            return (
+                _REPLY_MAIN_SEARCH_DEEP_TIMEOUT_SECONDS,
+                _REPLY_MAIN_SEARCH_DEEP_PER_TEXT_SECONDS,
+                _REPLY_MAIN_SEARCH_DEEP_SCROLLS,
+            )
         return (
-            _REPLY_MAIN_SEARCH_DEEP_TIMEOUT_SECONDS,
-            _REPLY_MAIN_SEARCH_DEEP_PER_TEXT_SECONDS,
-            _REPLY_MAIN_SEARCH_DEEP_SCROLLS,
+            _REPLY_MAIN_SEARCH_LARGE_TIMEOUT_SECONDS,
+            _REPLY_MAIN_SEARCH_LARGE_PER_TEXT_SECONDS,
+            _REPLY_MAIN_SEARCH_LARGE_SCROLLS,
         )
     return (
         _REPLY_MAIN_SEARCH_TIMEOUT_SECONDS,
@@ -4995,6 +5190,16 @@ def _batch_parent_search_should_try_single_fallback(info: Optional[Dict[str, Any
         return True
     if bool(info.get("partial_returned")):
         return True
+    if (
+        bool(info.get("search_exhausted"))
+        and not error
+        and (
+            _parent_search_info_int(info, "max_seen_rows") > 0
+            or _parent_search_info_int(info, "last_row_count") > 0
+            or _parent_search_info_int(info, "unique_rows_seen") > 0
+        )
+    ):
+        return False
     if _parent_search_info_int(info, "author_fallback_count") > 0:
         return True
     if info.get("author_fallback_candidates"):
@@ -7677,6 +7882,8 @@ async def _reply_with_variant_on_all_mains(
     parent_search_unique_rows_seen = 0
     parent_search_exhausted = False
     parent_search_scroll_container_scrollable: Optional[bool] = None
+    parent_search_total_comment_count: Optional[int] = None
+    parent_search_scroll_budget = 0
 
     def _parent_search_int(value: Any) -> int:
         try:
@@ -8213,6 +8420,10 @@ async def _reply_with_variant_on_all_mains(
 
         async def _finish_reply_attempt(result: ReplyAttemptResult) -> ReplyAttemptResult:
             nonlocal close_reason
+            if result.parent_search_total_comment_count is None:
+                result.parent_search_total_comment_count = parent_search_total_comment_count
+            if result.parent_search_scroll_budget <= 0:
+                result.parent_search_scroll_budget = parent_search_scroll_budget
             if result.submitted_parent_keys_count <= 0:
                 result.submitted_parent_keys_count = sum(
                     1 for outcome in result.replies if _reply_outcome_submitted(outcome)
@@ -8282,6 +8493,7 @@ async def _reply_with_variant_on_all_mains(
             fast_parallel_reply_open=_is_parallel_reply_correlation(correlation_id),
             retry_enabled=True,
         )
+        parent_search_total_comment_count = None
         comments_ready_for_search = await _open_comment_list_with_safe_retry(
             page,
             target_media_url,
@@ -8301,6 +8513,7 @@ async def _reply_with_variant_on_all_mains(
             variant_index=variant_index,
             opened=comments_ready_for_search,
         )
+        parent_search_total_comment_count = await _read_tiktok_total_comment_count(page)
         captcha_reason = await _visible_captcha_reason(page, phase="reply_open_comments_result")
         if captcha_reason:
             _register_reply_captcha_failure(db, account, captcha_reason)
@@ -8323,6 +8536,59 @@ async def _reply_with_variant_on_all_mains(
                     found_mains=list(found_mains_by_key.values()),
                     attempted_parent_keys=attempted_parent_keys,
                     searched=search_attempted,
+                )
+            )
+        if parent_search_total_comment_count == 0:
+            if not await _ensure_page_on_target_media(
+                page,
+                target_media_url,
+                video_url,
+                timeout_ms=int(timeout_ms),
+                correlation_id=correlation_id,
+                phase="after_zero_comment_count_for_parent_search",
+            ):
+                results.append(
+                    ReplyOutcome(
+                        text=reply_text,
+                        variant_index=variant_index,
+                        matched_main_text=None,
+                        parent_comment_id=None,
+                        success=False,
+                        method=None,
+                        error="url_drift_to_other_video",
+                        account_id=account.id,
+                    )
+                )
+                return await _finish_reply_attempt(
+                    ReplyAttemptResult(replies=results, searched=False)
+                )
+            _, _, parent_search_scroll_budget = _reply_parent_search_budget(
+                main_candidates,
+                parent_search_total_comment_count,
+            )
+            _log_user_trace(
+                "reply_parent_search_zero_comment_count",
+                page=page,
+                expected_video_url=target_media_url,
+                correlation_id=correlation_id,
+                account_id=account.id,
+                variant_index=variant_index,
+                comments_ready_for_search=comments_ready_for_search,
+                max_scrolls=parent_search_scroll_budget,
+                level=logging.INFO,
+            )
+            return await _finish_reply_attempt(
+                ReplyAttemptResult(
+                    replies=results,
+                    found_mains=[],
+                    attempted_parent_keys=attempted_parent_keys,
+                    searched=True,
+                    confident_empty_search=True,
+                    saw_comment_rows=False,
+                    parent_search_exhausted=True,
+                    parent_search_scroll_container_scrollable=False,
+                    parent_search_total_comment_count=0,
+                    parent_search_scroll_budget=parent_search_scroll_budget,
                 )
             )
         if not comments_ready_for_search:
@@ -8384,6 +8650,8 @@ async def _reply_with_variant_on_all_mains(
             phase="reply_parent_search",
             timeout_seconds=surface_wait_seconds,
         )
+        if parent_search_total_comment_count is None:
+            parent_search_total_comment_count = await _read_tiktok_total_comment_count(page)
         captcha_reason = await _visible_captcha_reason(page, phase="reply_parent_search_after_open")
         if captcha_reason:
             _register_reply_captcha_failure(db, account, captcha_reason)
@@ -8467,7 +8735,21 @@ async def _reply_with_variant_on_all_mains(
                 pending_parent_count=len(remaining_mains),
             )
         search_timeout_seconds, search_pass_seconds, search_scrolls = _reply_parent_search_budget(
-            remaining_mains
+            remaining_mains,
+            parent_search_total_comment_count,
+        )
+        parent_search_scroll_budget = search_scrolls
+        _log_user_trace(
+            "reply_parent_search_budget",
+            page=page,
+            expected_video_url=target_media_url,
+            correlation_id=correlation_id,
+            account_id=account.id,
+            variant_index=variant_index,
+            total_comment_count=parent_search_total_comment_count,
+            max_scrolls=search_scrolls,
+            total_timeout_seconds=search_timeout_seconds,
+            pass_timeout_seconds=search_pass_seconds,
         )
         search_deadline = time.monotonic() + search_timeout_seconds
         reply_http_session: Optional[_UserSchemaHttpSession] = None
@@ -8502,10 +8784,11 @@ async def _reply_with_variant_on_all_mains(
                 batch_remaining_seconds = search_deadline - time.monotonic()
                 if batch_remaining_seconds > 1.0:
                     search_attempted = True
-                    batch_timeout_seconds = min(
-                        search_pass_seconds,
-                        max(1.0, batch_remaining_seconds),
-                    )
+                    # The batch scanner is the fast path: one in-page DOM pass
+                    # per scroll. Give it the already-bounded total parent-search
+                    # deadline so a configured 25-scroll scan is not cancelled
+                    # at 16 seconds and replaced by the slower per-row fallback.
+                    batch_timeout_seconds = max(1.0, batch_remaining_seconds)
                     _log_user_trace(
                         "reply_parent_batch_started",
                         page=page,
@@ -9647,7 +9930,10 @@ async def _reply_with_variant_on_all_mains(
                 comments_ready_for_search
                 and surface_search_ready
                 and search_attempted
-                and own_saw_comment_rows
+                and (
+                    own_saw_comment_rows
+                    or parent_search_total_comment_count == 0
+                )
                 and not search_inconclusive
             )
             if fallback_main_texts and fallback_allowed and own_confident_empty:
@@ -9665,6 +9951,8 @@ async def _reply_with_variant_on_all_mains(
                     parent_search_unique_rows_seen=parent_search_unique_rows_seen,
                     parent_search_exhausted=parent_search_exhausted,
                     parent_search_scroll_container_scrollable=parent_search_scroll_container_scrollable,
+                    parent_search_total_comment_count=parent_search_total_comment_count,
+                    parent_search_scroll_budget=parent_search_scroll_budget,
                 )
             )
 
@@ -9680,6 +9968,8 @@ async def _reply_with_variant_on_all_mains(
                 parent_search_unique_rows_seen=parent_search_unique_rows_seen,
                 parent_search_exhausted=parent_search_exhausted,
                 parent_search_scroll_container_scrollable=parent_search_scroll_container_scrollable,
+                parent_search_total_comment_count=parent_search_total_comment_count,
+                parent_search_scroll_budget=parent_search_scroll_budget,
             )
         )
     except asyncio.CancelledError:
@@ -10028,36 +10318,81 @@ class _ParallelReplyVariantResult:
     parent_search_unique_rows_seen: int = 0
     parent_search_exhausted: bool = False
     parent_search_scroll_container_scrollable: Optional[bool] = None
+    parent_search_total_comment_count: Optional[int] = None
+    parent_search_scroll_budget: int = 0
 
 
-def _reply_result_is_confident_visibility_empty(item: _ParallelReplyVariantResult) -> bool:
-    if not bool(getattr(item, "no_main_found", False)):
+def _reply_search_is_confident_visibility_empty(
+    *,
+    no_main_found: bool,
+    found_any_main: bool,
+    error: Any,
+    unique_rows_seen: Any,
+    max_seen_rows: Any,
+    last_row_count: Any,
+    search_exhausted: bool,
+    scroll_container_scrollable: Optional[bool],
+    total_comment_count: Optional[int] = None,
+) -> bool:
+    if not bool(no_main_found):
         return False
-    if bool(getattr(item, "found_any_main", False)):
+    if bool(found_any_main):
         return False
-    if str(getattr(item, "error", "") or "") != "no_main_found_by_reply_account":
+    if str(error or "") != "no_main_found_by_reply_account":
         return False
     try:
-        unique_rows = int(getattr(item, "parent_search_unique_rows_seen", 0) or 0)
+        unique_rows = int(unique_rows_seen or 0)
     except Exception:
         unique_rows = 0
     try:
-        max_rows = int(getattr(item, "parent_search_max_seen_rows", 0) or 0)
+        max_rows = int(max_seen_rows or 0)
     except Exception:
         max_rows = 0
     if unique_rows >= _REPLY_VISIBILITY_MIN_UNIQUE_ROWS or max_rows >= _REPLY_VISIBILITY_MIN_MAX_ROWS:
         return True
     try:
-        last_rows = int(getattr(item, "parent_search_last_row_count", 0) or 0)
+        last_rows = int(last_row_count or 0)
     except Exception:
         last_rows = 0
-    exhausted = bool(getattr(item, "parent_search_exhausted", False))
-    scrollable = getattr(item, "parent_search_scroll_container_scrollable", None)
+    exhausted = bool(search_exhausted)
+    scrollable = scroll_container_scrollable
+    try:
+        known_total = None if total_comment_count is None else max(0, int(total_comment_count))
+    except Exception:
+        known_total = None
+    if (
+        exhausted
+        and (
+            known_total == 0
+            or unique_rows > 0
+            or max_rows > 0
+            or last_rows > 0
+        )
+    ):
+        return True
     small_real_rows = unique_rows >= 5 or max_rows >= 5 or last_rows >= 5
     return bool(
         exhausted
         and small_real_rows
         and (scrollable is False or unique_rows >= max(5, last_rows))
+    )
+
+
+def _reply_result_is_confident_visibility_empty(item: _ParallelReplyVariantResult) -> bool:
+    return _reply_search_is_confident_visibility_empty(
+        no_main_found=bool(getattr(item, "no_main_found", False)),
+        found_any_main=bool(getattr(item, "found_any_main", False)),
+        error=getattr(item, "error", None),
+        unique_rows_seen=getattr(item, "parent_search_unique_rows_seen", 0),
+        max_seen_rows=getattr(item, "parent_search_max_seen_rows", 0),
+        last_row_count=getattr(item, "parent_search_last_row_count", 0),
+        search_exhausted=bool(getattr(item, "parent_search_exhausted", False)),
+        scroll_container_scrollable=getattr(
+            item,
+            "parent_search_scroll_container_scrollable",
+            None,
+        ),
+        total_comment_count=getattr(item, "parent_search_total_comment_count", None),
     )
 
 
@@ -10559,7 +10894,11 @@ async def execute_user_schema_parallel(
         rotation_error: Optional[str] = None
         try:
             new_ip = await asyncio.wait_for(
-                ensure_proxy_ip_rotated(proxy_obj, attempt_db),
+                ensure_proxy_ip_rotated(
+                    proxy_obj,
+                    attempt_db,
+                    force_rotation=scope == "reply_visibility",
+                ),
                 timeout=35.0,
             )
             rotated_set.add(proxy_value)
@@ -12765,10 +13104,16 @@ async def execute_user_schema_parallel(
                         ):
                             pending_planned_rotation_proxy = proxy_value
                     if pending_rotation_proxy:
+                        pending_rotation_scope = (
+                            "reply_visibility"
+                            if pending_rotation_proxy
+                            == (reply_visibility_rotation_proxy or "").strip()
+                            else "reply"
+                        )
                         pending_rotated = await _rotate_mobile_proxy_after_failure(
                             attempt_db,
                             pending_rotation_proxy,
-                            scope="reply",
+                            scope=pending_rotation_scope,
                             rotated_set=edge_denied_reply_proxy_rotated,
                             counts=edge_denied_reply_proxy_counts,
                             cooled_values=edge_denied_reply_proxy_values,
@@ -12805,6 +13150,8 @@ async def execute_user_schema_parallel(
         variant_result.parent_search_unique_rows_seen = attempt_result.parent_search_unique_rows_seen
         variant_result.parent_search_exhausted = attempt_result.parent_search_exhausted
         variant_result.parent_search_scroll_container_scrollable = attempt_result.parent_search_scroll_container_scrollable
+        variant_result.parent_search_total_comment_count = attempt_result.parent_search_total_comment_count
+        variant_result.parent_search_scroll_budget = attempt_result.parent_search_scroll_budget
         submitted_outcomes = [outcome for outcome in outcomes if _reply_outcome_submitted(outcome)]
         variant_result.submitted_this_attempt = bool(submitted_outcomes) or submitted_this_attempt
         if submitted_outcomes:
@@ -12865,7 +13212,10 @@ async def execute_user_schema_parallel(
                 variant_result.replies = reported_outcomes or submitted_outcomes or soft_submitted_outcomes or outcomes
                 return variant_result
             variant_result.error = "reply_publication_incomplete"
-        elif attempt_result.confident_empty_search and attempt_result.saw_comment_rows:
+        elif attempt_result.confident_empty_search and (
+            attempt_result.saw_comment_rows
+            or attempt_result.parent_search_total_comment_count == 0
+        ):
             variant_result.no_main_found = True
             variant_result.error = "no_main_found_by_reply_account"
             variant_result.replies = outcomes or [
@@ -12914,6 +13264,8 @@ async def execute_user_schema_parallel(
     reply_visibility_post_accounts_by_proxy: Dict[str, set[int]] = {}
     reply_visibility_pre_results_by_proxy: Dict[str, List[_ParallelReplyVariantResult]] = {}
     reply_visibility_post_results_by_proxy: Dict[str, List[_ParallelReplyVariantResult]] = {}
+    reply_visibility_empty_accounts: set[int] = set()
+    reply_visibility_empty_results: List[_ParallelReplyVariantResult] = []
     reply_visibility_rotation_attempted = False
     reply_visibility_rotation_success = False
     reply_visibility_rotation_error: Optional[str] = None
@@ -12940,6 +13292,17 @@ async def execute_user_schema_parallel(
             ),
             "unique_rows_seen": max(
                 [int(item.parent_search_unique_rows_seen or 0) for item in items] or [0]
+            ),
+            "total_comment_count": max(
+                [
+                    int(item.parent_search_total_comment_count)
+                    for item in items
+                    if item.parent_search_total_comment_count is not None
+                ]
+                or [0]
+            ),
+            "scroll_budget": max(
+                [int(item.parent_search_scroll_budget or 0) for item in items] or [0]
             ),
             "search_exhausted": any(bool(item.parent_search_exhausted) for item in items),
             "scroll_container_scrollable": any(
@@ -13000,6 +13363,8 @@ async def execute_user_schema_parallel(
             "stage": reply_visibility_stage,
             "pre_rotation_accounts": len(reply_visibility_pre_accounts),
             "post_rotation_accounts": len(reply_visibility_post_accounts),
+            "confident_empty_accounts": len(reply_visibility_empty_accounts),
+            "stop_quorum": _REPLY_VISIBILITY_EMPTY_STOP_QUORUM,
             "rotation_attempted": reply_visibility_rotation_attempted,
             "rotation_success": reply_visibility_rotation_success,
             "rotation_proxy": _short_proxy_sig(reply_visibility_rotation_proxy),
@@ -13029,6 +13394,8 @@ async def execute_user_schema_parallel(
         reply_visibility_post_accounts_by_proxy.clear()
         reply_visibility_pre_results_by_proxy.clear()
         reply_visibility_post_results_by_proxy.clear()
+        reply_visibility_empty_accounts.clear()
+        reply_visibility_empty_results.clear()
         reply_visibility_pre_accounts = set()
         reply_visibility_post_accounts = set()
         reply_visibility_pre_results = []
@@ -13051,34 +13418,16 @@ async def execute_user_schema_parallel(
         account_id = int(item.account_id or 0)
         if account_id <= 0:
             return None
-        if (
-            reply_visibility_stage == "rotation_failed"
-            and reply_visibility_rotation_error
-            in {"missing_proxy_for_visibility_rotation", "rotation_failed_or_unavailable"}
-        ):
-            _update_reply_visibility_payload()
-            return "rotation_unavailable"
+        if account_id not in reply_visibility_empty_accounts:
+            reply_visibility_empty_accounts.add(account_id)
+            reply_visibility_empty_results.append(item)
         proxy_key = _reply_visibility_proxy_key(item.proxy_value)
         if reply_visibility_rotation_success:
-            rotated_proxy_key = _reply_visibility_proxy_key(reply_visibility_rotation_proxy)
-            if proxy_key != rotated_proxy_key:
-                logger.info(
-                    "Task %s: ignoring post-rotation empty visibility result from proxy=%s; "
-                    "waiting for rotated proxy=%s",
-                    task_id,
-                    _short_proxy_sig(item.proxy_value),
-                    _short_proxy_sig(reply_visibility_rotation_proxy),
-                )
-                _update_reply_visibility_payload()
-                return None
             _select_reply_visibility_bucket(post_rotation=True, proxy_key=proxy_key)
             if account_id not in reply_visibility_post_accounts:
                 reply_visibility_post_accounts.add(account_id)
                 reply_visibility_post_results.append(item)
         else:
-            if reply_visibility_stage != "pre_rotation":
-                _update_reply_visibility_payload()
-                return None
             _select_reply_visibility_bucket(post_rotation=False, proxy_key=proxy_key)
             if account_id not in reply_visibility_pre_accounts:
                 reply_visibility_pre_accounts.add(account_id)
@@ -13086,7 +13435,7 @@ async def execute_user_schema_parallel(
         _update_reply_visibility_payload()
         logger.info(
             "Task %s: reply visibility confident empty stage=%s account=%s proxy=%s "
-            "pre=%s/%s post=%s/%s rows=%s unique=%s",
+            "pre=%s/%s post=%s/%s total=%s/%s rows=%s unique=%s",
             task_id,
             reply_visibility_stage,
             account_id,
@@ -13095,9 +13444,13 @@ async def execute_user_schema_parallel(
             _REPLY_VISIBILITY_EMPTY_QUORUM,
             len(reply_visibility_post_accounts),
             _REPLY_VISIBILITY_EMPTY_QUORUM,
+            len(reply_visibility_empty_accounts),
+            _REPLY_VISIBILITY_EMPTY_STOP_QUORUM,
             item.parent_search_max_seen_rows,
             item.parent_search_unique_rows_seen,
         )
+        if len(reply_visibility_empty_accounts) >= _REPLY_VISIBILITY_EMPTY_STOP_QUORUM:
+            return "exhausted"
         if (
             not reply_visibility_rotation_success
             and not reply_visibility_rotation_attempted
@@ -13105,11 +13458,6 @@ async def execute_user_schema_parallel(
             and len(reply_visibility_pre_accounts) >= _REPLY_VISIBILITY_EMPTY_QUORUM
         ):
             return "rotate"
-        if (
-            reply_visibility_rotation_success
-            and len(reply_visibility_post_accounts) >= _REPLY_VISIBILITY_EMPTY_QUORUM
-        ):
-            return "exhausted"
         return None
 
     async def _attempt_reply_visibility_rotation(
@@ -13461,38 +13809,21 @@ async def execute_user_schema_parallel(
                                         "rotation_failed_or_unavailable",
                                     }
                                 ):
-                                    _finish_reply_visibility_exhausted(
-                                        "reply_visibility_rotation_unavailable"
+                                    logger.warning(
+                                        "Task %s: reply visibility rotation unavailable; continuing with "
+                                        "fresh accounts/proxies until %s-account visibility quorum",
+                                        task_id,
+                                        _REPLY_VISIBILITY_EMPTY_STOP_QUORUM,
                                     )
-                                    for failed_item in reply_visibility_pre_results:
-                                        result.replies.extend(failed_item.replies)
-                                    _append_unresolved_dynamic_reply_failures(
-                                        result.error or "reply_mains_not_found"
-                                    )
-                                    pending_reply_variants = []
-                                    stop_reply_scheduling = True
-                                    await _cancel_active_dynamic_reply_tasks()
-                            elif visibility_action == "rotation_unavailable":
-                                _finish_reply_visibility_exhausted(
-                                    "reply_visibility_rotation_unavailable"
-                                )
-                                for failed_item in reply_visibility_pre_results:
-                                    result.replies.extend(failed_item.replies)
-                                _append_unresolved_dynamic_reply_failures(
-                                    result.error or "reply_mains_not_found"
-                                )
-                                pending_reply_variants = []
-                                stop_reply_scheduling = True
-                                await _cancel_active_dynamic_reply_tasks()
                             elif visibility_action == "exhausted":
                                 _finish_reply_visibility_exhausted(
-                                    "remaining_main_comments_not_visible_after_ip_rotation"
+                                    "remaining_main_comments_not_visible_after_four_accounts"
                                 )
-                                for failed_item in reply_visibility_post_results:
+                                for failed_item in reply_visibility_empty_results:
                                     result.replies.extend(failed_item.replies)
                                 _append_unresolved_dynamic_reply_failures(result.error or "reply_mains_not_found")
                                 logger.warning(
-                                    "Task %s: stopping dynamic reply phase after post-rotation visibility quorum; "
+                                    "Task %s: stopping dynamic reply phase after four-account visibility quorum; "
                                     "visibility=%s",
                                     task_id,
                                     result.reply_visibility,
@@ -13720,6 +14051,18 @@ async def execute_user_schema_parallel(
                 if action:
                     visibility_actions.append((action, item))
             action_names = [action for action, _item in visibility_actions]
+            if "exhausted" in action_names:
+                _finish_reply_visibility_exhausted(
+                    "remaining_main_comments_not_visible_after_four_accounts"
+                )
+                for item in reply_visibility_empty_results:
+                    result.replies.extend(item.replies)
+                logger.warning(
+                    "Task %s: parallel reply batch stopped after four-account visibility quorum; visibility=%s",
+                    task_id,
+                    result.reply_visibility,
+                )
+                break
             if "rotate" in action_names:
                 trigger = next(
                     (item for action, item in visibility_actions if action == "rotate"),
@@ -13734,39 +14077,13 @@ async def execute_user_schema_parallel(
                         "rotation_failed_or_unavailable",
                     }
                 ):
-                    _finish_reply_visibility_exhausted("reply_visibility_rotation_unavailable")
-                    for item in reply_visibility_pre_results:
-                        result.replies.extend(item.replies)
                     logger.warning(
-                        "Task %s: parallel reply batch stopped because visibility quorum "
-                        "requires mobile rotation but no proxy is available; visibility=%s",
+                        "Task %s: parallel reply visibility rotation unavailable; continuing "
+                        "with fresh accounts/proxies until %s-account quorum; visibility=%s",
                         task_id,
+                        _REPLY_VISIBILITY_EMPTY_STOP_QUORUM,
                         result.reply_visibility,
                     )
-                    break
-            elif "rotation_unavailable" in action_names:
-                _finish_reply_visibility_exhausted("reply_visibility_rotation_unavailable")
-                for item in reply_visibility_pre_results:
-                    result.replies.extend(item.replies)
-                logger.warning(
-                    "Task %s: parallel reply batch stopped because delayed visibility "
-                    "rotation failed; visibility=%s",
-                    task_id,
-                    result.reply_visibility,
-                )
-                break
-            elif "exhausted" in action_names:
-                _finish_reply_visibility_exhausted(
-                    "remaining_main_comments_not_visible_after_ip_rotation"
-                )
-                for item in reply_visibility_post_results:
-                    result.replies.extend(item.replies)
-                logger.warning(
-                    "Task %s: parallel reply batch stopped after post-rotation visibility quorum; visibility=%s",
-                    task_id,
-                    result.reply_visibility,
-                )
-                break
 
         retry_variants: List[Tuple[int, str]] = []
         fatal_reply_error: Optional[_ParallelReplyVariantResult] = None

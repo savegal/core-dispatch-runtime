@@ -7,7 +7,7 @@ from unittest.mock import AsyncMock
 import pytest
 
 import executor.engagement_engine as engagement_engine
-from db.models import Account
+from db.models import Account, Proxy
 
 
 class _DummyPage:
@@ -2046,6 +2046,313 @@ async def test_engagement_only_full_flow_balances_four_workers_across_two_proxie
     assert len(proxy_by_variant) == 4
     assert list(proxy_by_variant.values()).count("http://proxy-a:1000") == 2
     assert list(proxy_by_variant.values()).count("http://proxy-b:1000") == 2
+
+
+@pytest.mark.unit
+@pytest.mark.asyncio
+async def test_engagement_only_stops_after_four_empty_accounts_across_two_proxies(db_session, monkeypatch):
+    import db.database as db_database
+    import executor.browser_pool as browser_pool
+    import executor.user_schema as user_schema
+
+    accounts = [
+        Account(id=431, label="reply-a-1", status="active", cookies='{"sessionid":"x"}', proxy="http://proxy-a:1000"),
+        Account(id=432, label="reply-a-2", status="active", cookies='{"sessionid":"x"}', proxy="http://proxy-a:1000"),
+        Account(id=433, label="reply-b-1", status="active", cookies='{"sessionid":"x"}', proxy="http://proxy-b:1000"),
+        Account(id=434, label="reply-b-2", status="active", cookies='{"sessionid":"x"}', proxy="http://proxy-b:1000"),
+    ]
+    attempts: list[tuple[int, str]] = []
+
+    @contextmanager
+    def _fake_db_context():
+        yield db_session
+
+    def _fake_get_free_account_for_reply(_db, exclude_ids=None, exclude_proxies=None, **_kwargs):
+        excluded = set(exclude_ids or [])
+        excluded_proxies = set(exclude_proxies or [])
+        return next(
+            (
+                account
+                for account in accounts
+                if account.id not in excluded
+                and str(account.proxy or "").strip() not in excluded_proxies
+            ),
+            None,
+        )
+
+    async def _fake_reply_with_variant_on_all_mains(
+        _db,
+        reply_account,
+        _video_url,
+        _pending_parent,
+        _reply_text,
+        **_kwargs,
+    ):
+        attempts.append((reply_account.id, str(reply_account.proxy or "")))
+        return user_schema.ReplyAttemptResult(
+            replies=[],
+            searched=True,
+            confident_empty_search=True,
+            saw_comment_rows=False,
+            parent_search_max_seen_rows=0,
+            parent_search_last_row_count=0,
+            parent_search_unique_rows_seen=0,
+            parent_search_exhausted=True,
+            parent_search_scroll_container_scrollable=False,
+            parent_search_total_comment_count=0,
+            parent_search_scroll_budget=120,
+        )
+
+    monkeypatch.setattr(engagement_engine.settings, "PARALLEL_COMMENTING_TARGET_BROWSERS", 3, raising=False)
+    monkeypatch.setattr(engagement_engine.settings, "PARALLEL_COMMENTING_MAX_BROWSERS", 3, raising=False)
+    monkeypatch.setattr(db_database, "get_sync_db_context", _fake_db_context)
+    monkeypatch.setattr(engagement_engine, "get_free_account_for_reply", _fake_get_free_account_for_reply)
+    monkeypatch.setattr(user_schema, "_reply_with_variant_on_all_mains", _fake_reply_with_variant_on_all_mains)
+    monkeypatch.setattr(browser_pool, "ensure_thread_browser_pool_capacity", lambda _value: None)
+    monkeypatch.setattr(browser_pool, "close_browser_pool", AsyncMock(return_value=None))
+
+    results, _resolved_parent_id, _resolved_author = await engagement_engine.execute_engagement_only_replies_via_full_flow(
+        db=db_session,
+        video_url="https://www.tiktok.com/@demo/video/1234567890123456789",
+        comment_text="target comment",
+        comment_id="parent_123",
+        comment_author="main_author",
+        replies=["reply one"],
+        task_id=205,
+    )
+
+    assert len(attempts) == 4
+    assert len({account_id for account_id, _proxy in attempts}) == 4
+    assert [proxy for _account_id, proxy in attempts].count("http://proxy-a:1000") == 2
+    assert [proxy for _account_id, proxy in attempts].count("http://proxy-b:1000") == 2
+    assert any(
+        row.get("error") == "remaining_main_comments_not_visible_after_four_accounts"
+        for row in results
+    )
+
+
+@pytest.mark.unit
+@pytest.mark.asyncio
+async def test_engagement_only_resets_empty_account_quorum_when_parent_was_found(db_session, monkeypatch):
+    import inspect
+    import db.database as db_database
+    import executor.browser_pool as browser_pool
+    import executor.user_schema as user_schema
+
+    accounts = [
+        Account(
+            id=441 + index,
+            label=f"reply-{index}",
+            status="active",
+            cookies='{"sessionid":"x"}',
+            proxy="http://proxy-a:1000" if index % 2 == 0 else "http://proxy-b:1000",
+        )
+        for index in range(5)
+    ]
+    attempts: list[int] = []
+
+    @contextmanager
+    def _fake_db_context():
+        yield db_session
+
+    def _fake_get_free_account_for_reply(_db, exclude_ids=None, exclude_proxies=None, **_kwargs):
+        excluded = set(exclude_ids or [])
+        excluded_proxies = set(exclude_proxies or [])
+        return next(
+            (
+                account
+                for account in accounts
+                if account.id not in excluded
+                and str(account.proxy or "").strip() not in excluded_proxies
+            ),
+            None,
+        )
+
+    async def _fake_reply_with_variant_on_all_mains(
+        _db,
+        reply_account,
+        _video_url,
+        pending_parent,
+        reply_text,
+        *,
+        variant_index,
+        **_kwargs,
+    ):
+        attempts.append(reply_account.id)
+        if len(attempts) == 3:
+            parent = pending_parent[0]
+            return user_schema.ReplyAttemptResult(
+                replies=[
+                    user_schema.ReplyOutcome(
+                        text=reply_text,
+                        variant_index=variant_index,
+                        matched_main_text=parent.text,
+                        parent_comment_id=parent.comment_id,
+                        success=False,
+                        method=None,
+                        error="reply_publish_failed",
+                        account_id=reply_account.id,
+                        attempted=True,
+                    )
+                ],
+                searched=True,
+                saw_comment_rows=True,
+                parent_search_max_seen_rows=40,
+                parent_search_unique_rows_seen=20,
+            )
+        return user_schema.ReplyAttemptResult(
+            replies=[],
+            searched=True,
+            confident_empty_search=True,
+            saw_comment_rows=True,
+            parent_search_max_seen_rows=40,
+            parent_search_last_row_count=40,
+            parent_search_unique_rows_seen=20,
+        )
+
+    monkeypatch.setattr(engagement_engine.settings, "PARALLEL_COMMENTING_TARGET_BROWSERS", 2, raising=False)
+    monkeypatch.setattr(engagement_engine.settings, "PARALLEL_COMMENTING_MAX_BROWSERS", 2, raising=False)
+    monkeypatch.setattr(db_database, "get_sync_db_context", _fake_db_context)
+    monkeypatch.setattr(engagement_engine, "get_free_account_for_reply", _fake_get_free_account_for_reply)
+    monkeypatch.setattr(user_schema, "_reply_with_variant_on_all_mains", _fake_reply_with_variant_on_all_mains)
+    monkeypatch.setattr(browser_pool, "ensure_thread_browser_pool_capacity", lambda _value: None)
+    monkeypatch.setattr(browser_pool, "close_browser_pool", AsyncMock(return_value=None))
+
+    results, _resolved_parent_id, _resolved_author = await engagement_engine.execute_engagement_only_replies_via_full_flow(
+        db=db_session,
+        video_url="https://www.tiktok.com/@demo/video/1234567890123456789",
+        comment_text="target comment",
+        comment_id="parent_123",
+        comment_author="main_author",
+        replies=["reply one"],
+        task_id=206,
+    )
+
+    assert len(attempts) == 5
+    assert not any(
+        row.get("error") == "remaining_main_comments_not_visible_after_four_accounts"
+        for row in results
+    )
+    source = inspect.getsource(engagement_engine.execute_engagement_only_replies_via_full_flow)
+    assert 'row[2].get("completed") or row[2].get("found_any_main")' in source
+    assert 'row[1].get("completed") or row[1].get("found_any_main")' in source
+
+
+@pytest.mark.unit
+@pytest.mark.asyncio
+async def test_engagement_only_rotates_mobile_proxy_after_two_empty_accounts(db_session, monkeypatch):
+    import db.database as db_database
+    import executor.browser_pool as browser_pool
+    import executor.user_schema as user_schema
+
+    proxy_value = "http://user:pass@mobile-proxy:1000"
+    proxy = Proxy(
+        id=901,
+        proxy=proxy_value,
+        status="active",
+        is_mobile="Y",
+        rotation_url="https://rotate.example",
+        fail_count=0,
+    )
+    accounts = [
+        Account(
+            id=451 + index,
+            label=f"reply-mobile-{index}",
+            status="active",
+            cookies='{"sessionid":"x"}',
+            proxy=proxy_value,
+        )
+        for index in range(5)
+    ]
+    db_session.add(proxy)
+    db_session.add_all(accounts)
+    db_session.commit()
+    attempts: list[int] = []
+    rotation_after_attempts: list[int] = []
+
+    @contextmanager
+    def _fake_db_context():
+        yield db_session
+
+    def _fake_get_free_account_for_reply(_db, exclude_ids=None, **_kwargs):
+        excluded = set(exclude_ids or [])
+        return next((account for account in accounts if account.id not in excluded), None)
+
+    async def _fake_reply_with_variant_on_all_mains(
+        _db,
+        reply_account,
+        _video_url,
+        pending_parent,
+        reply_text,
+        *,
+        variant_index,
+        **_kwargs,
+    ):
+        attempts.append(reply_account.id)
+        if len(attempts) == 1:
+            parent = pending_parent[0]
+            return user_schema.ReplyAttemptResult(
+                replies=[
+                    user_schema.ReplyOutcome(
+                        text=reply_text,
+                        variant_index=variant_index,
+                        matched_main_text=parent.text,
+                        parent_comment_id=parent.comment_id,
+                        success=False,
+                        method=None,
+                        error="reply_publish_failed",
+                        account_id=reply_account.id,
+                        attempted=True,
+                    )
+                ],
+                found_mains=[parent],
+                searched=True,
+                saw_comment_rows=True,
+                parent_search_max_seen_rows=40,
+                parent_search_unique_rows_seen=20,
+            )
+        return user_schema.ReplyAttemptResult(
+            replies=[],
+            searched=True,
+            confident_empty_search=True,
+            saw_comment_rows=True,
+            parent_search_max_seen_rows=40,
+            parent_search_last_row_count=40,
+            parent_search_unique_rows_seen=20,
+        )
+
+    async def _fake_ensure_proxy_ip_rotated(_proxy, _db, *, force_rotation=False):
+        assert force_rotation is True
+        rotation_after_attempts.append(len(attempts))
+        return "37.47.100.11"
+
+    monkeypatch.setattr(engagement_engine.settings, "MAX_RETRY_ACCOUNTS", 6, raising=False)
+    monkeypatch.setattr(engagement_engine.settings, "PARALLEL_COMMENTING_TARGET_BROWSERS", 1, raising=False)
+    monkeypatch.setattr(engagement_engine.settings, "PARALLEL_COMMENTING_MAX_BROWSERS", 1, raising=False)
+    monkeypatch.setattr(db_database, "get_sync_db_context", _fake_db_context)
+    monkeypatch.setattr(engagement_engine, "get_free_account_for_reply", _fake_get_free_account_for_reply)
+    monkeypatch.setattr(user_schema, "_reply_with_variant_on_all_mains", _fake_reply_with_variant_on_all_mains)
+    monkeypatch.setattr(engagement_engine, "ensure_proxy_ip_rotated", _fake_ensure_proxy_ip_rotated)
+    monkeypatch.setattr(engagement_engine, "clear_proxy_bad", lambda _proxy: None)
+    monkeypatch.setattr(browser_pool, "ensure_thread_browser_pool_capacity", lambda _value: None)
+    monkeypatch.setattr(browser_pool, "close_browser_pool", AsyncMock(return_value=None))
+
+    results, _resolved_parent_id, _resolved_author = await engagement_engine.execute_engagement_only_replies_via_full_flow(
+        db=db_session,
+        video_url="https://www.tiktok.com/@demo/video/1234567890123456789",
+        comment_text="target comment",
+        comment_id="parent_123",
+        comment_author="main_author",
+        replies=["reply one"],
+        task_id=2061,
+    )
+
+    assert len(attempts) == 5
+    assert rotation_after_attempts == [3]
+    assert any(
+        row.get("error") == "remaining_main_comments_not_visible_after_four_accounts"
+        for row in results
+    )
 
 
 @pytest.mark.unit

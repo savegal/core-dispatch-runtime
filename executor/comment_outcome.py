@@ -2047,6 +2047,17 @@ async def find_comments_in_list_batch(
                         const container = closest && scope.contains(closest) ? closest : root;
                         if (!intersectsScope(container)) continue;
                         if (seenContainers.has(container)) continue;
+                        // TikTok exposes several nested wrappers for one visible
+                        // top-level comment. The broad root selector can return
+                        // both the outer row and an inner CommentItem wrapper.
+                        // Treating both as separate rows maps one physical
+                        // comment to several duplicate-text targets. Document
+                        // order puts the outer wrapper first, so retain it and
+                        // reject later nested aliases during parent-only scans.
+                        const nestedContainerAlreadySeen = topLevelOnly && [...seenContainers].some(
+                            (existing) => existing.contains(container) || container.contains(existing)
+                        );
+                        if (nestedContainerAlreadySeen) continue;
                         seenContainers.add(container);
                         const structurallyCommentLike = (() => {
                             try {
