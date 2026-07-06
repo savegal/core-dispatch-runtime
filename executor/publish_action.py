@@ -5143,9 +5143,13 @@ async def _publish_via_current_input(
         remaining = _remaining()
         if remaining <= 0:
             return 0.0
-        cap = 8.0 if aggressive else (6.0 if fast_publish else 10.0)
+        cap = (
+            10.0
+            if reply_scoped and aggressive
+            else (8.0 if aggressive else (6.0 if fast_publish else 10.0))
+        )
         if retry:
-            cap = min(cap, 5.5 if aggressive else 5.0)
+            cap = min(cap, 6.0 if reply_scoped else (5.5 if aggressive else 5.0))
         reserve_for_post = 4.0 if aggressive else (5.0 if fast_publish else 6.0)
         if remaining > reserve_for_post + 0.75:
             return max(0.5, min(cap, remaining - reserve_for_post))
@@ -5829,11 +5833,13 @@ async def _publish_via_current_input(
         if reply_send_deadline_ref is not None:
             stored_deadline = float(reply_send_deadline_ref.get("deadline") or 0.0)
             if stored_deadline <= 0:
-                stored_deadline = time.monotonic() + (3.5 if fast_publish else 4.5)
+                # TikTok can remount the reply composer and enable its send
+                # control several seconds after the text is already visible.
+                stored_deadline = time.monotonic() + (6.0 if fast_publish else 8.0)
                 reply_send_deadline_ref["deadline"] = stored_deadline
             reply_send_deadline = stored_deadline
         else:
-            reply_send_deadline = time.monotonic() + (3.5 if fast_publish else 4.5)
+            reply_send_deadline = time.monotonic() + (6.0 if fast_publish else 8.0)
     await asyncio.sleep(0.15 if aggressive else (0.25 if fast_publish else 0.8))  # let TikTok render Post after robust input
 
     # Verify the input actually has text visible to React
@@ -5934,10 +5940,10 @@ async def _publish_via_current_input(
     if remaining <= 0:
         return _send_deadline_result("before_post_enabled_gate", input_info.strategy or post_info.strategy)
     post_enabled_wait_seconds = (
-        0.7
+        1.5
         if reply_scoped and aggressive
         else (
-            1.2
+            2.0
             if reply_scoped
             else (2.8 if main_comment_aggressive else (1.5 if aggressive else (3.0 if fast_publish else 8.0)))
         )
@@ -6165,7 +6171,7 @@ async def _publish_via_current_input(
                     try:
                         retry_enabled_button, retry_enabled_info = await wait_for_post_button_enabled(
                             page,
-                            max_wait_seconds=min(0.9 if fast_publish else 1.2, max(_send_remaining(), 0.2)),
+                            max_wait_seconds=min(1.5 if fast_publish else 2.0, max(_send_remaining(), 0.2)),
                             reply_scoped=True,
                             expected_text=text,
                         )
@@ -7614,7 +7620,7 @@ async def publish_reply_hybrid(
         return logged_out_result
     reply_open = None
     reply_box_attempts = 2 if fast_publish else None
-    reply_box_timeout = 6.0 if fast_publish else 8.0
+    reply_box_timeout = 8.0 if fast_publish else 10.0
     if comments_already_open:
         if _remaining() <= 0:
             return _deadline_result("before_open_reply_box")
@@ -7883,7 +7889,10 @@ async def publish_reply_hybrid(
         except Exception:
             recovered_target, recovered_info = None, None
         if recovered_target is not None:
-            retry_budget = min(max_total_seconds - (time.monotonic() - started), 2.2 if fast_publish else 3.0)
+            retry_budget = min(
+                max_total_seconds - (time.monotonic() - started),
+                14.0 if fast_publish else 16.0,
+            )
             if retry_budget > 0.35:
                 _log_publish_trace(
                     "reply_send_recover_send_only",

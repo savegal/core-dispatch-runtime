@@ -2163,7 +2163,7 @@ _JS_COMMENT_SURFACE_STATE = r"""
     const listCandidates = visibleNodes(document, listSelectors).map((el) => {
         const r = el.getBoundingClientRect();
         const strongItems = visibleNodes(el, strongItemSelectors).length;
-        const items = visibleNodes(el, itemSelectors).length;
+        const items = strongItems;
         const strongList = (() => {
             try {
                 return el.matches(
@@ -2188,7 +2188,44 @@ _JS_COMMENT_SURFACE_STATE = r"""
         // [data-cid] / text nodes that look like comments globally, so only a
         // real visible comment-list container is allowed to contribute items.
         return entry.strongList || entry.strongItems > 0;
-    }).sort((a, b) => {
+    });
+    // TikTok periodically renames/removes its CommentList wrapper classes while
+    // retaining stable comment-level nodes. Recover the closest bounded common
+    // container so an obviously open drawer is not rejected solely because the
+    // outer wrapper selector changed.
+    const fallbackStrongItems = visibleNodes(
+        document,
+        '[data-e2e="comment-item"], [data-e2e*="comment-level"], ' +
+        '[data-e2e*="comment-text"], [class*="DivCommentObject"]'
+    );
+    const fallbackContainers = new Set();
+    for (const item of fallbackStrongItems) {
+        for (let cur = item.parentElement, depth = 0; cur && depth < 9; cur = cur.parentElement, depth++) {
+            if (cur === document.body || cur === document.documentElement) break;
+            const r = cur.getBoundingClientRect();
+            if (r.width < 220 || r.height < 140) continue;
+            if (r.width > window.innerWidth * 0.98 && r.height > window.innerHeight * 0.92) continue;
+            const strongItems = visibleNodes(cur, strongItemSelectors).length;
+            if (strongItems < 1) continue;
+            fallbackContainers.add(cur);
+        }
+    }
+    for (const el of fallbackContainers) {
+        if (listCandidates.some(entry => entry.el === el)) continue;
+        const r = el.getBoundingClientRect();
+        const strongItems = visibleNodes(el, strongItemSelectors).length;
+        const items = visibleNodes(el, itemSelectors).length;
+        listCandidates.push({
+            el,
+            items,
+            strongItems,
+            strongList: false,
+            area: Math.max(0, r.width) * Math.max(0, r.height),
+            top: r.top,
+            left: r.left,
+        });
+    }
+    listCandidates.sort((a, b) => {
         const score = (entry) =>
             entry.strongItems * 1000 +
             entry.items * 10 +

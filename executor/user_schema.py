@@ -216,6 +216,8 @@ _REPLY_MAIN_SEARCH_TO_END_TIMEOUT_SECONDS = 85.0
 _REPLY_MAIN_SEARCH_TO_END_PER_TEXT_SECONDS = 80.0
 _REPLY_MAIN_SEARCH_TO_END_MAX_SCROLLS = 140
 _REPLY_MAIN_SEARCH_SCROLL_DELAY_MS = 350
+_PARALLEL_REPLY_COMMENT_OPEN_SECONDS = 15.0
+_PARALLEL_REPLY_COMMENT_OPEN_HARD_SECONDS = 17.0
 _REPLY_PARENT_SEARCH_EMPTY_COMPATIBLE_ERRORS: set[str] = {
     "batch_confident_miss",
 }
@@ -1327,7 +1329,7 @@ async def _open_comment_list_fast_for_parallel_reply(
     variant_index: Optional[int] = None,
 ) -> bool:
     started = time.monotonic()
-    deadline = started + 9.0
+    deadline = started + _PARALLEL_REPLY_COMMENT_OPEN_SECONDS
 
     def _remaining() -> float:
         return max(0.0, deadline - time.monotonic())
@@ -1551,7 +1553,7 @@ async def _open_comment_list_with_safe_retry(
     variant_index: Optional[int] = None,
 ) -> bool:
     if _is_parallel_reply_correlation(correlation_id):
-        hard_timeout = 9.5
+        hard_timeout = _PARALLEL_REPLY_COMMENT_OPEN_HARD_SECONDS
         try:
             return await _await_reply_hard_timeout(
                 _open_comment_list_fast_for_parallel_reply(
@@ -6508,6 +6510,7 @@ async def _find_main_anchors_batch(
     max_scrolls: int = _REPLY_MAIN_SEARCH_SCROLLS,
     require_author_match: bool = False,
     allow_author_fallback: bool = False,
+    ensure_open: bool = False,
 ) -> Tuple[List[MainAnchor], Dict[str, Any]]:
     """Find several main comments in one scoped pass through the comment list."""
     candidates = _normalize_main_candidates(mains)
@@ -6534,7 +6537,7 @@ async def _find_main_anchors_batch(
                 collect_author_fallbacks=allow_author_fallback,
                 max_scrolls=max_scrolls,
                 scroll_delay_ms=_REPLY_MAIN_SEARCH_SCROLL_DELAY_MS,
-                ensure_open=False,
+                ensure_open=ensure_open,
                 strict_scope=True,
                 min_match_ratio=1.0,
                 return_partial_on_found=True,
@@ -6841,8 +6844,8 @@ async def _verify_reply_visible_near_parent(
         "reason": "reply_not_found_under_parent",
         "minCountExclusive": min_count_exclusive,
     }
-    for attempt in range(1, 3):
-        delay = (0.0 if attempt == 1 else 0.35) if fast else (0.8 if attempt == 1 else 1.2)
+    attempt_delays = (0.0, 0.75, 1.5) if fast else (0.8, 1.2, 1.8)
+    for attempt, delay in enumerate(attempt_delays, start=1):
         if delay > 0:
             await asyncio.sleep(delay)
         try:
@@ -8530,7 +8533,7 @@ async def _reply_with_variant_on_all_mains(
             account_id=account.id,
             variant_index=variant_index,
             main_candidate_count=len(main_candidates),
-            open_comments_max_wait_seconds=9.0
+            open_comments_max_wait_seconds=_PARALLEL_REPLY_COMMENT_OPEN_SECONDS
             if _is_parallel_reply_correlation(correlation_id)
             else 12.0,
             fast_parallel_reply_open=_is_parallel_reply_correlation(correlation_id),
@@ -8635,25 +8638,26 @@ async def _reply_with_variant_on_all_mains(
                 )
             )
         if not comments_ready_for_search:
-            logger.warning(
-                "[USER_SCHEMA] %s: reply-account=%s comment_list_not_open before "
-                "parent search; retrying this reply variant with another account",
-                correlation_id, account.id,
+            # The surface probe is intentionally conservative and TikTok changes
+            # its list wrappers often. A visually open, usable drawer can miss
+            # these selectors. Do not retire a healthy page on this probe alone;
+            # let the strictly scoped parent scanner make one final open/search
+            # attempt. It still refuses unscoped sidebar/feed matches.
+            logger.info(
+                "[USER_SCHEMA] %s: reply-account=%s comment-list preflight was "
+                "inconclusive; continuing to scoped parent search",
+                correlation_id,
+                account.id,
             )
-            results.append(
-                ReplyOutcome(
-                    text=reply_text,
-                    variant_index=variant_index,
-                    matched_main_text=None,
-                    parent_comment_id=None,
-                    success=False,
-                    method=None,
-                    error="comment_list_not_open",
-                    account_id=account.id,
-                    attempted=False,
-                )
+            _log_user_trace(
+                "reply_parent_search_after_inconclusive_open_probe",
+                page=page,
+                expected_video_url=target_media_url,
+                correlation_id=correlation_id,
+                account_id=account.id,
+                variant_index=variant_index,
+                level=logging.INFO,
             )
-            return await _finish_reply_attempt(ReplyAttemptResult(replies=results, searched=False))
         if not await _ensure_page_on_target_media(
             page,
             target_media_url,
@@ -8675,7 +8679,7 @@ async def _reply_with_variant_on_all_mains(
                 )
             )
             return await _finish_reply_attempt(ReplyAttemptResult(replies=results, searched=True))
-        surface_wait_seconds = 3.0
+        surface_wait_seconds = 3.0 if comments_ready_for_search else 1.5
         _log_user_trace(
             "reply_parent_surface_wait",
             page=page,
@@ -8856,6 +8860,7 @@ async def _reply_with_variant_on_all_mains(
                         max_scrolls=search_scrolls,
                         require_author_match=require_parent_author_match,
                         allow_author_fallback=allow_parent_author_fallback,
+                        ensure_open=not comments_ready_for_search,
                     )
                     batch_info = batch_info or {}
                     _record_parent_search_evidence(batch_info)
@@ -8963,7 +8968,7 @@ async def _reply_with_variant_on_all_mains(
                                 replies=results,
                                 found_mains=list(found_mains_by_key.values()),
                                 attempted_parent_keys=attempted_parent_keys,
-                                searched=bool(found_mains_by_key),
+                                searched=search_attempted,
                             )
                         )
             ordered_remaining_mains = list(remaining_mains)
@@ -9219,7 +9224,7 @@ async def _reply_with_variant_on_all_mains(
                             replies=results,
                             found_mains=list(found_mains_by_key.values()),
                             attempted_parent_keys=attempted_parent_keys,
-                            searched=bool(found_mains_by_key or attempted_parent_keys),
+                            searched=search_attempted,
                         )
                     )
                 if not anchor_text:

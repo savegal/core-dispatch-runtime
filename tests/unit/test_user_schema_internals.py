@@ -1272,7 +1272,7 @@ async def test_parallel_reply_open_comments_has_hard_outer_deadline(monkeypatch)
     )
 
     assert ok is False
-    assert captured["timeout"] == pytest.approx(9.5)
+    assert captured["timeout"] == pytest.approx(17.0)
     assert captured["traces"][0][0] == "comment_list_fast_open_hard_timeout"
 
 
@@ -3322,7 +3322,7 @@ async def test_reply_visible_surface_not_open_does_not_count_as_confident_fallba
 
 @pytest.mark.unit
 @pytest.mark.asyncio
-async def test_reply_account_does_not_publish_fallback_when_comment_list_unavailable(monkeypatch):
+async def test_reply_account_runs_scoped_search_after_comment_open_probe_miss(monkeypatch):
     from executor import user_schema
 
     class FakePage:
@@ -3344,8 +3344,20 @@ async def test_reply_account_does_not_publish_fallback_when_comment_list_unavail
     async def fake_login_ready(*_args, **_kwargs):
         return True, None
 
-    async def fail_find_main_anchor(*_args, **_kwargs):
-        raise AssertionError("parent search must not run when the comment list is unavailable")
+    calls = {"batch": 0, "single": 0}
+
+    async def fake_find_main_anchors_batch(*_args, **kwargs):
+        calls["batch"] += 1
+        assert kwargs.get("ensure_open") is True
+        return [], {"error": "comment_list_not_open"}
+
+    async def fake_find_main_anchor(*_args, **_kwargs):
+        calls["single"] += 1
+        return user_schema.MainAnchor(
+            matched_text=None,
+            parent_comment_id=None,
+            error="comment_list_not_open",
+        )
 
     async def fail_publish_all(*_args, **_kwargs):
         raise AssertionError("fallback main must not publish when the comment list never opened")
@@ -3360,7 +3372,9 @@ async def test_reply_account_does_not_publish_fallback_when_comment_list_unavail
     monkeypatch.setattr(user_schema, "needs_enrichment", lambda _account: False)
     monkeypatch.setattr(user_schema, "_ensure_page_on_target_media", AsyncMock(return_value=True))
     monkeypatch.setattr(user_schema, "_open_comment_list_with_safe_retry", AsyncMock(return_value=False))
-    monkeypatch.setattr(user_schema, "_find_main_anchor", fail_find_main_anchor)
+    monkeypatch.setattr(user_schema, "_wait_for_searchable_comment_surface", AsyncMock(return_value=False))
+    monkeypatch.setattr(user_schema, "_find_main_anchors_batch", fake_find_main_anchors_batch)
+    monkeypatch.setattr(user_schema, "_find_main_anchor", fake_find_main_anchor)
     monkeypatch.setattr(user_schema, "_publish_all_variants_on_account", fail_publish_all)
     monkeypatch.setattr(user_schema.asyncio, "sleep", fake_sleep)
 
@@ -3375,9 +3389,10 @@ async def test_reply_account_does_not_publish_fallback_when_comment_list_unavail
         fallback_main_texts=["main one", "main two", "main three"],
     )
 
-    assert result.searched is False
+    assert result.searched is True
     assert result.fallback_attempted is False
     assert result.fallback_mains == []
+    assert calls == {"batch": 1, "single": 1}
     assert len(result.replies) == 1
     assert result.replies[0].error == "comment_list_not_open"
     assert result.replies[0].attempted is False
@@ -3510,7 +3525,7 @@ async def test_reply_single_search_comment_list_loss_does_not_publish_fallback(m
         fallback_main_texts=["main one", "main two", "main three"],
     )
 
-    assert result.searched is False
+    assert result.searched is True
     assert result.fallback_attempted is False
     assert result.fallback_mains == []
     assert len(result.replies) == 1
@@ -7578,6 +7593,7 @@ def test_reply_local_verifier_excludes_open_reply_editor_artifacts():
     assert "'[contenteditable=\"true\"]'" in source
     assert "if (isEditorArtifact(node)) return;" in source
     assert "if (!row || isEditorArtifact(row)) return;" in source
+    assert "attempt_delays = (0.0, 0.75, 1.5) if fast else (0.8, 1.2, 1.8)" in source
 
 
 @pytest.mark.unit
@@ -11368,11 +11384,12 @@ def test_publish_reply_retry_rebinds_target_and_caps_send_recovery():
 
     assert "typing_retry_reply_target_rebound" in source
     assert "find_reply_composer_for_parent(" in source
-    assert "reply_send_deadline = time.monotonic() + (3.5 if fast_publish else 4.5)" in source
+    assert "reply_send_deadline = time.monotonic() + (6.0 if fast_publish else 8.0)" in source
+    assert "1.5 if fast_publish else 2.0" in source
     assert "min(_PARALLEL_POST_RESPONSE_WAIT_SECONDS, 1.4)" in source
     assert "1000 if reply_scoped and fast_publish else 3000" in source
     assert "1000 if reply_scoped and fast_publish else 5000" in source
-    assert "2.2 if fast_publish else 3.0" in reply_source
+    assert "14.0 if fast_publish else 16.0" in reply_source
     assert "reply_send_recover_send_only" in reply_source
     assert "_recover_reply_send_only(" in reply_source
 

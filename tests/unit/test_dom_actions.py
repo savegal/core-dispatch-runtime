@@ -753,6 +753,15 @@ def test_comment_surface_state_detects_open_comment_panel_without_input():
     assert "comment_input_visible" in script
     assert "commentInputLike" in script
     assert "surface_visible" in script
+
+
+@pytest.mark.unit
+def test_comment_surface_state_recovers_renamed_list_wrapper_from_comment_rows():
+    script = dom_actions._JS_COMMENT_SURFACE_STATE
+
+    assert "fallbackStrongItems" in script
+    assert "fallbackContainers" in script
+    assert "[data-e2e*=\"comment-level\"]" in script
     assert "comment-username" in script
     assert "DivCommentObject" in script
     assert "comment-list-container" in script

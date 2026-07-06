@@ -1099,7 +1099,7 @@ async def test_publish_reply_hybrid_parallel_reply_uses_fast_open_attempts_and_b
 
     assert result.status == "success"
     assert captured["max_attempts"] == 2
-    assert 5.5 <= captured["timeouts"][0] <= 6.0
+    assert 7.5 <= captured["timeouts"][0] <= 8.0
     assert captured["reply_scoped"] is True
     assert captured["parent_anchor_token"] == "fresh-anchor-token"
     assert captured["reply_target_anchor"] == "fresh-anchor-token"
@@ -1296,7 +1296,7 @@ async def test_publish_reply_hybrid_hard_bounds_stuck_send_recovery(monkeypatch)
     assert result.status == "dom_error"
     assert result.error_reason == "post_button_stayed_disabled"
     assert captured["recovery_calls"] == 0
-    assert captured["hard_timeout"] == pytest.approx(2.2)
+    assert captured["hard_timeout"] == pytest.approx(14.0)
 
 
 @pytest.mark.unit
@@ -1340,7 +1340,7 @@ async def test_publish_reply_hybrid_stops_after_hard_reply_open_timeout(monkeypa
 
     assert result.status == "timeout"
     assert result.error_reason == "reply_box_open_timeout"
-    assert captured["hard_timeout"] == pytest.approx(6.0)
+    assert captured["hard_timeout"] == pytest.approx(8.0)
     assert captured["recovery_probe"] == 0
 
 
