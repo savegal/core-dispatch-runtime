@@ -134,6 +134,31 @@ logger = logging.getLogger("executor.user_schema")
 _settings = get_settings()
 
 
+def _consume_detached_reply_task_result(task: asyncio.Task) -> None:
+    try:
+        task.exception()
+    except asyncio.CancelledError:
+        pass
+    except Exception:
+        pass
+
+
+async def _await_reply_hard_timeout(awaitable: Any, *, timeout: float) -> Any:
+    """Bound reply UI work without waiting for a stuck Patchright cancellation."""
+    task = asyncio.ensure_future(awaitable)
+    try:
+        done, _pending = await asyncio.wait({task}, timeout=max(0.0, timeout))
+    except BaseException:
+        task.cancel()
+        task.add_done_callback(_consume_detached_reply_task_result)
+        raise
+    if task in done:
+        return task.result()
+    task.cancel()
+    task.add_done_callback(_consume_detached_reply_task_result)
+    raise asyncio.TimeoutError
+
+
 def _reply_variants_from_task(task: Task) -> List[str]:
     task_settings = task.settings or {}
     settings_replies = task_settings.get("replies")
@@ -1526,16 +1551,34 @@ async def _open_comment_list_with_safe_retry(
     variant_index: Optional[int] = None,
 ) -> bool:
     if _is_parallel_reply_correlation(correlation_id):
-        return await _open_comment_list_fast_for_parallel_reply(
-            page,
-            expected_video_url,
-            fallback_video_url,
-            timeout_ms=timeout_ms,
-            correlation_id=correlation_id,
-            phase=phase,
-            account_id=account_id,
-            variant_index=variant_index,
-        )
+        hard_timeout = 9.5
+        try:
+            return await _await_reply_hard_timeout(
+                _open_comment_list_fast_for_parallel_reply(
+                    page,
+                    expected_video_url,
+                    fallback_video_url,
+                    timeout_ms=timeout_ms,
+                    correlation_id=correlation_id,
+                    phase=phase,
+                    account_id=account_id,
+                    variant_index=variant_index,
+                ),
+                timeout=hard_timeout,
+            )
+        except asyncio.TimeoutError:
+            _log_user_trace(
+                "comment_list_fast_open_hard_timeout",
+                page=page,
+                expected_video_url=expected_video_url,
+                correlation_id=correlation_id,
+                account_id=account_id,
+                variant_index=variant_index,
+                phase=phase,
+                timeout_seconds=hard_timeout,
+                level=logging.WARNING,
+            )
+            return False
 
     try:
         opened = await open_comment_section(

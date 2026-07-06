@@ -64,6 +64,43 @@ _PARALLEL_MAIN_OPEN_COMMENTS_SECONDS_DEFAULT = 12.0
 _PARALLEL_MAIN_INPUT_SEARCH_SECONDS_DEFAULT = 8.0
 
 
+class _HardTimeoutError(asyncio.TimeoutError):
+    """The outer wall-clock deadline expired before cancellation drained."""
+
+
+def _consume_detached_task_result(task: asyncio.Task) -> None:
+    """Retrieve a detached task result so late browser-close errors stay handled."""
+    try:
+        task.exception()
+    except asyncio.CancelledError:
+        pass
+    except Exception:
+        pass
+
+
+async def _await_hard_timeout(awaitable: Any, *, timeout: float) -> Any:
+    """Stop waiting at the deadline even when a browser call is slow to cancel.
+
+    ``asyncio.wait_for`` cancels a timed-out coroutine and then waits for that
+    cancellation to finish. Patchright operations can take several additional
+    seconds to unwind, which made nominal 2-8 second reply phases block much
+    longer. Reply callers retire the page after these timeout failures, so it is
+    safer to detach and drain the cancelled task than to hold the proxy slot.
+    """
+    task = asyncio.ensure_future(awaitable)
+    try:
+        done, _pending = await asyncio.wait({task}, timeout=max(0.0, timeout))
+    except BaseException:
+        task.cancel()
+        task.add_done_callback(_consume_detached_task_result)
+        raise
+    if task in done:
+        return task.result()
+    task.cancel()
+    task.add_done_callback(_consume_detached_task_result)
+    raise _HardTimeoutError
+
+
 @dataclass
 class PublishResult:
     status: str
@@ -5565,7 +5602,8 @@ async def _publish_via_current_input(
         return _deadline_result("before_typing", input_info.strategy)
     if not typed_ok:
         try:
-            typed_result = await _asyncio_wait_for(
+            typing_wait = _await_hard_timeout if reply_scoped else _asyncio_wait_for
+            typed_result = await typing_wait(
                 type_into_comment(
                     page,
                     input_handle,
@@ -5722,7 +5760,8 @@ async def _publish_via_current_input(
             return _deadline_result("before_typing_retry", input_info.strategy)
         retry_typed_result: Any = None
         try:
-            retry_typed_result = await _asyncio_wait_for(
+            typing_wait = _await_hard_timeout if reply_scoped else _asyncio_wait_for
+            retry_typed_result = await typing_wait(
                 type_into_comment(
                     page,
                     retry_handle,
@@ -7580,7 +7619,8 @@ async def publish_reply_hybrid(
         if _remaining() <= 0:
             return _deadline_result("before_open_reply_box")
         try:
-            reply_open = await _asyncio_wait_for(
+            reply_open_wait = _await_hard_timeout if fast_publish else _asyncio_wait_for
+            reply_open = await reply_open_wait(
                 open_reply_box(
                     page,
                     parent_comment_text,
@@ -7589,6 +7629,21 @@ async def publish_reply_hybrid(
                     max_attempts=reply_box_attempts,
                 ),
                 timeout=max(0.5, min(_remaining(), reply_box_timeout)),
+            )
+        except _HardTimeoutError:
+            _log_publish_trace(
+                "reply_fast_open_hard_timeout",
+                page=page,
+                expected_video_url=expected_video_url,
+                correlation_id=correlation_id,
+                level=logging.WARNING,
+                timeout_seconds=reply_box_timeout,
+                remaining=round(_remaining(), 2),
+            )
+            return PublishResult(
+                status="timeout",
+                error_reason="reply_box_open_timeout",
+                elapsed_seconds=time.monotonic() - started,
             )
         except asyncio.TimeoutError:
             recovered = await _recover_reply_open_timeout("reply_fast_open_timeout")
@@ -7687,7 +7742,8 @@ async def publish_reply_hybrid(
         if _remaining() <= 0:
             return _deadline_result("before_open_reply_box")
         try:
-            reply_open = await _asyncio_wait_for(
+            reply_open_wait = _await_hard_timeout if fast_publish else _asyncio_wait_for
+            reply_open = await reply_open_wait(
                 open_reply_box(
                     page,
                     parent_comment_text,
@@ -7696,6 +7752,21 @@ async def publish_reply_hybrid(
                     max_attempts=reply_box_attempts,
                 ),
                 timeout=max(0.5, min(_remaining(), reply_box_timeout)),
+            )
+        except _HardTimeoutError:
+            _log_publish_trace(
+                "reply_fast_open_hard_timeout",
+                page=page,
+                expected_video_url=expected_video_url,
+                correlation_id=correlation_id,
+                level=logging.WARNING,
+                timeout_seconds=reply_box_timeout,
+                remaining=round(_remaining(), 2),
+            )
+            return PublishResult(
+                status="timeout",
+                error_reason="reply_box_open_timeout",
+                elapsed_seconds=time.monotonic() - started,
             )
         except asyncio.TimeoutError:
             recovered = await _recover_reply_open_timeout("open_reply_box")
@@ -7823,17 +7894,32 @@ async def publish_reply_hybrid(
                     strategy=getattr(recovered_info, "strategy", None),
                     level=logging.INFO,
                 )
-                send_only_result = await _recover_reply_send_only(
-                    page,
-                    text,
-                    started=time.monotonic(),
-                    max_total_seconds=retry_budget,
-                    expected_video_url=expected_video_url,
-                    reply_target=recovered_target,
-                    correlation_id=correlation_id,
-                    fast_publish=fast_publish,
-                    recovery_reason=result.error_reason,
-                )
+                try:
+                    send_only_result = await _await_hard_timeout(
+                        _recover_reply_send_only(
+                            page,
+                            text,
+                            started=time.monotonic(),
+                            max_total_seconds=retry_budget,
+                            expected_video_url=expected_video_url,
+                            reply_target=recovered_target,
+                            correlation_id=correlation_id,
+                            fast_publish=fast_publish,
+                            recovery_reason=result.error_reason,
+                        ),
+                        timeout=retry_budget,
+                    )
+                except asyncio.TimeoutError:
+                    send_only_result = None
+                    _log_publish_trace(
+                        "reply_send_recovery_hard_timeout",
+                        page=page,
+                        expected_video_url=expected_video_url,
+                        correlation_id=correlation_id,
+                        retry_budget=round(retry_budget, 2),
+                        previous_reason=result.error_reason,
+                        level=logging.WARNING,
+                    )
                 if send_only_result is not None:
                     result = send_only_result
             else:

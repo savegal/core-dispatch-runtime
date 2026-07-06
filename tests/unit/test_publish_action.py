@@ -1073,6 +1073,7 @@ async def test_publish_reply_hybrid_parallel_reply_uses_fast_open_attempts_and_b
         )
 
     monkeypatch.setattr(publish_action, "_asyncio_wait_for", _fake_wait_for)
+    monkeypatch.setattr(publish_action, "_await_hard_timeout", _fake_wait_for)
     monkeypatch.setattr(publish_action, "_publish_url_guard_result", lambda *args, **kwargs: None)
     monkeypatch.setattr(publish_action, "_captcha_result_if_present", _fake_none)
     monkeypatch.setattr(publish_action, "_logged_out_publish_result_if_visible", _fake_none)
@@ -1230,6 +1231,117 @@ async def test_publish_reply_hybrid_recovers_reply_send_soft_failure(monkeypatch
 
     assert result.status == "success"
     assert captured == {"publish_calls": 1, "target_resolves": 2, "send_only_calls": 1}
+
+
+@pytest.mark.unit
+@pytest.mark.asyncio
+async def test_publish_reply_hybrid_hard_bounds_stuck_send_recovery(monkeypatch):
+    page = _FakePage()
+    captured = {"hard_timeout": None, "recovery_calls": 0}
+
+    async def _fake_none(*args, **kwargs):
+        return None
+
+    async def _fake_open_reply_box(*args, **kwargs):
+        return SimpleNamespace(
+            success=True,
+            strategy="parent-anchor-reply",
+            reason=None,
+            anchor_token="anchor-1",
+        )
+
+    async def _fake_find_reply_composer_for_parent(*args, **kwargs):
+        return _fake_reply_target("anchor-1"), SimpleNamespace(
+            success=True,
+            strategy="reply-composer-test",
+            reason=None,
+        )
+
+    async def _fake_publish_via_current_input(*args, **kwargs):
+        return publish_action.PublishResult(
+            status="dom_error",
+            error_reason="post_button_stayed_disabled",
+            dom_strategy="reply-composer-test",
+        )
+
+    async def _fake_recover_reply_send_only(*args, **kwargs):
+        captured["recovery_calls"] += 1
+        return publish_action.PublishResult(status="success", comment_id="should-not-win")
+
+    async def _fake_hard_timeout(awaitable, *, timeout):
+        captured["hard_timeout"] = timeout
+        awaitable.close()
+        raise asyncio.TimeoutError
+
+    monkeypatch.setattr(publish_action, "_publish_url_guard_result", lambda *args, **kwargs: None)
+    monkeypatch.setattr(publish_action, "_captcha_result_if_present", _fake_none)
+    monkeypatch.setattr(publish_action, "_logged_out_publish_result_if_visible", _fake_none)
+    monkeypatch.setattr(publish_action, "open_reply_box", _fake_open_reply_box)
+    monkeypatch.setattr(publish_action, "find_reply_composer_for_parent", _fake_find_reply_composer_for_parent)
+    monkeypatch.setattr(publish_action, "_publish_via_current_input", _fake_publish_via_current_input)
+    monkeypatch.setattr(publish_action, "_recover_reply_send_only", _fake_recover_reply_send_only)
+    monkeypatch.setattr(publish_action, "_await_hard_timeout", _fake_hard_timeout)
+
+    result = await publish_action.publish_reply_hybrid(
+        page,
+        "reply text",
+        parent_comment_text="parent",
+        parent_anchor_token="anchor-1",
+        max_total_seconds=20.0,
+        correlation_id="task_1_parallel_reply_v1_a1_acc10_to_text",
+        expected_video_url=page.url,
+        comments_already_open=True,
+    )
+
+    assert result.status == "dom_error"
+    assert result.error_reason == "post_button_stayed_disabled"
+    assert captured["recovery_calls"] == 0
+    assert captured["hard_timeout"] == pytest.approx(2.2)
+
+
+@pytest.mark.unit
+@pytest.mark.asyncio
+async def test_publish_reply_hybrid_stops_after_hard_reply_open_timeout(monkeypatch):
+    page = _FakePage()
+    captured = {"recovery_probe": 0, "hard_timeout": None}
+
+    async def _fake_none(*args, **kwargs):
+        return None
+
+    async def _fake_open_reply_box(*args, **kwargs):
+        return SimpleNamespace(success=True, anchor_token="too-late")
+
+    async def _fake_find_reply_composer_for_parent(*args, **kwargs):
+        captured["recovery_probe"] += 1
+        return _fake_reply_target("anchor-1"), SimpleNamespace(success=True)
+
+    async def _fake_hard_timeout(awaitable, *, timeout):
+        captured["hard_timeout"] = timeout
+        awaitable.close()
+        raise publish_action._HardTimeoutError
+
+    monkeypatch.setattr(publish_action, "_publish_url_guard_result", lambda *args, **kwargs: None)
+    monkeypatch.setattr(publish_action, "_captcha_result_if_present", _fake_none)
+    monkeypatch.setattr(publish_action, "_logged_out_publish_result_if_visible", _fake_none)
+    monkeypatch.setattr(publish_action, "open_reply_box", _fake_open_reply_box)
+    monkeypatch.setattr(publish_action, "find_reply_composer_for_parent", _fake_find_reply_composer_for_parent)
+    monkeypatch.setattr(publish_action, "_await_hard_timeout", _fake_hard_timeout)
+
+    result = await publish_action.publish_reply_hybrid(
+        page,
+        "reply text",
+        parent_comment_text="parent",
+        parent_anchor_token="anchor-1",
+        max_total_seconds=20.0,
+        correlation_id="task_1_parallel_reply_v1_a1_acc10_to_text",
+        expected_video_url=page.url,
+        comments_already_open=True,
+    )
+
+    assert result.status == "timeout"
+    assert result.error_reason == "reply_box_open_timeout"
+    assert captured["hard_timeout"] == pytest.approx(6.0)
+    assert captured["recovery_probe"] == 0
 
 
 @pytest.mark.unit

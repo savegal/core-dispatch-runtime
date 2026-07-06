@@ -1239,6 +1239,45 @@ async def test_parallel_reply_open_comments_short_circuits_existing_surface(monk
 
 @pytest.mark.unit
 @pytest.mark.asyncio
+async def test_parallel_reply_open_comments_has_hard_outer_deadline(monkeypatch):
+    from executor import user_schema
+
+    target_url = "https://www.tiktok.com/@u/video/1234567890123456789"
+    captured = {"timeout": None, "traces": []}
+
+    async def fake_fast_open(*args, **kwargs):
+        return True
+
+    async def fake_hard_timeout(awaitable, *, timeout):
+        captured["timeout"] = timeout
+        awaitable.close()
+        raise asyncio.TimeoutError
+
+    def fake_trace(stage, **kwargs):
+        captured["traces"].append((stage, kwargs))
+
+    monkeypatch.setattr(user_schema, "_open_comment_list_fast_for_parallel_reply", fake_fast_open)
+    monkeypatch.setattr(user_schema, "_await_reply_hard_timeout", fake_hard_timeout)
+    monkeypatch.setattr(user_schema, "_log_user_trace", fake_trace)
+
+    ok = await user_schema._open_comment_list_with_safe_retry(
+        SimpleNamespace(url=target_url),
+        target_url,
+        target_url,
+        timeout_ms=30000,
+        correlation_id="task_1015_parallel_reply_v1_a1_acc1",
+        phase="reply_open_comments",
+        account_id=1,
+        variant_index=1,
+    )
+
+    assert ok is False
+    assert captured["timeout"] == pytest.approx(9.5)
+    assert captured["traces"][0][0] == "comment_list_fast_open_hard_timeout"
+
+
+@pytest.mark.unit
+@pytest.mark.asyncio
 async def test_parallel_reply_open_comments_uses_short_reclick_without_reload(monkeypatch):
     from executor import user_schema
 

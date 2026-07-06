@@ -2787,6 +2787,7 @@ async def execute_engagement_only_replies_via_full_flow(
         _infer_found_mains_from_reply_outcomes,
         _main_parent_keys,
         _reply_outcome_parent_key,
+        _reply_outcome_soft_submitted,
         _reply_outcome_submitted,
         _REPLY_VISIBILITY_EMPTY_QUORUM,
         _REPLY_VISIBILITY_EMPTY_STOP_QUORUM,
@@ -2825,6 +2826,7 @@ async def execute_engagement_only_replies_via_full_flow(
     )
     reply_selection_lock = asyncio.Lock()
     submitted_parent_keys_by_variant: Dict[int, set[str]] = {}
+    soft_submitted_reply_keys_by_variant: Dict[int, set[str]] = {}
     last_outcomes_by_variant: Dict[int, List[Any]] = {}
     last_reply_account_by_variant: Dict[int, Optional[int]] = {}
     confident_empty_reply_account_ids: set[int] = set()
@@ -3352,6 +3354,10 @@ async def execute_engagement_only_replies_via_full_flow(
             return attempt_info
 
         submitted_parent_keys = submitted_parent_keys_by_variant.setdefault(variant_idx, set())
+        soft_submitted_reply_keys = soft_submitted_reply_keys_by_variant.setdefault(
+            variant_idx,
+            set(),
+        )
         main_candidate = _current_main_candidate()
         pending_parent = (
             [main_candidate]
@@ -3416,6 +3422,7 @@ async def execute_engagement_only_replies_via_full_flow(
                         correlation_id=correlation_id,
                         fallback_main_texts=None,
                         already_replied_parent_keys=submitted_parent_keys,
+                        soft_submitted_reply_keys=soft_submitted_reply_keys,
                         require_parent_author_match=False,
                         allow_parent_author_fallback=False,
                     ),
@@ -3519,7 +3526,12 @@ async def execute_engagement_only_replies_via_full_flow(
             for outcome in outcomes
             if _reply_outcome_submitted(outcome)
         ]
-        if submitted_outcomes:
+        terminal_outcomes = [
+            outcome
+            for outcome in outcomes
+            if _reply_outcome_submitted(outcome) or _reply_outcome_soft_submitted(outcome)
+        ]
+        if terminal_outcomes:
             for outcome in submitted_outcomes:
                 parent_key = _reply_outcome_parent_key(outcome)
                 if parent_key:
@@ -3528,7 +3540,7 @@ async def execute_engagement_only_replies_via_full_flow(
                     submitted_parent_keys.add(str(outcome.parent_comment_id))
             attempt_info["replies"] = [
                 _engagement_reply_outcome_to_dict(outcome, attempts=attempt_num)
-                for outcome in submitted_outcomes
+                for outcome in terminal_outcomes
             ]
             attempt_info["completed"] = True
             return attempt_info

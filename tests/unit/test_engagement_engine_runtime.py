@@ -1669,6 +1669,80 @@ async def test_engagement_only_full_flow_reports_submitted_unconfirmed_reply(db_
 
 @pytest.mark.unit
 @pytest.mark.asyncio
+async def test_engagement_only_soft_submitted_reply_is_not_retried(db_session, monkeypatch):
+    import executor.user_schema as user_schema
+
+    accounts = [
+        Account(id=272, label="reply-dom-a", status="active", cookies='{"sessionid":"x"}'),
+        Account(id=273, label="reply-dom-b", status="active", cookies='{"sessionid":"x"}'),
+    ]
+    attempts = []
+
+    def _select_account(*args, **kwargs):
+        return accounts[min(len(attempts), len(accounts) - 1)]
+
+    async def _fake_reply_with_variant_on_all_mains(
+        _db,
+        reply_account,
+        _video_url,
+        pending_parent,
+        reply_text,
+        *,
+        variant_index,
+        soft_submitted_reply_keys,
+        **_kwargs,
+    ):
+        attempts.append(reply_account.id)
+        parent = pending_parent[0]
+        attempt_key = f"parent:{parent.comment_id}:reply:{reply_text}"
+        soft_submitted_reply_keys.add(attempt_key)
+        return user_schema.ReplyAttemptResult(
+            replies=[
+                user_schema.ReplyOutcome(
+                    text=reply_text,
+                    variant_index=variant_index,
+                    matched_main_text=parent.text,
+                    parent_comment_id=parent.comment_id,
+                    success=False,
+                    method="enabled-check",
+                    error="no_network_response_after_publish_request",
+                    account_id=reply_account.id,
+                    attempted=True,
+                    submitted_unconfirmed=True,
+                    counts_as_submitted=False,
+                    soft_submitted=True,
+                    reply_attempt_key=attempt_key,
+                )
+            ],
+            searched=True,
+            soft_submitted_reply_keys={attempt_key},
+        )
+
+    monkeypatch.setattr(engagement_engine, "get_free_account_for_reply", _select_account)
+    monkeypatch.setattr(user_schema, "_reply_with_variant_on_all_mains", _fake_reply_with_variant_on_all_mains)
+
+    results, _resolved_parent_id, _resolved_author = (
+        await engagement_engine.execute_engagement_only_replies_via_full_flow(
+            db=db_session,
+            video_url="https://www.tiktok.com/@demo/video/1234567890123456789",
+            comment_text="target comment",
+            comment_id="parent_123",
+            comment_author="main_author",
+            replies=["reply one"],
+            task_id=200,
+        )
+    )
+
+    assert attempts == [272]
+    assert len(results) == 1
+    assert results[0]["success"] is False
+    assert results[0]["submitted_unconfirmed"] is True
+    assert results[0]["visibility_status"] == "submitted_unconfirmed"
+    assert results[0]["attempts"] == 1
+
+
+@pytest.mark.unit
+@pytest.mark.asyncio
 async def test_engagement_only_full_flow_runs_three_reply_variants_in_parallel(db_session, monkeypatch):
     import db.database as db_database
     import executor.browser_pool as browser_pool
