@@ -2282,6 +2282,8 @@ async def test_engagement_only_resets_empty_account_quorum_when_parent_was_found
             parent_search_max_seen_rows=40,
             parent_search_last_row_count=40,
             parent_search_unique_rows_seen=20,
+            parent_search_exhausted=True,
+            parent_search_scroll_container_scrollable=False,
         )
 
     monkeypatch.setattr(engagement_engine.settings, "PARALLEL_COMMENTING_TARGET_BROWSERS", 2, raising=False)
@@ -2393,6 +2395,8 @@ async def test_engagement_only_rotates_mobile_proxy_after_two_empty_accounts(db_
             parent_search_max_seen_rows=40,
             parent_search_last_row_count=40,
             parent_search_unique_rows_seen=20,
+            parent_search_exhausted=True,
+            parent_search_scroll_container_scrollable=False,
         )
 
     async def _fake_ensure_proxy_ip_rotated(_proxy, _db, *, force_rotation=False):

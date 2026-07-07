@@ -7421,18 +7421,29 @@ def test_reply_visibility_empty_requires_real_comment_depth():
         error="no_main_found_by_reply_account",
     )
 
+    # A deep-looking sample is still inconclusive when the virtualized list
+    # was progressing and only hit its configured scroll cap.
     assert user_schema._reply_result_is_confident_visibility_empty(
         user_schema._ParallelReplyVariantResult(
             **base,
             parent_search_unique_rows_seen=20,
             parent_search_max_seen_rows=20,
         )
-    ) is True
+    ) is False
     assert user_schema._reply_result_is_confident_visibility_empty(
         user_schema._ParallelReplyVariantResult(
             **base,
             parent_search_unique_rows_seen=5,
             parent_search_max_seen_rows=40,
+        )
+    ) is False
+    assert user_schema._reply_result_is_confident_visibility_empty(
+        user_schema._ParallelReplyVariantResult(
+            **base,
+            parent_search_unique_rows_seen=20,
+            parent_search_max_seen_rows=20,
+            parent_search_exhausted=True,
+            parent_search_scroll_container_scrollable=True,
         )
     ) is True
     assert user_schema._reply_result_is_confident_visibility_empty(
@@ -7819,6 +7830,8 @@ async def test_reply_visibility_quorum_still_applies_after_some_mains_were_found
             parent_search_max_seen_rows=40,
             parent_search_last_row_count=40,
             parent_search_unique_rows_seen=20,
+            parent_search_exhausted=True,
+            parent_search_scroll_container_scrollable=False,
         )
 
     monkeypatch.setattr(user_schema._settings, "PARALLEL_DYNAMIC_WORKER_POOL_ENABLED", False, raising=False)
@@ -10216,6 +10229,8 @@ async def test_parallel_mode_stops_after_four_empty_reply_accounts_across_two_pr
             parent_search_max_seen_rows=40,
             parent_search_last_row_count=40,
             parent_search_unique_rows_seen=20,
+            parent_search_exhausted=True,
+            parent_search_scroll_container_scrollable=False,
         )
 
     monkeypatch.setattr(user_schema._settings, "PARALLEL_COMMENTING_TARGET_BROWSERS", 3, raising=False)
@@ -12284,16 +12299,35 @@ def test_reply_parent_batch_uses_the_total_remaining_search_deadline():
 
 
 @pytest.mark.unit
+def test_reply_action_time_does_not_consume_parent_search_budget():
+    from executor import user_schema
+
+    source = inspect.getsource(user_schema._reply_with_variant_on_all_mains)
+
+    assert "search_deadline += action_elapsed_seconds" in source
+    action_start = source.index("reply_action_started_at = time.monotonic()")
+    publish_call = source.index("publish_reply_hybrid(", action_start)
+    budget_resume = source.index(
+        "_resume_parent_search_budget_after_action(\n                    reply_action_started_at",
+        publish_call,
+    )
+    next_search_guard = source.index("reply_parent_short_fresh_search_after_action", budget_resume)
+
+    assert action_start < publish_call < budget_resume < next_search_guard
+    assert '"reply_parent_search_budget_resumed_after_action"' in source
+
+
+@pytest.mark.unit
 @pytest.mark.parametrize(
     ("total_comment_count", "expected_scrolls"),
     [
         (0, 140),
         (99, 140),
-        (100, 24),
-        (500, 24),
-        (501, 32),
-        (1000, 32),
-        (25_000, 32),
+        (100, 48),
+        (500, 48),
+        (501, 64),
+        (1000, 64),
+        (25_000, 64),
     ],
 )
 def test_reply_parent_search_budget_uses_video_comment_count_tiers(

@@ -208,10 +208,10 @@ _REPLY_MAIN_SEARCH_PER_TEXT_SECONDS = 6.0
 _REPLY_MAIN_SEARCH_SCROLLS = 12
 _REPLY_MAIN_SEARCH_DEEP_TIMEOUT_SECONDS = 42.0
 _REPLY_MAIN_SEARCH_DEEP_PER_TEXT_SECONDS = 14.0
-_REPLY_MAIN_SEARCH_DEEP_SCROLLS = 24
+_REPLY_MAIN_SEARCH_DEEP_SCROLLS = 48
 _REPLY_MAIN_SEARCH_LARGE_TIMEOUT_SECONDS = 55.0
 _REPLY_MAIN_SEARCH_LARGE_PER_TEXT_SECONDS = 22.0
-_REPLY_MAIN_SEARCH_LARGE_SCROLLS = 32
+_REPLY_MAIN_SEARCH_LARGE_SCROLLS = 64
 _REPLY_MAIN_SEARCH_TO_END_TIMEOUT_SECONDS = 85.0
 _REPLY_MAIN_SEARCH_TO_END_PER_TEXT_SECONDS = 80.0
 _REPLY_MAIN_SEARCH_TO_END_MAX_SCROLLS = 140
@@ -8810,6 +8810,30 @@ async def _reply_with_variant_on_all_mains(
         reply_http_disabled_logged = False
         short_fresh_search_after_action_used = False
 
+        def _resume_parent_search_budget_after_action(
+            action_started_at: float,
+            *,
+            action_correlation_id: str,
+        ) -> None:
+            nonlocal search_deadline
+            action_elapsed_seconds = max(0.0, time.monotonic() - action_started_at)
+            search_deadline += action_elapsed_seconds
+            _log_user_trace(
+                "reply_parent_search_budget_resumed_after_action",
+                page=page,
+                expected_video_url=target_media_url,
+                correlation_id=action_correlation_id,
+                account_id=account.id,
+                variant_index=variant_index,
+                action_elapsed_seconds=round(action_elapsed_seconds, 2),
+                search_remaining_seconds=round(
+                    max(0.0, search_deadline - time.monotonic()),
+                    2,
+                ),
+                remaining_main_count=len(remaining_mains),
+                level=logging.INFO,
+            )
+
         while remaining_mains and time.monotonic() < search_deadline:
             found_this_pass = False
             batch_anchors_by_key: Dict[str, MainAnchor] = {}
@@ -9327,6 +9351,11 @@ async def _reply_with_variant_on_all_mains(
                     attempted_for_parents.add(dedup_key)
 
                 sub_corr = f"{correlation_id}_to_{(parent_id or 'text')[:20]}"
+                # The deadline above is specifically a parent-search budget.
+                # Reply opening, typing, network confirmation, cleanup and the
+                # inter-reply delay must not consume the time reserved for
+                # finding the next main comment on this already-open page.
+                reply_action_started_at = time.monotonic()
                 open_parent_text = anchor.open_text or anchor_text
                 open_parent_id = parent_id if (
                     anchor.found_by == "id"
@@ -9362,6 +9391,10 @@ async def _reply_with_variant_on_all_mains(
                                 account_id=account.id,
                                 attempted=False,
                             )
+                        )
+                        _resume_parent_search_budget_after_action(
+                            reply_action_started_at,
+                            action_correlation_id=sub_corr,
                         )
                         continue
                     logged_out_deny = await _deny_if_visible_logged_out(
@@ -9476,6 +9509,10 @@ async def _reply_with_variant_on_all_mains(
                             anchor_preview=anchor_text[:80],
                             level=logging.INFO,
                         )
+                        _resume_parent_search_budget_after_action(
+                            reply_action_started_at,
+                            action_correlation_id=sub_corr,
+                        )
                         continue
                     if dedup_key:
                         attempted_parent_keys.add(dedup_key)
@@ -9581,6 +9618,10 @@ async def _reply_with_variant_on_all_mains(
                                 searched=True,
                             )
                         )
+                    _resume_parent_search_budget_after_action(
+                        reply_action_started_at,
+                        action_correlation_id=sub_corr,
+                    )
                     continue
                 finally:
                     if (
@@ -9949,6 +9990,10 @@ async def _reply_with_variant_on_all_mains(
                     else _INTER_REPLY_DELAY_RANGE
                 )
                 await asyncio.sleep(random.uniform(*delay_range))
+                _resume_parent_search_budget_after_action(
+                    reply_action_started_at,
+                    action_correlation_id=sub_corr,
+                )
 
             if (
                 found_this_pass
@@ -10399,7 +10444,13 @@ def _reply_search_is_confident_visibility_empty(
         max_rows = int(max_seen_rows or 0)
     except Exception:
         max_rows = 0
-    if unique_rows >= _REPLY_VISIBILITY_MIN_UNIQUE_ROWS or max_rows >= _REPLY_VISIBILITY_MIN_MAX_ROWS:
+    if (
+        bool(search_exhausted)
+        and (
+            unique_rows >= _REPLY_VISIBILITY_MIN_UNIQUE_ROWS
+            or max_rows >= _REPLY_VISIBILITY_MIN_MAX_ROWS
+        )
+    ):
         return True
     try:
         last_rows = int(last_row_count or 0)

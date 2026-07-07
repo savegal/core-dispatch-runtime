@@ -210,6 +210,84 @@ async def test_batch_search_partial_return_keeps_found_anchor_without_extra_scan
 
 @pytest.mark.unit
 @pytest.mark.asyncio
+async def test_batch_search_scroll_cap_is_not_reported_as_end_of_list(monkeypatch):
+    async def fake_detect_captcha(_page, wait_ms=0):
+        return False, None
+
+    class _Scope:
+        def __init__(self):
+            self.top = 0
+
+        async def evaluate(self, script, *_args):
+            if "scrollTop += " in script:
+                self.top += 450
+                return None
+            if "=> ({top:" in script:
+                return {"top": self.top, "height": 5000, "client": 500}
+            return None
+
+    class _Page:
+        url = "https://www.tiktok.com/@u/video/123"
+
+        def __init__(self):
+            self.scope = _Scope()
+            self.scan_calls = 0
+
+        async def evaluate(self, script, *_args, **_kwargs):
+            if "({selectors, strictScope})" in script:
+                return {
+                    "selector": '[data-smart-comment-surface-opened="1"]',
+                    "scroll_container_tag": "DIV",
+                    "scroll_container_scrollable": True,
+                    "items": 8,
+                    "strong_items": 8,
+                    "score": 8000,
+                }
+            self.scan_calls += 1
+            return {
+                "rows": [
+                    {
+                        "position": self.scan_calls,
+                        "text": f"other row {self.scan_calls}",
+                        "selector": '[data-e2e="comment-level-1"]',
+                        "cid": None,
+                        "author": "other_author",
+                        "scrollTop": self.scope.top,
+                        "anchorToken": f"other-{self.scan_calls}",
+                    }
+                ],
+                "scrollTop": self.scope.top,
+                "scopeMissing": False,
+            }
+
+        async def query_selector(self, selector):
+            if selector in {
+                '[data-smart-comment-list-batch-scope="1"]',
+                '[data-smart-comment-list-batch-scroll="1"]',
+            }:
+                return self.scope
+            return None
+
+    monkeypatch.setattr(comment_outcome, "detect_captcha", fake_detect_captcha)
+
+    found, info = await comment_outcome.find_comments_in_list_batch(
+        _Page(),
+        ["target parent"],
+        max_scrolls=2,
+        scroll_delay_ms=0,
+        ensure_open=False,
+        strict_scope=True,
+    )
+
+    assert found == {}
+    assert info["error"] == "scroll_limit_reached"
+    assert info["scroll_limit_reached"] is True
+    assert info.get("search_exhausted") is not True
+    assert info["unique_rows_seen"] == 2
+
+
+@pytest.mark.unit
+@pytest.mark.asyncio
 async def test_batch_search_accepts_expected_author_from_author_candidates(monkeypatch):
     async def fake_detect_captcha(_page, wait_ms=0):
         return False, None

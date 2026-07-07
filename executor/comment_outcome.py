@@ -1905,8 +1905,15 @@ async def find_comments_in_list_batch(
             payload["scroll_container_scrollable"] = selected_scroll_container_scrollable
         if selected_scroll_container_tag:
             payload["scroll_container_tag"] = selected_scroll_container_tag
-        if scroll_exhausted or (completed_scrolls >= max_scrolls and max_scrolls > 0):
+        if scroll_exhausted:
             payload["search_exhausted"] = True
+        elif completed_scrolls >= max_scrolls and max_scrolls > 0:
+            # Reaching the configured safety cap is not proof that the
+            # virtualized TikTok list reached its end.  In live traces the
+            # final capped scan was still hydrating several new rows, so
+            # treating the cap as exhaustion suppressed the bounded fallback
+            # and skipped valid parents farther down the list.
+            payload["scroll_limit_reached"] = True
         if scroll_stop_reason:
             payload["scroll_stop_reason"] = scroll_stop_reason
         if partial_returned:
@@ -2436,6 +2443,12 @@ async def find_comments_in_list_batch(
             scan_failures=scan_failures,
             author_fallback_candidates=author_fallback_candidates,
         )
+    scroll_limit_reached = bool(
+        completed_scrolls >= max_scrolls
+        and max_scrolls > 0
+        and not scroll_exhausted
+        and len(found) < len(targets)
+    )
     _log_batch_trace(
         "complete",
         level=level,
@@ -2448,11 +2461,13 @@ async def find_comments_in_list_batch(
         unique_rows_seen=len(seen_row_signatures),
         new_rows_last_scan=last_new_row_count,
         stagnant_row_steps=stagnant_row_steps,
+        scroll_limit_reached=scroll_limit_reached or None,
         last_row_samples=last_row_samples if not found else None,
         scan_failures=scan_failures if scan_failures else None,
         author_fallback_count=sum(len(items) for items in author_fallback_candidates.values()) or None,
     )
     return found, _result_info(
+        error="scroll_limit_reached" if scroll_limit_reached else None,
         scrolls=completed_scrolls,
         matched_list_selector=matched_list_selector,
         max_seen_rows=max_seen_rows,
