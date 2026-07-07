@@ -3037,7 +3037,7 @@ _JS_OPEN_REPLY = r"""
 """
 
 _JS_LIKE_PARENT_COMMENT = r"""
-([parentCommentId, parentText, parentAnchorToken]) => {
+async ([parentCommentId, parentText, parentAnchorToken]) => {
     const url = window.location.pathname || '';
     if (url.includes('/messages') || url.includes('/login') || url.includes('/verify')) {
         return { success: false, reason: 'redirected', url };
@@ -3094,14 +3094,15 @@ _JS_LIKE_PARENT_COMMENT = r"""
     const likeState = (button) => {
         const label = labelOf(button);
         const ariaPressed = (button.getAttribute('aria-pressed') || '').toLowerCase();
+        const dataState = (button.getAttribute('data-state') || '').toLowerCase();
         const pressed = ariaPressed === 'true' ||
             label.includes('unlike') ||
             label.includes('liked') ||
-            label.includes('active');
-        return { pressed, label: label.slice(0, 120), ariaPressed };
+            dataState === 'active';
+        return { pressed, label: label.slice(0, 120), ariaPressed, dataState };
     };
 
-    const clickLikeInside = (root, strategy) => {
+    const clickLikeInside = async (root, strategy) => {
         if (!root || !visible(root)) return { success: false, reason: 'parent_row_not_visible', strategy };
         if (!rootMatchesNeedle(root)) return { success: false, reason: 'parent_text_mismatch', strategy };
         const candidates = [
@@ -3164,11 +3165,28 @@ _JS_LIKE_PARENT_COMMENT = r"""
                     };
                 }
             }
-            const after = likeState(button);
+            // React updates aria/class state asynchronously. A click alone is
+            // not proof that the parent was liked, so wait briefly for the
+            // exact scoped button to report its new state.
+            let after = likeState(button);
+            for (let attempt = 0; attempt < 6 && !after.pressed; attempt++) {
+                await new Promise(resolve => setTimeout(resolve, 120));
+                after = likeState(button);
+            }
+            if (!after.pressed) {
+                return {
+                    success: false,
+                    clicked: true,
+                    liked_now: false,
+                    reason: 'like_state_not_confirmed_after_click',
+                    strategy,
+                    label: after.label,
+                };
+            }
             return {
                 success: true,
                 clicked: true,
-                liked_now: after.pressed,
+                liked_now: true,
                 strategy,
                 label: after.label,
             };
@@ -3218,7 +3236,7 @@ _JS_LIKE_PARENT_COMMENT = r"""
     for (const item of candidateRows) {
         let row = item.el;
         for (let depth = 0; row && depth < 4; row = row.parentElement, depth++) {
-            const result = clickLikeInside(row, item.strategy + (depth ? '-parent' : ''));
+            const result = await clickLikeInside(row, item.strategy + (depth ? '-parent' : ''));
             if (result && result.success) return result;
             if (result && result.reason !== 'like_button_not_found_in_parent') break;
         }

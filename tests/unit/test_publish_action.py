@@ -3020,6 +3020,10 @@ async def test_reply_publish_stops_when_nudge_and_optimistic_send_missing(monkey
     async def _fake_type_into_comment(*args, **kwargs):
         return {"ok": True, "strategy": "reply-test-type", "text": "reply text", "anchor_bound": True}
 
+    async def _fake_clear_reply_composer(*args, **kwargs):
+        calls["composer_clear"] = calls.get("composer_clear", 0) + 1
+        return True
+
     monkeypatch.setattr(publish_action.asyncio, "sleep", _fake_sleep)
     monkeypatch.setattr(publish_action, "detect_captcha", _fake_detect_captcha)
     monkeypatch.setattr(publish_action, "suppress_keyboard_shortcuts_overlay", AsyncMock(return_value=0))
@@ -3030,6 +3034,7 @@ async def test_reply_publish_stops_when_nudge_and_optimistic_send_missing(monkey
     monkeypatch.setattr(publish_action, "ensure_click_target_clear", _fake_ensure_click_target_clear)
     monkeypatch.setattr(publish_action, "_clear_post_click_blockers", _fake_clear_post_click_blockers)
     monkeypatch.setattr(publish_action, "type_into_comment", _fake_type_into_comment)
+    monkeypatch.setattr(publish_action, "_clear_reply_comment_composer_best_effort", _fake_clear_reply_composer)
     monkeypatch.setattr(publish_action, "_composer_cleared_state", AsyncMock(return_value={"exists": True, "empty": True}))
 
     result = await publish_action._publish_via_current_input(
@@ -3042,11 +3047,12 @@ async def test_reply_publish_stops_when_nudge_and_optimistic_send_missing(monkey
         reply_target=_fake_reply_target("anchor-1"),
     )
 
-    assert calls == {"nudge": 1, "optimistic": 1}
+    assert calls == {"nudge": 1, "optimistic": 1, "composer_clear": 1}
     assert page.click_count == 0
     assert result.status == "dom_error"
     assert result.error_reason == "post_button_stayed_disabled"
     assert result.post_was_enabled_at_click is False
+    assert result.composer_clean_after_submit is True
 
 
 @pytest.mark.unit

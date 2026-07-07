@@ -1074,6 +1074,10 @@ def test_like_parent_comment_script_is_scoped_to_parent_row():
     assert "CSS.escape" in script
     assert "candidate.closest && candidate.closest('button, [role=\"button\"], div[tabindex=\"0\"]')" in script
     assert "querySelectorAll('button, [role=\"button\"], div[tabindex=\"0\"]')" in script
+    assert "await new Promise(resolve => setTimeout(resolve, 120))" in script
+    assert "like_state_not_confirmed_after_click" in script
+    assert "dataState === 'active'" in script
+    assert "label.includes('active')" not in script
 
 
 @pytest.mark.unit

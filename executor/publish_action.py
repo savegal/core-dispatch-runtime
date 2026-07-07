@@ -42,6 +42,12 @@ MANUAL_CAPTCHA_WAIT_SECONDS = float(os.getenv("MANUAL_CAPTCHA_WAIT_SECONDS", "15
 MANUAL_CAPTCHA_POLL_SECONDS = 2.0
 _REPLY_INPUT_MIN_SECONDS = 8.0
 _PARALLEL_REPLY_INPUT_MIN_SECONDS = float(os.getenv("PARALLEL_REPLY_INPUT_MIN_SECONDS", "4"))
+_REPLY_TYPING_MAX_SECONDS = 15.0
+_REPLY_TYPING_RETRY_MAX_SECONDS = 8.0
+_REPLY_POST_TYPING_SEND_GRACE_SECONDS = max(
+    5.0,
+    min(30.0, float(os.getenv("REPLY_POST_TYPING_SEND_GRACE_SECONDS", "15"))),
+)
 _PARALLEL_POST_RESPONSE_WAIT_SECONDS = float(os.getenv("PARALLEL_POST_RESPONSE_WAIT_SECONDS", "2.0"))
 _PARALLEL_POST_RESPONSE_GRACE_SECONDS = float(os.getenv("PARALLEL_POST_RESPONSE_GRACE_SECONDS", "0.35"))
 _TRUE_ENV_VALUES = {"1", "true", "yes", "on"}
@@ -5133,7 +5139,10 @@ async def _publish_via_current_input(
     def _send_remaining() -> float:
         remaining = _remaining()
         if reply_scoped and reply_send_deadline is not None:
-            return min(remaining, reply_send_deadline - time.monotonic())
+            # Once the exact reply text is committed, sending gets its own
+            # bounded grace window. The earlier open/search/type deadline must
+            # not close the page with a valid unsent draft already present.
+            return reply_send_deadline - time.monotonic()
         return remaining
 
     def _send_deadline_result(phase: str, dom_strategy: Optional[str] = None) -> PublishResult:
@@ -5144,12 +5153,17 @@ async def _publish_via_current_input(
         if remaining <= 0:
             return 0.0
         cap = (
-            10.0
+            _REPLY_TYPING_MAX_SECONDS
             if reply_scoped and aggressive
             else (8.0 if aggressive else (6.0 if fast_publish else 10.0))
         )
         if retry:
-            cap = min(cap, 6.0 if reply_scoped else (5.5 if aggressive else 5.0))
+            cap = min(
+                cap,
+                _REPLY_TYPING_RETRY_MAX_SECONDS
+                if reply_scoped
+                else (5.5 if aggressive else 5.0),
+            )
         reserve_for_post = 4.0 if aggressive else (5.0 if fast_publish else 6.0)
         if remaining > reserve_for_post + 0.75:
             return max(0.5, min(cap, remaining - reserve_for_post))
@@ -5157,9 +5171,10 @@ async def _publish_via_current_input(
 
     async def _text_visible_after_typing_timeout(phase: str, dom_strategy: Optional[str]) -> bool:
         remaining = _remaining()
-        if remaining <= 0:
+        if remaining <= 0 and not reply_scoped:
             return False
-        probe_timeout = min(0.8 if aggressive else 1.2, max(0.2, remaining))
+        probe_cap = 0.8 if aggressive else 1.2
+        probe_timeout = min(probe_cap, max(0.2, remaining if remaining > 0 else probe_cap))
         try:
             if reply_scoped:
                 ok, visible_text = await _asyncio_wait_for(
@@ -5827,19 +5842,21 @@ async def _publish_via_current_input(
                 )
         input_handle = retry_handle
 
-    if _remaining() <= 0:
-        return _deadline_result("after_typing", input_info.strategy)
     if reply_scoped:
         if reply_send_deadline_ref is not None:
             stored_deadline = float(reply_send_deadline_ref.get("deadline") or 0.0)
             if stored_deadline <= 0:
                 # TikTok can remount the reply composer and enable its send
                 # control several seconds after the text is already visible.
-                stored_deadline = time.monotonic() + (6.0 if fast_publish else 8.0)
+                # This deadline deliberately starts AFTER exact typing and is
+                # independent of the earlier open/search/type phase budget.
+                stored_deadline = time.monotonic() + _REPLY_POST_TYPING_SEND_GRACE_SECONDS
                 reply_send_deadline_ref["deadline"] = stored_deadline
             reply_send_deadline = stored_deadline
         else:
-            reply_send_deadline = time.monotonic() + (6.0 if fast_publish else 8.0)
+            reply_send_deadline = time.monotonic() + _REPLY_POST_TYPING_SEND_GRACE_SECONDS
+    elif _remaining() <= 0:
+        return _deadline_result("after_typing", input_info.strategy)
     await asyncio.sleep(0.15 if aggressive else (0.25 if fast_publish else 0.8))  # let TikTok render Post after robust input
 
     # Verify the input actually has text visible to React
@@ -6231,6 +6248,12 @@ async def _publish_via_current_input(
 
         if not post_was_enabled and reply_scoped and not reply_optimistic_send_click:
             safe_reason = disabled_reason or "reply_post_not_enabled"
+            composer_clean_after_submit = await _clear_reply_comment_composer_best_effort(
+                page,
+                reason=f"reply_send_exhausted:{safe_reason}"[:160],
+                expected_video_url=expected_video_url,
+                correlation_id=correlation_id,
+            )
             _log_publish_trace(
                 "publish_result",
                 page=page,
@@ -6249,6 +6272,7 @@ async def _publish_via_current_input(
                 elapsed_seconds=time.monotonic() - started,
                 post_was_enabled_at_click=False,
                 network_request_attempted=False,
+                composer_clean_after_submit=composer_clean_after_submit,
             )
         if not post_was_enabled:
             logger.warning(
@@ -6404,7 +6428,7 @@ async def _publish_via_current_input(
     # A late overlay cleanup can steal focus, change pointer-events or make the
     # previously found Post button stale. This was the likely reason for
     # no_network_request_after_post_click after a verified input text.
-    if _remaining() <= 0:
+    if (reply_scoped and _send_remaining() <= 0) or (not reply_scoped and _remaining() <= 0):
         _detach_listener()
         return _deadline_result("before_click_target_clear", input_info.strategy or post_info.strategy)
     try:
@@ -6636,7 +6660,7 @@ async def _publish_via_current_input(
                         elapsed_seconds=time.monotonic() - started,
                     )
 
-    wait_remaining = max_total_seconds - (time.monotonic() - started)
+    wait_remaining = _send_remaining() if reply_scoped else _remaining()
     if wait_remaining <= 0:
         _detach_listener()
         await _finish_early_confirmation_task()
@@ -6664,7 +6688,7 @@ async def _publish_via_current_input(
             _PARALLEL_POST_RESPONSE_GRACE_SECONDS,
             0.8 if reply_scoped and fast_publish else 0.0,
         )
-        grace = min(local_or_response_grace, max(_remaining(), 0.0))
+        grace = min(local_or_response_grace, max(_send_remaining(), 0.0))
         if grace > 0:
             await _wait_for_publish_or_early_confirmation(grace, require_response_url=True)
             await _yield_to_publish_listener_tasks(listener_tasks)
@@ -6685,7 +6709,7 @@ async def _publish_via_current_input(
             "[PUBLISH] Fast parallel publish mode: skipping second Post click "
             "after captured publish request to avoid duplicate comments."
         )
-    elif not captured and _remaining() <= 0:
+    elif not captured and (reply_scoped and _send_remaining() <= 0 or not reply_scoped and _remaining() <= 0):
         logger.info("[PUBLISH] Skipping second Post click because publish deadline is exhausted.")
     elif not captured:
         # Last clean attempt: if the first mouse click closed a toast or focused the page
@@ -6693,7 +6717,7 @@ async def _publish_via_current_input(
         try:
             retry_button, retry_info = await wait_for_post_button_enabled(
                 page,
-                max_wait_seconds=min(2.0, max(_remaining(), 0.5)),
+                max_wait_seconds=min(2.0, max(_send_remaining() if reply_scoped else _remaining(), 0.5)),
                 reply_scoped=reply_scoped,
                 expected_text=text,
             )
@@ -6710,7 +6734,7 @@ async def _publish_via_current_input(
                             expected_text=text,
                             reply_scoped=reply_scoped,
                         ),
-                        timeout=max(_remaining(), 0.5),
+                        timeout=max(_send_remaining() if reply_scoped else _remaining(), 0.5),
                     )
                     retry_box = await retry_button.bounding_box()
                     if retry_box:
@@ -6756,7 +6780,7 @@ async def _publish_via_current_input(
                         await page.mouse.up()
 
                     try:
-                        retry_wait_remaining = max_total_seconds - (time.monotonic() - started)
+                        retry_wait_remaining = _send_remaining() if reply_scoped else _remaining()
                         if retry_wait_remaining > 0:
                             await asyncio.wait_for(event.wait(), timeout=min(4.0, max(retry_wait_remaining, 0.5)))
                     except asyncio.TimeoutError:
@@ -6787,7 +6811,7 @@ async def _publish_via_current_input(
                     reply_scoped=reply_scoped,
                     input_handle=input_handle,
                 ),
-                timeout=min(1.5, max(_remaining(), 0.2)),
+                timeout=min(1.5, max(_send_remaining() if reply_scoped else _remaining(), 0.2)),
             )
         except asyncio.TimeoutError:
             cleared = {}
@@ -7846,6 +7870,12 @@ async def publish_reply_hybrid(
         )
         input_budget = max(remaining, min_input_budget)
     reply_send_deadline_ref: Dict[str, float] = {}
+
+    def _reply_send_recovery_remaining() -> float:
+        stored_deadline = float(reply_send_deadline_ref.get("deadline") or 0.0)
+        grace_remaining = stored_deadline - time.monotonic() if stored_deadline > 0 else 0.0
+        return max(_remaining(), grace_remaining)
+
     result = await _publish_via_current_input(
         page,
         text,
@@ -7862,7 +7892,7 @@ async def publish_reply_hybrid(
     if (
         result.status in {"dom_error", "timeout"}
         and _is_recoverable_reply_send_reason(result.error_reason)
-        and _remaining() > 1.0
+        and _reply_send_recovery_remaining() > 1.0
     ):
         _log_publish_trace(
             "reply_send_recover_start",
@@ -7871,10 +7901,13 @@ async def publish_reply_hybrid(
             correlation_id=correlation_id,
             reason=result.error_reason,
             strategy=result.dom_strategy,
-            remaining=round(_remaining(), 2),
+            remaining=round(_reply_send_recovery_remaining(), 2),
             level=logging.INFO,
         )
-        recover_timeout = min(1.0 if fast_publish else 1.4, max(0.35, _remaining()))
+        recover_timeout = min(
+            1.0 if fast_publish else 1.4,
+            max(0.35, _reply_send_recovery_remaining()),
+        )
         try:
             recovered_target, recovered_info = await _asyncio_wait_for(
                 find_reply_composer_for_parent(
@@ -7890,7 +7923,7 @@ async def publish_reply_hybrid(
             recovered_target, recovered_info = None, None
         if recovered_target is not None:
             retry_budget = min(
-                max_total_seconds - (time.monotonic() - started),
+                _reply_send_recovery_remaining(),
                 14.0 if fast_publish else 16.0,
             )
             if retry_budget > 0.35:
@@ -7938,7 +7971,7 @@ async def publish_reply_hybrid(
                     expected_video_url=expected_video_url,
                     correlation_id=correlation_id,
                     reason="send_deadline_exhausted",
-                    remaining=round(_remaining(), 2),
+                    remaining=round(_reply_send_recovery_remaining(), 2),
                     level=logging.INFO,
                 )
         else:
