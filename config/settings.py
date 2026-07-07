@@ -461,14 +461,19 @@ class Settings(BaseSettings):
     PARALLEL_REPLY_VARIANT_WORKERS: int = 2
     PARALLEL_MAIN_WORKER_ATTEMPT_TIMEOUT_SECONDS: float = 300.0
     PARALLEL_MAIN_REFILL_POLL_SECONDS: float = 0.15
-    PARALLEL_REPLY_WORKER_ATTEMPT_TIMEOUT_SECONDS: float = 240.0
+    # One reply account searches once and can publish under every discovered
+    # main. 300s covers the 85s deep-search ceiling, three 50s publishes,
+    # navigation/comment-open work, and a shared-mobile-proxy safety margin.
+    PARALLEL_REPLY_WORKER_ATTEMPT_TIMEOUT_SECONDS: float = 300.0
     PARALLEL_REPLY_REFILL_POLL_SECONDS: float = 0.15
     PARALLEL_PROXY_SLOT_REFILL_BACKOFF_SECONDS: float = 0.25
     PARALLEL_MAIN_PUBLISH_MAX_SECONDS: float = 50.0
     PARALLEL_MAIN_INPUT_RETRY_MAX_SECONDS: float = 35.0
     PARALLEL_MAIN_OPEN_COMMENTS_MAX_SECONDS: float = 18.0
     PARALLEL_MAIN_INPUT_SEARCH_MAX_SECONDS: float = 10.0
-    PARALLEL_REPLY_PUBLISH_MAX_SECONDS: float = 45.0
+    # Preserve a small pre-send margin for two contending local browsers. The
+    # post-typing send grace remains a separate, bounded deadline.
+    PARALLEL_REPLY_PUBLISH_MAX_SECONDS: float = 50.0
     PARALLEL_REPLY_START_DELAY_MIN_SECONDS: float = 2.0
     PARALLEL_REPLY_START_DELAY_MAX_SECONDS: float = 5.0
     PARALLEL_MAIN_READY_IDLE_MIN_SECONDS: float = 0.2

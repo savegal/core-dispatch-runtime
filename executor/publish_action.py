@@ -42,14 +42,14 @@ MANUAL_CAPTCHA_WAIT_SECONDS = float(os.getenv("MANUAL_CAPTCHA_WAIT_SECONDS", "15
 MANUAL_CAPTCHA_POLL_SECONDS = 2.0
 _REPLY_INPUT_MIN_SECONDS = 8.0
 _PARALLEL_REPLY_INPUT_MIN_SECONDS = float(os.getenv("PARALLEL_REPLY_INPUT_MIN_SECONDS", "4"))
-_REPLY_TYPING_MAX_SECONDS = 15.0
-_REPLY_TYPING_RETRY_MAX_SECONDS = 8.0
+_REPLY_TYPING_MAX_SECONDS = 18.0
+_REPLY_TYPING_RETRY_MAX_SECONDS = 10.0
 _REPLY_POST_TYPING_SEND_GRACE_SECONDS = max(
     5.0,
     min(30.0, float(os.getenv("REPLY_POST_TYPING_SEND_GRACE_SECONDS", "15"))),
 )
-_PARALLEL_POST_RESPONSE_WAIT_SECONDS = float(os.getenv("PARALLEL_POST_RESPONSE_WAIT_SECONDS", "2.0"))
-_PARALLEL_POST_RESPONSE_GRACE_SECONDS = float(os.getenv("PARALLEL_POST_RESPONSE_GRACE_SECONDS", "0.35"))
+_PARALLEL_POST_RESPONSE_WAIT_SECONDS = float(os.getenv("PARALLEL_POST_RESPONSE_WAIT_SECONDS", "2.5"))
+_PARALLEL_POST_RESPONSE_GRACE_SECONDS = float(os.getenv("PARALLEL_POST_RESPONSE_GRACE_SECONDS", "0.75"))
 _TRUE_ENV_VALUES = {"1", "true", "yes", "on"}
 _TIKTOK_MEDIA_ID_RE = re.compile(r"(?:/(?:video|photo)/|[?&](?:aweme_id|item_id)=)(\d+)", re.IGNORECASE)
 _PARALLEL_FAST_PUBLISH_MARKERS = (
@@ -6432,14 +6432,31 @@ async def _publish_via_current_input(
         _detach_listener()
         return _deadline_result("before_click_target_clear", input_info.strategy or post_info.strategy)
     try:
-        click_target_timeout = _send_remaining()
+        click_target_timeout = min(
+            _send_remaining(),
+            2.5 if reply_scoped and fast_publish else 4.0,
+        )
         if click_target_timeout <= 0:
             _detach_listener()
             return _send_deadline_result("before_click_target_clear", input_info.strategy or post_info.strategy)
         await _asyncio_wait_for(ensure_click_target_clear(page, post_button), timeout=max(click_target_timeout, 0.5))
     except asyncio.TimeoutError:
-        _detach_listener()
-        return _send_deadline_result("click_target_clear", input_info.strategy or post_info.strategy)
+        if not reply_scoped:
+            _detach_listener()
+            return _send_deadline_result("click_target_clear", input_info.strategy or post_info.strategy)
+        # Exact reply text already has its own send deadline. Do not let this
+        # defensive overlay probe consume the whole window before any click is
+        # attempted; the scoped blocker-clear and click fallbacks below remain
+        # bounded and preserve parent affinity.
+        _log_publish_trace(
+            "reply_click_target_clear_soft_timeout",
+            page=page,
+            expected_video_url=expected_video_url,
+            correlation_id=correlation_id,
+            timeout_seconds=round(click_target_timeout, 2),
+            remaining=round(_send_remaining(), 2),
+            level=logging.WARNING,
+        )
     captcha_result = await _captcha_result_if_present(
         page,
         started,
@@ -6450,7 +6467,7 @@ async def _publish_via_current_input(
         return captcha_result
 
     try:
-        await post_button.scroll_into_view_if_needed(timeout=800 if reply_scoped and fast_publish else 1500)
+        await post_button.scroll_into_view_if_needed(timeout=1200 if reply_scoped and fast_publish else 1500)
     except Exception:
         pass
 
@@ -6475,7 +6492,13 @@ async def _publish_via_current_input(
                 expected_text=text,
                 reply_scoped=reply_scoped,
             ),
-            timeout=max(_send_remaining(), 0.5),
+            timeout=max(
+                0.5,
+                min(
+                    _send_remaining(),
+                    3.0 if reply_scoped and fast_publish else 5.0,
+                ),
+            ),
         )
         if not click_point_clear:
             if _point_diag_looks_like_challenge(point_diag):
@@ -6617,7 +6640,7 @@ async def _publish_via_current_input(
                 await page.mouse.up()
                 logger.info("[PUBLISH] Post button mouse-clicked, waiting for /api/comment/publish/")
         else:
-            await post_button.click(timeout=1000 if reply_scoped and fast_publish else 5000, force=True)
+            await post_button.click(timeout=1500 if reply_scoped and fast_publish else 5000, force=True)
             logger.info("[PUBLISH] Post button clicked by Playwright fallback, waiting for /api/comment/publish/")
     except Exception as exc:
         logger.warning("[PUBLISH] Normal/mouse post click failed: %s", exc)
@@ -6629,11 +6652,11 @@ async def _publish_via_current_input(
             # top-level comment by mistake.
             locator_selector = _post_click_fallback_selector(reply_scoped=reply_scoped)
             locator = page.locator(locator_selector).last
-            await locator.click(timeout=1000 if reply_scoped and fast_publish else 3000, force=True)
+            await locator.click(timeout=1500 if reply_scoped and fast_publish else 3000, force=True)
             logger.info("[PUBLISH] Used fresh locator click fallback, waiting for /api/comment/publish/")
         except Exception as locator_exc:
             try:
-                await post_button.click(timeout=1000 if reply_scoped and fast_publish else 5000, force=False)
+                await post_button.click(timeout=1500 if reply_scoped and fast_publish else 5000, force=False)
                 logger.info("[PUBLISH] Used non-force Playwright click fallback, waiting for /api/comment/publish/")
             except Exception as pw_exc:
                 try:
@@ -6668,11 +6691,7 @@ async def _publish_via_current_input(
     if post_was_enabled:
         _start_early_confirmation_task()
     try:
-        publish_wait = (
-            min(_PARALLEL_POST_RESPONSE_WAIT_SECONDS, 1.4)
-            if fast_publish and reply_scoped
-            else (_PARALLEL_POST_RESPONSE_WAIT_SECONDS if fast_publish else 6.0)
-        )
+        publish_wait = _PARALLEL_POST_RESPONSE_WAIT_SECONDS if fast_publish else 6.0
         await _wait_for_publish_or_early_confirmation(min(publish_wait, max(wait_remaining, 0.5)))
     except asyncio.TimeoutError:
         pass
@@ -7644,7 +7663,7 @@ async def publish_reply_hybrid(
         return logged_out_result
     reply_open = None
     reply_box_attempts = 2 if fast_publish else None
-    reply_box_timeout = 8.0 if fast_publish else 10.0
+    reply_box_timeout = 10.0 if fast_publish else 12.0
     if comments_already_open:
         if _remaining() <= 0:
             return _deadline_result("before_open_reply_box")

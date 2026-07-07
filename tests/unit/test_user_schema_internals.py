@@ -11382,6 +11382,8 @@ def test_publish_reply_retry_rebinds_target_and_caps_send_recovery():
     source = inspect.getsource(publish_action._publish_via_current_input)
     reply_source = inspect.getsource(publish_action.publish_reply_hybrid)
 
+    assert publish_action._REPLY_TYPING_MAX_SECONDS == pytest.approx(18.0)
+    assert publish_action._REPLY_TYPING_RETRY_MAX_SECONDS == pytest.approx(10.0)
     assert "typing_retry_reply_target_rebound" in source
     assert "find_reply_composer_for_parent(" in source
     assert "_REPLY_TYPING_MAX_SECONDS" in source
@@ -11390,9 +11392,12 @@ def test_publish_reply_retry_rebinds_target_and_caps_send_recovery():
     assert "return reply_send_deadline - time.monotonic()" in source
     assert "remaining <= 0 and not reply_scoped" in source
     assert "1.5 if fast_publish else 2.0" in source
-    assert "min(_PARALLEL_POST_RESPONSE_WAIT_SECONDS, 1.4)" in source
-    assert "1000 if reply_scoped and fast_publish else 3000" in source
-    assert "1000 if reply_scoped and fast_publish else 5000" in source
+    assert "2.5 if reply_scoped and fast_publish else 4.0" in source
+    assert "3.0 if reply_scoped and fast_publish else 5.0" in source
+    assert "reply_click_target_clear_soft_timeout" in source
+    assert "publish_wait = _PARALLEL_POST_RESPONSE_WAIT_SECONDS if fast_publish else 6.0" in source
+    assert "1500 if reply_scoped and fast_publish else 3000" in source
+    assert "1500 if reply_scoped and fast_publish else 5000" in source
     assert "14.0 if fast_publish else 16.0" in reply_source
     assert "_reply_send_recovery_remaining" in reply_source
     assert "reply_send_recover_send_only" in reply_source

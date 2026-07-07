@@ -2853,10 +2853,10 @@ async def execute_engagement_only_replies_via_full_flow(
     try:
         reply_worker_attempt_timeout_seconds = max(
             1.0,
-            float(getattr(settings, "PARALLEL_REPLY_WORKER_ATTEMPT_TIMEOUT_SECONDS", 240.0) or 240.0),
+            float(getattr(settings, "PARALLEL_REPLY_WORKER_ATTEMPT_TIMEOUT_SECONDS", 300.0) or 300.0),
         )
     except Exception:
-        reply_worker_attempt_timeout_seconds = 240.0
+        reply_worker_attempt_timeout_seconds = 300.0
     try:
         reply_selection_capacity_backoff_seconds = min(
             5.0,

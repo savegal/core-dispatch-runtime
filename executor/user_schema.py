@@ -360,7 +360,7 @@ def _proxy_is_rotatable_mobile_for_reply(db: Session, proxy_value: Optional[str]
 def _parallel_reply_worker_attempt_timeout_seconds() -> float:
     return _bounded_float_setting(
         "PARALLEL_REPLY_WORKER_ATTEMPT_TIMEOUT_SECONDS",
-        240.0,
+        300.0,
         minimum=0.1,
         maximum=480.0,
     )
@@ -378,7 +378,7 @@ def _parallel_reply_refill_poll_seconds() -> float:
 def _parallel_reply_publish_max_seconds() -> float:
     return _bounded_float_setting(
         "PARALLEL_REPLY_PUBLISH_MAX_SECONDS",
-        30.0,
+        50.0,
         minimum=12.0,
         maximum=120.0,
     )
@@ -8679,7 +8679,10 @@ async def _reply_with_variant_on_all_mains(
                 )
             )
             return await _finish_reply_attempt(ReplyAttemptResult(replies=results, searched=True))
-        surface_wait_seconds = 3.0 if comments_ready_for_search else 1.5
+        # The probe returns immediately when rows are ready. The extra ceiling
+        # only helps when two local browsers contend for CPU or shared-proxy
+        # latency delays the final comment-list hydration.
+        surface_wait_seconds = 4.0 if comments_ready_for_search else 2.5
         _log_user_trace(
             "reply_parent_surface_wait",
             page=page,
