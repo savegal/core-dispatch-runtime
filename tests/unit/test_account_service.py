@@ -884,6 +884,51 @@ class TestAccountService:
         assert selected is not None
         assert selected.id == same_source_account.id
 
+    def test_get_free_account_for_main_comment_restricts_to_allowed_proxies(
+        self,
+        db_session: Session,
+        monkeypatch: pytest.MonkeyPatch,
+    ):
+        """Strict 6x1 wave 2 must only reuse the exact proxies that were rotated."""
+        monkeypatch.setattr(account_service_module.settings, "USE_PROXY", True, raising=False)
+        monkeypatch.setattr(account_service_module.settings, "PARALLEL_PROXY_DIVERSIFY_BY_SOURCE_HOST", False, raising=False)
+        rotated_proxy = "http://user:pass@10.30.40.50:1000"
+        other_proxy = "http://user:pass@10.30.40.51:1000"
+        rotated_account = Account(
+            label="restrict_rotated",
+            status="active",
+            cookies='{"sessionid":"restrict-a","sid_tt":"restrict-a-sid","s_v_web_id":"restrict-a-verify","ttwid":"restrict-a-wid","msToken":"restrict-a-ms"}',
+            proxy=rotated_proxy,
+            created_at=datetime.now(timezone.utc) - timedelta(hours=4),
+            last_validation_ok=datetime.now(timezone.utc),
+        )
+        other_account = Account(
+            label="restrict_other",
+            status="active",
+            cookies='{"sessionid":"restrict-b","sid_tt":"restrict-b-sid","s_v_web_id":"restrict-b-verify","ttwid":"restrict-b-wid","msToken":"restrict-b-ms"}',
+            proxy=other_proxy,
+            created_at=datetime.now(timezone.utc) - timedelta(hours=4),
+            last_validation_ok=datetime.now(timezone.utc),
+        )
+        db_session.add_all([rotated_account, other_account])
+        db_session.commit()
+
+        selected = get_free_account_for_main_comment(
+            db_session,
+            restrict_to_proxies={rotated_proxy},
+        )
+        assert selected is not None
+        assert selected.id == rotated_account.id
+
+        # When only the non-rotated proxy is reachable, selection must fail
+        # rather than drift to an endpoint that was never rotated.
+        blocked = get_free_account_for_main_comment(
+            db_session,
+            exclude_ids=[rotated_account.id],
+            restrict_to_proxies={rotated_proxy},
+        )
+        assert blocked is None
+
     def test_get_free_account_for_main_comment_can_exclude_same_source_host(
         self,
         db_session: Session,

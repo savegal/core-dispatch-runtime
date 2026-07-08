@@ -10713,12 +10713,13 @@ async def execute_user_schema_parallel(
         result.elapsed_seconds = time.monotonic() - started
         return result
 
-    async def _close_parallel_phase_browsers(phase: str) -> None:
+    async def _close_parallel_phase_browsers(phase: str) -> bool:
         try:
             from executor.browser_pool import close_browser_pool
 
             await close_browser_pool()
             logger.info("Task %s: parallel %s browser pool closed", task_id, phase)
+            return True
         except Exception as exc:
             logger.warning(
                 "Task %s: failed to close browser pool after parallel %s: %s",
@@ -10726,6 +10727,7 @@ async def execute_user_schema_parallel(
                 phase,
                 str(exc)[:120],
             )
+            return False
 
     def _ensure_parallel_browser_capacity() -> bool:
         try:
@@ -10915,6 +10917,9 @@ async def execute_user_schema_parallel(
     used_reply_ids: set[int] = set()
     used_main_proxy_values: set[str] = set()
     used_main_proxy_counts: Dict[str, int] = {}
+    # When set (strict 6x1 wave 2), main selection is pinned to these proxies so
+    # the second wave reuses the mobile endpoints that were just IP-rotated.
+    main_wave_two_required_proxies: set[str] = set()
     used_reply_proxy_values: set[str] = set()
     used_reply_proxy_counts: Dict[str, int] = {}
     active_main_proxy_counts: Dict[str, int] = {}
@@ -11322,6 +11327,9 @@ async def execute_user_schema_parallel(
         if not unique_values:
             return False, "parallel_6x1_rotation_missing_proxy"
 
+        if _is_stop_requested():
+            return False, "stopped_by_user"
+
         lock_timeout = _bounded_float_setting(
             "PARALLEL_6X1_ROTATION_LOCK_TIMEOUT_SECONDS",
             30.0,
@@ -11337,6 +11345,8 @@ async def execute_user_schema_parallel(
         rotated_proxy_ids: set[int] = set()
 
         for proxy_value in unique_values:
+            if _is_stop_requested():
+                return False, "stopped_by_user"
             with get_sync_db_context() as rotation_db:
                 proxy_obj = (
                     rotation_db.query(Proxy)
@@ -11819,6 +11829,7 @@ async def execute_user_schema_parallel(
         exclude_proxies: set[str],
         exclude_proxy_source_hosts: Optional[bool] = None,
     ) -> Optional[Account]:
+        restrict_to_proxies = set(main_wave_two_required_proxies) or None
         with get_sync_db_context() as selection_db:
             return get_free_account_for_main_comment(
                 selection_db,
@@ -11826,6 +11837,7 @@ async def execute_user_schema_parallel(
                 exclude_proxies=exclude_proxies,
                 exclude_proxy_source_hosts=exclude_proxy_source_hosts,
                 pool_owner_user_id=pool_owner_user_id,
+                restrict_to_proxies=restrict_to_proxies,
             )
 
     async def _select_main_account() -> Tuple[Optional[Account], Optional[str]]:
@@ -11927,6 +11939,15 @@ async def execute_user_schema_parallel(
                 )
                 if candidate_id in tried_main_ids:
                     reject_reason = "already_tried"
+                elif strict_6x1_main and (
+                    not proxy_value
+                    or proxy_value not in main_rotatable_mobile_proxy_values
+                ):
+                    # 6x1 requires a mandatory IP rotation between waves, which is
+                    # only possible on a rotatable mobile proxy. Reject anything
+                    # else BEFORE opening a browser so we never publish the first
+                    # wave on a proxy that cannot rotate afterwards.
+                    reject_reason = "requires_rotatable_mobile_proxy"
                 elif proxy_value and proxy_value in current_edge_denied:
                     reject_reason = "edge_denied_proxy"
                 elif proxy_value and proxy_value in current_pending_rotation:
@@ -11963,6 +11984,7 @@ async def execute_user_schema_parallel(
                 "pending_proxy_rotation",
                 "edge_denied_proxy",
                 "planned_proxy_rotation",
+                "requires_rotatable_mobile_proxy",
             }:
                 local_rejected_proxies.add(proxy_value)
             logger.info(
@@ -12562,11 +12584,28 @@ async def execute_user_schema_parallel(
                     and all(main_published_by_slot.get(slot_index) for slot_index in range(1, 4))
                 )
                 if wave_one_complete:
+                    if _is_stop_requested():
+                        logger.info(
+                            "Task %s: user stop detected before 6x1 mandatory rotation; aborting wave 2",
+                            task_id,
+                        )
+                        return _mark_stopped()
                     logger.info(
                         "Task %s: 6x1 wave 1 reached 3/3; closing browsers before mandatory IP rotation",
                         task_id,
                     )
-                    await _close_parallel_phase_browsers("main_6x1_wave_1")
+                    # In strict 6x1 mode the browsers MUST be fully closed before we
+                    # rotate the mobile IP; otherwise a live browser could keep the
+                    # old IP alive and the "rotate between waves" guarantee breaks.
+                    if not await _close_parallel_phase_browsers("main_6x1_wave_1"):
+                        result.error = "parallel_6x1_browser_close_failed"
+                        pending_main_slots = []
+                        logger.error(
+                            "Task %s: 6x1 wave 2 blocked because wave-1 browsers "
+                            "could not be closed before mandatory IP rotation",
+                            task_id,
+                        )
+                        break
                     wave_one_proxies = [
                         main_success_proxy_by_slot.get(slot_index, "")
                         for slot_index in range(1, 4)
@@ -12575,6 +12614,12 @@ async def execute_user_schema_parallel(
                         wave_one_proxies,
                     )
                     if not rotation_ok:
+                        if rotation_error == "stopped_by_user":
+                            logger.info(
+                                "Task %s: 6x1 mandatory rotation interrupted by user stop",
+                                task_id,
+                            )
+                            return _mark_stopped()
                         result.error = rotation_error or "parallel_6x1_rotation_failed"
                         pending_main_slots = []
                         logger.warning(
@@ -12587,14 +12632,23 @@ async def execute_user_schema_parallel(
                         result.error = "parallel_browser_capacity_unavailable_after_6x1_rotation"
                         pending_main_slots = []
                         break
+                    # Pin wave 2 to the exact proxies that were just rotated, so the
+                    # second three accounts reuse the freshly rotated mobile IPs
+                    # instead of drifting to other (unrotated) endpoints.
+                    main_wave_two_required_proxies.clear()
+                    main_wave_two_required_proxies.update(
+                        proxy for proxy in wave_one_proxies if proxy
+                    )
                     strict_6x1_second_wave_started = True
                     pending_main_slots.extend(
                         (slot_index, list(main_texts_by_slot[slot_index]))
                         for slot_index in range(4, 7)
                     )
                     logger.info(
-                        "Task %s: 6x1 mandatory rotation confirmed; starting wave 2 with three new accounts",
+                        "Task %s: 6x1 mandatory rotation confirmed; starting wave 2 with three "
+                        "new accounts pinned to rotated proxies=%s",
                         task_id,
+                        [_short_proxy_sig(proxy) for proxy in main_wave_two_required_proxies],
                     )
 
                 if deferred_main_selection_seen and active_main_tasks:

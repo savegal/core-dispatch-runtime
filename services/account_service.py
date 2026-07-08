@@ -1676,6 +1676,7 @@ def get_free_account_for_main_comment(
     exclude_proxies: set[str] | list[str] | tuple[str, ...] | None = None,
     exclude_proxy_source_hosts: bool | None = None,
     pool_owner_user_id: int | None = None,
+    restrict_to_proxies: set[str] | list[str] | tuple[str, ...] | None = None,
 ) -> Account | None:
     """
     Выбирает свободный аккаунт для основного комментария.
@@ -1772,6 +1773,18 @@ def get_free_account_for_main_comment(
                 Account.proxy.is_(None),
                 ~Account.proxy.in_(sorted(normalized_exclude_proxies)),
             )
+        )
+
+    # Жёсткое ограничение выбора конкретным набором прокси (strict 6x1 wave 2):
+    # аккаунт обязан находиться на одном из уже ротированных мобильных прокси.
+    normalized_restrict_to_proxies = {
+        str(proxy).strip()
+        for proxy in (restrict_to_proxies or [])
+        if proxy and str(proxy).strip()
+    }
+    if normalized_restrict_to_proxies:
+        query = query.filter(
+            Account.proxy.in_(sorted(normalized_restrict_to_proxies))
         )
 
     if settings.USE_PROXY:
