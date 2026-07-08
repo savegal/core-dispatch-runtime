@@ -1656,6 +1656,7 @@ def process_task(task_id: int) -> None:
                     try:
                         from services.app_settings_service import (
                             COMMENTING_MODE_PARALLEL,
+                            COMMENTING_MODE_PARALLEL_6X1,
                             get_commenting_mode,
                             get_user_schema_enabled,
                         )
@@ -1664,9 +1665,14 @@ def process_task(task_id: int) -> None:
                     except Exception:
                         user_schema_active = bool(getattr(settings, "USER_SCHEMA_ENABLED", True))
                         COMMENTING_MODE_PARALLEL = "parallel"
+                        COMMENTING_MODE_PARALLEL_6X1 = "parallel_6x1"
 
                     if user_schema_active:
-                        from executor.user_schema import execute_user_schema_full, execute_user_schema_parallel
+                        from executor.user_schema import (
+                            execute_user_schema_full,
+                            execute_user_schema_parallel,
+                            execute_user_schema_parallel_6x1,
+                        )
                         from executor.browser_pool import browser_pool_task_scope
 
                         # Подготовка текстов: spintax + skip shadowed-вариантов.
@@ -1757,11 +1763,12 @@ def process_task(task_id: int) -> None:
                                         )
                                     return False
 
-                                user_schema_runner = (
-                                    execute_user_schema_parallel
-                                    if commenting_mode == COMMENTING_MODE_PARALLEL
-                                    else execute_user_schema_full
-                                )
+                                if commenting_mode == COMMENTING_MODE_PARALLEL_6X1:
+                                    user_schema_runner = execute_user_schema_parallel_6x1
+                                elif commenting_mode == COMMENTING_MODE_PARALLEL:
+                                    user_schema_runner = execute_user_schema_parallel
+                                else:
+                                    user_schema_runner = execute_user_schema_full
                                 logger.info(
                                     "Task %s, URL %s: user_schema commenting_mode=%s",
                                     task_id,

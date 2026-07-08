@@ -30,6 +30,7 @@ from services.app_settings_service import (
     SOFTWARE_MODES,
     COMMENTING_MODE_OLD,
     COMMENTING_MODE_PARALLEL,
+    COMMENTING_MODE_PARALLEL_6X1,
     COMMENTING_MODES,
     ORDER_EXECUTION_STRATEGY_BALANCED,
     ORDER_EXECUTION_STRATEGIES,
@@ -326,7 +327,10 @@ async def get_commenting_mode_settings(
             mode = get_commenting_mode(sync_db, default=COMMENTING_MODE_OLD)
             return CommentingModeSettingsResponse(
                 commenting_mode=mode,
-                is_parallel_mode=mode == COMMENTING_MODE_PARALLEL,
+                is_parallel_mode=mode in {
+                    COMMENTING_MODE_PARALLEL,
+                    COMMENTING_MODE_PARALLEL_6X1,
+                },
             )
     except Exception as e:
         logger.error(f"Error getting commenting mode settings: {e}", exc_info=True)
@@ -344,7 +348,10 @@ async def update_commenting_mode_settings(
         if mode not in COMMENTING_MODES:
             raise HTTPException(
                 status_code=400,
-                detail=f"Invalid commenting_mode. Must be one of: {[COMMENTING_MODE_OLD, COMMENTING_MODE_PARALLEL]}",
+                detail=(
+                    "Invalid commenting_mode. Must be one of: "
+                    f"{[COMMENTING_MODE_OLD, COMMENTING_MODE_PARALLEL, COMMENTING_MODE_PARALLEL_6X1]}"
+                ),
             )
 
         with get_sync_db_context() as sync_db:
@@ -352,7 +359,10 @@ async def update_commenting_mode_settings(
             updated_mode = get_commenting_mode(sync_db, default=COMMENTING_MODE_OLD)
             return CommentingModeSettingsResponse(
                 commenting_mode=updated_mode,
-                is_parallel_mode=updated_mode == COMMENTING_MODE_PARALLEL,
+                is_parallel_mode=updated_mode in {
+                    COMMENTING_MODE_PARALLEL,
+                    COMMENTING_MODE_PARALLEL_6X1,
+                },
             )
     except HTTPException:
         raise

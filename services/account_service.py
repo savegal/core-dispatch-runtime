@@ -77,6 +77,23 @@ def release_main_account_reservation(account_id: int) -> None:
         _MAIN_ACCOUNT_RESERVED_UNTIL.pop(account_id, None)
 
 
+def extend_main_account_reservation(account_id: int, ttl_seconds: float) -> bool:
+    """Extend an existing process-local main-account lease.
+
+    The strict 6x1 coordinator can keep a browser alive for up to its 300s
+    worker deadline, which is longer than the default 180s selection lease.
+    Only an already-reserved account can be extended.
+    """
+    with _MAIN_ACCOUNT_RESERVATION_LOCK:
+        _cleanup_main_account_reservations_locked()
+        if account_id not in _MAIN_ACCOUNT_RESERVED_UNTIL:
+            return False
+        _MAIN_ACCOUNT_RESERVED_UNTIL[account_id] = (
+            time.monotonic() + max(1.0, float(ttl_seconds))
+        )
+        return True
+
+
 _REPLY_ACCOUNT_RESERVATION_LOCK = threading.Lock()
 _REPLY_ACCOUNT_RESERVED_UNTIL: dict[int, float] = {}
 _REPLY_ACCOUNT_RESERVATION_TTL_SECONDS = 180.0

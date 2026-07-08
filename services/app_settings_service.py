@@ -37,7 +37,12 @@ SOFTWARE_MODES = {SOFTWARE_MODE_FULL, SOFTWARE_MODE_PARSING}
 COMMENTING_MODE_KEY = "commenting_mode"
 COMMENTING_MODE_OLD = "old"
 COMMENTING_MODE_PARALLEL = "parallel"
-COMMENTING_MODES = {COMMENTING_MODE_OLD, COMMENTING_MODE_PARALLEL}
+COMMENTING_MODE_PARALLEL_6X1 = "parallel_6x1"
+COMMENTING_MODES = {
+    COMMENTING_MODE_OLD,
+    COMMENTING_MODE_PARALLEL,
+    COMMENTING_MODE_PARALLEL_6X1,
+}
 ORDER_EXECUTION_STRATEGY_KEY = "order_execution_strategy"
 ORDER_EXECUTION_STRATEGY_BALANCED = "balanced"
 ORDER_EXECUTION_STRATEGY_FAST = "fast"
@@ -300,7 +305,10 @@ def set_commenting_mode(db: Session, mode: str, updated_by: int | None = None) -
         description=(
             "Commenting workflow mode: old keeps the current user-schema flow; "
             "parallel publishes up to three main comments in parallel and replies "
-            "in batches of up to three accounts without reply-side fallback mains."
+            "in batches of up to three accounts without reply-side fallback mains; "
+            "parallel_6x1 publishes two strict waves of three one-comment accounts "
+            "with a mandatory mobile-IP rotation between waves and reuses the "
+            "parallel reply workflow."
         ),
         updated_by=updated_by,
     )

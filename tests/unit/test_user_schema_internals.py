@@ -7604,7 +7604,83 @@ def test_reply_local_verifier_excludes_open_reply_editor_artifacts():
     assert "'[contenteditable=\"true\"]'" in source
     assert "if (isEditorArtifact(node)) return;" in source
     assert "if (!row || isEditorArtifact(row)) return;" in source
-    assert "attempt_delays = (0.0, 0.75, 1.5) if fast else (0.8, 1.2, 1.8)" in source
+    assert "attempt_delays = (" in source
+    assert "if preflight" in source
+    assert "(0.0,)" in source
+    assert "directOnly" in source
+
+
+@pytest.mark.unit
+@pytest.mark.asyncio
+async def test_reply_local_preflight_is_single_pass_anchor_only():
+    from executor import user_schema
+
+    captured = []
+
+    class _Page:
+        url = "https://www.tiktok.com/@demo/video/1234567890123456789"
+
+        async def evaluate(self, _script, payload):
+            captured.append(payload)
+            return {
+                "found": False,
+                "count": 0,
+                "reason": "reply_not_found_in_anchored_parent",
+            }
+
+    result = await user_schema._verify_reply_visible_near_parent(
+        _Page(),
+        reply_text="reply text",
+        parent_text="parent text",
+        parent_comment_id=None,
+        parent_anchor_token="anchor-1",
+        correlation_id="preflight-test",
+        fast=True,
+        return_state=True,
+        preflight=True,
+    )
+
+    assert result["found"] is False
+    assert len(captured) == 1
+    assert captured[0]["directOnly"] is True
+    assert captured[0]["allowExpand"] is False
+
+
+@pytest.mark.unit
+@pytest.mark.asyncio
+async def test_reply_local_preflight_timeout_is_non_blocking_miss(monkeypatch):
+    from executor import user_schema
+
+    class _Page:
+        url = "https://www.tiktok.com/@demo/video/1234567890123456789"
+
+        async def evaluate(self, _script, _payload):
+            return {"found": True, "count": 1}
+
+    async def _timeout(awaitable, *, timeout):
+        awaitable.close()
+        assert timeout == pytest.approx(2.0)
+        raise asyncio.TimeoutError
+
+    monkeypatch.setattr(user_schema, "_await_reply_hard_timeout", _timeout)
+
+    result = await user_schema._verify_reply_visible_near_parent(
+        _Page(),
+        reply_text="reply text",
+        parent_text="parent text",
+        parent_comment_id=None,
+        parent_anchor_token="anchor-1",
+        correlation_id="preflight-timeout-test",
+        fast=True,
+        return_state=True,
+        preflight=True,
+    )
+
+    assert result == {
+        "found": False,
+        "count": 0,
+        "reason": "preflight_timeout",
+    }
 
 
 @pytest.mark.unit
@@ -12296,6 +12372,24 @@ def test_reply_parent_batch_uses_the_total_remaining_search_deadline():
 
     assert "batch_timeout_seconds = max(1.0, batch_remaining_seconds)" in source
     assert "batch_timeout_seconds = min(\n                        search_pass_seconds" not in source
+
+
+@pytest.mark.unit
+def test_scroll_limited_parent_batch_always_allows_single_fallback():
+    from executor import user_schema
+
+    assert user_schema._batch_parent_search_should_try_single_fallback(
+        {
+            "error": "scroll_limit_reached",
+            "found_count": 0,
+            "missing_count": 20,
+            "target_count": 20,
+            "max_seen_rows": 12,
+            "last_row_count": 10,
+            "unique_rows_seen": 94,
+            "new_rows_last_scan": 7,
+        }
+    ) is True
 
 
 @pytest.mark.unit

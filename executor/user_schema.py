@@ -106,6 +106,7 @@ from services.account_service import (
     MAIN_SCOPE,
     REPLY_SCOPE,
     RUNTIME_CATEGORY_COOKIE_ENRICHMENT,
+    extend_main_account_reservation,
     get_free_account_for_main_comment,
     get_free_account_for_reply,
     get_http_execution_strategy,
@@ -120,7 +121,14 @@ from services.account_service import (
     release_reply_account_reservation,
 )
 from services.proxy_health_service import clear_proxy_bad, mark_proxy_bad
-from services.mobile_proxy_service import ProxyRotationError, ensure_proxy_ip_rotated
+from services.mobile_proxy_service import (
+    ProxyRotationError,
+    acquire_proxy_lock,
+    ensure_proxy_ip_rotated,
+    get_current_ip,
+    release_proxy_lock,
+    save_proxy_last_ip,
+)
 from executor.cookie_enricher import (
     EnrichmentResult,
     enrich_cookies_via_browser,
@@ -5229,6 +5237,7 @@ def _batch_parent_search_should_try_single_fallback(info: Optional[Dict[str, Any
         "scan_failed",
         "batch_search_timeout",
         "batch_search_timeout_partial",
+        "scroll_limit_reached",
     }:
         return True
     if error.startswith("batch_search_exception:"):
@@ -6826,6 +6835,7 @@ async def _verify_reply_visible_near_parent(
     log_negative: bool = False,
     min_count_exclusive: Optional[int] = None,
     return_state: bool = False,
+    preflight: bool = False,
 ) -> Any:
     """Best-effort local check for ambiguous reply submits.
 
@@ -6844,14 +6854,22 @@ async def _verify_reply_visible_near_parent(
         "reason": "reply_not_found_under_parent",
         "minCountExclusive": min_count_exclusive,
     }
-    attempt_delays = (0.0, 0.75, 1.5) if fast else (0.8, 1.2, 1.8)
+    # Before publication this probe is only a duplicate-suppression fast path.
+    # It must never delay the actual Reply click by repeatedly walking TikTok's
+    # large virtualized comment DOM.  Post-submit confirmation keeps the wider
+    # retry/expansion behavior below.
+    attempt_delays = (
+        (0.0,)
+        if preflight
+        else ((0.0, 0.75, 1.5) if fast else (0.8, 1.2, 1.8))
+    )
     for attempt, delay in enumerate(attempt_delays, start=1):
         if delay > 0:
             await asyncio.sleep(delay)
         try:
-            result = await page.evaluate(
+            evaluate_call = page.evaluate(
                 r"""
-                ({replyText, parentText, parentId, parentAnchorToken, allowExpand, minCountExclusive}) => {
+                ({replyText, parentText, parentId, parentAnchorToken, allowExpand, minCountExclusive, directOnly}) => {
                     const normalize = (value) => String(value || '')
                         .replace(/[\u200b-\u200d\ufeff]/g, '')
                         .replace(/\s+/g, ' ')
@@ -6917,6 +6935,35 @@ async def _verify_reply_visible_near_parent(
                         '[data-e2e*="reply"] span',
                         '[data-e2e*="reply"] p',
                     ].join(', ');
+
+                    // The pre-publish duplicate check already has the exact
+                    // row token produced by the parent scanner.  Stay inside
+                    // that row and avoid the expensive document-wide root and
+                    // text searches used by post-submit confirmation.
+                    if (directOnly) {
+                        const anchorNode = targetAnchorToken
+                            ? document.querySelector(
+                                `[data-smart-parent-anchor="${cssEscape(targetAnchorToken)}"]`
+                            )
+                            : null;
+                        if (!anchorNode || !visible(anchorNode)) {
+                            return { found: false, count: 0, reason: 'preflight_anchor_not_found' };
+                        }
+                        const matches = [...anchorNode.querySelectorAll(replyTextSelector)]
+                            .filter(visible)
+                            .filter(node => !node.closest(
+                                '[contenteditable="true"], textarea, input, [role="textbox"], ' +
+                                '[data-smart-reply-input="1"], [data-smart-reply-composer="1"]'
+                            ))
+                            .filter(node => normalize(node.innerText || node.textContent || '') === replyNeedle);
+                        return {
+                            found: matches.length > requiredCount,
+                            count: matches.length,
+                            reason: matches.length > requiredCount
+                                ? 'reply_inside_anchored_parent'
+                                : 'reply_not_found_in_anchored_parent',
+                        };
+                    }
 
                     const list = [...document.querySelectorAll(listSelectors)]
                         .filter(visible)
@@ -7111,14 +7158,34 @@ async def _verify_reply_visible_near_parent(
                     "parentText": parent_text or "",
                     "parentId": parent_comment_id or "",
                     "parentAnchorToken": parent_anchor_token or "",
-                    "allowExpand": attempt == 1,
+                    "allowExpand": not preflight and attempt == 1,
                     "minCountExclusive": (
                         int(min_count_exclusive)
                         if min_count_exclusive is not None
                         else None
                     ),
+                    "directOnly": bool(preflight),
                 },
             )
+            if preflight:
+                result = await _await_reply_hard_timeout(evaluate_call, timeout=2.0)
+            else:
+                result = await evaluate_call
+        except asyncio.TimeoutError:
+            last_result = {
+                "found": False,
+                "count": 0,
+                "reason": "preflight_timeout" if preflight else "reply_verify_timeout",
+            }
+            _log_user_trace(
+                "reply_local_verify_timeout",
+                page=page,
+                correlation_id=correlation_id,
+                preflight=preflight,
+                timeout_seconds=2.0 if preflight else None,
+                level=logging.INFO if preflight else logging.DEBUG,
+            )
+            break
         except Exception as exc:
             logger.debug(
                 "[USER_SCHEMA] %s reply local verify attempt %s failed: %s",
@@ -9435,6 +9502,7 @@ async def _reply_with_variant_on_all_mains(
                         correlation_id=f"{sub_corr}_preflight",
                         fast=True,
                         return_state=True,
+                        preflight=True,
                     )
                     already_present_local = _reply_visibility_probe_found(already_present_probe)
                     reply_baseline_count = _reply_visibility_probe_count(already_present_probe)
@@ -10418,6 +10486,10 @@ class _ParallelReplyVariantResult:
     parent_search_scroll_budget: int = 0
 
 
+_PARALLEL_MAIN_STRATEGY_ACCOUNT_SERIES = "account_series"
+_PARALLEL_MAIN_STRATEGY_6X1 = "parallel_6x1"
+
+
 def _reply_search_is_confident_visibility_empty(
     *,
     no_main_found: bool,
@@ -10551,6 +10623,7 @@ async def execute_user_schema_parallel(
     boost_quantity: int,
     pool_owner_user_id: Optional[int] = None,
     stop_requested: Optional[Callable[[], bool]] = None,
+    _main_strategy: str = _PARALLEL_MAIN_STRATEGY_ACCOUNT_SERIES,
 ) -> UserSchemaResult:
     """Parallel commenting mode.
 
@@ -10584,7 +10657,12 @@ async def execute_user_schema_parallel(
             return value.strip().lower() in {"1", "true", "yes", "on"}
         return bool(value)
 
-    parallel_main_account_slots = _positive_int_setting("PARALLEL_MAIN_ACCOUNT_SLOTS", 3)
+    strict_6x1_main = _main_strategy == _PARALLEL_MAIN_STRATEGY_6X1
+    parallel_main_account_slots = (
+        6
+        if strict_6x1_main
+        else _positive_int_setting("PARALLEL_MAIN_ACCOUNT_SLOTS", 3)
+    )
 
     def _reply_outcome_report_key(outcome: ReplyOutcome) -> tuple[Any, ...]:
         return (
@@ -10673,35 +10751,65 @@ async def execute_user_schema_parallel(
         result.error = "no_text_variants"
         result.elapsed_seconds = time.monotonic() - started
         return result
+    if strict_6x1_main and len(main_texts) != 3:
+        result.error = "parallel_6x1_requires_three_distinct_main_variants"
+        result.elapsed_seconds = time.monotonic() - started
+        return result
     main_variant_index_by_text = _variant_index_by_text(main_texts)
-    main_texts_by_slot: Dict[int, List[str]] = {
-        slot_index: _rotate_main_texts_for_slot(main_texts, slot_index)
-        for slot_index in range(1, parallel_main_account_slots + 1)
-    }
-    result.expected_main_publications = len(main_texts) * parallel_main_account_slots
+    if strict_6x1_main:
+        main_texts_by_slot = {
+            slot_index: [main_texts[(slot_index - 1) % len(main_texts)]]
+            for slot_index in range(1, parallel_main_account_slots + 1)
+        }
+    else:
+        main_texts_by_slot = {
+            slot_index: _rotate_main_texts_for_slot(main_texts, slot_index)
+            for slot_index in range(1, parallel_main_account_slots + 1)
+        }
+    result.expected_main_publications = sum(len(texts) for texts in main_texts_by_slot.values())
     reply_variants: List[str] = _reply_variants_from_task(task)
     result.expected_reply_variants = len(reply_variants)
 
     retry_account_limit = _positive_int_setting("MAX_RETRY_ACCOUNTS", 30)
-    max_main_attempts = min(
-        retry_account_limit,
-        _positive_int_setting("PARALLEL_COMMENTING_MAX_MAIN_ATTEMPTS", retry_account_limit),
+    max_main_attempts = (
+        _positive_int_setting("PARALLEL_6X1_MAX_MAIN_ATTEMPTS_PER_SLOT", 6)
+        if strict_6x1_main
+        else min(
+            retry_account_limit,
+            _positive_int_setting("PARALLEL_COMMENTING_MAX_MAIN_ATTEMPTS", retry_account_limit),
+        )
     )
     max_reply_attempts = min(
         retry_account_limit,
         _positive_int_setting("PARALLEL_COMMENTING_MAX_REPLY_ATTEMPTS", retry_account_limit),
     )
-    dynamic_worker_pool_enabled = _bool_setting("PARALLEL_DYNAMIC_WORKER_POOL_ENABLED", True)
+    dynamic_worker_pool_enabled = (
+        True
+        if strict_6x1_main
+        else _bool_setting("PARALLEL_DYNAMIC_WORKER_POOL_ENABLED", True)
+    )
     requested_parallel_worker_target = _positive_int_setting("PARALLEL_COMMENTING_TARGET_BROWSERS", 3)
     parallel_browser_capacity = _positive_int_setting(
         "PARALLEL_COMMENTING_MAX_BROWSERS",
         max(parallel_main_account_slots, requested_parallel_worker_target),
     )
+    if strict_6x1_main:
+        parallel_browser_capacity = max(
+            3,
+            parallel_browser_capacity,
+            _positive_int_setting("PARALLEL_6X1_MAX_BROWSERS", 3),
+        )
     parallel_worker_target = min(requested_parallel_worker_target, parallel_browser_capacity)
-    main_worker_target = min(
-        parallel_worker_target,
-        _positive_int_setting("PARALLEL_MAIN_WORKERS", min(3, parallel_worker_target)),
-    )
+    if strict_6x1_main:
+        main_worker_target = min(
+            parallel_browser_capacity,
+            _positive_int_setting("PARALLEL_6X1_MAIN_WORKERS", 3),
+        )
+    else:
+        main_worker_target = min(
+            parallel_worker_target,
+            _positive_int_setting("PARALLEL_MAIN_WORKERS", min(3, parallel_worker_target)),
+        )
     reply_variant_worker_target = min(
         parallel_worker_target,
         _positive_int_setting("PARALLEL_REPLY_VARIANT_WORKERS", 2),
@@ -10717,6 +10825,11 @@ async def execute_user_schema_parallel(
             legacy_max_active_browsers_per_proxy,
         ),
     )
+    if strict_6x1_main:
+        max_active_main_browsers_per_proxy = min(
+            parallel_browser_capacity,
+            _positive_int_setting("PARALLEL_6X1_MAX_ACTIVE_BROWSERS_PER_PROXY", 3),
+        )
     main_rotate_mobile_proxy_after_accounts = _positive_int_setting(
         "PARALLEL_MAIN_ROTATE_MOBILE_PROXY_AFTER_ACCOUNTS",
         2,
@@ -10742,8 +10855,26 @@ async def execute_user_schema_parallel(
         minimum=0.05,
         maximum=1.0,
     )
-    main_worker_attempt_timeout_seconds = _parallel_main_worker_attempt_timeout_seconds()
-    main_refill_poll_seconds = _parallel_main_refill_poll_seconds()
+    main_worker_attempt_timeout_seconds = (
+        _bounded_float_setting(
+            "PARALLEL_6X1_MAIN_WORKER_ATTEMPT_TIMEOUT_SECONDS",
+            300.0,
+            minimum=0.1,
+            maximum=600.0,
+        )
+        if strict_6x1_main
+        else _parallel_main_worker_attempt_timeout_seconds()
+    )
+    main_refill_poll_seconds = (
+        _bounded_float_setting(
+            "PARALLEL_6X1_MAIN_REFILL_POLL_SECONDS",
+            0.15,
+            minimum=0.05,
+            maximum=1.0,
+        )
+        if strict_6x1_main
+        else _parallel_main_refill_poll_seconds()
+    )
     reply_worker_attempt_timeout_seconds = _parallel_reply_worker_attempt_timeout_seconds()
     reply_refill_poll_seconds = _parallel_reply_refill_poll_seconds()
     parallel_capacity_request = (
@@ -10885,6 +11016,8 @@ async def execute_user_schema_parallel(
         proxy_value: Optional[str],
         active_on_proxy: int,
     ) -> bool:
+        if strict_6x1_main:
+            return False
         proxy_value = str(proxy_value or "").strip()
         if (
             not proxy_value
@@ -11138,6 +11271,8 @@ async def execute_user_schema_parallel(
         attempt_db: Session,
         proxy_value: Optional[str],
     ) -> None:
+        if strict_6x1_main:
+            return
         proxy_value = (proxy_value or "").strip()
         if not proxy_value or proxy_value in main_planned_rotation_failed_proxy_values:
             return
@@ -11174,6 +11309,119 @@ async def execute_user_schema_parallel(
             rotate_now = True
         if rotate_now:
             await _rotate_main_mobile_proxy_for_planned_reuse(attempt_db, proxy_value)
+
+    async def _rotate_6x1_wave_proxies(
+        proxy_values: List[str],
+    ) -> Tuple[bool, Optional[str]]:
+        """Force and verify the mobile-IP barrier between 6x1 main waves."""
+        unique_values = list(dict.fromkeys(
+            str(value or "").strip()
+            for value in proxy_values
+            if str(value or "").strip()
+        ))
+        if not unique_values:
+            return False, "parallel_6x1_rotation_missing_proxy"
+
+        lock_timeout = _bounded_float_setting(
+            "PARALLEL_6X1_ROTATION_LOCK_TIMEOUT_SECONDS",
+            30.0,
+            minimum=1.0,
+            maximum=120.0,
+        )
+        rotation_timeout = _bounded_float_setting(
+            "PARALLEL_6X1_ROTATION_TIMEOUT_SECONDS",
+            240.0,
+            minimum=30.0,
+            maximum=600.0,
+        )
+        rotated_proxy_ids: set[int] = set()
+
+        for proxy_value in unique_values:
+            with get_sync_db_context() as rotation_db:
+                proxy_obj = (
+                    rotation_db.query(Proxy)
+                    .filter(Proxy.proxy == proxy_value)
+                    .first()
+                )
+                if proxy_obj is None:
+                    return False, "parallel_6x1_rotation_proxy_not_found"
+                proxy_id = int(getattr(proxy_obj, "id", 0) or 0)
+                if proxy_id in rotated_proxy_ids:
+                    continue
+                if (
+                    getattr(proxy_obj, "is_mobile", None) != "Y"
+                    or not str(getattr(proxy_obj, "rotation_url", "") or "").strip()
+                ):
+                    return False, "parallel_6x1_rotation_proxy_not_rotatable"
+
+                lock_acquired = False
+                try:
+                    lock_acquired = await acquire_proxy_lock(
+                        proxy_id,
+                        timeout=max(1, int(lock_timeout)),
+                    )
+                    if not lock_acquired:
+                        return False, "parallel_6x1_rotation_lock_timeout"
+
+                    old_ip = await get_current_ip(proxy_value)
+                    new_ip = await asyncio.wait_for(
+                        ensure_proxy_ip_rotated(
+                            proxy_obj,
+                            rotation_db,
+                            previous_ip=old_ip,
+                            force_rotation=True,
+                        ),
+                        timeout=rotation_timeout,
+                    )
+                    if not new_ip or (old_ip and new_ip == old_ip):
+                        return False, "parallel_6x1_rotation_ip_unchanged"
+                    await save_proxy_last_ip(proxy_id, new_ip)
+                    try:
+                        clear_proxy_bad(proxy_value)
+                    except Exception:
+                        logger.debug(
+                            "clear_proxy_bad after 6x1 wave rotation failed",
+                            exc_info=True,
+                        )
+                    rotated_proxy_ids.add(proxy_id)
+                    logger.info(
+                        "Task %s: 6x1 wave barrier rotated mobile proxy=%s old_ip=%s new_ip=%s",
+                        task_id,
+                        _short_proxy_sig(proxy_value),
+                        old_ip or "unknown",
+                        new_ip,
+                    )
+                except asyncio.TimeoutError:
+                    return False, "parallel_6x1_rotation_timeout"
+                except ProxyRotationError as exc:
+                    logger.warning(
+                        "Task %s: 6x1 wave rotation failed for proxy=%s: %s",
+                        task_id,
+                        _short_proxy_sig(proxy_value),
+                        str(exc)[:160],
+                    )
+                    return False, "parallel_6x1_rotation_failed"
+                except Exception as exc:
+                    logger.warning(
+                        "Task %s: unexpected 6x1 wave rotation failure for proxy=%s: %s",
+                        task_id,
+                        _short_proxy_sig(proxy_value),
+                        str(exc)[:160],
+                    )
+                    return False, "parallel_6x1_rotation_exception"
+                finally:
+                    if lock_acquired:
+                        try:
+                            await release_proxy_lock(proxy_id)
+                        except Exception:
+                            logger.warning(
+                                "Task %s: failed to release 6x1 rotation lock for proxy=%s",
+                                task_id,
+                                _short_proxy_sig(proxy_value),
+                                exc_info=True,
+                            )
+
+        return True, None
 
     def _ensure_reply_proxy_rotation_capability_locked(
         attempt_db: Session,
@@ -11808,6 +12056,19 @@ async def execute_user_schema_parallel(
             slot_result.account_id = candidate.id
             slot_result.proxy_value = _account_proxy_value(candidate)
             slot_result.attempts = attempt
+            if strict_6x1_main:
+                try:
+                    extend_main_account_reservation(
+                        candidate.id,
+                        main_worker_attempt_timeout_seconds + 60.0,
+                    )
+                except Exception as exc:
+                    logger.debug(
+                        "Task %s: failed to extend 6x1 main reservation for account=%s: %s",
+                        task_id,
+                        candidate.id,
+                        str(exc)[:120],
+                    )
             corr = f"task_{task_id}_parallel_main_v{slot_index}_a{attempt}_acc{candidate.id}"
             logger.info(
                 "Task %s: parallel main account slot %s/%s attempt %s/%s on account=%s texts=%s",
@@ -11965,14 +12226,19 @@ async def execute_user_schema_parallel(
         return slot_result
 
     max_empty_main_batches_before_fail = 2
+    initial_main_slot_items = list(main_texts_by_slot.items())
+    if strict_6x1_main:
+        initial_main_slot_items = initial_main_slot_items[:3]
     pending_main_slots: List[Tuple[int, List[str]]] = [
         (slot_index, list(slot_texts))
-        for slot_index, slot_texts in main_texts_by_slot.items()
+        for slot_index, slot_texts in initial_main_slot_items
     ]
     main_attempts_by_slot: Dict[int, int] = {}
     main_published_by_slot: Dict[int, List[PublishedMain]] = {}
     main_results_by_slot: Dict[int, _ParallelMainSlotResult] = {}
     main_failures_by_slot: Dict[int, _ParallelMainSlotResult] = {}
+    main_success_proxy_by_slot: Dict[int, str] = {}
+    strict_6x1_second_wave_started = False
     empty_main_batches_without_any_publication = 0
     proxy_main_batches_without_any_publication = 0
 
@@ -12195,6 +12461,8 @@ async def execute_user_schema_parallel(
                     if slot_result.published:
                         slot_result.published = list(main_published_by_slot.get(slot_result.slot_index, []))
                         main_results_by_slot[slot_result.slot_index] = slot_result
+                        if slot_result.proxy_value:
+                            main_success_proxy_by_slot[slot_result.slot_index] = slot_result.proxy_value
                         retryable_partial = (
                             bool(slot_result.remaining_texts)
                             and slot_result.error not in {"no_free_main_accounts", "stopped_by_user"}
@@ -12286,6 +12554,48 @@ async def execute_user_schema_parallel(
                 if processed_non_deferred_main_result:
                     next_main_selection_retry_at = 0.0
                     main_selection_waiting_for_active_change = False
+
+                wave_one_complete = bool(
+                    strict_6x1_main
+                    and not strict_6x1_second_wave_started
+                    and not active_main_tasks
+                    and all(main_published_by_slot.get(slot_index) for slot_index in range(1, 4))
+                )
+                if wave_one_complete:
+                    logger.info(
+                        "Task %s: 6x1 wave 1 reached 3/3; closing browsers before mandatory IP rotation",
+                        task_id,
+                    )
+                    await _close_parallel_phase_browsers("main_6x1_wave_1")
+                    wave_one_proxies = [
+                        main_success_proxy_by_slot.get(slot_index, "")
+                        for slot_index in range(1, 4)
+                    ]
+                    rotation_ok, rotation_error = await _rotate_6x1_wave_proxies(
+                        wave_one_proxies,
+                    )
+                    if not rotation_ok:
+                        result.error = rotation_error or "parallel_6x1_rotation_failed"
+                        pending_main_slots = []
+                        logger.warning(
+                            "Task %s: 6x1 wave 2 blocked because mandatory rotation failed: %s",
+                            task_id,
+                            result.error,
+                        )
+                        break
+                    if not _ensure_parallel_browser_capacity():
+                        result.error = "parallel_browser_capacity_unavailable_after_6x1_rotation"
+                        pending_main_slots = []
+                        break
+                    strict_6x1_second_wave_started = True
+                    pending_main_slots.extend(
+                        (slot_index, list(main_texts_by_slot[slot_index]))
+                        for slot_index in range(4, 7)
+                    )
+                    logger.info(
+                        "Task %s: 6x1 mandatory rotation confirmed; starting wave 2 with three new accounts",
+                        task_id,
+                    )
 
                 if deferred_main_selection_seen and active_main_tasks:
                     await asyncio.sleep(min(proxy_slot_refill_backoff_seconds, main_refill_poll_seconds))
@@ -12691,6 +13001,24 @@ async def execute_user_schema_parallel(
     if result.error:
         result.elapsed_seconds = time.monotonic() - started
         _log_parallel_order_summary("main_error")
+        return result
+
+    if strict_6x1_main and len(result.published_mains) < result.expected_main_publications:
+        result.error = (
+            "parallel_6x1_main_incomplete:"
+            f"submitted={len(result.published_mains)}/"
+            f"expected={result.expected_main_publications}"
+        )
+        result.warnings.append(
+            {
+                "code": "parallel_6x1_main_incomplete",
+                "submitted": len(result.published_mains),
+                "expected": result.expected_main_publications,
+                "message": "Replies were not started because strict 6x1 main completion was not reached",
+            }
+        )
+        result.elapsed_seconds = time.monotonic() - started
+        _log_parallel_order_summary("main_6x1_incomplete")
         return result
 
     if len(result.published_mains) < result.expected_main_publications:
@@ -14319,6 +14647,33 @@ async def execute_user_schema_parallel(
     result.elapsed_seconds = time.monotonic() - started
     _log_parallel_order_summary("final")
     return result
+
+
+async def execute_user_schema_parallel_6x1(
+    db: Session,
+    task: Task,
+    video_url: str,
+    text_variants: List[str],
+    task_id: int,
+    *,
+    boost_enabled: bool,
+    boost_quantity: int,
+    pool_owner_user_id: Optional[int] = None,
+    stop_requested: Optional[Callable[[], bool]] = None,
+) -> UserSchemaResult:
+    """Two strict 3-account main waves followed by the shared parallel replies."""
+    return await execute_user_schema_parallel(
+        db=db,
+        task=task,
+        video_url=video_url,
+        text_variants=text_variants,
+        task_id=task_id,
+        boost_enabled=boost_enabled,
+        boost_quantity=boost_quantity,
+        pool_owner_user_id=pool_owner_user_id,
+        stop_requested=stop_requested,
+        _main_strategy=_PARALLEL_MAIN_STRATEGY_6X1,
+    )
 
 
 async def execute_user_schema_full(

@@ -7689,11 +7689,15 @@ async def publish_reply_hybrid(
                 timeout_seconds=reply_box_timeout,
                 remaining=round(_remaining(), 2),
             )
-            return PublishResult(
-                status="timeout",
-                error_reason="reply_box_open_timeout",
-                elapsed_seconds=time.monotonic() - started,
-            )
+            recovered = await _recover_reply_open_timeout("reply_fast_open_hard_timeout")
+            if recovered is not None:
+                reply_open = recovered
+            else:
+                return PublishResult(
+                    status="timeout",
+                    error_reason="reply_box_open_timeout",
+                    elapsed_seconds=time.monotonic() - started,
+                )
         except asyncio.TimeoutError:
             recovered = await _recover_reply_open_timeout("reply_fast_open_timeout")
             if recovered is not None:
@@ -7812,11 +7816,15 @@ async def publish_reply_hybrid(
                 timeout_seconds=reply_box_timeout,
                 remaining=round(_remaining(), 2),
             )
-            return PublishResult(
-                status="timeout",
-                error_reason="reply_box_open_timeout",
-                elapsed_seconds=time.monotonic() - started,
-            )
+            recovered = await _recover_reply_open_timeout("reply_open_hard_timeout")
+            if recovered is not None:
+                reply_open = recovered
+            else:
+                return PublishResult(
+                    status="timeout",
+                    error_reason="reply_box_open_timeout",
+                    elapsed_seconds=time.monotonic() - started,
+                )
         except asyncio.TimeoutError:
             recovered = await _recover_reply_open_timeout("open_reply_box")
             if recovered is not None:

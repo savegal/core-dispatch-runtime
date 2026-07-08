@@ -487,6 +487,17 @@ class Settings(BaseSettings):
     PARALLEL_PROXY_DIVERSIFY_BY_SOURCE_HOST: bool = False
     PARALLEL_COMMENTING_DOM_FIRST: bool = True
     PARALLEL_COMMENTING_FAST_AUTH_GATE: bool = True
+    # Strict 6x1 main strategy: two waves, three concurrent accounts per wave,
+    # one template variant per account. Existing PARALLEL_* orchestration
+    # settings above keep their current behavior.
+    PARALLEL_6X1_MAX_BROWSERS: int = 3
+    PARALLEL_6X1_MAIN_WORKERS: int = 3
+    PARALLEL_6X1_MAX_ACTIVE_BROWSERS_PER_PROXY: int = 3
+    PARALLEL_6X1_MAX_MAIN_ATTEMPTS_PER_SLOT: int = 6
+    PARALLEL_6X1_MAIN_WORKER_ATTEMPT_TIMEOUT_SECONDS: float = 300.0
+    PARALLEL_6X1_MAIN_REFILL_POLL_SECONDS: float = 0.15
+    PARALLEL_6X1_ROTATION_LOCK_TIMEOUT_SECONDS: float = 30.0
+    PARALLEL_6X1_ROTATION_TIMEOUT_SECONDS: float = 240.0
     ACCOUNT_VALIDATION_CACHE_TTL_MINUTES: int = 2  # TTL кэша валидации аккаунтов (минуты)
     ACCOUNT_VALIDATION_MAX_AGE_MINUTES: int = 10  # Максимальный возраст валидации аккаунта (минуты)
 

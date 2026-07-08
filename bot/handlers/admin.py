@@ -655,7 +655,10 @@ async def admin_menu(callback: CallbackQuery):
         software_mode_label = "🟢 Полный" if current_software_mode == "full" else "🟡 Парсинг"
         current_commenting_mode = commenting_mode_data.get("commenting_mode", "old")
         order_strategy_label = str(order_strategy_data.get("order_execution_strategy") or "balanced")
-        commenting_mode_label = "🟢 Новая параллельная" if current_commenting_mode == "parallel" else "⚪ Старая"
+        commenting_mode_label = {
+            "parallel": "🟢 Новая параллельная",
+            "parallel_6x1": "🟣 Параллельная 6×1",
+        }.get(current_commenting_mode, "⚪ Старая")
 
         attention_lines = _build_attention_lines(
             health_summary=health_summary,
@@ -4832,9 +4835,13 @@ async def set_software_mode_handler(callback: CallbackQuery):
 
 def _build_commenting_mode_text(mode: str) -> tuple[str, InlineKeyboardMarkup]:
     """Returns (text, keyboard) for the commenting mode panel."""
-    is_old = mode != "parallel"
+    is_old = mode == "old"
     is_parallel = mode == "parallel"
-    active_label = "🟢 Новая параллельная" if is_parallel else "⚪ Старая"
+    is_parallel_6x1 = mode == "parallel_6x1"
+    active_label = {
+        "parallel": "🟢 Новая параллельная",
+        "parallel_6x1": "🟣 Параллельная 6×1",
+    }.get(mode, "⚪ Старая")
 
     text = (
         "💬 *Режим комментинга*\n"
@@ -4846,14 +4853,25 @@ def _build_commenting_mode_text(mode: str) -> tuple[str, InlineKeyboardMarkup]:
         "Главные комментарии публикуются максимум тремя аккаунтами одновременно. "
         "Ответы идут батчами до трёх аккаунтов, без публикации fallback-главных "
         "со стороны ответчиков.\n\n"
+        "*🟣 Параллельная 6×1*\n"
+        "Две строгие волны по три аккаунта. Каждый аккаунт публикует только один "
+        "из трёх вариантов. Между волнами обязательно меняется IP мобильного "
+        "прокси; ответы запускаются только после успешных 6/6 главных комментариев.\n\n"
         "_Переключение применяется к новым заказам._"
     )
     old_btn = f"{'✅ ' if is_old else ''}⚪ Старая"
     parallel_btn = f"{'✅ ' if is_parallel else ''}🟢 Новая"
+    parallel_6x1_btn = f"{'✅ ' if is_parallel_6x1 else ''}🟣 6×1"
     keyboard = InlineKeyboardMarkup(inline_keyboard=[
         [
             InlineKeyboardButton(text=old_btn, callback_data="admin:commenting_mode:set:old"),
             InlineKeyboardButton(text=parallel_btn, callback_data="admin:commenting_mode:set:parallel"),
+        ],
+        [
+            InlineKeyboardButton(
+                text=parallel_6x1_btn,
+                callback_data="admin:commenting_mode:set:parallel_6x1",
+            ),
         ],
         [InlineKeyboardButton(text="◀️ Назад", callback_data="admin:main")],
     ])
@@ -4881,11 +4899,14 @@ async def commenting_mode_menu(callback: CallbackQuery):
 async def set_commenting_mode_handler(callback: CallbackQuery):
     """Updates the commenting workflow mode."""
     mode = callback.data.split(":")[-1]
-    if mode not in {"old", "parallel"}:
+    if mode not in {"old", "parallel", "parallel_6x1"}:
         await callback.answer("Неверный режим", show_alert=True)
         return
 
-    mode_label = "🟢 Новая" if mode == "parallel" else "⚪ Старая"
+    mode_label = {
+        "parallel": "🟢 Новая",
+        "parallel_6x1": "🟣 6×1",
+    }.get(mode, "⚪ Старая")
     try:
         await callback.answer(f"Комментинг: {mode_label}", show_alert=False)
     except Exception:

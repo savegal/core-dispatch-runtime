@@ -77,11 +77,25 @@ class Draft:
 _drafts_fallback: dict[int, Draft] = {}
 _last_comment_fallback: dict[int, str] = {}
 _recent_links_fallback: dict[int, list[str]] = {}
+_DRAFT_TTL_SECONDS = 86400
 
 
 def _get_redis_key(key: str, user_id: int) -> str:
     """Формирует ключ Redis."""
     return f"draft:{user_id}:{key}"
+
+
+def _write_draft_hash(user_id: int, draft: Draft) -> None:
+    """Write a complete draft using Redis 3-compatible single-field HSETs."""
+    redis_key = _get_redis_key("data", user_id)
+    # redis-py turns hset(mapping=...) into the Redis 4+ multi-field HSET
+    # syntax. The deployed Redis 3 server rejects it, so queue legacy-safe
+    # field/value commands in one transaction.
+    with redis_client.pipeline(transaction=True) as pipeline:
+        for field_name, value in draft.to_dict().items():
+            pipeline.hset(redis_key, field_name, value)
+        pipeline.expire(redis_key, _DRAFT_TTL_SECONDS)
+        pipeline.execute()
 
 
 def get_draft(user_id: int) -> Draft:
@@ -93,8 +107,7 @@ def get_draft(user_id: int) -> Draft:
                 return Draft.from_dict(draft_data)
             # Создаём новый черновик
             draft = Draft()
-            redis_client.hset(_get_redis_key("data", user_id), mapping=draft.to_dict())
-            redis_client.expire(_get_redis_key("data", user_id), 86400)  # TTL 24 часа
+            _write_draft_hash(user_id, draft)
             return draft
         except Exception as e:
             logger.error(f"Error getting draft from Redis: {e}, using fallback")
@@ -171,12 +184,14 @@ def set_comment(user_id: int, text: str) -> None:
     # ИСПРАВЛЕНО: Всегда сохраняем в fallback для надежности
     _last_comment_fallback[user_id] = text
     _drafts_fallback[user_id] = draft
+
+    # Persist the complete object so clearing text_variants survives the next
+    # callback and process boundary.
+    save_draft(user_id, draft)
     
     # Сохраняем черновик в Redis (если доступен)
     if redis_available:
         try:
-            redis_client.hset(_get_redis_key("data", user_id), "comment", text or "")
-            redis_client.expire(_get_redis_key("data", user_id), 86400)
             # Сохраняем как последний комментарий
             redis_client.set(_get_redis_key("last_comment", user_id), text or "", ex=2592000)
         except Exception as e:
@@ -199,8 +214,7 @@ def save_draft(user_id: int, draft: Draft) -> None:
     
     if redis_available:
         try:
-            redis_client.hset(_get_redis_key("data", user_id), mapping=draft.to_dict())
-            redis_client.expire(_get_redis_key("data", user_id), 86400)
+            _write_draft_hash(user_id, draft)
         except Exception as e:
             logger.error(f"Error saving draft to Redis: {e}, using fallback")
             logger.warning(f"Redis недоступен для сохранения draft, используется fallback в памяти")

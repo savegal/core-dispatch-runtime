@@ -14,6 +14,7 @@ from services.app_settings_service import (
     COMMENTING_MODE_KEY,
     COMMENTING_MODE_OLD,
     COMMENTING_MODE_PARALLEL,
+    COMMENTING_MODE_PARALLEL_6X1,
     ORDER_EXECUTION_STRATEGY_BALANCED,
     ORDER_EXECUTION_STRATEGY_FAST,
     ORDER_EXECUTION_STRATEGY_KEY,
@@ -158,6 +159,21 @@ def test_commenting_mode_reads_parallel(monkeypatch):
 
 
 @pytest.mark.unit
+def test_commenting_mode_reads_parallel_6x1(monkeypatch):
+    from services import app_settings_service as svc
+    clear_cache()
+
+    def fake_get_setting(_db, key, default=None):
+        if key == COMMENTING_MODE_KEY:
+            return COMMENTING_MODE_PARALLEL_6X1
+        return default
+
+    monkeypatch.setattr(svc, "get_setting", fake_get_setting)
+
+    assert get_commenting_mode(None) == COMMENTING_MODE_PARALLEL_6X1
+
+
+@pytest.mark.unit
 def test_commenting_mode_rejects_invalid_value():
     assert normalize_commenting_mode("unknown") == COMMENTING_MODE_OLD
 
@@ -256,6 +272,28 @@ async def test_commenting_mode_api_get_returns_current_mode(monkeypatch):
     response = await api_settings.get_commenting_mode_settings(_=None)
 
     assert response.commenting_mode == COMMENTING_MODE_PARALLEL
+    assert response.is_parallel_mode is True
+
+
+@pytest.mark.unit
+@pytest.mark.asyncio
+async def test_commenting_mode_api_get_treats_parallel_6x1_as_parallel(monkeypatch):
+    from api import app_settings as api_settings
+
+    @contextmanager
+    def fake_db_context():
+        yield object()
+
+    monkeypatch.setattr(api_settings, "get_sync_db_context", fake_db_context)
+    monkeypatch.setattr(
+        api_settings,
+        "get_commenting_mode",
+        lambda _db, default=COMMENTING_MODE_OLD: COMMENTING_MODE_PARALLEL_6X1,
+    )
+
+    response = await api_settings.get_commenting_mode_settings(_=None)
+
+    assert response.commenting_mode == COMMENTING_MODE_PARALLEL_6X1
     assert response.is_parallel_mode is True
 
 

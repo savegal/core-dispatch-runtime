@@ -116,5 +116,7 @@ def test_executor_selects_parallel_user_schema_runner_from_commenting_mode():
 
     assert "get_commenting_mode" in src
     assert "execute_user_schema_parallel" in src
-    assert "if commenting_mode == COMMENTING_MODE_PARALLEL" in src
-    assert "else execute_user_schema_full" in src
+    assert "execute_user_schema_parallel_6x1" in src
+    assert "if commenting_mode == COMMENTING_MODE_PARALLEL_6X1" in src
+    assert "elif commenting_mode == COMMENTING_MODE_PARALLEL" in src
+    assert "user_schema_runner = execute_user_schema_full" in src

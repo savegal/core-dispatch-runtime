@@ -37,6 +37,7 @@ from bot.services.order_creation_ui import (
     build_template_choice_text,
 )
 from datetime import datetime, timezone, timedelta
+from typing import Optional
 import logging
 
 logger = logging.getLogger("bot.order_wizard")
@@ -1134,7 +1135,12 @@ async def wizard_create_order_from_callback(callback: CallbackQuery, state: FSMC
     logger.info(f"[wizard_create_order_from_callback] User {user_id}, draft.links count: {len(draft.links) if draft.links else 0}, links: {draft.links}")
     # ИСПРАВЛЕНО: Сохраняем draft перед созданием заказа, чтобы убедиться что ссылки не потерялись
     save_draft(user_id, draft)
-    await _wizard_create_order_impl(callback.message, state)
+    await _wizard_create_order_impl(
+        callback.message,
+        state,
+        user_id=user_id,
+        is_message=False,
+    )
 
 
 async def wizard_create_order_from_message(message: Message, state: FSMContext):
@@ -1142,15 +1148,25 @@ async def wizard_create_order_from_message(message: Message, state: FSMContext):
     await _wizard_create_order_impl(message, state)
 
 
-async def _wizard_create_order_impl(message_or_edit_target, state: FSMContext):
+async def _wizard_create_order_impl(
+    message_or_edit_target,
+    state: FSMContext,
+    *,
+    user_id: Optional[int] = None,
+    is_message: Optional[bool] = None,
+):
     """Общая логика создания заказа."""
     # Получаем user_id
-    if hasattr(message_or_edit_target, 'from_user'):
-        user_id = message_or_edit_target.from_user.id
-        is_message = True
-    else:
-        user_id = message_or_edit_target.chat.id
-        is_message = False
+    # Callback messages are authored by the bot, so message.from_user.id is
+    # the bot ID, not the operator who pressed the button. Callback callers
+    # pass the real actor explicitly; message callers keep this inference path.
+    if user_id is None:
+        if hasattr(message_or_edit_target, 'from_user'):
+            user_id = message_or_edit_target.from_user.id
+        else:
+            user_id = message_or_edit_target.chat.id
+    if is_message is None:
+        is_message = hasattr(message_or_edit_target, 'from_user')
 
     # Шаг выбора аккаунт-пула. Если работник ещё не выбрал пул и у него есть
     # личные аккаунты — спрашиваем, какие аккаунты использовать. Иначе по

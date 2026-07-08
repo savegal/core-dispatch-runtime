@@ -1301,9 +1301,9 @@ async def test_publish_reply_hybrid_hard_bounds_stuck_send_recovery(monkeypatch)
 
 @pytest.mark.unit
 @pytest.mark.asyncio
-async def test_publish_reply_hybrid_stops_after_hard_reply_open_timeout(monkeypatch):
+async def test_publish_reply_hybrid_recovers_after_hard_reply_open_timeout(monkeypatch):
     page = _FakePage()
-    captured = {"recovery_probe": 0, "hard_timeout": None}
+    captured = {"recovery_probe": 0, "hard_timeout": None, "publish_calls": 0}
 
     async def _fake_none(*args, **kwargs):
         return None
@@ -1313,7 +1313,15 @@ async def test_publish_reply_hybrid_stops_after_hard_reply_open_timeout(monkeypa
 
     async def _fake_find_reply_composer_for_parent(*args, **kwargs):
         captured["recovery_probe"] += 1
-        return _fake_reply_target("anchor-1"), SimpleNamespace(success=True)
+        return _fake_reply_target("anchor-1"), SimpleNamespace(
+            success=True,
+            strategy="reply-composer-test",
+            reason=None,
+        )
+
+    async def _fake_publish_via_current_input(*args, **kwargs):
+        captured["publish_calls"] += 1
+        return publish_action.PublishResult(status="success", comment_id="reply_cid")
 
     async def _fake_hard_timeout(awaitable, *, timeout):
         captured["hard_timeout"] = timeout
@@ -1326,6 +1334,7 @@ async def test_publish_reply_hybrid_stops_after_hard_reply_open_timeout(monkeypa
     monkeypatch.setattr(publish_action, "open_reply_box", _fake_open_reply_box)
     monkeypatch.setattr(publish_action, "find_reply_composer_for_parent", _fake_find_reply_composer_for_parent)
     monkeypatch.setattr(publish_action, "_await_hard_timeout", _fake_hard_timeout)
+    monkeypatch.setattr(publish_action, "_publish_via_current_input", _fake_publish_via_current_input)
 
     result = await publish_action.publish_reply_hybrid(
         page,
@@ -1338,10 +1347,11 @@ async def test_publish_reply_hybrid_stops_after_hard_reply_open_timeout(monkeypa
         comments_already_open=True,
     )
 
-    assert result.status == "timeout"
-    assert result.error_reason == "reply_box_open_timeout"
+    assert result.status == "success"
+    assert result.comment_id == "reply_cid"
     assert captured["hard_timeout"] == pytest.approx(10.0)
-    assert captured["recovery_probe"] == 0
+    assert captured["recovery_probe"] >= 2
+    assert captured["publish_calls"] == 1
 
 
 @pytest.mark.unit
