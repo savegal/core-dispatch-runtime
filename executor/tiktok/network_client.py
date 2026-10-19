@@ -84,39 +84,15 @@ async def publish_comment_via_network(page: Page, text: str, artifacts: Dict[str
         cookies_list = await page.context.cookies()
         cookies_dict = _cookies_list_to_dict(cookies_list)
 
-        # Шаг 2: строим итоговый URL (тот же профиль, что пойдёт в реальный запрос)
-        profile = RequestProfile.publish_main_profile()
-        dynamic_params = {
-            "aweme_id": aweme_id,
-            "text": text
-        }
-        if video_url:
-            dynamic_params["referer"] = video_url
-            dynamic_params["root_referer"] = video_url
-
-        # Не даём build_url подмешать потенциально старый X-Bogus из cookies
-        cookies_for_signature = {k: v for k, v in cookies_dict.items() if k.lower() not in {"x-bogus", "x_bogus"}}
-        sign_url = build_unsigned_request_url(profile, dynamic_params, cookies=cookies_for_signature)
-
-        # Шаг 3: Генерируем X-Bogus подпись по полному URL
-        logger.info("[NETWORK] Запрос генерации X-Bogus подписи через JS Inject...")
-        x_bogus = await generate_x_bogus(page, sign_url)
-
-        if not x_bogus:
-            logger.warning("[NETWORK] Не удалось сгенерировать X-Bogus — переключаемся на UI/fallback.")
-            return None
-
-        # Шаг 4: Инициализируем клиент (cookies/headers подтянутся из page)
+        # Делегируем подпись POST-запроса (query + form body) нативному window.fetch страницы
         logger.debug("[NETWORK] Инициализация PlaywrightHttpClient из page...")
         http_client = await PlaywrightHttpClient.from_page(page)
 
-        # Передаем X-Bogus в запрос (query params) и пробрасываем cookies для единообразия
         success, comment_id, error_msg, error_type = await http_client.publish_main_comment(
             aweme_id=aweme_id,
             text=text,
             video_url=video_url,
             cookies=cookies_dict,
-            **{"X-Bogus": x_bogus}  # попадет в dynamic_params как query param
         )
         
         if success and comment_id:
@@ -161,25 +137,6 @@ async def reply_comment_via_network(page, parent_comment_id: str, text: str, art
         cookies_list = await page.context.cookies()
         cookies_dict = _cookies_list_to_dict(cookies_list)
 
-        profile = RequestProfile.publish_reply_profile()
-        dynamic_params = {
-            "aweme_id": aweme_id,
-            "reply_id": parent_comment_id,
-            "text": text
-        }
-        if video_url:
-            dynamic_params["referer"] = video_url
-            dynamic_params["root_referer"] = video_url
-
-        cookies_for_signature = {k: v for k, v in cookies_dict.items() if k.lower() not in {"x-bogus", "x_bogus"}}
-        sign_url = build_unsigned_request_url(profile, dynamic_params, cookies=cookies_for_signature)
-
-        logger.info("[NETWORK] (reply) Генерация X-Bogus через JS Inject...")
-        x_bogus = await generate_x_bogus(page, sign_url)
-        if not x_bogus:
-            logger.warning("[NETWORK] (reply) Не удалось сгенерировать X-Bogus — fallback на DOM.")
-            return None
-
         http_client = await PlaywrightHttpClient.from_page(page)
         success, comment_id, error_msg, error_type, _reply_meta = await http_client.reply_comment(
             aweme_id=aweme_id,
@@ -187,7 +144,6 @@ async def reply_comment_via_network(page, parent_comment_id: str, text: str, art
             text=text,
             video_url=video_url,
             cookies=cookies_dict,
-            **{"X-Bogus": x_bogus}
         )
 
         if success and comment_id:

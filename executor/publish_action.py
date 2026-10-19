@@ -14,6 +14,8 @@ from typing import Any, Awaitable, Callable, Dict, Optional, Tuple
 from patchright.async_api import Page, Response
 
 from executor.dom_actions import (
+    _JS_DIAGNOSE_PAGE,
+    _JS_REPLY_SEND_CONTROL_GUARD,
     DomActionResult,
     atomic_set_comment_text,
     comment_input_contains_expected_text,
@@ -35,6 +37,7 @@ from executor.dom_actions import (
 from executor.captcha_detector import detect_captcha
 from executor.session_bootstrap import get_browser_login_state
 from config.settings import get_settings
+from executor.http.execution_policy import http_first_enabled
 
 logger = logging.getLogger("executor.publish_action")
 
@@ -46,10 +49,14 @@ _REPLY_TYPING_MAX_SECONDS = 18.0
 _REPLY_TYPING_RETRY_MAX_SECONDS = 10.0
 _REPLY_POST_TYPING_SEND_GRACE_SECONDS = max(
     5.0,
-    min(30.0, float(os.getenv("REPLY_POST_TYPING_SEND_GRACE_SECONDS", "15"))),
+    min(30.0, float(os.getenv("REPLY_POST_TYPING_SEND_GRACE_SECONDS", "20"))),
 )
 _PARALLEL_POST_RESPONSE_WAIT_SECONDS = float(os.getenv("PARALLEL_POST_RESPONSE_WAIT_SECONDS", "2.5"))
 _PARALLEL_POST_RESPONSE_GRACE_SECONDS = float(os.getenv("PARALLEL_POST_RESPONSE_GRACE_SECONDS", "0.75"))
+_CAPTCHA_PROBE_HARD_TIMEOUT_SECONDS = max(
+    0.5,
+    min(3.0, float(os.getenv("CAPTCHA_PROBE_HARD_TIMEOUT_SECONDS", "1.25"))),
+)
 _TRUE_ENV_VALUES = {"1", "true", "yes", "on"}
 _TIKTOK_MEDIA_ID_RE = re.compile(r"(?:/(?:video|photo)/|[?&](?:aweme_id|item_id)=)(\d+)", re.IGNORECASE)
 _PARALLEL_FAST_PUBLISH_MARKERS = (
@@ -180,9 +187,10 @@ def _post_click_fallback_selector(*, reply_scoped: bool) -> str:
     if reply_scoped:
         return '[data-smart-reply-post="1"]'
     return (
-        '[data-smart-id="comment-post-ready"], '
-        '[data-smart-id="comment-post"], '
-        '[data-e2e="comment-post"]'
+        '[data-smart-main-post="1"]:not([data-smart-reply-post="1"]), '
+        '[data-smart-id="comment-post-ready"]:not([data-smart-reply-post="1"]), '
+        '[data-smart-id="comment-post"]:not([data-smart-reply-post="1"]), '
+        '[data-e2e="comment-post"]:not([data-smart-reply-post="1"])'
     )
 
 
@@ -258,6 +266,26 @@ def _publish_response_matches_current_request(captured: Dict[str, Any], response
         captured["ignored_response_post_data_mismatch"] = True
         return False
     return True
+
+
+def _unread_publish_response_result(
+    captured: Dict[str, Any], *, started: float, strategy: Optional[str], post_was_enabled: bool,
+) -> Optional[PublishResult]:
+    if not captured.get("url") or "body" in captured:
+        return None
+    # Headers prove that a response arrived, but do not prove its body is
+    # empty. In particular, cancelling response.text() at the deadline is not
+    # a TikTok rejection and must not trigger another publication attempt.
+    return PublishResult(
+        status="timeout",
+        error_reason="publish_response_body_unavailable",
+        network_captured=True,
+        network_request_attempted=bool(captured.get("request_url")),
+        network_status_code=captured.get("status"),
+        elapsed_seconds=time.monotonic() - started,
+        dom_strategy=strategy,
+        post_was_enabled_at_click=post_was_enabled,
+    )
 
 
 async def _yield_to_publish_listener_tasks(listener_tasks: set) -> None:
@@ -472,6 +500,101 @@ _JS_COMPOSER_CLEARED_V2 = r"""
 """
 
 
+# Reads whether a visible comment/reply "Post" button is still ENABLED (red).
+# TikTok disables (greys out) the Post button the instant a comment is actually
+# submitted, and re-enables it only when the editor state holds text. So a still
+# enabled Post button together with a visually-empty composer means the text is
+# still queued in TikTok's editor model and nothing was sent (the desync the
+# user reported: "text vanished but counter shows 55/2200 and Post is red").
+_JS_POST_BUTTON_ENABLED = r"""
+([replyScoped]) => {
+    __REPLY_SEND_CONTROL_GUARD__
+    const visible = (el) => {
+        if (!el || !el.getBoundingClientRect) return false;
+        const r = el.getBoundingClientRect();
+        const st = getComputedStyle(el);
+        return r.width > 0 && r.height > 0 && st.display !== 'none' && st.visibility !== 'hidden';
+    };
+    const disabled = (el) => {
+        if (!el) return true;
+        const st = getComputedStyle(el);
+        return el.hasAttribute('disabled') ||
+            el.getAttribute('aria-disabled') === 'true' ||
+            (el.classList && el.classList.contains('disabled')) ||
+            st.pointerEvents === 'none' ||
+            parseFloat(st.opacity || '1') < 0.45;
+    };
+    let root = document;
+    let selectors;
+    if (replyScoped) {
+        const composer = document.querySelector('[data-smart-reply-input="1"]');
+        let container = null;
+        for (let cur = composer, depth = 0; cur && depth < 6; cur = cur.parentElement, depth++) {
+            if (cur.querySelector && cur.querySelector('[data-smart-reply-post="1"], [data-e2e="comment-post"]')) {
+                container = cur;
+                break;
+            }
+        }
+        if (container) {
+            root = container;
+            selectors = ['[data-smart-reply-post="1"]', '[data-e2e="comment-post"]'];
+        } else {
+            // No reply container resolved: restrict to the reply-specific marker
+            // so we never mistake the MAIN composer's Post button for the reply's.
+            root = document;
+            selectors = ['[data-smart-reply-post="1"]'];
+        }
+    } else {
+        const composer =
+            document.querySelector('[data-smart-main-input="1"]:not([data-smart-reply-input="1"])') ||
+            document.querySelector(
+                '[data-smart-id="comment-input"]:not([data-smart-reply-input="1"]):not([data-smart-reply-anchor-token])'
+            );
+        const scopedSelectors = [
+            '[data-smart-id="comment-post-ready"]:not([data-smart-reply-post="1"])',
+            '[data-smart-main-post="1"]:not([data-smart-reply-post="1"])',
+            '[data-smart-id="comment-post"]:not([data-smart-reply-post="1"])',
+            '[data-e2e="comment-post"]:not([data-smart-reply-post="1"])',
+            '[data-e2e*="comment-post"]:not([data-smart-reply-post="1"])',
+            '[data-e2e="post-comment-button"]:not([data-smart-reply-post="1"])'
+        ];
+        let container = null;
+        for (let cur = composer, depth = 0; cur && depth < 7; cur = cur.parentElement, depth++) {
+            if (cur.querySelector && cur.querySelector(scopedSelectors.join(', '))) {
+                container = cur;
+                break;
+            }
+        }
+        if (container) {
+            root = container;
+            selectors = scopedSelectors;
+        } else {
+            // Without a resolved MAIN composer only trust explicit MAIN markers.
+            // A document-wide generic comment-post selector can otherwise pick
+            // a reply composer and falsely report that the main Post is enabled.
+            selectors = [
+                '[data-smart-id="comment-post-ready"]:not([data-smart-reply-post="1"])',
+                '[data-smart-main-post="1"]:not([data-smart-reply-post="1"])'
+            ];
+        }
+    }
+    let found = false;
+    for (const sel of selectors) {
+        const btns = root.querySelectorAll ? root.querySelectorAll(sel) : [];
+        for (const b of btns) {
+            if (!visible(b) || (replyScoped && isNonSendReplyControl(b))) continue;
+            found = true;
+            // Several stale/duplicate TikTok nodes can be visible briefly. A
+            // disabled first match must not mask the enabled button bonded to
+            // the current composer.
+            if (!disabled(b)) return { found: true, enabled: true };
+        }
+    }
+    return { found, enabled: false };
+}
+""".replace("__REPLY_SEND_CONTROL_GUARD__", _JS_REPLY_SEND_CONTROL_GUARD)
+
+
 _JS_CLEAR_REPLY_COMMENT_COMPOSER = r"""
 () => {
     const visible = (el) => {
@@ -659,6 +782,51 @@ async def _composer_cleared_state(page: Page, *, reply_scoped: bool) -> Dict[str
     return {"exists": False, "empty": False, "text": ""}
 
 
+async def _post_button_still_enabled(page: Page, *, reply_scoped: bool) -> Optional[bool]:
+    """Return True if the Post button is still visibly enabled (red), False if it
+    is disabled/absent, or None if the probe failed.
+
+    Used to tell apart a real submit (TikTok greys out Post) from the stuck
+    desync where the visible text vanished but TikTok still holds it (Post stays
+    red / character counter non-zero) and nothing was actually sent.
+    """
+    try:
+        result = await page.evaluate(_JS_POST_BUTTON_ENABLED, [bool(reply_scoped)])
+        if isinstance(result, dict):
+            if not result.get("found"):
+                return False
+            return bool(result.get("enabled"))
+    except Exception as exc:
+        logger.debug("[PUBLISH] post-button-enabled probe failed: %s", str(exc)[:120])
+        return None
+    return None
+
+
+async def _composer_empty_but_post_still_enabled(
+    page: Page,
+    *,
+    reply_scoped: bool,
+    request_attempted: bool,
+) -> bool:
+    """Confirm the TikTok editor-model desync with two stable UI probes."""
+    if request_attempted:
+        return False
+    post_enabled_after = await _post_button_still_enabled(
+        page,
+        reply_scoped=reply_scoped,
+    )
+    if post_enabled_after is not True:
+        return False
+    # Avoid classifying the short transition immediately after a real click as
+    # a failure. The desync is considered proven only while Post stays enabled.
+    await asyncio.sleep(0.6)
+    post_enabled_after = await _post_button_still_enabled(
+        page,
+        reply_scoped=reply_scoped,
+    )
+    return post_enabled_after is True
+
+
 async def _main_comment_handle_state(input_handle: Any) -> Dict[str, Any]:
     """Read state from the exact main composer handle instead of re-scanning DOM."""
     if input_handle is None:
@@ -729,11 +897,31 @@ async def _main_comment_handle_state(input_handle: Any) -> Dict[str, Any]:
                 const text = String(rawText || '').trim();
                 const lower = text.toLowerCase();
                 const isPlaceholder = placeholderMarkers.some(m => lower.startsWith(m));
-                const post = document.querySelector(
-                    '[data-smart-id="comment-post-ready"], [data-smart-main-post="1"], ' +
-                    '[data-smart-id="comment-post"], [data-e2e="comment-post"], ' +
-                    '[data-e2e*="comment-post"], [data-e2e="post-comment-button"]'
+                const postSelectors = [
+                    '[data-smart-main-post="1"]',
+                    '[data-smart-id="comment-post-ready"]',
+                    '[data-smart-id="comment-post"]',
+                    '[data-e2e="comment-post"]',
+                    '[data-e2e*="comment-post"]',
+                    '[data-e2e="post-comment-button"]'
+                ].join(', ');
+                const isMarkedReplyPost = (el) => Boolean(
+                    el && el.closest && el.closest(
+                        '[data-smart-reply-post="1"], [data-smart-reply-input="1"], ' +
+                        '[data-smart-reply-composer="1"], [data-smart-reply-anchor-token]'
+                    )
                 );
+                let post = null;
+                for (let cur = editor, depth = 0; cur && cur !== document.body && depth < 8; cur = cur.parentElement, depth++) {
+                    if (!cur.querySelectorAll) continue;
+                    const candidates = [...cur.querySelectorAll(postSelectors)].filter(
+                        candidate => visible(candidate) && !isMarkedReplyPost(candidate)
+                    );
+                    if (candidates.length) {
+                        post = candidates.find(candidate => candidate.getAttribute('data-smart-main-post') === '1') || candidates[0];
+                        break;
+                    }
+                }
                 const postDisabled = post ? (
                     post.hasAttribute('disabled') ||
                     post.getAttribute('aria-disabled') === 'true' ||
@@ -901,16 +1089,27 @@ async def _clear_main_comment_composer_handle_trusted(
     reason: str,
     expected_video_url: Optional[str] = None,
     correlation_id: Optional[str] = None,
-    timeout_seconds: float = 1.2,
+    timeout_seconds: float = 3.5,
 ) -> bool:
-    deadline = time.monotonic() + max(0.2, timeout_seconds)
+    started = time.monotonic()
+    deadline = started + max(0.0, timeout_seconds)
+    phase = "focus"
+
+    async def _step(awaitable: Any, name: str) -> Any:
+        nonlocal phase
+        phase = name
+        # Share the caller's budget instead of cancelling individual browser
+        # round trips at 250-450ms even when most of that budget remains.
+        return await _asyncio_wait_for(awaitable, timeout=max(0.0, deadline - time.monotonic()))
+
+    _log_publish_trace(
+        "main_handle_clear_start", page=page, expected_video_url=expected_video_url,
+        correlation_id=correlation_id, reason=reason, timeout_seconds=round(timeout_seconds, 2),
+    )
     try:
-        focus_state = await _asyncio_wait_for(
-            _focus_main_comment_handle_for_keyboard(page, input_handle),
-            timeout=max(0.1, min(0.45, deadline - time.monotonic())),
-        )
+        focus_state = await _step(_focus_main_comment_handle_for_keyboard(page, input_handle), "focus")
     except Exception as exc:
-        focus_state = {"ok": False, "reason": f"focus_timeout_or_error:{str(exc)[:80]}"}
+        focus_state = {"ok": False, "reason": f"focus_timeout_or_error:{type(exc).__name__}:{str(exc)[:80]}"}
 
     if not isinstance(focus_state, dict) or not focus_state.get("ok"):
         _log_publish_trace(
@@ -922,13 +1121,14 @@ async def _clear_main_comment_composer_handle_trusted(
             focus_reason=str(focus_state.get("reason") if isinstance(focus_state, dict) else "focus_failed"),
             active_tag=focus_state.get("activeTag") if isinstance(focus_state, dict) else None,
             active_e2e=focus_state.get("activeE2e") if isinstance(focus_state, dict) else None,
+            elapsed=round(time.monotonic() - started, 2),
             level=logging.WARNING,
         )
         return False
 
     try:
-        await page.keyboard.press("Control+A")
-        await page.keyboard.press("Backspace")
+        await _step(page.keyboard.press("Control+A"), "select_text")
+        await _step(page.keyboard.press("Backspace"), "delete_text")
     except Exception as exc:
         _log_publish_trace(
             "main_handle_clear_keyboard_failed",
@@ -936,7 +1136,9 @@ async def _clear_main_comment_composer_handle_trusted(
             expected_video_url=expected_video_url,
             correlation_id=correlation_id,
             reason=reason,
-            error=str(exc)[:120],
+            error=f"{type(exc).__name__}:{str(exc)[:100]}",
+            phase=phase,
+            elapsed=round(time.monotonic() - started, 2),
             level=logging.WARNING,
         )
         return False
@@ -953,34 +1155,34 @@ async def _clear_main_comment_composer_handle_trusted(
         return False
 
     try:
-        state = await _asyncio_wait_for(
-            _main_comment_handle_state(input_handle),
-            timeout=max(0.1, min(0.35, deadline - time.monotonic())),
-        )
+        state = await _step(_main_comment_handle_state(input_handle), "confirm_empty")
     except Exception:
         state = {}
     text = str(state.get("text") or "") if isinstance(state, dict) else ""
     cleared = bool(
         isinstance(state, dict)
         and state.get("exists")
+        and state.get("visible") is not False
         and (state.get("empty") or _looks_like_comment_placeholder_text(text))
     )
-    if cleared and deadline - time.monotonic() > 0.18:
-        await asyncio.sleep(0.15)
-        try:
-            state2 = await _asyncio_wait_for(
-                _main_comment_handle_state(input_handle),
-                timeout=max(0.1, min(0.25, deadline - time.monotonic())),
+    if cleared:
+        if deadline - time.monotonic() <= 0.15:
+            cleared = False
+            phase = "stable_empty_budget_exhausted"
+        else:
+            await asyncio.sleep(0.15)
+            try:
+                state2 = await _step(_main_comment_handle_state(input_handle), "confirm_stable_empty")
+            except Exception:
+                state2 = {}
+            text2 = str(state2.get("text") or "") if isinstance(state2, dict) else ""
+            cleared = bool(
+                isinstance(state2, dict)
+                and state2.get("exists")
+                and state2.get("visible") is not False
+                and (state2.get("empty") or _looks_like_comment_placeholder_text(text2))
             )
-        except Exception:
-            state2 = {}
-        text2 = str(state2.get("text") or "") if isinstance(state2, dict) else ""
-        cleared = bool(
-            isinstance(state2, dict)
-            and state2.get("exists")
-            and (state2.get("empty") or _looks_like_comment_placeholder_text(text2))
-        )
-        state = state2 if isinstance(state2, dict) else state
+            state = state2 if isinstance(state2, dict) else state
 
     _log_publish_trace(
         "main_handle_trusted_clear",
@@ -992,6 +1194,8 @@ async def _clear_main_comment_composer_handle_trusted(
         text_len=len(str(state.get("text") or "")) if isinstance(state, dict) else None,
         focus_ok=bool(state.get("focusOk")) if isinstance(state, dict) else None,
         post_disabled=state.get("postDisabled") if isinstance(state, dict) else None,
+        phase=phase,
+        elapsed=round(time.monotonic() - started, 2),
         level=logging.INFO if cleared else logging.WARNING,
     )
     return cleared
@@ -1003,7 +1207,7 @@ async def _clear_main_comment_composer_best_effort(
     reason: str,
     expected_video_url: Optional[str] = None,
     correlation_id: Optional[str] = None,
-    timeout_seconds: float = 1.2,
+    timeout_seconds: float = 3.5,
     input_handle: Optional[Any] = None,
 ) -> bool:
     """Clear dirty main composer state before retrying another variant/account.
@@ -1085,7 +1289,7 @@ async def _ensure_main_comment_composer_clean_before_typing(
     reason: str,
     expected_video_url: Optional[str] = None,
     correlation_id: Optional[str] = None,
-    timeout_seconds: float = 1.2,
+    timeout_seconds: float = 3.5,
     input_handle: Optional[Any] = None,
 ) -> bool:
     """Make a main-comment composer boundary explicit before typing a variant.
@@ -1095,20 +1299,7 @@ async def _ensure_main_comment_composer_clean_before_typing(
     eventual public comment is old text + new text. This guard forces a delete
     event and blocks only when a known dirty composer cannot be cleaned.
     """
-    try:
-        state = await _asyncio_wait_for(
-            _composer_cleared_state_for_publish(
-                page,
-                reply_scoped=False,
-                input_handle=input_handle,
-            ),
-            timeout=max(0.1, min(0.45, timeout_seconds)),
-        )
-    except Exception:
-        state = {}
-    if not isinstance(state, dict):
-        state = {}
-
+    deadline = time.monotonic() + max(0.0, timeout_seconds)
     trusted_cleared = await _clear_main_comment_composer_best_effort(
         page,
         reason=reason,
@@ -1119,6 +1310,22 @@ async def _ensure_main_comment_composer_clean_before_typing(
     )
     if trusted_cleared:
         return True
+
+    # This read only explains a failure. Reading before the mandatory keyboard
+    # clear added a browser round trip to every successful publication.
+    try:
+        state = await _asyncio_wait_for(
+            _composer_cleared_state_for_publish(
+                page,
+                reply_scoped=False,
+                input_handle=input_handle,
+            ),
+            timeout=max(0.0, min(0.45, deadline - time.monotonic())),
+        )
+    except Exception:
+        state = {}
+    if not isinstance(state, dict):
+        state = {}
 
     state_text = str(state.get("text") or "")
     state_empty = bool(state.get("empty") or _looks_like_comment_placeholder_text(state_text))
@@ -1141,11 +1348,15 @@ async def reset_main_comment_composer_for_next_variant(
     *,
     expected_video_url: Optional[str] = None,
     correlation_id: Optional[str] = None,
-    timeout_seconds: float = 2.0,
+    timeout_seconds: float = 4.0,
     comment_surface_ready: bool = True,
 ) -> bool:
     """One bounded main-composer reset before reusing the same page for another variant."""
     started = time.monotonic()
+    _log_publish_trace(
+        "main_series_reset_start", page=page, expected_video_url=expected_video_url,
+        correlation_id=correlation_id, timeout_seconds=timeout_seconds,
+    )
 
     def _remaining() -> float:
         return timeout_seconds - (time.monotonic() - started)
@@ -1171,12 +1382,16 @@ async def reset_main_comment_composer_for_next_variant(
             input_handle, input_info = await _asyncio_wait_for(
                 find_comment_input_smart(
                     page,
-                    max_total_seconds=max(0.2, min(0.8, _remaining())),
+                    # The page surface has already proved that the composer is
+                    # visible.  Give the one-round-trip exact rebind enough
+                    # wall time to cross a busy Patchright transport; 0.8s was
+                    # below observed browser latency and produced false closes.
+                    max_total_seconds=max(0.2, min(2.2, _remaining())),
                     aggressive=True,
                     skip_initial_open=comment_surface_ready,
                     main_comment_aggressive=True,
                 ),
-                timeout=max(0.25, min(0.95, _remaining())),
+                timeout=max(0.25, min(2.4, _remaining())),
             )
             if input_handle:
                 break
@@ -1215,7 +1430,7 @@ async def reset_main_comment_composer_for_next_variant(
         reason="main_series_reset_for_next_variant",
         expected_video_url=expected_video_url,
         correlation_id=correlation_id,
-        timeout_seconds=max(0.3, min(1.2, _remaining())),
+        timeout_seconds=max(0.0, min(3.5, _remaining())),
         input_handle=input_handle,
     )
     _log_publish_trace(
@@ -1766,9 +1981,26 @@ async def _captcha_result_or_cleared_if_present(
     started: float,
     *,
     dom_strategy: Optional[str] = None,
+    probe_timeout_seconds: Optional[float] = _CAPTCHA_PROBE_HARD_TIMEOUT_SECONDS,
 ) -> tuple[Optional[PublishResult], bool]:
     try:
-        has_captcha, captcha_type = await detect_captcha(page, wait_ms=0)
+        detector = detect_captcha(page, wait_ms=0)
+        if probe_timeout_seconds is None:
+            has_captcha, captcha_type = await detector
+        else:
+            has_captcha, captcha_type = await _await_hard_timeout(
+                detector,
+                timeout=max(0.2, float(probe_timeout_seconds)),
+            )
+    except _HardTimeoutError:
+        # A positive challenge result is still terminal below. This branch only
+        # prevents a stuck page.evaluate from freezing a reply that has already
+        # been located; publish has several further challenge guards before click.
+        logger.info(
+            "[PUBLISH] Captcha DOM probe exceeded %.2fs; continuing to the next guarded check.",
+            float(probe_timeout_seconds or 0.0),
+        )
+        return None, False
     except Exception as exc:
         logger.debug("[PUBLISH] Captcha detector failed: %s", exc)
         return None, False
@@ -1797,11 +2029,13 @@ async def _captcha_result_if_present(
     started: float,
     *,
     dom_strategy: Optional[str] = None,
+    probe_timeout_seconds: Optional[float] = _CAPTCHA_PROBE_HARD_TIMEOUT_SECONDS,
 ) -> Optional[PublishResult]:
     result, _cleared = await _captcha_result_or_cleared_if_present(
         page,
         started,
         dom_strategy=dom_strategy,
+        probe_timeout_seconds=probe_timeout_seconds,
     )
     return result
 
@@ -2492,7 +2726,7 @@ _JS_MAIN_COMMENT_DIRECT_POST_CLICK = r"""
     const rawButtons = [];
     const seenButtons = new Set();
     const addButton = (raw) => {
-        if (!raw || seenButtons.has(raw) || !visible(raw)) return;
+        if (!raw || seenButtons.has(raw) || !visible(raw) || replyScoped(raw)) return;
         seenButtons.add(raw);
         rawButtons.push(raw);
     };
@@ -2541,7 +2775,7 @@ _JS_MAIN_COMMENT_DIRECT_POST_CLICK = r"""
             label.includes('\u043e\u0442\u043f\u0440\u0430\u0432');
         if (!looksPost) continue;
         const target = clickTargetFor(raw);
-        if (!target) continue;
+        if (!target || replyScoped(target)) continue;
         post = target;
         rawPost = raw;
         break;
@@ -2558,6 +2792,7 @@ _JS_MAIN_COMMENT_DIRECT_POST_CLICK = r"""
     }
 
     try { post.setAttribute('data-smart-id', 'comment-post-ready'); } catch (_) {}
+    try { post.setAttribute('data-smart-main-post', '1'); } catch (_) {}
     try { post.scrollIntoView({block:'center', inline:'center'}); } catch (_) {}
     const r = post.getBoundingClientRect();
     const cx = r.left + r.width / 2;
@@ -2788,6 +3023,7 @@ _JS_REPLY_SCOPED_TEXT_MATCH = r"""
 
 _JS_REPLY_DIRECT_POST_CLICK = r"""
 ([expected]) => {
+    __REPLY_SEND_CONTROL_GUARD__
     const normalizeText = (value) => String(value || '').replace(/\s+/g, ' ').trim();
     const expectedText = normalizeText(expected);
     const placeholderMarkers = [
@@ -2844,7 +3080,7 @@ _JS_REPLY_DIRECT_POST_CLICK = r"""
     }
 
     const clickTargetFor = (raw) => {
-        if (!raw) return null;
+        if (!raw || isNonSendReplyControl(raw)) return null;
         const candidates = [
             raw,
             raw.closest && raw.closest('button'),
@@ -2855,7 +3091,7 @@ _JS_REPLY_DIRECT_POST_CLICK = r"""
         ].filter(Boolean);
         const seen = new Set();
         for (const el of candidates) {
-            if (!el || seen.has(el) || !visible(el)) continue;
+            if (!el || seen.has(el) || !visible(el) || isNonSendReplyControl(el)) continue;
             seen.add(el);
             if (!composer.contains(el)) continue;
             const r = el.getBoundingClientRect();
@@ -2868,7 +3104,7 @@ _JS_REPLY_DIRECT_POST_CLICK = r"""
     let post = null;
     let rawPost = null;
     const markedPost = document.querySelector('[data-smart-reply-post="1"]');
-    if (markedPost && visible(markedPost) && composer.contains(markedPost) && !disabled(markedPost)) {
+    if (markedPost && !isNonSendReplyControl(markedPost) && visible(markedPost) && composer.contains(markedPost) && !disabled(markedPost)) {
         post = markedPost;
         rawPost = markedPost;
     }
@@ -2935,7 +3171,7 @@ _JS_REPLY_DIRECT_POST_CLICK = r"""
         y: Math.round(cy),
     };
 }
-"""
+""".replace("__REPLY_SEND_CONTROL_GUARD__", _JS_REPLY_SEND_CONTROL_GUARD)
 
 
 def _normalize_publish_text(value: str) -> str:
@@ -3751,7 +3987,7 @@ async def _publish_main_comment_direct_dom(
         previous_reason=previous_reason,
     )
 
-    preclean_timeout = min(1.2, max(0.2, _remaining() - 3.0))
+    preclean_timeout = min(3.5, max(0.2, _remaining() - 3.0))
     if preclean_timeout > 0:
         preclean_ok = await _ensure_main_comment_composer_clean_before_typing(
             page,
@@ -3840,6 +4076,7 @@ async def _publish_main_comment_direct_dom(
 
     captured: Dict[str, Any] = {}
     event = asyncio.Event()
+    response_complete = asyncio.Event()
     listener_tasks = set()
 
     def _consume_listener_task(task: asyncio.Task) -> None:
@@ -3872,6 +4109,7 @@ async def _publish_main_comment_direct_dom(
         except Exception as exc:
             captured["body_error"] = str(exc)[:100]
         finally:
+            response_complete.set()
             event.set()
 
     def on_response(response: Response):
@@ -3957,6 +4195,28 @@ async def _publish_main_comment_direct_dom(
                         status="success",
                         comment_id=comment_id,
                         network_captured=True,
+                        network_request_attempted=True,
+                        network_status_code=captured.get("status"),
+                        network_body_preview=body_preview,
+                        network_response_json=response_json,
+                        elapsed_seconds=elapsed,
+                        dom_strategy=strategy,
+                        post_was_enabled_at_click=True,
+                        composer_clean_after_submit=composer_clean_after_submit,
+                    )
+                status_code = _extract_tiktok_status_code(response_json)
+                if status_code is not None and status_code != 0:
+                    composer_clean_after_submit = await _cleanup_composer_after_ambiguous_submit(
+                        page,
+                        reply_scoped=False,
+                        reason=f"api_error_status_code={status_code}",
+                        expected_video_url=expected_video_url,
+                        correlation_id=correlation_id,
+                    )
+                    return PublishResult(
+                        status="failed",
+                        error_reason=f"api_error_status_code={status_code}",
+                        network_captured=bool(captured.get("url")),
                         network_request_attempted=True,
                         network_status_code=captured.get("status"),
                         network_body_preview=body_preview,
@@ -4063,11 +4323,20 @@ async def _publish_main_comment_direct_dom(
             except asyncio.TimeoutError:
                 pass
         await _yield_to_publish_listener_tasks(listener_tasks)
-        if captured.get("request_url") and not captured.get("url"):
+        if captured.get("request_url") and not response_complete.is_set():
             grace = min(_PARALLEL_POST_RESPONSE_GRACE_SECONDS, max(_remaining(), 0.0))
             if grace > 0:
-                await asyncio.sleep(grace)
+                try:
+                    await asyncio.wait_for(response_complete.wait(), timeout=grace)
+                except asyncio.TimeoutError:
+                    pass
                 await _yield_to_publish_listener_tasks(listener_tasks)
+
+        unread_result = _unread_publish_response_result(
+            captured, started=started, strategy=combined_strategy, post_was_enabled=post_was_enabled,
+        )
+        if unread_result is not None:
+            return unread_result
 
         if captured.get("url"):
             elapsed = time.monotonic() - started
@@ -4096,6 +4365,28 @@ async def _publish_main_comment_direct_dom(
                 return PublishResult(
                     status="success",
                     comment_id=comment_id,
+                    network_captured=True,
+                    network_request_attempted=True,
+                    network_status_code=captured.get("status"),
+                    network_body_preview=body_preview,
+                    network_response_json=response_json,
+                    elapsed_seconds=elapsed,
+                    dom_strategy=combined_strategy,
+                    post_was_enabled_at_click=post_was_enabled,
+                    composer_clean_after_submit=composer_clean_after_submit,
+                )
+            status_code = _extract_tiktok_status_code(response_json)
+            if status_code is not None and status_code != 0:
+                composer_clean_after_submit = await _cleanup_composer_after_ambiguous_submit(
+                    page,
+                    reply_scoped=False,
+                    reason=f"api_error_status_code={status_code}",
+                    expected_video_url=expected_video_url,
+                    correlation_id=correlation_id,
+                )
+                return PublishResult(
+                    status="failed",
+                    error_reason=f"api_error_status_code={status_code}",
                     network_captured=True,
                     network_request_attempted=True,
                     network_status_code=captured.get("status"),
@@ -4177,6 +4468,32 @@ async def _publish_main_comment_direct_dom(
         request_attempted = bool(captured.get("request_url"))
         elapsed = time.monotonic() - started
         if post_was_enabled and cleared.get("exists") and cleared.get("empty"):
+            if await _composer_empty_but_post_still_enabled(
+                page,
+                reply_scoped=False,
+                request_attempted=request_attempted,
+            ):
+                _log_publish_trace(
+                    "publish_result",
+                    page=page,
+                    expected_video_url=expected_video_url,
+                    correlation_id=correlation_id,
+                    status="failed",
+                    reason="composer_empty_but_post_still_enabled",
+                    request_attempted=request_attempted,
+                    post_was_enabled=post_was_enabled,
+                    elapsed=round(elapsed, 2),
+                )
+                return PublishResult(
+                    status="failed",
+                    error_reason="composer_empty_but_post_still_enabled",
+                    network_captured=False,
+                    network_request_attempted=False,
+                    elapsed_seconds=elapsed,
+                    dom_strategy=combined_strategy,
+                    post_was_enabled_at_click=post_was_enabled,
+                    composer_clean_after_submit=False,
+                )
             _log_publish_trace(
                 "publish_result",
                 page=page,
@@ -4340,6 +4657,7 @@ async def _publish_reply_comment_direct_dom(
 
     captured: Dict[str, Any] = {}
     event = asyncio.Event()
+    response_complete = asyncio.Event()
     listener_tasks = set()
 
     def _consume_listener_task(task: asyncio.Task) -> None:
@@ -4372,6 +4690,7 @@ async def _publish_reply_comment_direct_dom(
         except Exception as exc:
             captured["body_error"] = str(exc)[:100]
         finally:
+            response_complete.set()
             event.set()
 
     def on_response(response: Response):
@@ -4486,11 +4805,20 @@ async def _publish_reply_comment_direct_dom(
             except asyncio.TimeoutError:
                 pass
         await _yield_to_publish_listener_tasks(listener_tasks)
-        if captured.get("request_url") and not captured.get("url"):
+        if captured.get("request_url") and not response_complete.is_set():
             grace = min(_PARALLEL_POST_RESPONSE_GRACE_SECONDS, max(_remaining(), 0.0))
             if grace > 0:
-                await asyncio.sleep(grace)
+                try:
+                    await asyncio.wait_for(response_complete.wait(), timeout=grace)
+                except asyncio.TimeoutError:
+                    pass
                 await _yield_to_publish_listener_tasks(listener_tasks)
+
+        unread_result = _unread_publish_response_result(
+            captured, started=started, strategy=combined_strategy, post_was_enabled=post_was_enabled,
+        )
+        if unread_result is not None:
+            return unread_result
 
         if captured.get("url"):
             elapsed = time.monotonic() - started
@@ -4677,13 +5005,30 @@ async def _recover_reply_send_only(
         return None
 
     exact_state = await _reply_target_input_exact_text_state(page, text)
-    if not exact_state.get("ok"):
+
+    async def _terminal_failure(reason: str) -> PublishResult:
+        # This recovery is the last send-only attempt. Once it fails, retaining
+        # the exact draft makes the next parent search reopen the same composer
+        # and can hide every other parent on the page.
+        composer_clean = await _clear_reply_comment_composer_best_effort(
+            page,
+            reason=reason,
+            expected_video_url=expected_video_url,
+            correlation_id=correlation_id,
+            timeout_seconds=0.8,
+        )
         return PublishResult(
             status="dom_error",
-            error_reason=f"reply_send_recovery_text_not_exact:{exact_state.get('reason') or 'unknown'}",
+            error_reason=reason,
             elapsed_seconds=time.monotonic() - started,
             network_request_attempted=False,
             post_was_enabled_at_click=False,
+            composer_clean_after_submit=composer_clean,
+        )
+
+    if not exact_state.get("ok"):
+        return await _terminal_failure(
+            f"reply_send_recovery_text_not_exact:{exact_state.get('reason') or 'unknown'}"
         )
 
     async def _find_candidate(stage: str) -> tuple[Optional[Any], DomActionResult]:
@@ -4745,13 +5090,7 @@ async def _recover_reply_send_only(
                 if str(recovery_reason or "").startswith("no_network_request_after_optimistic_reply_send")
                 else "reply_send_recovery_nudge_failed_after_disabled_gate"
             )
-            return PublishResult(
-                status="dom_error",
-                error_reason=nudge_reason,
-                elapsed_seconds=time.monotonic() - started,
-                network_request_attempted=False,
-                post_was_enabled_at_click=False,
-            )
+            return await _terminal_failure(nudge_reason)
         post_button, post_info = await _wait_enabled_candidate("after_forced_nudge_enabled")
         if not post_button:
             post_button, post_info = await _find_candidate("after_forced_nudge")
@@ -4770,17 +5109,14 @@ async def _recover_reply_send_only(
         if not post_button:
             post_button, post_info = await _find_candidate("after_nudge")
     if not post_button:
-        return PublishResult(
-            status="dom_error",
-            error_reason=f"reply_send_recovery_no_candidate:{getattr(post_info, 'reason', None) or 'unknown'}",
-            elapsed_seconds=time.monotonic() - started,
-            network_request_attempted=False,
-            post_was_enabled_at_click=False,
+        return await _terminal_failure(
+            f"reply_send_recovery_no_candidate:{getattr(post_info, 'reason', None) or 'unknown'}"
         )
     post_was_enabled = getattr(post_info, "strategy", None) == "enabled-check"
 
     captured: Dict[str, Any] = {}
     event = asyncio.Event()
+    response_complete = asyncio.Event()
     listener_tasks = set()
 
     def _consume_listener_task(task: asyncio.Task) -> None:
@@ -4813,6 +5149,7 @@ async def _recover_reply_send_only(
         except Exception as exc:
             captured["body_error"] = str(exc)[:100]
         finally:
+            response_complete.set()
             event.set()
 
     def on_response(response: Response):
@@ -4860,26 +5197,14 @@ async def _recover_reply_send_only(
         except Exception:
             clear_ok = None
         if clear_ok is False:
-            return PublishResult(
-                status="dom_error",
-                error_reason="reply_send_click_target_blocked",
-                elapsed_seconds=time.monotonic() - started,
-                network_request_attempted=False,
-                post_was_enabled_at_click=False,
-            )
+            return await _terminal_failure("reply_send_click_target_blocked")
         box = await post_button.bounding_box()
         if not box:
             post_button, post_info = await _find_candidate("after_missing_box")
             post_was_enabled = getattr(post_info, "strategy", None) == "enabled-check"
             box = await post_button.bounding_box() if post_button else None
         if not box:
-            return PublishResult(
-                status="dom_error",
-                error_reason="reply_send_recovery_button_not_visible",
-                elapsed_seconds=time.monotonic() - started,
-                network_request_attempted=False,
-                post_was_enabled_at_click=False,
-            )
+            return await _terminal_failure("reply_send_recovery_button_not_visible")
         x = box["x"] + box["width"] / 2
         y = box["y"] + box["height"] / 2
         _log_publish_trace(
@@ -4905,10 +5230,13 @@ async def _recover_reply_send_only(
         except asyncio.TimeoutError:
             pass
         await _yield_to_publish_listener_tasks(listener_tasks)
-        if captured.get("request_url") and not captured.get("url") and _remaining() > 0.1:
+        # Request receipt wakes the first wait. The response/body must use a
+        # separate event: waiting on the already-set request event returns
+        # immediately and removes listeners before the server can answer.
+        if captured.get("request_url") and not response_complete.is_set() and _remaining() > 0.1:
             try:
                 await asyncio.wait_for(
-                    event.wait(),
+                    response_complete.wait(),
                     timeout=min(_PARALLEL_POST_RESPONSE_GRACE_SECONDS, max(_remaining(), 0.1)),
                 )
             except asyncio.TimeoutError:
@@ -4917,6 +5245,12 @@ async def _recover_reply_send_only(
     finally:
         _detach_listener()
         await _cancel_and_drain_publish_listener_tasks(listener_tasks)
+
+    unread_result = _unread_publish_response_result(
+        captured, started=started, strategy=getattr(post_info, "strategy", None), post_was_enabled=post_was_enabled,
+    )
+    if unread_result is not None:
+        return unread_result
 
     elapsed = time.monotonic() - started
     body_preview = (captured.get("body") or "")[:200].replace("\n", " ")
@@ -5022,6 +5356,36 @@ async def _publish_via_current_input(
             dom_strategy=dom_strategy,
         )
 
+    async def _log_main_input_failure_diagnostic(phase: str, reason: Any) -> None:
+        if reply_scoped:
+            return
+        timeout = min(1.25, max(0.0, _remaining()))
+        if timeout <= 0.05:
+            return
+        try:
+            diag = await _await_hard_timeout(
+                page.evaluate(_JS_DIAGNOSE_PAGE),
+                timeout=timeout,
+            )
+        except Exception as exc:
+            diag = {"diagnostic_error": f"{type(exc).__name__}:{str(exc)[:100]}"}
+        _log_publish_trace(
+            "main_comment_input_failure_diagnostic",
+            page=page,
+            expected_video_url=expected_video_url,
+            correlation_id=correlation_id,
+            phase=phase,
+            reason=str(reason or "unknown")[:160],
+            ready_state=diag.get("readyState") if isinstance(diag, dict) else None,
+            editable_count=diag.get("editableCount") if isinstance(diag, dict) else None,
+            textarea_count=diag.get("textareaCount") if isinstance(diag, dict) else None,
+            editor_candidates=diag.get("dataE2eCommentElements") if isinstance(diag, dict) else None,
+            open_button_candidates=diag.get("commentTriggerCandidates") if isinstance(diag, dict) else None,
+            loading_candidates=diag.get("loadingCandidates") if isinstance(diag, dict) else None,
+            diagnostic_error=diag.get("diagnostic_error") if isinstance(diag, dict) else None,
+            level=logging.WARNING,
+        )
+
     early_confirmation_result: Any = None
     early_confirmation_confirmed = False
     early_confirmation_task: Optional[asyncio.Task] = None
@@ -5050,14 +5414,15 @@ async def _publish_via_current_input(
         wait_timeout = max(0.0, timeout_seconds)
         if wait_timeout <= 0:
             return
-        network_wait_task = None if require_response_url else asyncio.create_task(event.wait())
+        wait_event = response_complete if require_response_url else event
+        network_wait_task = asyncio.create_task(wait_event.wait())
         deadline = time.monotonic() + wait_timeout
         try:
             while time.monotonic() < deadline:
-                if require_response_url:
-                    if captured.get("url"):
-                        break
-                elif event.is_set():
+                # A response URL is available before response.text() finishes.
+                # Wait for the body as well, or a slow body looks like an empty
+                # rejection and its listener gets cancelled during parsing.
+                if wait_event.is_set():
                     break
                 waiters = set()
                 if network_wait_task is not None:
@@ -5147,6 +5512,26 @@ async def _publish_via_current_input(
 
     def _send_deadline_result(phase: str, dom_strategy: Optional[str] = None) -> PublishResult:
         return _deadline_result(f"reply_send_deadline:{phase}" if reply_scoped else phase, dom_strategy)
+
+    async def _bounded_shortcuts_cleanup(phase: str) -> None:
+        # This is optional housekeeping. Exact input/Post hit-tests and captcha
+        # guards still run, so a stalled global sweep must not strand a draft.
+        timeout = max(0.0, min(0.75 if aggressive else 1.0, _send_remaining()))
+        if timeout <= 0:
+            return
+        probe_started = time.monotonic()
+        _log_publish_trace(
+            "shortcuts_cleanup_start", page=page, expected_video_url=expected_video_url,
+            correlation_id=correlation_id, phase=phase, timeout_seconds=timeout,
+        )
+        try:
+            await _await_hard_timeout(suppress_keyboard_shortcuts_overlay(page), timeout=timeout)
+        except Exception as exc:
+            _log_publish_trace(
+                "shortcuts_cleanup_soft_failure", page=page, expected_video_url=expected_video_url,
+                correlation_id=correlation_id, phase=phase, reason=type(exc).__name__,
+                elapsed=round(time.monotonic() - probe_started, 2),
+            )
 
     def _typing_phase_timeout(*, retry: bool = False) -> float:
         remaining = _remaining()
@@ -5335,7 +5720,11 @@ async def _publish_via_current_input(
         correlation_id=correlation_id,
         text_len=len(text or ""),
     )
-    await suppress_keyboard_shortcuts_overlay(page)
+    reusing_reply_target = reply_scoped and reply_target is not None
+    # The caller already resolved this parent's editor. Its exact hit-test below
+    # handles blockers without another page-wide sweep before input can begin.
+    if not (reusing_reply_target or comment_surface_ready):
+        await _bounded_shortcuts_cleanup("before_input_search")
     captcha_result = await _captcha_result_if_present(page, started)
     if captcha_result:
         return captcha_result
@@ -5430,8 +5819,13 @@ async def _publish_via_current_input(
                     previous_reason="input_search_timeout",
                     level=logging.WARNING,
                 )
+            await _log_main_input_failure_diagnostic("input_search_timeout", "input_search_timeout")
             return _deadline_result("input_search")
     if _remaining() <= 0:
+        await _log_main_input_failure_diagnostic(
+            "after_input_search_deadline",
+            getattr(input_info, "reason", None),
+        )
         return _deadline_result("after_input_search", getattr(input_info, "strategy", None))
     if not input_handle:
         captcha_result, captcha_cleared = await _captcha_result_or_cleared_if_present(page, started)
@@ -5451,6 +5845,10 @@ async def _publish_via_current_input(
                 captcha_result = await _captcha_result_if_present(page, started)
                 if captcha_result:
                     return captcha_result
+                await _log_main_input_failure_diagnostic(
+                    "after_captcha_clear",
+                    getattr(input_info, "reason", None),
+                )
                 return PublishResult(
                     status="dom_error",
                     error_reason=f"input_not_found_after_captcha_clear: {input_info.reason}",
@@ -5485,6 +5883,10 @@ async def _publish_via_current_input(
                     previous_reason=input_info.reason,
                     level=logging.WARNING,
                 )
+            await _log_main_input_failure_diagnostic(
+                "input_not_found",
+                getattr(input_info, "reason", None),
+            )
             return PublishResult(
                 status="dom_error",
                 error_reason=f"input_not_found: {input_info.reason}",
@@ -5506,13 +5908,17 @@ async def _publish_via_current_input(
         elapsed=round(input_info.elapsed_seconds, 2),
     )
 
-    captcha_result = await _captcha_result_if_present(
-        page,
-        started,
-        dom_strategy=input_info.strategy,
-    )
-    if captcha_result:
-        return captcha_result
+    # A reused handle did not require a browser search since the initial guard.
+    # Keep the check after an actual search, and always recheck after the target
+    # hit-test immediately before typing.
+    if not reusing_reply_target:
+        captcha_result = await _captcha_result_if_present(
+            page,
+            started,
+            dom_strategy=input_info.strategy,
+        )
+        if captcha_result:
+            return captcha_result
 
     # dismiss_overlays intentionally removed here: calling it after finding the
     # input steals focus before type_into_comment runs. Overlays are dismissed
@@ -5539,7 +5945,7 @@ async def _publish_via_current_input(
                 timeout=max(0.1, min(_remaining(), 2.5 if aggressive else 3.0)),
             )
         except asyncio.TimeoutError:
-            if not main_comment_aggressive:
+            if not (main_comment_aggressive or reply_scoped):
                 return _deadline_result("input_clear", input_info.strategy)
             _log_publish_trace(
                 "input_clear_soft_timeout",
@@ -5548,6 +5954,7 @@ async def _publish_via_current_input(
                 correlation_id=correlation_id,
                 strategy=input_info.strategy,
                 remaining=round(_remaining(), 2),
+                reply_scoped=reply_scoped,
                 level=logging.WARNING,
             )
     captcha_result = await _captcha_result_if_present(
@@ -5564,7 +5971,7 @@ async def _publish_via_current_input(
             reason="main_current_input_pre_type_clean",
             expected_video_url=expected_video_url,
             correlation_id=correlation_id,
-            timeout_seconds=min(1.2, max(0.2, _remaining())),
+            timeout_seconds=min(3.5, max(0.0, _remaining())),
             input_handle=input_handle,
         )
         if not composer_clean_before_typing:
@@ -5620,6 +6027,11 @@ async def _publish_via_current_input(
     if typing_timeout <= 0 and not typed_ok:
         return _deadline_result("before_typing", input_info.strategy)
     if not typed_ok:
+        _log_publish_trace(
+            "input_typing_start", page=page, expected_video_url=expected_video_url,
+            correlation_id=correlation_id, strategy=input_info.strategy,
+            timeout_seconds=round(typing_timeout, 2), reply_scoped=reply_scoped,
+        )
         try:
             typing_wait = _await_hard_timeout if reply_scoped else _asyncio_wait_for
             typed_result = await typing_wait(
@@ -5861,8 +6273,9 @@ async def _publish_via_current_input(
 
     # Verify the input actually has text visible to React
     try:
-        input_text = await input_handle.evaluate(
-            "el => (el.textContent || el.innerText || '').trim()"
+        input_text = await _await_hard_timeout(
+            input_handle.evaluate("el => (el.value || el.textContent || el.innerText || '').trim()"),
+            timeout=max(0.0, min(0.6 if aggressive else 1.0, _send_remaining())),
         )
         if not input_text:
             logger.warning("[PUBLISH] Input text empty after typing — React may not have registered it")
@@ -5876,10 +6289,13 @@ async def _publish_via_current_input(
             input_text_len=len(input_text or ""),
             input_preview=(input_text or "")[:60],
         )
-    except Exception:
-        pass
+    except Exception as exc:
+        _log_publish_trace(
+            "typing_diagnostic_unavailable", page=page, expected_video_url=expected_video_url,
+            correlation_id=correlation_id, reason=type(exc).__name__,
+        )
 
-    await suppress_keyboard_shortcuts_overlay(page)
+    await _bounded_shortcuts_cleanup("after_typing")
     captcha_result = await _captcha_result_if_present(
         page,
         started,
@@ -5957,7 +6373,7 @@ async def _publish_via_current_input(
     if remaining <= 0:
         return _send_deadline_result("before_post_enabled_gate", input_info.strategy or post_info.strategy)
     post_enabled_wait_seconds = (
-        1.5
+        0.9
         if reply_scoped and aggressive
         else (
             2.0
@@ -6188,7 +6604,7 @@ async def _publish_via_current_input(
                     try:
                         retry_enabled_button, retry_enabled_info = await wait_for_post_button_enabled(
                             page,
-                            max_wait_seconds=min(1.5 if fast_publish else 2.0, max(_send_remaining(), 0.2)),
+                            max_wait_seconds=min(0.8 if fast_publish else 2.0, max(_send_remaining(), 0.2)),
                             reply_scoped=True,
                             expected_text=text,
                         )
@@ -6248,12 +6664,33 @@ async def _publish_via_current_input(
 
         if not post_was_enabled and reply_scoped and not reply_optimistic_send_click:
             safe_reason = disabled_reason or "reply_post_not_enabled"
-            composer_clean_after_submit = await _clear_reply_comment_composer_best_effort(
-                page,
-                reason=f"reply_send_exhausted:{safe_reason}"[:160],
-                expected_video_url=expected_video_url,
-                correlation_id=correlation_id,
+            # publish_reply_hybrid has a final send-only recovery pass that
+            # rebinds TikTok's remounted reply composer. Preserve the exact
+            # draft until that pass runs. Clearing here used to mutate the
+            # contenteditable (sometimes only partially, while reporting
+            # cleared=False), so recovery immediately failed with
+            # reply_send_recovery_text_not_exact:text_mismatch.
+            preserve_for_send_recovery = bool(
+                reply_send_deadline_ref is not None
+                and _is_recoverable_reply_send_reason(safe_reason)
             )
+            if preserve_for_send_recovery:
+                composer_clean_after_submit = None
+                _log_publish_trace(
+                    "reply_composer_preserved_for_send_recovery",
+                    page=page,
+                    expected_video_url=expected_video_url,
+                    correlation_id=correlation_id,
+                    reason=safe_reason,
+                    level=logging.INFO,
+                )
+            else:
+                composer_clean_after_submit = await _clear_reply_comment_composer_best_effort(
+                    page,
+                    reason=f"reply_send_exhausted:{safe_reason}"[:160],
+                    expected_video_url=expected_video_url,
+                    correlation_id=correlation_id,
+                )
             _log_publish_trace(
                 "publish_result",
                 page=page,
@@ -6348,6 +6785,7 @@ async def _publish_via_current_input(
 
     captured: Dict[str, Any] = {}
     event = asyncio.Event()
+    response_complete = asyncio.Event()
     listener_tasks = set()
 
     def _consume_listener_task(task: asyncio.Task) -> None:
@@ -6380,6 +6818,7 @@ async def _publish_via_current_input(
         except Exception as exc:
             captured["body_error"] = str(exc)[:100]
         finally:
+            response_complete.set()
             event.set()
 
     def on_response(response: Response):
@@ -6523,7 +6962,7 @@ async def _publish_via_current_input(
             )
             # Last hard sweep before click. If the blocker is the keyboard shortcuts popup,
             # the persistent killer should make it pointer-events:none/remove it before the click.
-            await suppress_keyboard_shortcuts_overlay(page)
+            await _bounded_shortcuts_cleanup("post_blocked")
             await asyncio.sleep(0.15 if fast_publish else 0.35)
             if reply_scoped and _send_remaining() <= 0:
                 _detach_listener()
@@ -6644,7 +7083,7 @@ async def _publish_via_current_input(
             logger.info("[PUBLISH] Post button clicked by Playwright fallback, waiting for /api/comment/publish/")
     except Exception as exc:
         logger.warning("[PUBLISH] Normal/mouse post click failed: %s", exc)
-        await suppress_keyboard_shortcuts_overlay(page)
+        await _bounded_shortcuts_cleanup("post_click_failed")
         try:
             # Prefer a fresh DOM locator over a stale ElementHandle. In reply-scoped
             # mode never fall back to TikTok's global comment-post selector; if the
@@ -6700,7 +7139,7 @@ async def _publish_via_current_input(
     if (
         fast_publish
         and captured.get("request_url")
-        and not captured.get("url")
+        and not response_complete.is_set()
         and not early_confirmation_confirmed
     ):
         local_or_response_grace = max(
@@ -6763,7 +7202,7 @@ async def _publish_via_current_input(
                         "[PUBLISH] Retry elementFromPoint before Post click: %s",
                         json.dumps(retry_diag, ensure_ascii=False)[:1000],
                     )
-                    await suppress_keyboard_shortcuts_overlay(page)
+                    await _bounded_shortcuts_cleanup("post_click_retry")
                     _retry_synthetic = isinstance(retry_diag, dict) and (retry_diag.get("tag") or "").upper() == "BODY"
                     if _retry_synthetic:
                         logger.warning("[PUBLISH] Retry: elementFromPoint=BODY; using synthetic dispatchEvent.")
@@ -6801,7 +7240,7 @@ async def _publish_via_current_input(
                     try:
                         retry_wait_remaining = _send_remaining() if reply_scoped else _remaining()
                         if retry_wait_remaining > 0:
-                            await asyncio.wait_for(event.wait(), timeout=min(4.0, max(retry_wait_remaining, 0.5)))
+                            await asyncio.wait_for(response_complete.wait(), timeout=min(4.0, max(retry_wait_remaining, 0.5)))
                     except asyncio.TimeoutError:
                         pass
                     await _yield_to_publish_listener_tasks(listener_tasks)
@@ -6863,6 +7302,12 @@ async def _publish_via_current_input(
             post_was_enabled_at_click=post_was_enabled,
             composer_clean_after_submit=True,
         )
+
+    unread_result = _unread_publish_response_result(
+        captured, started=started, strategy=input_info.strategy, post_was_enabled=post_was_enabled,
+    )
+    if unread_result is not None:
+        return unread_result
 
     if captured.get("url"):
         body_preview = (captured.get("body") or "")[:200].replace("\n", " ")
@@ -7090,6 +7535,48 @@ async def _publish_via_current_input(
             input_handle=input_handle,
         )
         if cleared.get("exists") and cleared.get("empty"):
+            # Distinguish a real submit from the stuck desync the user reported:
+            # after a genuine send TikTok greys out (disables) the Post button,
+            # but in the failure case the visible text vanishes while the Post
+            # button stays RED/enabled (character counter non-zero) and NOTHING
+            # was sent. Only trust "composer cleared == submitted" when either a
+            # network request was actually attempted OR the Post button is no
+            # longer enabled. If Post is still enabled and no request went out,
+            # this is NOT a submit — report a real failure so the reply/comment
+            # is retried instead of being silently counted as submitted. This is
+            # safe against duplicates precisely because no request was attempted.
+            if await _composer_empty_but_post_still_enabled(
+                page,
+                reply_scoped=reply_scoped,
+                request_attempted=request_attempted,
+            ):
+                elapsed = time.monotonic() - started
+                _log_publish_trace(
+                    "publish_result",
+                    page=page,
+                    expected_video_url=expected_video_url,
+                    correlation_id=correlation_id,
+                    status="failed",
+                    reason="composer_empty_but_post_still_enabled",
+                    post_was_enabled=post_was_enabled,
+                    request_attempted=request_attempted,
+                    elapsed=round(elapsed, 2),
+                )
+                logger.warning(
+                    "[PUBLISH] Composer visually empty but Post button still "
+                    "enabled and no request was sent; treating as NOT submitted "
+                    "(will be retried) instead of submitted_unconfirmed."
+                )
+                return PublishResult(
+                    status="failed",
+                    error_reason="composer_empty_but_post_still_enabled",
+                    network_captured=False,
+                    network_request_attempted=False,
+                    elapsed_seconds=elapsed,
+                    dom_strategy=input_info.strategy or post_info.strategy,
+                    post_was_enabled_at_click=post_was_enabled,
+                    composer_clean_after_submit=False,
+                )
             _log_publish_trace(
                 "publish_result",
                 page=page,
@@ -7333,6 +7820,8 @@ async def publish_comment_hybrid(
     expected_video_url: Optional[str] = None,
     comments_already_open: bool = False,
 ) -> PublishResult:
+    if http_first_enabled(get_settings()):
+        return PublishResult(status="failed", error_reason="http_only_dom_publish_disabled")
     started = time.monotonic()
     fast_publish = _is_parallel_fast_publish(correlation_id)
     aggressive_publish = fast_publish
@@ -7348,6 +7837,31 @@ async def publish_comment_hybrid(
             expected_video_url=expected_video_url,
             correlation_id=correlation_id,
             dom_strategy=dom_strategy,
+        )
+
+    async def _log_open_failure_diagnostic(phase: str, reason: Any) -> None:
+        timeout = min(1.25, max(0.0, _remaining()))
+        if timeout <= 0.05:
+            return
+        try:
+            diag = await _await_hard_timeout(page.evaluate(_JS_DIAGNOSE_PAGE), timeout=timeout)
+        except Exception as exc:
+            diag = {"diagnostic_error": f"{type(exc).__name__}:{str(exc)[:100]}"}
+        _log_publish_trace(
+            "main_comment_open_failure_diagnostic",
+            page=page,
+            expected_video_url=expected_video_url,
+            correlation_id=correlation_id,
+            phase=phase,
+            reason=str(reason or "unknown")[:160],
+            ready_state=diag.get("readyState") if isinstance(diag, dict) else None,
+            editable_count=diag.get("editableCount") if isinstance(diag, dict) else None,
+            textarea_count=diag.get("textareaCount") if isinstance(diag, dict) else None,
+            editor_candidates=diag.get("dataE2eCommentElements") if isinstance(diag, dict) else None,
+            open_button_candidates=diag.get("commentTriggerCandidates") if isinstance(diag, dict) else None,
+            loading_candidates=diag.get("loadingCandidates") if isinstance(diag, dict) else None,
+            diagnostic_error=diag.get("diagnostic_error") if isinstance(diag, dict) else None,
+            level=logging.WARNING,
         )
 
     drift_result = _publish_url_guard_result(
@@ -7374,23 +7888,29 @@ async def publish_comment_hybrid(
         return logged_out_result
     if _remaining() <= 0:
         return _deadline_result("before_open_comments")
-    comment_surface_ready = False
-    if comments_already_open:
+    # This is a hint to resolve the existing editor, never proof of submission.
+    # The input resolver and focus/clear/text checks below still validate it.
+    # Re-running the broad surface scan after a trusted reset could consume
+    # 2.5s and reopen the same ready panel for another 18.75s on a timeout.
+    comment_surface_ready = bool(comments_already_open)
+
+    async def _read_surface(phase: str) -> Any:
+        timeout = max(0.0, min(2.5, _remaining()))
+        _log_publish_trace(
+            "main_comment_surface_probe_start", page=page, expected_video_url=expected_video_url,
+            correlation_id=correlation_id, phase=phase, timeout_seconds=round(timeout, 2),
+        )
         try:
-            surface = await get_comment_surface_state(page)
-            comment_surface_ready = _surface_has_publish_input(surface)
-            if not comment_surface_ready:
-                logger.info(
-                    "[PUBLISH] Ignoring comments_already_open for %s: publish input is not visible. surface=%s",
-                    correlation_id or "unknown",
-                    json.dumps(surface, ensure_ascii=False)[:500] if isinstance(surface, dict) else str(surface)[:200],
-                )
-        except Exception as exc:
-            logger.debug(
-                "[PUBLISH] Could not validate already-open composer for %s: %s",
-                correlation_id or "unknown",
-                str(exc)[:120],
+            # Read-only diagnostics must not leave an already visible composer
+            # idle indefinitely before opening or recovering its input.
+            return await _await_hard_timeout(get_comment_surface_state(page), timeout=timeout)
+        except asyncio.TimeoutError:
+            _log_publish_trace(
+                "main_comment_surface_probe_timeout", page=page, expected_video_url=expected_video_url,
+                correlation_id=correlation_id, phase=phase, timeout_seconds=round(timeout, 2),
             )
+            raise
+
     if comment_surface_ready:
         logger.info(
             "[PUBLISH] Publish input already visible for %s; skipping open_comment_section",
@@ -7403,14 +7923,25 @@ async def publish_comment_hybrid(
                 if aggressive_publish and _is_parallel_main_publish(correlation_id)
                 else (2.5 if aggressive_publish else 5.0)
             )
+            remaining_before_open = max(0.0, _remaining())
+            diagnostic_reserve = (
+                min(1.25, max(0.25, remaining_before_open * 0.1))
+                if remaining_before_open > 0.75
+                else 0.0
+            )
+            open_available = max(0.1, remaining_before_open - diagnostic_reserve)
             open_comments_outer_timeout = min(
-                max(_remaining(), 0.5),
+                open_available,
                 max(open_comments_budget + 0.75, 0.75),
+            )
+            _log_publish_trace(
+                "main_open_comments_start", page=page, expected_video_url=expected_video_url,
+                correlation_id=correlation_id, timeout_seconds=round(open_comments_outer_timeout, 2),
             )
             comment_surface_ready = bool(await _asyncio_wait_for(
                 open_comment_section(
                     page,
-                    max_wait=min(open_comments_budget, max(_remaining(), 0.5)),
+                    max_wait=min(open_comments_budget, open_available),
                     # Publishing is ready only when the composer is visible.
                     # A comment list/drawer alone is not enough and leads to
                     # long input-search loops on already loaded pages.
@@ -7422,7 +7953,7 @@ async def publish_comment_hybrid(
             ))
         except asyncio.TimeoutError:
             try:
-                surface = await get_comment_surface_state(page)
+                surface = await _read_surface("after_open_timeout")
                 if _surface_has_publish_input(surface):
                     logger.info(
                         "[PUBLISH] open_comment_section timed out, but publish input is visible; continuing. surface=%s",
@@ -7430,21 +7961,33 @@ async def publish_comment_hybrid(
                     )
                     comment_surface_ready = True
                 else:
+                    await _log_open_failure_diagnostic("open_timeout", surface)
                     return _deadline_result("open_comments")
-            except Exception:
+            except Exception as exc:
+                await _log_open_failure_diagnostic("open_timeout_probe", exc)
                 return _deadline_result("open_comments")
+    _log_publish_trace(
+        "main_open_comments_complete", page=page, expected_video_url=expected_video_url,
+        correlation_id=correlation_id, comment_surface_ready=comment_surface_ready,
+        elapsed=round(time.monotonic() - started, 2),
+    )
     captcha_result = await _captcha_result_if_present(page, started)
     if captcha_result:
         return captcha_result
-    return await _publish_via_current_input(
+    remaining_budget = _remaining()
+    if remaining_budget <= 0:
+        return _deadline_result("before_current_input_publish")
+    result = await _publish_via_current_input(
         page,
         text,
-        max_total_seconds=max_total_seconds,
+        max_total_seconds=remaining_budget,
         correlation_id=correlation_id,
         expected_video_url=expected_video_url,
         aggressive=aggressive_publish,
         comment_surface_ready=comment_surface_ready,
     )
+    result.elapsed_seconds = time.monotonic() - started
+    return result
 
 
 async def publish_reply_hybrid(
@@ -7460,6 +8003,8 @@ async def publish_reply_hybrid(
     comments_already_open: bool = False,
     early_submit_confirmation: Optional[Callable[[], Awaitable[Any]]] = None,
 ) -> PublishResult:
+    if http_first_enabled(get_settings()):
+        return PublishResult(status="failed", error_reason="http_only_dom_publish_disabled")
     started = time.monotonic()
     fast_publish = _is_parallel_fast_publish(correlation_id)
     has_parent_target = any(
@@ -7494,54 +8039,156 @@ async def publish_reply_hybrid(
             dom_strategy=dom_strategy,
         )
 
-    async def _recover_reply_open_timeout(phase: str) -> Optional[DomActionResult]:
+    recovered_reply_target: Optional[tuple[Any, DomActionResult]] = None
+
+    async def _recover_visible_reply_target(
+        phase: str, anchor_token: Optional[str] = None,
+    ) -> Optional[DomActionResult]:
+        nonlocal recovered_reply_target
+        recovery_anchor = anchor_token or parent_anchor_token
         remaining = _remaining()
         if remaining <= 0:
             return None
         probe_timeout = min(2.5 if fast_publish else 2.0, max(0.4, remaining))
+        reply_target = None
+        input_info = None
+        probe_failure = None
         try:
-            reply_target, input_info = await _asyncio_wait_for(
+            recovery_wait = _await_hard_timeout if fast_publish else _asyncio_wait_for
+            reply_target, input_info = await recovery_wait(
                 find_reply_composer_for_parent(
                     page,
-                    parent_anchor_token=parent_anchor_token,
+                    parent_anchor_token=recovery_anchor,
                     expected_parent_text=parent_comment_text,
                     parent_comment_id=parent_comment_id,
                     max_total_seconds=probe_timeout,
                 ),
                 timeout=probe_timeout,
             )
-        except asyncio.TimeoutError:
-            return None
-        except Exception:
-            return None
-        if not reply_target:
-            return None
-        strategy = getattr(input_info, "strategy", None) or "reply-input-visible"
-        logger.info(
-            "[PUBLISH] Reply box %s timed out, but bonded reply composer is visible via %s; continuing",
-            phase,
-            strategy,
-        )
+        except (asyncio.TimeoutError, _HardTimeoutError):
+            reply_target = None
+            probe_failure = "timeout"
+        except Exception as exc:
+            reply_target = None
+            probe_failure = f"{type(exc).__name__}:{str(exc)[:100]}"
+        if reply_target:
+            recovered_reply_target = (reply_target, input_info)
+            strategy = getattr(input_info, "strategy", None) or "reply-input-visible"
+            logger.info(
+                "[PUBLISH] Reply box %s timed out, but bonded reply composer is visible via %s; continuing",
+                phase,
+                strategy,
+            )
+            _log_publish_trace(
+                "reply_open_timeout_recovered_input_visible",
+                page=page,
+                expected_video_url=expected_video_url,
+                correlation_id=correlation_id,
+                phase=phase,
+                strategy=strategy,
+            )
+            return DomActionResult(
+                True,
+                strategy=f"{phase}+{strategy}",
+                anchor_token=getattr(reply_target, "anchor_token", None) or recovery_anchor,
+                elapsed_seconds=time.monotonic() - started,
+            )
         _log_publish_trace(
-            "reply_open_timeout_recovered_input_visible",
-            page=page,
-            expected_video_url=expected_video_url,
-            correlation_id=correlation_id,
-            phase=phase,
-            strategy=strategy,
+            "reply_open_recovery_probe_miss", page=page, expected_video_url=expected_video_url,
+            correlation_id=correlation_id, phase=phase, anchor_token=recovery_anchor,
+            reason=probe_failure or getattr(input_info, "reason", None) or "no_target",
+            timeout_seconds=round(probe_timeout, 2),
         )
-        return DomActionResult(
-            True,
-            strategy=f"{phase}+{strategy}",
-            anchor_token=parent_anchor_token,
-            elapsed_seconds=time.monotonic() - started,
-        )
+        return None
+
+    async def _recover_reply_open_timeout(
+        phase: str, anchor_token: Optional[str] = None,
+    ) -> Optional[DomActionResult]:
+        recovery_anchor = anchor_token or parent_anchor_token
+        recovered = await _recover_visible_reply_target(phase, recovery_anchor)
+        if recovered is not None:
+            return recovered
+
+        # TikTok can remount a virtualized comment row while Reply is being
+        # clicked. The first click may then disappear without opening an input.
+        # Keep the exact parent anchor, but use the DOM fallback. Repeating
+        # Locator.click after its outer timeout can hit the same driver stall
+        # again and never reach open_reply_box's internal fallback.
+        remaining = _remaining()
+        if fast_publish and remaining > 1.0:
+            # Allow the pre-probe (0.65s), scoped DOM click and mounted-composer
+            # probe (1.2s) to finish within the existing action budget.
+            reclick_timeout = min(3.2, max(0.45, remaining - 0.35))
+            _log_publish_trace(
+                "reply_open_timeout_reclick",
+                page=page,
+                expected_video_url=expected_video_url,
+                correlation_id=correlation_id,
+                phase=phase,
+                timeout_seconds=round(reclick_timeout, 2),
+                click_strategy="exact_parent_dom",
+                level=logging.INFO,
+            )
+            try:
+                reclick_result = await _await_hard_timeout(
+                    open_reply_box(
+                        page,
+                        parent_comment_text,
+                        parent_comment_id,
+                        recovery_anchor,
+                        max_attempts=1,
+                        prefer_dom_click=True,
+                    ),
+                    timeout=reclick_timeout,
+                )
+            except (asyncio.TimeoutError, _HardTimeoutError):
+                reclick_result = None
+            except Exception:
+                reclick_result = None
+            if reclick_result is not None and reclick_result.success:
+                _log_publish_trace(
+                    "reply_open_timeout_reclick_succeeded",
+                    page=page,
+                    expected_video_url=expected_video_url,
+                    correlation_id=correlation_id,
+                    phase=phase,
+                    strategy=getattr(reclick_result, "strategy", None),
+                    level=logging.INFO,
+                )
+                return reclick_result
+            # A click can complete just as its acknowledgement/probe times
+            # out. Check this parent's field once more before reporting failure
+            # and allowing the caller to scroll on to the next parent.
+            recovery_anchor = getattr(reclick_result, "anchor_token", None) or recovery_anchor
+            return await _recover_visible_reply_target(f"{phase}_after_reclick", recovery_anchor)
+        return None
+
+    async def _recover_transient_reply_open_failure(result: DomActionResult) -> DomActionResult:
+        # React may mount the editor just after open_reply_box's bounded probe.
+        # A normal "not found" result needs the same scoped recovery as a timeout;
+        # otherwise this common race skipped recovery and burned the account.
+        if not result.success and result.reason in {
+            "reply_composer_triple_not_found", "reply_composer_not_resolved",
+            "reply_composer_probe_timeout",
+        }:
+            recovered = await _recover_reply_open_timeout(
+                "reply_open_probe_miss", getattr(result, "anchor_token", None),
+            )
+            if recovered is not None:
+                return recovered
+        return result
 
     async def _resolve_reply_target_with_reclick(
         *,
         anchor_token: Optional[str],
         open_strategy: Optional[str],
     ) -> tuple[Optional[Any], DomActionResult]:
+        nonlocal recovered_reply_target
+        if recovered_reply_target is not None:
+            cached_target, cached_info = recovered_reply_target
+            recovered_reply_target = None
+            if getattr(cached_target, "anchor_token", None) == anchor_token:
+                return cached_target, cached_info
         last_info = DomActionResult(
             False,
             reason="reply_composer_not_resolved",
@@ -7623,8 +8270,9 @@ async def publish_reply_hybrid(
                             parent_comment_id,
                             token_for_probe,
                             max_attempts=1,
+                            prefer_dom_click=True,
                         ),
-                        timeout=max(0.4, min(_remaining(), 1.5 if fast_publish else 2.0)),
+                        timeout=max(0.4, min(_remaining(), 3.2 if fast_publish else 3.5)),
                     )
                     if getattr(reclick_open, "anchor_token", None):
                         token_for_probe = getattr(reclick_open, "anchor_token")
@@ -7663,7 +8311,11 @@ async def publish_reply_hybrid(
         return logged_out_result
     reply_open = None
     reply_box_attempts = 2 if fast_publish else None
-    reply_box_timeout = 10.0 if fast_publish else 12.0
+    # The anchor-token path clicks Reply first, then performs a heavy bonded
+    # composer probe. Under several parallel browsers that probe can stall even
+    # though TikTok has already opened the correct editor. Fall back to the
+    # dedicated composer resolver quickly instead of looking idle for 10s.
+    reply_box_timeout = 4.0 if fast_publish else 12.0
     if comments_already_open:
         if _remaining() <= 0:
             return _deadline_result("before_open_reply_box")
@@ -7716,6 +8368,18 @@ async def publish_reply_hybrid(
                     error_reason="reply_box_open_timeout",
                     elapsed_seconds=time.monotonic() - started,
                 )
+        if reply_open is not None and not reply_open.success:
+            captcha_result = await _captcha_result_if_present(page, started)
+            if captcha_result:
+                return captcha_result
+            logged_out_result = await _logged_out_publish_result_if_visible(
+                page, started, phase="reply_box_failed", correlation_id=correlation_id,
+                expected_video_url=expected_video_url,
+                timeout_seconds=min(0.5, max(_remaining(), 0.2)),
+            )
+            if logged_out_result:
+                return logged_out_result
+            reply_open = await _recover_transient_reply_open_failure(reply_open)
         if reply_open is not None and not reply_open.success:
             if reply_open.reason == "redirected":
                 return PublishResult(
@@ -7845,6 +8509,9 @@ async def publish_reply_hybrid(
         )
         if logged_out_result:
             return logged_out_result
+        if not comments_already_open:
+            reply_open = await _recover_transient_reply_open_failure(reply_open)
+    if not reply_open.success:
         if reply_open.reason == "redirected":
             return PublishResult(
                 status="redirected",

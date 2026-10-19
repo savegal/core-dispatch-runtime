@@ -6,6 +6,7 @@ import asyncio
 import aiohttp
 from typing import Optional, Tuple
 from urllib.parse import urlparse
+from services.log_sanitizer import sanitize_url
 
 logger = logging.getLogger("services.geo_service")
 
@@ -84,17 +85,28 @@ async def detect_proxy_country(proxy_str: str, timeout: float = 10.0) -> Optiona
                                         
                                         if country_code:
                                             country_code = country_code.upper()[:2]  # Безопасность: только 2 символа
-                                            logger.info(f"Detected proxy {proxy_str[:30]} country: {country_code}")
+                                            logger.info(
+                                                "Detected proxy %s country: %s",
+                                                sanitize_url(proxy_str, max_length=80),
+                                                country_code,
+                                            )
                                             return country_code
                 except Exception as e:
                     logger.debug(f"Failed to detect country via {api_url_template}: {e}")
                     continue
             
-            logger.warning(f"Could not detect country for proxy {proxy_str[:30]}")
+            logger.warning(
+                "Could not detect country for proxy %s",
+                sanitize_url(proxy_str, max_length=80),
+            )
             return None
             
     except Exception as e:
-        logger.warning(f"Error detecting proxy country for {proxy_str[:30]}: {e}")
+        logger.warning(
+            "Error detecting proxy country for %s: %s",
+            sanitize_url(str(proxy_str or ""), max_length=80),
+            e,
+        )
         return None
 
 

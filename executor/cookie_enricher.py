@@ -26,6 +26,7 @@ from sqlalchemy.orm import Session
 
 from db.models import Account
 from executor.dom_actions import dismiss_cookie_banners
+from services.cookie_validator import NormalizedCookies, normalize_cookie_records
 
 logger = logging.getLogger("executor.cookie_enricher")
 
@@ -60,10 +61,10 @@ def assess_cookie_strength(cookies: Dict[str, str]) -> str:
     - minimal: sid_guard без generated cookies
     - dead: нет auth cookies
     """
-    has_full_session = any(c in cookies for c in FULL_SESSION_COOKIES)
-    has_partial_session = any(c in cookies for c in PARTIAL_SESSION_COOKIES)
-    has_ttwid = "ttwid" in cookies
-    has_csrf = "tt_csrf_token" in cookies
+    has_full_session = any(cookies.get(c) for c in FULL_SESSION_COOKIES)
+    has_partial_session = any(cookies.get(c) for c in PARTIAL_SESSION_COOKIES)
+    has_ttwid = bool(cookies.get("ttwid"))
+    has_csrf = bool(cookies.get("tt_csrf_token"))
 
     if has_full_session and has_ttwid and has_csrf:
         return "full"
@@ -128,6 +129,35 @@ async def enrich_cookies_via_browser(
     correlation_id: Optional[str] = None,
     timeout_seconds: float = 25.0,
 ) -> EnrichmentResult:
+    """Block heavy resources only for the duration of cookie enrichment."""
+    async def filter_resources(route):
+        if route.request.resource_type in {"image", "media", "font"}:
+            await route.abort()
+        else:
+            await route.fallback()
+
+    await page.route("**/*", filter_resources)
+    try:
+        return await _enrich_cookies_via_browser(
+            page,
+            existing_cookies,
+            correlation_id=correlation_id,
+            timeout_seconds=timeout_seconds,
+        )
+    finally:
+        try:
+            await page.unroute("**/*", filter_resources)
+        except Exception as exc:
+            logger.debug("[ENRICH] Resource filter cleanup failed for %s: %s", correlation_id or "?", exc)
+
+
+async def _enrich_cookies_via_browser(
+    page: Page,
+    existing_cookies: Dict[str, str],
+    *,
+    correlation_id: Optional[str],
+    timeout_seconds: float,
+) -> EnrichmentResult:
     """
     Обогащает cookies через реальный browser visit.
     """
@@ -171,23 +201,17 @@ async def enrich_cookies_via_browser(
     except Exception:
         pass
 
-    # Чуть-чуть поведения, чтобы страница догенерировала browser cookies.
-    for i, scroll_y in enumerate([200, 350, 150, 400, 100]):
-        if i in (0, 2):
-            try:
-                await dismiss_cookie_banners(page)
-            except Exception:
-                pass
-        try:
-            await page.evaluate(f"window.scrollBy(0, {scroll_y})")
-        except Exception:
-            break
-        await asyncio.sleep(0.7 + i * 0.25)
-
     deadline = started + timeout_seconds
-    best_cookies: Dict[str, str] = dict(existing_cookies)
+    best_cookies = NormalizedCookies(existing_cookies, records=getattr(existing_cookies, "records", ()))
+    # Browser cookie identity includes domain and path, not just name.
+    records = {
+        (c["name"], c.get("domain", ".tiktok.com"), c.get("path", "/")): dict(c)
+        for c in getattr(existing_cookies, "records", ())
+    }
+    scrolls = iter([200, 350, 150, 400, 100])
 
-    while time.monotonic() < deadline:
+    # Always collect once, even if navigation has already consumed the budget.
+    while True:
         try:
             current_url = (page.url or "").lower()
             for marker in DEAD_URL_MARKERS:
@@ -204,23 +228,33 @@ async def enrich_cookies_via_browser(
 
         try:
             cookies_list = await page.context.cookies()
-            fresh = {
-                c.get("name"): c.get("value")
-                for c in cookies_list
-                if c.get("name") and c.get("value") is not None
-            }
-            best_cookies = {**existing_cookies, **fresh}
+            for cookie in cookies_list:
+                if cookie.get("name") and cookie.get("value") is not None:
+                    key = (cookie["name"], cookie.get("domain", ".tiktok.com"), cookie.get("path", "/"))
+                    records[key] = dict(cookie)
+            fresh = normalize_cookie_records(list(records.values()))
+            best_cookies = NormalizedCookies({**existing_cookies, **fresh}, records=fresh.records)
         except Exception:
+            if time.monotonic() >= deadline:
+                break
             await asyncio.sleep(0.4)
             continue
 
-        if all(c in best_cookies for c in CRITICAL_ENRICHMENT_COOKIES):
+        if all(best_cookies.get(c) for c in CRITICAL_ENRICHMENT_COOKIES):
+            break
+        if time.monotonic() >= deadline:
             break
 
         try:
             await dismiss_cookie_banners(page)
         except Exception:
             pass
+        scroll_y = next(scrolls, None)
+        if scroll_y is not None:
+            try:
+                await page.evaluate(f"window.scrollBy(0, {scroll_y})")
+            except Exception:
+                scrolls = iter(())
         await asyncio.sleep(0.5)
 
     new_cookies = [
@@ -231,7 +265,7 @@ async def enrich_cookies_via_browser(
     success = strength_after in ("full", "enriched")
     if success:
         error = None
-    elif all(c in best_cookies for c in CRITICAL_ENRICHMENT_COOKIES):
+    elif all(best_cookies.get(c) for c in CRITICAL_ENRICHMENT_COOKIES):
         error = "auth_cookies_not_restored"
     else:
         error = "critical_cookies_not_generated"
@@ -251,16 +285,21 @@ def _serialize_cookies_to_json(cookies_dict: Dict[str, str]) -> str:
     """
     Сериализует cookies в JSON-array формат, который уже понимает проект.
     """
-    result = []
+    result = [dict(c) for c in getattr(cookies_dict, "records", ())]
+    recorded_names = {c["name"] for c in result}
+    guard = next((c for c in result if c["name"].lower() == "sid_guard"
+                  and c["value"] == cookies_dict.get(c["name"])), {})
     for name, value in cookies_dict.items():
-        result.append({
-            "name": name,
-            "value": value,
-            "domain": ".tiktok.com",
-            "path": "/",
-            "secure": True,
-            "httpOnly": name in {"sid_guard", "sessionid", "sessionid_ss", "sid_tt"},
-        })
+        if name in recorded_names:
+            continue
+        # Derived session aliases inherit the selected sid_guard's scope.
+        scope = guard if name in FULL_SESSION_COOKIES and len(value) == 32 and guard.get("value", "")[:32] == value else {}
+        result.append({**scope, "name": name, "value": value})
+    for cookie in result:
+        cookie.setdefault("domain", ".tiktok.com")
+        cookie.setdefault("path", "/")
+        cookie.setdefault("secure", True)
+        cookie.setdefault("httpOnly", cookie["name"].lower() in {"sid_guard", "sessionid", "sessionid_ss", "sid_tt"})
     return json.dumps(result, ensure_ascii=False)
 
 

@@ -258,3 +258,159 @@ def test_reply_parent_confirmed_does_not_mean_reply_was_published():
     assert replies["failed"] == 1
     assert ledger["coverage"]["reply_variants"][0]["status"] == "failed"
     assert ledger["coverage"]["reply_variants"][1]["status"] == "confirmed"
+
+
+@pytest.mark.unit
+def test_duplicate_parent_texts_bind_by_stable_target_and_keep_later_comment_id():
+    result = {
+        "status": "success",
+        "publication_complete": True,
+        "engagement": {
+            "main": {
+                "posted": True,
+                "expected": 2,
+                "variants_published": [
+                    {
+                        "text": "same text",
+                        "comment_id": None,
+                        "account_id": 11,
+                        "tiktok_username": "author_one",
+                        "target_id": "account:11:text:same text",
+                    },
+                    {
+                        "text": "same text",
+                        "comment_id": None,
+                        "account_id": 12,
+                        "tiktok_username": "author_two",
+                        "target_id": "account:12:text:same text",
+                    },
+                ],
+            },
+            "replies": {
+                "expected_submissions": 2,
+                "items": [
+                    {
+                        "variant_index": 1,
+                        "attempted": True,
+                        "success": True,
+                        "matched_main_text": "same text",
+                        "parent_target_id": "account:11:text:same text",
+                        "parent_comment_id": "cid-later-11",
+                        "requested_parent_author": "author_one",
+                        "matched_parent_author": "author_one",
+                    },
+                    {
+                        "variant_index": 1,
+                        "attempted": True,
+                        "success": True,
+                        "matched_main_text": "same text",
+                        "parent_target_id": "account:12:text:same text",
+                        "parent_comment_id": "cid-later-12",
+                        "requested_parent_author": "author_two",
+                        "matched_parent_author": "author_two",
+                    },
+                ],
+            },
+            "likes": {"enabled": False},
+        },
+    }
+
+    ledger = build_url_execution_ledger(result)
+    targets = [row for row in ledger["coverage"]["parent_targets"] if row["expected"]]
+
+    assert len(targets) == 2
+    assert {row["target_id"] for row in targets} == {
+        "account:11:text:same text",
+        "account:12:text:same text",
+    }
+    assert {row["requested_author"] for row in targets} == {"author_one", "author_two"}
+    assert {tuple(row["comment_ids"]) for row in targets} == {
+        ("cid-later-11",),
+        ("cid-later-12",),
+    }
+    assert all(row["submitted"] == 1 for row in targets)
+
+
+@pytest.mark.unit
+def test_ledger_preserves_all_account_attempt_reasons():
+    attempts = [
+        {
+            "phase": "main",
+            "account_id": 100 + idx,
+            "attempt": idx,
+            "variant_index": 1,
+            "success": False,
+            "submitted": 0,
+            "reason": "input_not_found" if idx < 18 else "login_required",
+        }
+        for idx in range(1, 19)
+    ]
+    ledger = build_url_execution_ledger(
+        {
+            "status": "fail",
+            "execution_attempts": attempts,
+            "engagement": {
+                "main": {"posted": False, "expected": 9},
+                "replies": {},
+                "likes": {"enabled": False},
+            },
+        }
+    )
+
+    assert ledger["summary"]["attempts"]["total"] == 18
+    assert ledger["summary"]["attempts"]["failed"] == 18
+    assert ledger["summary"]["attempts"]["reasons"] == {
+        "input_not_found": 17,
+        "login_required": 1,
+    }
+    assert ledger["health_signals"]["accounts_with_errors"] == 18
+    assert len(ledger["attempts"]) == 18
+
+
+@pytest.mark.unit
+def test_disabled_likes_ignore_stale_orders_and_errors():
+    ledger = build_url_execution_ledger(
+        {
+            "status": "fail",
+            "engagement": {
+                "main": {},
+                "replies": {},
+                "likes": {
+                    "enabled": False,
+                    "requested": True,
+                    "error": "provider_failed",
+                    "orders": [{"username": "stale", "ok": False}],
+                },
+            },
+        }
+    )
+
+    assert ledger["summary"]["likes"] == {
+        "enabled": False,
+        "requested": False,
+        "quantity": 0,
+        "target_mode": None,
+        "orders_total": 0,
+        "orders_ok": 0,
+        "orders_failed": 0,
+        "targets": [],
+        "error": None,
+    }
+
+
+@pytest.mark.unit
+def test_incomplete_unconfirmed_url_is_not_success_like():
+    ledger = build_url_execution_ledger(
+        {
+            "status": "submitted_unconfirmed",
+            "publication_complete": False,
+            "error": "reply_publication_incomplete",
+            "engagement": {
+                "main": {"complete": True},
+                "replies": {"complete": False},
+                "likes": {"enabled": False},
+            },
+        }
+    )
+
+    assert ledger["success_like"] is False

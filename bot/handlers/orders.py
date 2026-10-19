@@ -764,6 +764,8 @@ def _publication_submitted(item: dict) -> bool:
 
 
 def _main_publication_status(variant: dict) -> str:
+    if "public_confirmed" in variant:
+        return "✅ подтверждено" if variant["public_confirmed"] else "☑️ видимость не подтверждена"
     if variant.get("network_confirmed") or variant.get("local_confirmed"):
         return "✅ подтверждено"
     return "☑️ отправлено без публичной проверки"
@@ -962,7 +964,8 @@ def _build_publication_map_rows(task: dict) -> tuple[list[dict], list[dict], dic
 
             reply_row = {
                 "text": str(raw_item.get("text") or "").strip(),
-                "status": "✅ подтверждено" if raw_item.get("success") else "☑️ отправлено без публичной проверки",
+                "status": (_main_publication_status(raw_item) if "public_confirmed" in raw_item
+                           else "✅ подтверждено" if raw_item.get("success") else "☑️ отправлено без публичной проверки"),
                 "requested_author": _clean_public_username(raw_item.get("requested_parent_author")),
                 "matched_author": _clean_public_username(raw_item.get("matched_parent_author")),
                 "fallback_used": bool(raw_item.get("author_fallback_used")),
@@ -1887,10 +1890,28 @@ def _render_order_settings(task: dict) -> str:
 
     lines.extend([
         f"Задержки: {'вкл' if settings_dict.get('delays', True) else 'выкл'}",
+        f"Проверка видимости главных: {'вкл, с заменой' if settings_dict.get('verify_main_visibility') is True else 'выкл'}",
+        f"Проверка видимости ответов: {'вкл, с заменой' if settings_dict.get('verify_reply_visibility') is True else 'выкл'}",
         f"Перемешивание: {'вкл' if settings_dict.get('shuffle', False) else 'выкл'}",
         f"Ротация аккаунтов: {'вкл' if settings_dict.get('rotate_accounts', True) else 'выкл'}",
         f"ID заказа: {_html_inline_code(task_id)}",
     ])
+    reports = [row.get("main_visibility") for row in (settings_dict.get("url_results") or {}).values()
+               if isinstance(row, dict) and isinstance(row.get("main_visibility"), dict)
+               and row["main_visibility"].get("enabled")]
+    if reports:
+        confirmed = sum(int(row.get("confirmed", 0)) for row in reports)
+        expected = sum(int(row.get("expected", 0)) for row in reports)
+        replacements = sum(int(row.get("replacements", 0)) for row in reports)
+        lines.append(f"Главные найдены при проверке: {confirmed}/{expected}; замен: {replacements}")
+    reply_reports = [row.get("reply_publication_visibility") for row in (settings_dict.get("url_results") or {}).values()
+                     if isinstance(row, dict) and isinstance(row.get("reply_publication_visibility"), dict)
+                     and row["reply_publication_visibility"].get("enabled")]
+    if reply_reports:
+        confirmed = sum(int(row.get("confirmed", 0)) for row in reply_reports)
+        expected = sum(int(row.get("expected", 0)) for row in reply_reports)
+        replacements = sum(int(row.get("replacements", 0)) for row in reply_reports)
+        lines.append(f"Ответы найдены при проверке: {confirmed}/{expected}; замен: {replacements}")
     return _html_screen(f"Заказ #{task_id} · Детали", _html_block("Параметры", lines))
 
 

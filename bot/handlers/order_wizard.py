@@ -29,6 +29,7 @@ from bot.config import load_config
 from config.settings import get_settings
 from bot.keyboards.common import get_access_denied_keyboard
 from bot.keyboards.templates import get_template_choice_keyboard
+from bot.services.main_visibility_ui import CALLBACK_PREFIX as VISIBILITY_CALLBACK_PREFIX, set_visibility_option, visibility_keyboard, REPLY_CALLBACK_PREFIX, set_reply_visibility_option
 from bot.services.order_creation_ui import (
     build_cancel_keyboard,
     build_links_prompt_text,
@@ -42,6 +43,16 @@ import logging
 
 logger = logging.getLogger("bot.order_wizard")
 router = Router()
+
+
+@router.callback_query(F.data.startswith(REPLY_CALLBACK_PREFIX))
+async def wizard_reply_visibility_option(callback: CallbackQuery, state: FSMContext):
+    await set_reply_visibility_option(callback, state)
+
+
+@router.callback_query(F.data.startswith(VISIBILITY_CALLBACK_PREFIX))
+async def wizard_visibility_option(callback: CallbackQuery, state: FSMContext):
+    await set_visibility_option(callback, state)
 config = load_config()
 settings = get_settings()
 
@@ -569,13 +580,13 @@ async def wizard_show_preview_from_message(message: Message, state: FSMContext):
         
         await message.answer(
             preview_text,
-            reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+            reply_markup=visibility_keyboard(InlineKeyboardMarkup(inline_keyboard=[
                 [
                     InlineKeyboardButton(text="🚀 Запустить", callback_data="wizard:confirm"),
                     InlineKeyboardButton(text="✏️ Изменить", callback_data="wizard:edit"),
                 ],
                 [InlineKeyboardButton(text=f"{Emoji.CANCEL} Отмена", callback_data="menu:main")],
-            ]),
+            ]), bool(state_data.get("verify_main_visibility", False)), bool(state_data.get("verify_reply_visibility", False))),
             parse_mode="Markdown"
         )
         await state.set_state(OrderStates.CONFIRM_ORDER)
@@ -618,13 +629,13 @@ async def wizard_show_preview(callback: CallbackQuery, state: FSMContext):
         
         await callback.message.edit_text(
             preview_text,
-            reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+            reply_markup=visibility_keyboard(InlineKeyboardMarkup(inline_keyboard=[
                 [
                     InlineKeyboardButton(text="🚀 Запустить", callback_data="wizard:confirm"),
                     InlineKeyboardButton(text="✏️ Изменить", callback_data="wizard:edit")
                 ],
                 [InlineKeyboardButton(text=f"{Emoji.CANCEL} Отмена", callback_data="menu:main")]
-            ]),
+            ]), bool(state_data.get("verify_main_visibility", False)), bool(state_data.get("verify_reply_visibility", False))),
             parse_mode="Markdown"
         )
         await state.set_state(OrderStates.CONFIRM_ORDER)
@@ -799,6 +810,7 @@ async def show_template_preview_and_confirm(callback: CallbackQuery, state: FSMC
         [InlineKeyboardButton(text=f"{Emoji.CANCEL} Отмена", callback_data="menu:main")],
     ])
 
+    keyboard = visibility_keyboard(keyboard, bool(state_data.get("verify_main_visibility", False)), bool(state_data.get("verify_reply_visibility", False)))
     await callback.message.edit_text(text, reply_markup=keyboard, parse_mode="Markdown")
     await callback.answer()
 
@@ -867,6 +879,8 @@ async def wizard_confirm_with_template(callback: CallbackQuery, state: FSMContex
             "template_id": template_id,
             "template_name": template.get("name") or "Без названия",
             "origin": "wizard_template",
+            "verify_main_visibility": bool(state_data.get("verify_main_visibility", False)),
+            "verify_reply_visibility": bool(state_data.get("verify_reply_visibility", False)),
         }
         text_variants = normalize_text_variants_list(state_data.get("text_variants") or [])
         if len(text_variants) < 3:
@@ -994,7 +1008,12 @@ async def ask_save_template_with_preview(message_or_callback: Message | Callback
         ],
         [InlineKeyboardButton(text="❌ Отмена", callback_data="menu:main")]
     ])
-    
+    keyboard = visibility_keyboard(
+        keyboard,
+        bool(state_data.get("verify_main_visibility", False)),
+        bool(state_data.get("verify_reply_visibility", False)),
+    )
+
     if isinstance(message_or_callback, Message):
         await message_or_callback.answer(text, reply_markup=keyboard, parse_mode="Markdown")
     else:
@@ -1364,6 +1383,8 @@ async def _wizard_create_order_impl(
             "reply_count": reply_count,
             "replies": replies_dict_to_list(replies),
             "origin": "wizard",  # REFACTOR: Указываем источник заказа
+            "verify_main_visibility": bool(state_data.get("verify_main_visibility", False)),
+            "verify_reply_visibility": bool(state_data.get("verify_reply_visibility", False)),
             "account_pool_mode": account_pool_mode,
         }
         

@@ -539,6 +539,7 @@ class TestAccountService:
         db_session: Session,
         monkeypatch: pytest.MonkeyPatch,
     ):
+        monkeypatch.setattr(account_service_module.settings, "USE_PROXY", True)
         monkeypatch.setattr(account_service_module, "get_proxy_type_filter", lambda _db: "mobile")
         residential_proxy = "http://reply-residential-last-resort"
         mobile_proxy = "http://reply-mobile-sid-last-resort"
@@ -809,6 +810,38 @@ class TestAccountService:
         assert health["main_comment"]["captcha_recent"] >= 1
         assert "runtime_risky" in health["main_comment"]
         assert health["monitor"]["captcha_recent"] == 0
+
+    def test_runtime_health_parses_session_once_per_scope(
+        self,
+        db_session: Session,
+        monkeypatch: pytest.MonkeyPatch,
+    ):
+        account = Account(
+            label="runtime_health_single_parse",
+            status="active",
+            cookies="sessionid=single-parse; sid_tt=single-parse",
+            last_validation_ok=datetime.now(timezone.utc),
+        )
+        db_session.add(account)
+        db_session.commit()
+
+        original = account_service_module._read_account_session_quality
+        call_count = 0
+
+        def counted_session_quality(*args, **kwargs):
+            nonlocal call_count
+            call_count += 1
+            return original(*args, **kwargs)
+
+        monkeypatch.setattr(
+            account_service_module,
+            "_read_account_session_quality",
+            counted_session_quality,
+        )
+
+        get_account_runtime_health(db_session)
+
+        assert call_count == 3
 
     def test_get_free_account_for_main_comment_skips_bad_proxy(self, db_session: Session, monkeypatch: pytest.MonkeyPatch):
         """Main selector should skip accounts whose proxy is currently marked bad."""

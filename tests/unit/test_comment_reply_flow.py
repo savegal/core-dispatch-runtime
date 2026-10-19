@@ -1,5 +1,6 @@
 import pytest
 from types import SimpleNamespace
+from unittest.mock import AsyncMock
 
 import executor.http.playwright_http_client as playwright_http_client
 from executor.http.playwright_http_client import PlaywrightHttpClient
@@ -59,13 +60,15 @@ async def test_execute_request_publish_requires_comment_id():
 
 @pytest.mark.unit
 @pytest.mark.asyncio
-async def test_execute_request_publish_recovers_comment_id_from_dom(monkeypatch):
+async def test_execute_request_publish_does_not_recover_api_receipt_from_dom(monkeypatch):
     response = _DummyResponse(status=200, body='{"status_code":0}')
     request_context = _DummyRequestContext(response)
     client = PlaywrightHttpClient(
         request_context,
         retry_policy=RetryPolicy(max_retries=0),
-        page=object(),
+        page=SimpleNamespace(context=SimpleNamespace(cookies=AsyncMock(return_value=[])), evaluate=AsyncMock(return_value={
+            "status": 200, "headers": response.headers, "text": await response.text(),
+        })),
     )
 
     async def _fake_recover(page, text):
@@ -86,12 +89,10 @@ async def test_execute_request_publish_recovers_comment_id_from_dom(monkeypatch)
         correlation_id="test_publish_dom_recovery",
     )
 
-    assert success is True
-    assert error_msg is None
-    assert error_type is None
-    assert response_data is not None
-    assert response_data["data"]["comment"]["cid"] == "cid_dom_recovered"
-    assert response_data["__confirmation_source"] == "dom_recovery_after_http"
+    assert success is False
+    assert error_type == HttpErrorType.API_ERROR
+    assert error_msg and "missing confirmation" in error_msg
+    assert response_data is None
 
 
 @pytest.mark.unit
@@ -102,7 +103,9 @@ async def test_execute_request_reply_does_not_use_main_comment_dom_recovery(monk
     client = PlaywrightHttpClient(
         request_context,
         retry_policy=RetryPolicy(max_retries=0),
-        page=object(),
+        page=SimpleNamespace(context=SimpleNamespace(cookies=AsyncMock(return_value=[])), evaluate=AsyncMock(return_value={
+            "status": 200, "headers": response.headers, "text": await response.text(),
+        })),
     )
 
     async def _fake_recover(*args, **kwargs):
@@ -229,7 +232,7 @@ async def test_reply_comment_success_with_nested_comment_id(monkeypatch):
     client = PlaywrightHttpClient(request_context, retry_policy=RetryPolicy(max_retries=0))
 
     async def _fake_execute_request(*args, **kwargs):
-        return True, {"status_code": 0, "data": {"comment": {"cid": "cid_789"}}}, None, None
+        return True, {"status_code": 0, "data": {"comment": {"cid": "7641761192486196000"}}}, None, None
 
     monkeypatch.setattr(client, "_execute_request", _fake_execute_request)
 
@@ -242,7 +245,7 @@ async def test_reply_comment_success_with_nested_comment_id(monkeypatch):
     )
 
     assert success is True
-    assert comment_id == "cid_789"
+    assert comment_id == "7641761192486196000"
     assert error_msg is None
     assert error_type is None
     assert meta["parent_confirmed"] is False
@@ -261,7 +264,7 @@ async def test_reply_comment_accepts_extra_query_params(monkeypatch):
     async def _fake_execute_request(*args, **kwargs):
         nonlocal captured_dynamic_params
         captured_dynamic_params = kwargs.get("dynamic_params", {})
-        return True, {"status_code": 0, "comment": {"cid": "cid_extra"}}, None, None
+        return True, {"status_code": 0, "comment": {"cid": "7641761192486196001"}}, None, None
 
     monkeypatch.setattr(client, "_execute_request", _fake_execute_request)
 
@@ -275,7 +278,7 @@ async def test_reply_comment_accepts_extra_query_params(monkeypatch):
     )
 
     assert success is True
-    assert comment_id == "cid_extra"
+    assert comment_id == "7641761192486196001"
     assert error_msg is None
     assert error_type is None
     assert meta["parent_confirmed"] is False
@@ -291,7 +294,7 @@ async def test_reply_comment_sets_network_exact_when_parent_matches(monkeypatch)
     client = PlaywrightHttpClient(request_context, retry_policy=RetryPolicy(max_retries=0))
 
     async def _fake_execute_request(*args, **kwargs):
-        return True, {"status_code": 0, "comment": {"cid": "cid_1", "reply_id": "parent_456"}}, None, None
+        return True, {"status_code": 0, "comment": {"cid": "7641761192486196002", "reply_id": "parent_456"}}, None, None
 
     monkeypatch.setattr(client, "_execute_request", _fake_execute_request)
 
@@ -304,7 +307,7 @@ async def test_reply_comment_sets_network_exact_when_parent_matches(monkeypatch)
     )
 
     assert success is True
-    assert comment_id == "cid_1"
+    assert comment_id == "7641761192486196002"
     assert error_msg is None
     assert error_type is None
     assert meta["parent_confirmed"] is True
@@ -322,7 +325,7 @@ async def test_reply_comment_sets_network_reply_to_reply_when_reply_target_match
         return True, {
             "status_code": 0,
             "comment": {
-                "cid": "cid_nested_1",
+                "cid": "7641761192486196003",
                 "reply_id": "root_111",
                 "reply_to_reply_id": "reply_222",
             },
@@ -339,7 +342,7 @@ async def test_reply_comment_sets_network_reply_to_reply_when_reply_target_match
     )
 
     assert success is True
-    assert comment_id == "cid_nested_1"
+    assert comment_id == "7641761192486196003"
     assert error_msg is None
     assert error_type is None
     assert meta["parent_confirmed"] is True
@@ -360,7 +363,7 @@ async def test_reply_comment_accepts_network_root_match_for_top_level_parent(mon
             "status_code": 0,
             "data": {
                 "comment": {
-                    "cid": "cid_root_1",
+                    "cid": "7641761192486196004",
                     "root_comment_id": "parent_456",
                 }
             },
@@ -377,7 +380,7 @@ async def test_reply_comment_accepts_network_root_match_for_top_level_parent(mon
     )
 
     assert success is True
-    assert comment_id == "cid_root_1"
+    assert comment_id == "7641761192486196004"
     assert error_msg is None
     assert error_type is None
     assert meta["parent_confirmed"] is True
@@ -396,7 +399,7 @@ async def test_reply_comment_treats_parent_mismatch_with_comment_id_as_submitted
         return True, {
             "status_code": 0,
             "comment": {
-                "cid": "cid_mismatch_1",
+                "cid": "7641761192486196005",
                 "reply_id": "other_parent_999",
             },
         }, None, None
@@ -412,7 +415,7 @@ async def test_reply_comment_treats_parent_mismatch_with_comment_id_as_submitted
     )
 
     assert success is True
-    assert comment_id == "cid_mismatch_1"
+    assert comment_id == "7641761192486196005"
     assert error_msg is None
     assert error_type is None
     assert meta["parent_confirmed"] is False

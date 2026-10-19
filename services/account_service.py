@@ -21,7 +21,7 @@ import json  # ИСПРАВЛЕНО: Для проверки cooldown в last_er
 from pathlib import Path
 from datetime import datetime, timezone, timedelta
 from urllib.parse import urlparse
-from sqlalchemy import and_, or_, func, case
+from sqlalchemy import and_, or_, func, case, select
 from sqlalchemy.orm import Session
 from db.models import Account, Proxy
 from config.settings import get_settings
@@ -30,6 +30,14 @@ from services.app_settings_service import get_proxy_prefer_mobile
 from services.proxy_health_service import get_bad_proxy_set, is_proxy_bad
 from services.mobile_proxy_service import get_locked_proxy_ids
 from services.cookie_validator import parse_cookies_to_dict, validate_cookies
+from services.account_assignment import (
+    assignment_order_sql, assignment_rank, available_assignment_filter,
+    claim_assignment, release_assignment, extend_assignment,
+)
+from services.dedicated_proxy_service import (
+    apply_dedicated_proxy,
+    get_current_dedicated_proxy,
+)
 
 logger = logging.getLogger("executor.account_service")
 settings = get_settings()
@@ -73,6 +81,7 @@ def reserve_main_account(account_id: int, ttl_seconds: float = _MAIN_ACCOUNT_RES
 
 
 def release_main_account_reservation(account_id: int) -> None:
+    release_assignment(account_id, "main_comment")
     with _MAIN_ACCOUNT_RESERVATION_LOCK:
         _MAIN_ACCOUNT_RESERVED_UNTIL.pop(account_id, None)
 
@@ -84,6 +93,7 @@ def extend_main_account_reservation(account_id: int, ttl_seconds: float) -> bool
     worker deadline, which is longer than the default 180s selection lease.
     Only an already-reserved account can be extended.
     """
+    extend_assignment(account_id, "main_comment", ttl_seconds)
     with _MAIN_ACCOUNT_RESERVATION_LOCK:
         _cleanup_main_account_reservations_locked()
         if account_id not in _MAIN_ACCOUNT_RESERVED_UNTIL:
@@ -126,6 +136,7 @@ def reserve_reply_account(account_id: int, ttl_seconds: float = _REPLY_ACCOUNT_R
 
 
 def release_reply_account_reservation(account_id: int) -> None:
+    release_assignment(account_id, "reply")
     with _REPLY_ACCOUNT_RESERVATION_LOCK:
         _REPLY_ACCOUNT_RESERVED_UNTIL.pop(account_id, None)
 
@@ -398,6 +409,9 @@ def _read_account_spend_lane(
     account: Account,
     scope: str,
     now: datetime | None = None,
+    *,
+    lifecycle: dict[str, Any] | None = None,
+    session_quality: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """
     Determines how aggressively the system should spend this account.
@@ -412,8 +426,8 @@ def _read_account_spend_lane(
         accounts that should effectively leave rotation.
     """
     now = now or datetime.now(timezone.utc)
-    lifecycle = _read_account_lifecycle(account, now)
-    session_quality = _read_account_session_quality(account, scope, now)
+    lifecycle = lifecycle or _read_account_lifecycle(account, now)
+    session_quality = session_quality or _read_account_session_quality(account, scope, now)
     validation_fail_count = int(account.validation_fail_count or 0)
     recent_validation = _has_recent_validation(account, now)
     stage = lifecycle["stage"]
@@ -704,7 +718,7 @@ def _read_account_session_quality(
             "missing_http_optional": [],
         }
 
-    cookie_keys = {str(key).lower(): value for key, value in cookies_dict.items()}
+    cookie_keys = {str(key).lower(): value for key, value in cookies_dict.items() if str(value or "").strip()}
     has_sid_tt = "sid_tt" in cookie_keys
     has_sessionid = "sessionid" in cookie_keys or "sessionid_ss" in cookie_keys
     has_sid_guard = "sid_guard" in cookie_keys
@@ -848,6 +862,7 @@ def _read_account_session_quality(
         "has_sessionid": has_sessionid,
         "has_sid_guard": has_sid_guard,
         "has_ms_token": has_ms_token,
+        "can_warmup_http": has_sid_guard and has_ms_token and has_browser_auth,
         "has_verify_fp": has_verify_fp,
         "has_browser_linkage": has_browser_linkage,
         "has_device_linkage": has_device_linkage,
@@ -1201,6 +1216,11 @@ def get_http_execution_strategy(
     account: Account,
     scope: str,
     now: datetime | None = None,
+    *,
+    lifecycle: dict[str, Any] | None = None,
+    state: dict[str, Any] | None = None,
+    session_quality: dict[str, Any] | None = None,
+    spend_lane: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """
     Returns how aggressive the runtime should be with HTTP for this account.
@@ -1212,10 +1232,20 @@ def get_http_execution_strategy(
     - skip: account should not be used right now
     """
     now = now or datetime.now(timezone.utc)
-    lifecycle = _read_account_lifecycle(account, now)
-    state = _read_monitor_state(account, now) if scope == MONITOR_SCOPE else _read_runtime_state(account, now)
-    session_quality = _read_account_session_quality(account, scope, now)
-    spend_lane = _read_account_spend_lane(account, scope, now)
+    lifecycle = lifecycle or _read_account_lifecycle(account, now)
+    state = state or (
+        _read_monitor_state(account, now)
+        if scope == MONITOR_SCOPE
+        else _read_runtime_state(account, now)
+    )
+    session_quality = session_quality or _read_account_session_quality(account, scope, now)
+    spend_lane = spend_lane or _read_account_spend_lane(
+        account,
+        scope,
+        now,
+        lifecycle=lifecycle,
+        session_quality=session_quality,
+    )
 
     if (
         lifecycle["hard_expired"]
@@ -1226,6 +1256,9 @@ def get_http_execution_strategy(
         strategy = "skip"
     elif state["active_cooldown"]:
         strategy = "skip"
+    elif scope in {MAIN_SCOPE, REPLY_SCOPE} and session_quality.get("can_warmup_http"):
+        # Browser-generated linkage/CSRF cookies are collected during warmup.
+        strategy = "http_first"
     elif scope == MAIN_SCOPE:
         if session_quality["bucket"] in {SESSION_BUCKET_STRONG, SESSION_BUCKET_WORKABLE}:
             strategy = "http_cautious" if spend_lane["lane"] == ACCOUNT_LANE_BURNER else "http_first"
@@ -1347,6 +1380,10 @@ def _calculate_scope_quality_score(
     state: dict[str, Any],
     scope: str,
     now: datetime | None = None,
+    *,
+    lifecycle: dict[str, Any] | None = None,
+    session_quality: dict[str, Any] | None = None,
+    spend_lane: dict[str, Any] | None = None,
 ) -> int:
     now = now or datetime.now(timezone.utc)
     score = 100
@@ -1380,11 +1417,18 @@ def _calculate_scope_quality_score(
     else:
         score -= 5
 
-    lifecycle = _read_account_lifecycle(account, now)
+    lifecycle = lifecycle or _read_account_lifecycle(account, now)
     if lifecycle["hard_expired"]:
         return 0
 
-    spend_lane = _read_account_spend_lane(account, scope, now)
+    session_quality = session_quality or _read_account_session_quality(account, scope, now)
+    spend_lane = spend_lane or _read_account_spend_lane(
+        account,
+        scope,
+        now,
+        lifecycle=lifecycle,
+        session_quality=session_quality,
+    )
     if spend_lane["lane"] == ACCOUNT_LANE_RETIRE:
         return 0
 
@@ -1398,7 +1442,6 @@ def _calculate_scope_quality_score(
     elif stage == ACCOUNT_LIFECYCLE_UNKNOWN:
         score -= 6
 
-    session_quality = _read_account_session_quality(account, scope, now)
     session_bucket = session_quality["bucket"]
     if session_bucket == SESSION_BUCKET_DEAD:
         return 0
@@ -1496,6 +1539,15 @@ def _has_bad_proxy(account: Account, bad_proxy_set: set[str] | None = None) -> b
         return is_proxy_bad(proxy)
     except Exception:
         return False
+
+
+def _selection_runtime_state(account: Account, now: datetime, proxy_cache: dict[str, bool]) -> dict[str, Any]:
+    """Read each proxy once per selection, even when thousands share it."""
+    proxy = str(account.proxy or "").strip()
+    if proxy and proxy not in proxy_cache:
+        proxy_cache[proxy] = _has_bad_proxy(account)
+    bad = {proxy} if proxy_cache.get(proxy, False) else set()
+    return _read_runtime_state(account, now, bad_proxy_set=bad)
 
 
 def _read_monitor_state(
@@ -1707,6 +1759,7 @@ def get_free_account_for_main_comment(
     - принадлежность пулу (см. выше)
     """
     now = datetime.now(timezone.utc)
+    dedicated_route = get_current_dedicated_proxy()
     auth_material = or_(
         and_(Account.cookies.isnot(None), Account.cookies != ""),
         and_(Account.cookie_file.isnot(None), Account.cookie_file != ""),
@@ -1745,18 +1798,30 @@ def get_free_account_for_main_comment(
             )
         )
     )
+    if settings.USE_PROXY and dedicated_route is None:
+        query = query.filter(
+            or_(
+                Account.proxy.is_(None),
+                ~Account.proxy.in_(
+                    select(Proxy.proxy).where(Proxy.dedicated_user_id.isnot(None))
+                ),
+            )
+        )
 
-    reserved_ids = get_reserved_main_account_ids()
+    query = query.filter(available_assignment_filter(now))
+    reserved_ids = get_reserved_main_account_ids() | get_reserved_reply_account_ids()
     combined_exclude_ids = set(exclude_ids or [])
     combined_exclude_ids.update(reserved_ids)
     if combined_exclude_ids:
         query = query.filter(~Account.id.in_(combined_exclude_ids))
 
-    normalized_exclude_proxies = {
-        str(proxy).strip()
-        for proxy in (exclude_proxies or [])
-        if proxy and str(proxy).strip()
-    }
+    normalized_exclude_proxies = set()
+    if settings.USE_PROXY and dedicated_route is None:
+        normalized_exclude_proxies = {
+            str(proxy).strip()
+            for proxy in (exclude_proxies or [])
+            if proxy and str(proxy).strip()
+        }
     exclude_same_proxy_source_host = (
         _parallel_proxy_diversify_by_source_host()
         if exclude_proxy_source_hosts is None
@@ -1777,25 +1842,27 @@ def get_free_account_for_main_comment(
 
     # Жёсткое ограничение выбора конкретным набором прокси (strict 6x1 wave 2):
     # аккаунт обязан находиться на одном из уже ротированных мобильных прокси.
-    normalized_restrict_to_proxies = {
-        str(proxy).strip()
-        for proxy in (restrict_to_proxies or [])
-        if proxy and str(proxy).strip()
-    }
+    normalized_restrict_to_proxies = set()
+    if settings.USE_PROXY and dedicated_route is None:
+        normalized_restrict_to_proxies = {
+            str(proxy).strip()
+            for proxy in (restrict_to_proxies or [])
+            if proxy and str(proxy).strip()
+        }
     if normalized_restrict_to_proxies:
         query = query.filter(
             Account.proxy.in_(sorted(normalized_restrict_to_proxies))
         )
 
-    if settings.USE_PROXY:
+    if settings.USE_PROXY and dedicated_route is None:
         query = query.filter(
             Account.proxy.isnot(None),
             Account.proxy != "",
         )
     
     # Geo-matching и фильтрация типов прокси через JOIN
-    proxy_type_filter = get_proxy_type_filter(db)
-    proxy_prefer_mobile = get_proxy_prefer_mobile(db)
+    proxy_type_filter = None if dedicated_route is not None or not settings.USE_PROXY else get_proxy_type_filter(db)
+    proxy_prefer_mobile = False if dedicated_route is not None or not settings.USE_PROXY else get_proxy_prefer_mobile(db)
     has_proxy_join = False
     
     # Подключаем JOIN если нужна фильтрация по типу прокси
@@ -1811,13 +1878,14 @@ def get_free_account_for_main_comment(
         has_proxy_join = True
     
     # Geo-приоритизация: если включено, подключаем JOIN для сортировки
-    if settings.PROXY_GEO_MATCHING and not has_proxy_join:
+    if settings.PROXY_GEO_MATCHING and dedicated_route is None and not has_proxy_join:
         query = query.outerjoin(Proxy, Account.proxy == Proxy.proxy)
         has_proxy_join = True
     
     # Сортировка: ORDER BY с учетом geo-matching
     order_by_clauses = [
-        # active статус первый
+        assignment_order_sql(),
+        # Status/quality break ties; they cannot monopolize successive turns.
         (Account.status != "active").asc(),
         # Меньше ошибок - лучше
         Account.error_count_recent.asc().nulls_first(),
@@ -1920,6 +1988,11 @@ def get_free_account_for_main_comment(
         candidate_limit,
         total_matching_for_scan,
     )
+    # Sort lightweight IDs once. Re-sorting large cookie rows for every OFFSET
+    # batch made a scan through 2,500 weak sessions take tens of seconds on SQLite.
+    ordered_sqlite_ids = None
+    if dialect_name == "sqlite":
+        ordered_sqlite_ids = [row[0] for row in query.with_entities(Account.id).order_by(*order_by_clauses).limit(max_candidate_scan).all()]
 
     ranked_candidates: list[tuple[tuple[Any, ...], Account, dict[str, Any], int]] = []
     runtime_last_resort_candidates: list[tuple[tuple[Any, ...], Account, dict[str, Any], int]] = []
@@ -1930,14 +2003,16 @@ def get_free_account_for_main_comment(
     except (TypeError, ValueError):
         desired_ranked_candidates = 3
     desired_ranked_candidates = max(1, min(10, desired_ranked_candidates))
+    selection_proxy_cache: dict[str, bool] = {}
     offset = 0
     while offset < max_candidate_scan and len(ranked_candidates) < desired_ranked_candidates:
-        candidate_query = (
-            query
-            .order_by(*order_by_clauses)
-            .offset(offset)
-            .limit(candidate_limit)
-        )
+        batch_ids = ordered_sqlite_ids[offset:offset + candidate_limit] if ordered_sqlite_ids is not None else None
+        if batch_ids is not None:
+            if not batch_ids:
+                break
+            candidate_query = query.filter(Account.id.in_(batch_ids))
+        else:
+            candidate_query = query.order_by(*order_by_clauses).offset(offset).limit(candidate_limit)
 
         try:
             if supports_skip_locked:
@@ -1948,10 +2023,17 @@ def get_free_account_for_main_comment(
             logger.warning(f"SELECT FOR UPDATE not supported, falling back to regular candidate query: {lock_error}")
             candidate_batch = candidate_query.all()
 
+        if batch_ids is not None:
+            positions = {account_id: index for index, account_id in enumerate(batch_ids)}
+            candidate_batch.sort(key=lambda account: positions[account.id])
+        if not candidate_batch and batch_ids:
+            offset += candidate_limit
+            continue
         if not candidate_batch:
             break
         candidates.extend(candidate_batch)
         for batch_index, candidate in enumerate(candidate_batch):
+            apply_dedicated_proxy(candidate)
             index = offset + batch_index
             candidate_proxy = str(candidate.proxy or "").strip()
             if candidate_proxy:
@@ -1961,10 +2043,10 @@ def get_free_account_for_main_comment(
                     continue
             if not _has_auth_material(candidate):
                 continue
-            state = _read_runtime_state(candidate, now)
+            state = _selection_runtime_state(candidate, now, selection_proxy_cache)
             lifecycle = _read_account_lifecycle(candidate, now)
             session_quality = _read_account_session_quality(candidate, MAIN_SCOPE, now)
-            spend_lane = _read_account_spend_lane(candidate, MAIN_SCOPE, now)
+            spend_lane = _read_account_spend_lane(candidate, MAIN_SCOPE, now, lifecycle=lifecycle, session_quality=session_quality)
             if lifecycle["hard_expired"]:
                 continue
             if state["active_cooldown"] or state["bucket"] in {"dead_session", "proxy_issue"}:
@@ -1973,9 +2055,10 @@ def get_free_account_for_main_comment(
                 continue
             if spend_lane["lane"] == ACCOUNT_LANE_RETIRE:
                 continue
-            score = _calculate_scope_quality_score(candidate, state, MAIN_SCOPE, now)
+            score = _calculate_scope_quality_score(candidate, state, MAIN_SCOPE, now, lifecycle=lifecycle, session_quality=session_quality, spend_lane=spend_lane)
             ranked_item = (
                 (
+                    assignment_rank(candidate),
                     RUNTIME_BUCKET_ORDER.get(state["bucket"], 5),
                     0 if candidate.status == "active" else 1,
                     _lane_sort_rank(MAIN_SCOPE, spend_lane["lane"]),
@@ -2085,6 +2168,15 @@ def get_free_account_for_main_comment(
     account_score = None
     for _, candidate_account, candidate_state, candidate_score in ranked_candidates:
         if reserve_main_account(candidate_account.id):
+            try:
+                claimed = claim_assignment(db, candidate_account, MAIN_SCOPE)
+            except Exception:
+                release_main_account_reservation(candidate_account.id)
+                raise
+            if not claimed:
+                release_main_account_reservation(candidate_account.id)
+                continue
+            apply_dedicated_proxy(candidate_account)
             account = candidate_account
             account_state = candidate_state
             account_score = candidate_score
@@ -2109,7 +2201,11 @@ def get_free_account_for_main_comment(
                     elif not proxy_obj.country_code:
                         logger.debug(f"[GEO] Selected account {account.id} for main comment: proxy has no country_code (account: {account.country_code})")
                 else:
-                    logger.debug(f"[GEO] Selected account {account.id} for main comment: proxy {account.proxy[:30]} not in Proxy table")
+                    logger.debug(
+                        "[GEO] Selected account %s for main comment: proxy %s not in Proxy table",
+                        account.id,
+                        _safe_proxy_selection_diag(account.proxy),
+                    )
         except Exception as log_err:
             logger.debug(f"[GEO] Could not log geo match for account {account.id}: {log_err}")
 
@@ -2174,6 +2270,7 @@ def get_free_account_for_reply(
     pool_owner_user_id: то же, что и для main-селектора, см. его docstring.
     Per-account override: today_replies < COALESCE(daily_reply_limit, MAX_ACTIONS_PER_ACCOUNT).
     """
+    dedicated_route = get_current_dedicated_proxy()
     daily_reply_limit_expr = func.coalesce(
         Account.daily_reply_limit, settings.MAX_ACTIONS_PER_ACCOUNT
     )
@@ -2201,8 +2298,17 @@ def get_free_account_for_reply(
             Account.today_replies < daily_reply_limit_expr,
         )
     )
+    if settings.USE_PROXY and dedicated_route is None:
+        query = query.filter(
+            or_(
+                Account.proxy.is_(None),
+                ~Account.proxy.in_(
+                    select(Proxy.proxy).where(Proxy.dedicated_user_id.isnot(None))
+                ),
+            )
+        )
 
-    if settings.USE_PROXY:
+    if settings.USE_PROXY and dedicated_route is None:
         query = query.filter(
             and_(
                 Account.proxy.isnot(None),
@@ -2211,16 +2317,17 @@ def get_free_account_for_reply(
         )
 
     excluded_account_ids: set[int] = set(exclude_ids or [])
-    if reserve:
-        excluded_account_ids.update(get_reserved_reply_account_ids())
+    excluded_account_ids.update(get_reserved_reply_account_ids() | get_reserved_main_account_ids())
     if excluded_account_ids:
         query = query.filter(~Account.id.in_(list(excluded_account_ids)))
 
-    normalized_exclude_proxies = {
-        str(proxy).strip()
-        for proxy in (exclude_proxies or [])
-        if proxy and str(proxy).strip()
-    }
+    normalized_exclude_proxies = set()
+    if settings.USE_PROXY and dedicated_route is None:
+        normalized_exclude_proxies = {
+            str(proxy).strip()
+            for proxy in (exclude_proxies or [])
+            if proxy and str(proxy).strip()
+        }
     normalized_exclude_degraded_categories = {
         str(category).strip()
         for category in (exclude_degraded_categories or [])
@@ -2245,9 +2352,11 @@ def get_free_account_for_reply(
         )
 
     now = datetime.now(timezone.utc)
-    proxy_type_filter = get_proxy_type_filter(db)
-    proxy_prefer_mobile = get_proxy_prefer_mobile(db)
+    query = query.filter(available_assignment_filter(now))
+    proxy_type_filter = None if dedicated_route is not None or not settings.USE_PROXY else get_proxy_type_filter(db)
+    proxy_prefer_mobile = False if dedicated_route is not None or not settings.USE_PROXY else get_proxy_prefer_mobile(db)
     order_by_clauses = [
+        assignment_order_sql(),
         (Account.status != "active").asc(),
         Account.error_count_recent.asc().nulls_first(),
         Account.last_used_at.asc().nulls_first(),
@@ -2263,12 +2372,21 @@ def get_free_account_for_reply(
     runtime_last_resort_accounts: list[tuple[Account, dict[str, Any], int]] = []
     last_resort_accounts: list[tuple[Account, dict[str, Any], int]] = []
     scanned_count = 0
+    selection_proxy_cache: dict[str, bool] = {}
+    ordered_sqlite_ids = None
+    sqlite_offset = 0
+    if dialect_name == "sqlite":
+        ordered_sqlite_ids = [row[0] for row in query.with_entities(Account.id).order_by(*order_by_clauses).all()]
 
     while True:
         batch_query = query
         if seen_ids:
             batch_query = batch_query.filter(~Account.id.in_(list(seen_ids)))
-        batch_query = batch_query.order_by(*order_by_clauses).limit(batch_size)
+        batch_ids = ordered_sqlite_ids[sqlite_offset:sqlite_offset + batch_size] if ordered_sqlite_ids is not None else None
+        if batch_ids is not None:
+            batch_query = batch_query.filter(Account.id.in_(batch_ids))
+        else:
+            batch_query = batch_query.order_by(*order_by_clauses).limit(batch_size)
 
         try:
             if locking_enabled:
@@ -2285,6 +2403,12 @@ def get_free_account_for_reply(
                 continue
             raise
 
+        if batch_ids is not None:
+            sqlite_offset += batch_size
+            positions = {account_id: index for index, account_id in enumerate(batch_ids)}
+            accounts.sort(key=lambda account: positions[account.id])
+            if not accounts and sqlite_offset < len(ordered_sqlite_ids):
+                continue
         if not accounts:
             if runtime_last_resort_accounts:
                 logger.warning(
@@ -2322,6 +2446,7 @@ def get_free_account_for_reply(
 
             available_accounts: list[tuple[Account, dict[str, Any], int]] = []
             for index, acc in enumerate(accounts):
+                apply_dedicated_proxy(acc)
                 acc_proxy = str(acc.proxy or "").strip()
                 if acc_proxy:
                     if acc_proxy in normalized_exclude_proxies:
@@ -2330,10 +2455,10 @@ def get_free_account_for_reply(
                         continue
                 if not _has_auth_material(acc):
                     continue
-                state = _read_runtime_state(acc, now)
+                state = _selection_runtime_state(acc, now, selection_proxy_cache)
                 lifecycle = _read_account_lifecycle(acc, now)
                 session_quality = _read_account_session_quality(acc, REPLY_SCOPE, now)
-                spend_lane = _read_account_spend_lane(acc, REPLY_SCOPE, now)
+                spend_lane = _read_account_spend_lane(acc, REPLY_SCOPE, now, lifecycle=lifecycle, session_quality=session_quality)
                 if lifecycle["hard_expired"]:
                     continue
                 if session_quality["bucket"] == SESSION_BUCKET_DEAD:
@@ -2483,6 +2608,7 @@ def get_free_account_for_reply(
                 ranked_available.append(
                     (
                         (
+                            assignment_rank(acc),
                             RUNTIME_BUCKET_ORDER.get(state["bucket"], 5),
                             0 if acc.status == "active" else 1,
                             _lane_sort_rank(REPLY_SCOPE, spend_lane["lane"]),
@@ -2509,6 +2635,18 @@ def get_free_account_for_reply(
                         candidate_account.id,
                     )
                     continue
+                try:
+                    claimed = claim_assignment(db, candidate_account, REPLY_SCOPE, reserve=reserve)
+                except Exception:
+                    if reserve:
+                        release_reply_account_reservation(candidate_account.id)
+                    raise
+                if not claimed:
+                    if reserve:
+                        release_reply_account_reservation(candidate_account.id)
+                    seen_ids.add(candidate_account.id)
+                    continue
+                apply_dedicated_proxy(candidate_account)
                 account = candidate_account
                 account_state = candidate_state
                 account_score = candidate_score
@@ -2532,7 +2670,11 @@ def get_free_account_for_reply(
                         elif not proxy_obj.country_code:
                             logger.debug(f"[GEO] Selected account {account.id} for reply: proxy has no country_code (account: {account.country_code})")
                     elif account.proxy:
-                        logger.warning(f"[GEO] Selected account {account.id} for reply: proxy {account.proxy[:30]} not found in Proxy table")
+                        logger.warning(
+                            "[GEO] Selected account %s for reply: proxy %s not found in Proxy table",
+                            account.id,
+                            _safe_proxy_selection_diag(account.proxy),
+                        )
                 except Exception as log_err:
                     logger.debug(f"[GEO] Could not log geo match for account {account.id}: {log_err}")
             logger.info(
@@ -2729,6 +2871,7 @@ def count_viable_accounts_for_http(
     pool_owner_user_id=<int> → личный пул конкретного работника.
     """
     now = datetime.now(timezone.utc)
+    dedicated_route = get_current_dedicated_proxy()
     cooldown_threshold = now - timedelta(seconds=settings.ACCOUNT_COOLDOWN_SECONDS)
     auth_material = or_(
         and_(Account.cookies.isnot(None), Account.cookies != ""),
@@ -2757,11 +2900,21 @@ def count_viable_accounts_for_http(
             Account.last_main_comment_at < cooldown_threshold,
         ),
     )
-    if settings.USE_PROXY:
+    if settings.USE_PROXY and dedicated_route is None:
+        query = query.filter(
+            or_(
+                Account.proxy.is_(None),
+                ~Account.proxy.in_(
+                    select(Proxy.proxy).where(Proxy.dedicated_user_id.isnot(None))
+                ),
+            )
+        )
+    if settings.USE_PROXY and dedicated_route is None:
         query = query.filter(Account.proxy.isnot(None), Account.proxy != "")
 
     eligible = 0
     for account in query.all():
+        apply_dedicated_proxy(account)
         if not _has_auth_material(account):
             continue
         state = _read_runtime_state(account, now)
@@ -3100,8 +3253,22 @@ def _build_scope_runtime_stats(
             state = _read_runtime_state(account, now, bad_proxy_set=known_bad_proxy_set)
         lifecycle = _read_account_lifecycle(account, now)
         session_quality = _read_account_session_quality(account, scope, now)
-        strategy_info = get_http_execution_strategy(account, scope, now)
-        spend_lane = _read_account_spend_lane(account, scope, now)
+        spend_lane = _read_account_spend_lane(
+            account,
+            scope,
+            now,
+            lifecycle=lifecycle,
+            session_quality=session_quality,
+        )
+        strategy_info = get_http_execution_strategy(
+            account,
+            scope,
+            now,
+            lifecycle=lifecycle,
+            state=state,
+            session_quality=session_quality,
+            spend_lane=spend_lane,
+        )
 
         bucket = state["bucket"]
         health_grade = _runtime_health_grade(state) if scope != MONITOR_SCOPE else RUNTIME_HEALTH_HEALTHY
@@ -3167,7 +3334,15 @@ def _build_scope_runtime_stats(
         if quality_reason:
             session_issue_counts[quality_reason] = session_issue_counts.get(quality_reason, 0) + 1
 
-        score = _calculate_scope_quality_score(account, state, scope, now)
+        score = _calculate_scope_quality_score(
+            account,
+            state,
+            scope,
+            now,
+            lifecycle=lifecycle,
+            session_quality=session_quality,
+            spend_lane=spend_lane,
+        )
         scores.append(score)
         session_scores.append(int(session_quality["score"]))
 
@@ -3251,6 +3426,14 @@ def get_monitor_account(
             Account.status.notin_(["dead", "reauth_needed", "banned"]),
             Account.error_count_recent < ERROR_THRESHOLD,
             auth_material,
+        )
+    )
+    query = query.filter(
+        or_(
+            Account.proxy.is_(None),
+            ~Account.proxy.in_(
+                select(Proxy.proxy).where(Proxy.dedicated_user_id.isnot(None))
+            ),
         )
     )
 

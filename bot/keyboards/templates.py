@@ -4,6 +4,7 @@ from typing import Dict, List
 from config.settings import get_settings
 
 from bot.services.formatting import markdown_inline_code
+from bot.services.main_visibility_ui import visibility_keyboard
 from bot.services.template_utils import is_replies_only_template, template_replies, template_text_variants
 from bot.utils.markdown_escape import escape_markdown_simple
 
@@ -80,7 +81,9 @@ def get_template_choice_keyboard(
     return InlineKeyboardMarkup(inline_keyboard=keyboard), current_page, total_pages
 
 
-def get_template_preview_keyboard(template_id: int, reply_count: int = 3, is_editing: bool = False) -> InlineKeyboardMarkup:
+def get_template_preview_keyboard(template_id: int, reply_count: int = 3, is_editing: bool = False,
+                                  verify_main_visibility: bool = False,
+                                  verify_reply_visibility: bool = False) -> InlineKeyboardMarkup:
     """
     Клавиатура предпросмотра шаблона.
     """
@@ -115,7 +118,8 @@ def get_template_preview_keyboard(template_id: int, reply_count: int = 3, is_edi
 
         keyboard.append([InlineKeyboardButton(text="◀️ Назад", callback_data="quicktpl:back_to_choice")])
 
-    return InlineKeyboardMarkup(inline_keyboard=keyboard)
+    markup = InlineKeyboardMarkup(inline_keyboard=keyboard)
+    return markup if is_editing else visibility_keyboard(markup, verify_main_visibility, verify_reply_visibility)
 
 
 def format_template_preview(

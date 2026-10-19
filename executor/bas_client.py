@@ -10,6 +10,7 @@ from typing import Optional, Dict, Any
 from db.models import Account
 from config.settings import get_settings
 from executor.tiktok_client_async import parse_cookies, TikTokClientError
+from services.log_sanitizer import sanitize_url
 
 logger = logging.getLogger("executor.bas_client")
 settings = get_settings()
@@ -203,7 +204,11 @@ class BASClient:
             return proxy_dict
             
         except Exception as e:
-            logger.warning(f"Failed to parse proxy {proxy_str[:50]}: {e}")
+            logger.warning(
+                "Failed to parse proxy %s: %s",
+                sanitize_url(str(proxy_str or ""), max_length=80),
+                e,
+            )
             return None
     
     async def post_comment(

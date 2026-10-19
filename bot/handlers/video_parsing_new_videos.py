@@ -7,6 +7,7 @@ from aiogram.fsm.context import FSMContext
 from aiogram.exceptions import TelegramBadRequest
 from bot.services.api_client import api_client
 from bot.services.user_utils import get_user_backend_id
+from bot.services.main_visibility_ui import visibility_keyboard
 from bot.keyboards.video_parsing import get_video_parsing_menu_keyboard
 from bot.services.formatting import Emoji, escape_markdown, markdown_inline_code
 from bot.services.template_utils import filter_full_templates
@@ -363,6 +364,12 @@ async def new_videos_template_selected(callback: CallbackQuery, state: FSMContex
             [InlineKeyboardButton(text="🚀 Запустить", callback_data=f"vp:new_videos:confirm_order:{creator_id}:{batch_id}:{template_id}")],
             [InlineKeyboardButton(text="⬅️ Назад", callback_data=f"vp:new_videos:select_template:{creator_id}:{batch_id}")]
         ])
+        state_data = await state.get_data()
+        keyboard = visibility_keyboard(
+            keyboard,
+            bool(state_data.get("verify_main_visibility", False)),
+            bool(state_data.get("verify_reply_visibility", False)),
+        )
         
         await callback.message.edit_text(
             message,
@@ -483,11 +490,15 @@ async def new_videos_confirm_order(callback: CallbackQuery, state: FSMContext):
         reply_count = min(requested_reply_count, len(template_reply_list), settings.MAX_REPLIES)
         selected_replies = template_reply_list[:reply_count]
         
+        # Visibility options belong to this order, independently of the template.
+        state_data = await state.get_data()
         # Формируем settings для заказа
         task_settings = {
             "reply_mode": template_settings.get("reply_mode", "A"),
             "reply_count": reply_count,
             "replies": selected_replies,
+            "verify_main_visibility": bool(state_data.get("verify_main_visibility", False)),
+            "verify_reply_visibility": bool(state_data.get("verify_reply_visibility", False)),
             "delays": template_settings.get("delays", True),
             "shuffle": template_settings.get("shuffle", False),
             "rotate_accounts": template_settings.get("rotate_accounts", True),

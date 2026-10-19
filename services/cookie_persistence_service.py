@@ -9,12 +9,175 @@ import json
 import logging
 from typing import List, Dict, Any, Optional
 from pathlib import Path
-from sqlalchemy.orm import Session
+from sqlalchemy.orm import Session, object_session
 from db.models import Account
 from config.settings import get_settings
 
 logger = logging.getLogger("services.cookie_persistence_service")
 settings = get_settings()
+
+
+def _inject_web_identity_records(
+    records: List[Dict[str, Any]],
+    *,
+    account: Optional[Account] = None,
+    context: Any = None,
+    previous: Optional[Dict[str, str]] = None,
+) -> tuple[List[Dict[str, Any]], Dict[str, str]]:
+    """Attach persisted/cached (device_id, WebIdLastTime, odinId) metadata records for DB storage."""
+    from executor.http.playwright_http_client import get_cached_web_identity
+
+    account_id = getattr(account, "id", None) or getattr(context, "_pool_account_id", None)
+    cached = get_cached_web_identity(account_id, context=context, account=account)
+    prev = previous if isinstance(previous, dict) else {}
+
+    device_id = str(cached.get("device_id") or prev.get("device_id") or prev.get("device-id") or "").strip()
+    web_id_last_time = str(
+        cached.get("web_id_last_time")
+        or prev.get("WebIdLastTime")
+        or prev.get("web_id_last_time")
+        or ""
+    ).strip()
+    odin_id = str(
+        cached.get("odin_id")
+        or prev.get("odinId")
+        or prev.get("odin_id")
+        or prev.get("odin_tt")
+        or ""
+    ).strip()
+
+    identity_map: Dict[str, str] = {}
+    if device_id:
+        identity_map["device_id"] = device_id
+    if web_id_last_time:
+        identity_map["WebIdLastTime"] = web_id_last_time
+    if odin_id:
+        identity_map["odinId"] = odin_id
+
+    if not identity_map:
+        return list(records or []), identity_map
+
+    meta_lower = {k.lower() for k in identity_map}
+    filtered = [
+        dict(r)
+        for r in (records or [])
+        if isinstance(r, dict) and str(r.get("name") or "").strip().lower() not in meta_lower
+    ]
+    for name, value in identity_map.items():
+        filtered.append(
+            {
+                "name": name,
+                "value": value,
+                "domain": ".tiktok.com",
+                "path": "/",
+                "secure": True,
+                "httpOnly": False,
+            }
+        )
+    return filtered, identity_map
+
+
+async def synchronize_browser_cookies(
+    context: Any, account: Optional[Account] = None, db: Optional[Session] = None,
+) -> tuple[Dict[str, str], bool]:
+    """Restore missing browser auth aliases and save fresh page cookies + JS web identity."""
+    from services.cookie_validator import (
+        get_cookies_for_account,
+        normalize_cookie_records,
+        normalize_cookies_for_browser,
+        parse_cookies_to_dict,
+    )
+
+    records = await context.cookies()
+    names = {c["name"] for c in records}
+    restored = [c for c in normalize_cookies_for_browser(records, drop_stale_antifraud=False)
+                if c["name"] in {"sessionid", "sid_tt", "sessionid_ss"} and c["name"] not in names]
+    if restored:
+        await context.add_cookies(restored)
+    previous = parse_cookies_to_dict(get_cookies_for_account(account)) if account is not None else {}
+    merged_records, identity_map = _inject_web_identity_records(
+        [*records, *restored],
+        account=account,
+        context=context,
+        previous=previous,
+    )
+    cookies = normalize_cookie_records(merged_records)
+    for k, v in identity_map.items():
+        cookies[k] = v
+    try:
+        saved = save_warmed_cookies_for_account(account, cookies, db, context=context)
+    except Exception:
+        logger.warning("Could not persist warmed browser cookies for account %s", getattr(account, "id", None), exc_info=True)
+        saved = False
+    return cookies, saved
+
+
+def save_warmed_cookies_for_account(
+    account: Optional[Account],
+    cookies: Dict[str, str],
+    db: Optional[Session] = None,
+    *,
+    context: Any = None,
+) -> bool:
+    """Persist generated/rotated browser linkage cookies and JS web identity after page warmup."""
+    if account is None:
+        return False
+    from services.cookie_validator import (
+        get_cookies_for_account, parse_cookies_to_dict, normalize_cookies_for_browser,
+    )
+
+    previous = parse_cookies_to_dict(get_cookies_for_account(account))
+    records = getattr(cookies, "records", None)
+    if records is None:
+        if cookies:
+            records = [{"name": name, "value": value} for name, value in cookies.items()]
+        else:
+            records = getattr(previous, "records", None) or [
+                {"name": name, "value": value} for name, value in previous.items()
+            ]
+    records, identity_map = _inject_web_identity_records(
+        records,
+        account=account,
+        context=context,
+        previous=previous,
+    )
+    effective_cookies = dict(previous)
+    effective_cookies.update(cookies or {})
+    effective_cookies.update(identity_map)
+
+    tracked_names = (
+        "ttwid",
+        "tt_csrf_token",
+        "odin_tt",
+        "msToken",
+        "s_v_web_id",
+        "device_id",
+        "WebIdLastTime",
+        "odinId",
+    )
+    if not any(
+        effective_cookies.get(name) and effective_cookies[name] != previous.get(name)
+        for name in tracked_names
+    ):
+        return False
+    if db is None and isinstance(account, Account):
+        db = object_session(account)
+    if db is None:
+        return False
+    normalized_records = normalize_cookies_for_browser(records, drop_stale_antifraud=False)
+    saved = save_cookies_to_db(db, account.id, normalized_records)
+    if getattr(account, "cookie_file", None):
+        save_cookies_to_file(account.cookie_file, normalized_records)
+    if saved:
+        from datetime import datetime, timezone
+        now_utc = datetime.now(timezone.utc)
+        cookies_str = cookies_to_string(normalized_records)
+        if cookies_str and hasattr(account, "cookies"):
+            account.cookies = cookies_str
+        setattr(account, "_cookies_warmed_at", now_utc)
+        if hasattr(account, "last_validation_ok"):
+            account.last_validation_ok = now_utc
+    return saved
 
 
 def cookies_to_string(cookies: List[Dict[str, Any]]) -> str:
@@ -149,7 +312,22 @@ async def save_cookies_after_action(
         if not cookies:
             logger.debug(f"No cookies to save for account {account.id}")
             return False
-        
+
+        try:
+            from services.cookie_validator import get_cookies_for_account, parse_cookies_to_dict
+            previous = parse_cookies_to_dict(get_cookies_for_account(account))
+        except Exception:
+            previous = {}
+        cookies, _ = _inject_web_identity_records(
+            cookies,
+            account=account,
+            context=context,
+            previous=previous,
+        )
+
+        if db is None and isinstance(account, Account):
+            db = object_session(account)
+
         # Сохраняем в БД (если сессия предоставлена)
         saved_to_db = False
         if db:
@@ -161,6 +339,9 @@ async def save_cookies_after_action(
             saved_to_file = save_cookies_to_file(account.cookie_file, cookies)
         
         if saved_to_db or saved_to_file:
+            cookies_str = cookies_to_string(cookies)
+            if cookies_str and hasattr(account, "cookies"):
+                account.cookies = cookies_str
             logger.debug(f"Cookies persisted for account {account.id} (db={saved_to_db}, file={saved_to_file})")
             return True
         

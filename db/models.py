@@ -69,6 +69,12 @@ class Account(Base):
     today_main_comments = Column(Integer, default=0, nullable=False)
     today_replies = Column(Integer, default=0, nullable=False)
     last_used_at = Column(DateTime(timezone=True), nullable=True)
+    # Scheduler history is separate from successful posts and monitor reads.
+    last_assigned_at = Column(DateTime(timezone=True), nullable=True, index=True)
+    assignment_count = Column(Integer, default=0, server_default="0", nullable=False)
+    assignment_lease_until = Column(DateTime(timezone=True), nullable=True)
+    assignment_lease_token = Column(String(64), nullable=True)
+    last_validation_attempt_at = Column(DateTime(timezone=True), nullable=True, index=True)
     last_main_comment_at = Column(DateTime(timezone=True), nullable=True, index=True)
     last_error = Column(Text, nullable=True)
     error_count_recent = Column(Integer, default=0, nullable=False)
@@ -216,6 +222,17 @@ class Proxy(Base):
     # response_time_ms = Column(Integer, nullable=True)  # УДАЛЕНО
     rotation_url = Column(Text, nullable=True)  # URL для ротации IP (для мобильных прокси)
     is_mobile = Column(String(1), default="N", nullable=False)  # "Y" или "N" - быстрая проверка типа прокси
+    # NULL -> обычный общий прокси. Значение -> прокси зарезервирован только
+    # для shared-заказов конкретного пользователя. TikTok-аккаунты при этом
+    # остаются в общем пуле; executor подставляет этот прокси только на время
+    # выполнения заказа и не сохраняет его в Account.proxy.
+    dedicated_user_id = Column(
+        Integer,
+        ForeignKey("users.id", ondelete="SET NULL"),
+        nullable=True,
+        unique=True,
+        index=True,
+    )
     created_at = Column(DateTime(timezone=True), server_default=func.now())
     updated_at = Column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now())
     

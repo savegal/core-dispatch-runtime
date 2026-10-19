@@ -1,5 +1,5 @@
 from fastapi import APIRouter, Depends, HTTPException, Query, Request, Header
-from pydantic import BaseModel, field_validator, model_validator
+from pydantic import BaseModel, TypeAdapter, field_validator, model_validator
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import delete, select
 from db.database import get_db
@@ -185,6 +185,16 @@ class TaskCreate(BaseModel):
     engagement_comment_text: str | None = None  # Ð¢ÐµÐºÑÑ‚ ÐºÐ¾Ð¼Ð¼ÐµÐ½Ñ‚Ð°Ñ€Ð¸Ñ Ð´Ð»Ñ Ð¿Ð¾Ð¸ÑÐºÐ°
     
     # Ð˜Ð¡ÐŸÐ ÐÐ’Ð›Ð•ÐÐž: Ð’Ð°Ð»Ð¸Ð´Ð°Ñ†Ð¸Ñ Ð²Ñ…Ð¾Ð´Ð½Ñ‹Ñ… Ð´Ð°Ð½Ð½Ñ‹Ñ…
+    @field_validator('settings')
+    @classmethod
+    def validate_visibility_setting(cls, value):
+        if value is not None:
+            value = dict(value)
+            for key in ("verify_main_visibility", "verify_reply_visibility"):
+                if key in value:
+                    value[key] = TypeAdapter(bool).validate_python(value[key])
+        return value
+
     @field_validator('video_urls')
     @classmethod
     def validate_video_urls(cls, v: list[str]) -> list[str]:
@@ -272,6 +282,8 @@ class TaskCreate(BaseModel):
     @model_validator(mode="after")
     def validate_kind_specific_fields(self):
         """Cross-field validation for full/engagement_only orders."""
+        if self.kind != "full" and (self.settings or {}).get("verify_main_visibility"):
+            raise ValueError("verify_main_visibility is available only for full orders")
         if self.kind == "full":
             if not self.main_comment:
                 raise ValueError("main_comment cannot be empty for full orders")
@@ -529,10 +541,6 @@ async def create_task(
         [task_data.reply1, task_data.reply2, task_data.reply3],
     )
     
-    # REFACTOR: Ð˜ÑÐ¿Ð¾Ð»ÑŒÐ·ÑƒÐµÐ¼ text_variants[0] Ð´Ð»Ñ Ð´ÐµÐ´ÑƒÐ¿Ð»Ð¸ÐºÐ°Ñ†Ð¸Ð¸ (Ð²Ð¼ÐµÑÑ‚Ð¾ main_comment Ð¸Ð· Ð·Ð°Ð¿Ñ€Ð¾ÑÐ°)
-    # WHY: main_comment Ð¼Ð¾Ð¶ÐµÑ‚ Ð¾Ñ‚Ð»Ð¸Ñ‡Ð°Ñ‚ÑŒÑÑ Ð¾Ñ‚ Ñ€ÐµÐ°Ð»ÑŒÐ½Ð¾Ð³Ð¾ Ð¿ÐµÑ€Ð²Ð¾Ð³Ð¾ Ð²Ð°Ñ€Ð¸Ð°Ð½Ñ‚Ð° Ñ‚ÐµÐºÑÑ‚Ð°
-    task_main_text_for_dedup = task_data.text_variants[0] if task_data.text_variants else task_data.main_comment
-
     idempotency_key = _normalize_header_key(
         request.headers.get("X-Idempotency-Key") or request.headers.get("Idempotency-Key")
     )
@@ -551,7 +559,7 @@ async def create_task(
         for existing_task in idem_result.scalars().all():
             existing_settings = existing_task.settings or {}
             existing_key = _normalize_header_key(
-                existing_settings.get("client_task_fingerprint") or existing_settings.get("idempotency_key")
+                existing_settings.get("idempotency_key") or existing_settings.get("client_task_fingerprint")
             )
             if existing_key and existing_key == idempotency_key:
                 logger.info(
@@ -565,78 +573,9 @@ async def create_task(
                     "idempotency_reuse": True
                 }
 
-    # 2) ÐŸÑ€Ð¾Ð²ÐµÑ€ÐºÐ° Ð´ÑƒÐ±Ð»Ð¸ÐºÐ°Ñ‚Ð¾Ð² Ð¿Ð¾ Ð±Ð¸Ð·Ð½ÐµÑ-Ð¿Ñ€Ð°Ð²Ð¸Ð»Ð°Ð¼ Ð·Ð° Ð¿Ð¾ÑÐ»ÐµÐ´Ð½Ð¸Ð¹ Ñ‡Ð°Ñ
-    one_hour_ago = datetime.now(timezone.utc) - timedelta(hours=1)
-    result = await db.execute(
-        select(Task).filter(
-            Task.user_id == task_data.user_id,
-            Task.status.in_(["pending", "in_progress", "done", "partial"]),
-            Task.main_comment == task_main_text_for_dedup,
-            Task.created_at >= one_hour_ago
-        )
-    )
-    existing_tasks = result.scalars().all()
-
-    new_urls = set(task_data.video_urls)
-    new_kind = (task_data.kind or "full").strip()
-    new_comment_id = (task_data.engagement_comment_id or "").strip()
-    new_username = (task_data.engagement_username or "").strip().lower()
-    new_comment_text = (task_data.engagement_comment_text or "").strip()
+    # Identical content is allowed in separate full and reply orders.
     new_account_pool_mode = _normalize_account_pool_mode_from_settings(normalized_task_settings)
 
-    for existing_task in existing_tasks:
-        existing_urls = set(existing_task.video_urls or [])
-        if not existing_urls.intersection(new_urls):
-            continue
-
-        existing_kind = (getattr(existing_task, "kind", "full") or "full").strip()
-        if existing_kind != new_kind:
-            # full Ð¸ engagement_only â€” Ñ€Ð°Ð·Ð½Ñ‹Ðµ Ñ‚Ð¸Ð¿Ñ‹ Ð·Ð°Ð´Ð°Ñ‡, Ð½Ðµ ÑÑ‡Ð¸Ñ‚Ð°ÐµÐ¼ Ð¸Ñ… Ð´ÑƒÐ±Ð»ÑÐ¼Ð¸
-            continue
-
-        if new_kind == "engagement_only":
-            existing_settings = existing_task.settings or {}
-            existing_comment_id = (existing_settings.get("engagement_comment_id") or "").strip()
-            existing_username = (existing_settings.get("engagement_username") or "").strip().lower()
-            existing_comment_text = (existing_settings.get("engagement_comment_text") or "").strip()
-
-            # Ð”Ð»Ñ engagement_only Ð´ÑƒÐ±Ð»Ð¸ÐºÐ°Ñ‚ Ñ‚Ð¾Ð»ÑŒÐºÐ¾ ÐµÑÐ»Ð¸ ÑÐ¾Ð²Ð¿Ð°Ð´Ð°ÐµÑ‚ Ñ†ÐµÐ»ÑŒ Ð¾Ñ‚Ð²ÐµÑ‚Ð°:
-            # Ð»Ð¸Ð±Ð¾ Ð¾Ð´Ð¸Ð½Ð°ÐºÐ¾Ð²Ñ‹Ð¹ comment_id, Ð»Ð¸Ð±Ð¾ Ð¾Ð´Ð¸Ð½Ð°ÐºÐ¾Ð²Ð°Ñ Ð¿Ð°Ñ€Ð° username+comment_text.
-            same_target = False
-            if new_comment_id or existing_comment_id:
-                same_target = (new_comment_id == existing_comment_id and bool(new_comment_id))
-            else:
-                same_text = bool(new_comment_text) and new_comment_text == existing_comment_text
-                if same_text and new_username and existing_username:
-                    same_target = new_username == existing_username
-                else:
-                    same_target = same_text
-
-            if not same_target:
-                continue
-
-        if existing_task.status in ["done", "partial"]:
-            raise HTTPException(
-                status_code=409,
-                detail=(
-                    f"DUPLICATE_ORDER: Вы уже успешно публиковали этот комментарий под это видео "
-                    f"(задача #{existing_task.id}). ТикТок может склеить их или скрыть. "
-                    "Пожалуйста, измените текст комментария (хотя бы пару слов)."
-                )
-            )
-        if existing_task.status in ["pending", "in_progress"]:
-            if not _active_duplicate_matches_pool(existing_task, new_account_pool_mode):
-                logger.info(
-                    "Duplicate content found in active task #%s but account_pool_mode differs "
-                    "(existing=%s, new=%s); creating a separate task.",
-                    existing_task.id,
-                    _normalize_account_pool_mode_from_settings(existing_task.settings or {}),
-                    new_account_pool_mode,
-                )
-                continue
-            logger.info(f"Duplicate task detected: existing task_id={existing_task.id}, returning existing task")
-            return {"task_id": existing_task.id, "status": existing_task.status, "duplicate": True}
-    
     # REFACTOR: Ð˜ÑÐ¿Ð¾Ð»ÑŒÐ·ÑƒÐµÐ¼ text_variants[0] ÐºÐ°Ðº Ð¾ÑÐ½Ð¾Ð²Ð½Ð¾Ð¹ Ñ‚ÐµÐºÑÑ‚ Ð²ÐµÐ·Ð´Ðµ
     # WHY: Ð“Ð°Ñ€Ð°Ð½Ñ‚Ð¸Ñ€ÑƒÐµÐ¼ ÐµÐ´Ð¸Ð½Ð¾Ð¾Ð±Ñ€Ð°Ð·Ð¸Ðµ - Ð¾ÑÐ½Ð¾Ð²Ð½Ð¾Ð¹ Ñ‚ÐµÐºÑÑ‚ Ð²ÑÐµÐ³Ð´Ð° Ð¿ÐµÑ€Ð²Ñ‹Ð¹ Ð²Ð°Ñ€Ð¸Ð°Ð½Ñ‚
     task_main_text = task_data.text_variants[0] if task_data.text_variants else task_data.main_comment
@@ -656,32 +595,17 @@ async def create_task(
         if isinstance(admin_ids, list) and user.telegram_id:
             user_is_admin = user.telegram_id in admin_ids
 
-    # Ð”ÐµÐ´ÑƒÐ¿Ð»Ð¸ÐºÐ°Ñ†Ð¸Ñ Ñ‡ÐµÑ€ÐµÐ· Redis (TTL 30 ÑÐµÐºÑƒÐ½Ð´ - Ñ‚Ð¾Ð»ÑŒÐºÐ¾ Ð·Ð°Ñ‰Ð¸Ñ‚Ð° Ð¾Ñ‚ Ð´Ð°Ð±Ð»-ÐºÐ»Ð¸ÐºÐ°)
-    # Ð˜Ð¡ÐŸÐ ÐÐ’Ð›Ð•ÐÐž: Ð£Ð¼ÐµÐ½ÑŒÑˆÐµÐ½ TTL Ñ 2 Ñ‡Ð°ÑÐ¾Ð² Ð´Ð¾ 30 ÑÐµÐºÑƒÐ½Ð´.
-    # Ð ÐµÐ°Ð»ÑŒÐ½Ð°Ñ Ð¿Ñ€Ð¾Ð²ÐµÑ€ÐºÐ° Ð´ÑƒÐ±Ð»Ð¸ÐºÐ°Ñ‚Ð¾Ð² Ñ‚ÐµÐ¿ÐµÑ€ÑŒ Ð¸Ð´ÐµÑ‚ Ñ‡ÐµÑ€ÐµÐ· Ð‘Ð” (Ñ‚Ð¾Ð»ÑŒÐºÐ¾ ÑƒÑÐ¿ÐµÑˆÐ½Ñ‹Ðµ/Ð°ÐºÑ‚Ð¸Ð²Ð½Ñ‹Ðµ Ð·Ð°Ð´Ð°Ñ‡Ð¸).
-    dedup_scope_parts = [f"kind={new_kind}"]
-    dedup_scope_parts.append(f"pool={new_account_pool_mode}")
-    if idempotency_key:
-        dedup_scope_parts.append(f"idem={idempotency_key}")
-    if new_kind == "engagement_only":
-        dedup_scope_parts.append(f"comment_id={new_comment_id}")
-        dedup_scope_parts.append(f"username={new_username}")
-        dedup_scope_parts.append(f"comment_text={new_comment_text}")
-    dedup_scope = "|".join(dedup_scope_parts)
-
-    dedup_ok = claim_dedup_key(
-        task_data.user_id,
-        task_main_text,
-        task_data.video_urls,
-        ttl_seconds=30,
-        scope=dedup_scope
-    )
-    if not dedup_ok:
+    # Only replay of the same explicitly identified request is deduplicated.
+    # Separate orders may have identical video URLs, comments and replies.
+    if idempotency_key and not claim_dedup_key(
+        task_data.user_id, "", [], ttl_seconds=30,
+        scope=f"idempotency={idempotency_key}",
+    ):
         raise HTTPException(
             status_code=409,
-            detail="DUPLICATE_ORDER_DEDUP: Похожий заказ только что был отправлен. Подождите пару секунд."
+            detail="ORDER_REQUEST_IN_PROGRESS: This order request is already being created. Retry with the same key.",
         )
-    
+
     hold_transaction = None
 
     if not settings.DEMO_MODE and not user_is_admin:
@@ -748,13 +672,15 @@ async def create_task(
     # REFACTOR: Ð¡Ð¾Ñ…Ñ€Ð°Ð½ÑÐµÐ¼ origin Ð² settings (Ð´Ð»Ñ Ñ„Ð¸Ð»ÑŒÑ‚Ñ€Ð°Ñ†Ð¸Ð¸ Ð¸ Ð¾Ñ‚Ð¾Ð±Ñ€Ð°Ð¶ÐµÐ½Ð¸Ñ)
     # WHY: Ð¥Ñ€Ð°Ð½Ð¸Ð¼ Ð² settings, Ð½Ð¾ Ð¼Ð¾Ð¶Ð½Ð¾ Ð»ÐµÐ³ÐºÐ¾ Ñ„Ð¸Ð»ÑŒÑ‚Ñ€Ð¾Ð²Ð°Ñ‚ÑŒ Ñ‡ÐµÑ€ÐµÐ· JSONB queries Ð² Ð±ÑƒÐ´ÑƒÑ‰ÐµÐ¼
     task_settings = dict(normalized_task_settings)
+    task_settings.setdefault("verify_main_visibility", False)
+    task_settings.setdefault("verify_reply_visibility", False)
     task_settings["text_variants"] = task_data.text_variants
     task_settings["account_pool_mode"] = new_account_pool_mode
     # Ð£ÑÑ‚Ð°Ð½Ð°Ð²Ð»Ð¸Ð²Ð°ÐµÐ¼ origin ÐµÑÐ»Ð¸ Ð½Ðµ ÑƒÐºÐ°Ð·Ð°Ð½ (Ð´Ð»Ñ Ð¾Ð±Ñ€Ð°Ñ‚Ð½Ð¾Ð¹ ÑÐ¾Ð²Ð¼ÐµÑÑ‚Ð¸Ð¼Ð¾ÑÑ‚Ð¸)
     if "origin" not in task_settings:
         task_settings["origin"] = "manual"  # ÐŸÐ¾ ÑƒÐ¼Ð¾Ð»Ñ‡Ð°Ð½Ð¸ÑŽ manual
     if idempotency_key:
-        task_settings.setdefault("client_task_fingerprint", idempotency_key)
+        task_settings["client_task_fingerprint"] = idempotency_key
         task_settings["idempotency_key"] = idempotency_key
     if request_id:
         task_settings["request_id"] = request_id

@@ -30,6 +30,7 @@ aiohttp>=3.9.0  # HTTP-сервер для bas_http_server.py
 
 # Utilities
 python-dotenv>=1.0.0
+tzlocal>=5.0  # System IANA timezone on Windows and Unix
 
 # Rate limiting (безопасность API)
 slowapi>=0.1.9

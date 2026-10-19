@@ -209,6 +209,18 @@ class Settings(BaseSettings):
     
     # ИСПРАВЛЕНО: Настройки для надёжной верификации комментариев (рекомендации ChatGPT)
     COMMENT_APPEARANCE_TIMEOUT: int = 90  # Максимальное время ожидания появления комментария (секунды, 90 секунд)
+    MAIN_VISIBILITY_REPAIR_ROUNDS: int = Field(default=2, ge=0, le=3)
+    MAIN_VISIBILITY_OBSERVER_ATTEMPTS: int = Field(default=6, ge=2, le=12)
+    MAIN_VISIBILITY_MAX_PAGES: int = Field(default=20, ge=1, le=100)
+    MAIN_VISIBILITY_INITIAL_DELAY_SECONDS: float = Field(default=10.0, ge=0, le=60)
+    MAIN_VISIBILITY_RECHECK_DELAY_SECONDS: float = Field(default=10.0, ge=0, le=60)
+    MAIN_VISIBILITY_MAX_SECONDS: float = Field(default=300.0, ge=1, le=900)
+    REPLY_PUBLICATION_VISIBILITY_REPAIR_ROUNDS: int = Field(default=2, ge=0, le=3)
+    REPLY_PUBLICATION_VISIBILITY_OBSERVER_ATTEMPTS: int = Field(default=6, ge=2, le=12)
+    REPLY_PUBLICATION_VISIBILITY_MAX_PAGES: int = Field(default=20, ge=1, le=100)
+    REPLY_PUBLICATION_VISIBILITY_INITIAL_DELAY_SECONDS: float = Field(default=10.0, ge=0, le=60)
+    REPLY_PUBLICATION_VISIBILITY_RECHECK_DELAY_SECONDS: float = Field(default=10.0, ge=0, le=60)
+    REPLY_PUBLICATION_VISIBILITY_MAX_SECONDS: float = Field(default=300.0, ge=1, le=900)
     COMMENT_VERIFY_CHECK_INTERVAL: int = 8  # Интервал между проверками видимости комментария (секунды, 8 секунд)
     COMMENT_LOCAL_VERIFY_DELAY: int = 3  # Задержка перед локальной проверкой (автор видит свой комментарий, секунды)
     COMMENT_LOCAL_VERIFY_TIMEOUT: int = 10  # Таймаут для локальной проверки (секунды)
@@ -289,8 +301,8 @@ class Settings(BaseSettings):
     COMMENT_SECTION_SEARCH_ATTEMPTS: int = 4  # Попытки поиска секции комментариев
     SUBMIT_BUTTON_SEARCH_ATTEMPTS: int = 3  # Попытки поиска кнопки отправки
     TIKTOK_NETWORK_PROBE: bool = False  # Логирование network endpoints (debug)
-    TIKTOK_NETWORK_FIRST: bool = False  # Включить network-first publish/verify (hybrid)
-    TIKTOK_NETWORK_IMPL_READY: bool = False  # Safety: включать только когда network-логика реально реализована
+    TIKTOK_NETWORK_FIRST: bool = True  # With IMPL_READY, publication/search are HTTP-only; no DOM fallback
+    TIKTOK_NETWORK_IMPL_READY: bool = True  # Page-backed window.fetch transport is implemented
     
     # Delays и timeouts
     POST_COMMENT_TIMEOUT: int = 600  # ИСПРАВЛЕНО: Увеличен таймаут для операции post_comment (секунды, 10 минут) - для медленных прокси
@@ -332,10 +344,10 @@ class Settings(BaseSettings):
     PLAYWRIGHT_SCREENSHOTS_ON_ERROR: bool = True  # Сохранять скриншоты при ошибках
     PLAYWRIGHT_SCREENSHOTS_DIR: str = "screenshots"  # Папка для сохранения скриншотов
     BLOCK_IMAGES: bool = True  # Блокировать загрузку картинок для экономии трафика (аватары, превью)
-    BLOCK_MEDIA: bool = False  # ИСПРАВЛЕНО: НЕ блокировать видео - важно для маскировки (TikTok может проверять загрузку)
+    BLOCK_MEDIA: bool = True  # Block video streams while keeping scripts/API and DOM available
     BLOCK_FONTS: bool = True  # Блокировать загрузку шрифтов для экономии трафика (не критично)
     BLOCK_STYLESHEETS: bool = False  # НЕ блокировать стили (нужны для корректного отображения UI)
-    USE_PROXY: bool = True  # Использовать прокси для аккаунтов (обязательно True - работа только с прокси)
+    USE_PROXY: bool = True  # False: direct connection, ignoring saved account/dedicated proxies at runtime
     PROXY_GEO_MATCHING: bool = True  # Подбирать прокси по географии аккаунта (снижает вероятность капчи)
     PROXY_GEO_FALLBACK: bool = True  # Если нет прокси из той же страны, использовать любой доступный
     
@@ -474,18 +486,21 @@ class Settings(BaseSettings):
     # Preserve a small pre-send margin for two contending local browsers. The
     # post-typing send grace remains a separate, bounded deadline.
     PARALLEL_REPLY_PUBLISH_MAX_SECONDS: float = 50.0
-    PARALLEL_REPLY_START_DELAY_MIN_SECONDS: float = 2.0
-    PARALLEL_REPLY_START_DELAY_MAX_SECONDS: float = 5.0
+    PARALLEL_REPLY_START_DELAY_MIN_SECONDS: float = 0.1
+    PARALLEL_REPLY_START_DELAY_MAX_SECONDS: float = 0.3
     PARALLEL_MAIN_READY_IDLE_MIN_SECONDS: float = 0.2
     PARALLEL_MAIN_READY_IDLE_MAX_SECONDS: float = 0.6
     PARALLEL_REPLY_READY_IDLE_MIN_SECONDS: float = 0.2
     PARALLEL_REPLY_READY_IDLE_MAX_SECONDS: float = 0.6
     PARALLEL_INITIAL_SHELL_READY_SECONDS: float = 12.0
+    # Start at response commit and poll the scoped comment trigger while TikTok
+    # is still hydrating. The normal opener/retry remains the fallback.
+    PARALLEL_EARLY_COMMENT_OPEN_SECONDS: float = 6.0
     PARALLEL_PAGE_LOADING_EXTRA_WAIT_SECONDS: float = 24.0
     PARALLEL_MAIN_WARMUP_PROBABILITY: float = 0.0
     PARALLEL_MAIN_WARMUP_TIMEOUT_SECONDS: float = 3.0
     PARALLEL_PROXY_DIVERSIFY_BY_SOURCE_HOST: bool = False
-    PARALLEL_COMMENTING_DOM_FIRST: bool = True
+    PARALLEL_COMMENTING_DOM_FIRST: bool = False
     PARALLEL_COMMENTING_FAST_AUTH_GATE: bool = True
     # Strict 6x1 main strategy: two waves, three concurrent accounts per wave,
     # one template variant per account. Existing PARALLEL_* orchestration

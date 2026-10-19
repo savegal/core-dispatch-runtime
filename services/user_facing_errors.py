@@ -6,12 +6,20 @@ import re
 from collections.abc import Mapping
 from typing import Any
 
-from services.task_execution_ledger import build_task_execution_ledger, LEDGER_VERSION
+from services.task_execution_ledger import build_task_execution_ledger, LEDGER_VERSION, visibility_checks_complete
 
 
 _SUMMARY_RE = re.compile(r"успешно:\s*(\d+)\s*/\s*(\d+)", re.IGNORECASE)
 
 _MESSAGES: dict[str, tuple[str, str]] = {
+    "reply_visibility_unconfirmed": (
+        "Видимость ответов не подтверждена",
+        "Ответы отправлены, но проверка с других аккаунтов не подтвердила видимость всех ответов.",
+    ),
+    "main_visibility_unconfirmed": (
+        "Видимость главных не подтверждена",
+        "Не удалось подтвердить видимость всех главных комментариев. Ответы не запускались.",
+    ),
     "captcha": (
         "Капча TikTok",
         "TikTok запросил капчу. Нужен другой аккаунт или пауза перед повтором.",
@@ -123,6 +131,10 @@ def _extract_first_error_line(text: str) -> str | None:
 
 def _detect_error_code(text: str) -> str | None:
     lower = text.lower()
+    if "reply_visibility_unconfirmed" in lower:
+        return "reply_visibility_unconfirmed"
+    if "main_visibility_unconfirmed" in lower:
+        return "main_visibility_unconfirmed"
 
     if any(token in lower for token in ("boost_failed", "likes were not created", "лайки не удалось", "comment_author_username empty")):
         return "likes_failed"
@@ -255,6 +267,8 @@ def humanize_warning(warning: Any, short: bool = False) -> str | None:
         message = _clean_text(warning.get("message"))
         if code == "boost_failed":
             return humanize_error_text("boost_failed", short=short)
+        if code in {"main_visibility_unconfirmed", "reply_visibility_unconfirmed"}:
+            return humanize_error_text(code, short=short)
         if code == "main_submitted_unconfirmed":
             if short:
                 return "Комментарий отправлен, но пока не подтвержден"
@@ -395,13 +409,11 @@ def build_task_display_reason(task: Mapping[str, Any] | None, short: bool = Fals
     only_successful_results = False
     if isinstance(url_results, Mapping) and url_results:
         result_statuses = [
-            _clean_text(result.get("status")).lower()
+            _clean_text(result.get("status")).lower() in _VIDEO_SUCCESS_STATUSES and visibility_checks_complete(result)
             for result in url_results.values()
             if isinstance(result, Mapping)
         ]
-        only_successful_results = bool(result_statuses) and all(
-            status in _VIDEO_SUCCESS_STATUSES for status in result_statuses
-        )
+        only_successful_results = bool(result_statuses) and all(result_statuses)
 
     status = _clean_text(task.get("status")).lower()
     error_code = _detect_error_code(_clean_text(task.get("error_reason")))
@@ -422,7 +434,7 @@ def build_task_display_reason(task: Mapping[str, Any] | None, short: bool = Fals
         for result in url_results.values():
             if not isinstance(result, Mapping):
                 continue
-            if _clean_text(result.get("status")).lower() in _VIDEO_SUCCESS_STATUSES:
+            if _clean_text(result.get("status")).lower() in _VIDEO_SUCCESS_STATUSES and visibility_checks_complete(result):
                 continue
             human_reason = humanize_error_text(result.get("error"), short=short)
             if human_reason:
@@ -528,7 +540,7 @@ def build_task_execution_summary(task: Mapping[str, Any] | None) -> dict[str, An
             continue
 
         result_status = _clean_text(result.get("status"))
-        if result_status in _VIDEO_SUCCESS_STATUSES:
+        if result_status in _VIDEO_SUCCESS_STATUSES and visibility_checks_complete(result):
             video_success += 1
         else:
             video_failed += 1
@@ -560,7 +572,8 @@ def build_task_execution_summary(task: Mapping[str, Any] | None) -> dict[str, An
                 for variant in variants:
                     if not isinstance(variant, Mapping):
                         continue
-                    if variant.get("network_confirmed") or variant.get("local_confirmed"):
+                    if (bool(variant["public_confirmed"]) if "public_confirmed" in variant
+                            else bool(variant.get("network_confirmed") or variant.get("local_confirmed"))):
                         verified_count += 1
             elif main.get("verified"):
                 verified_count = submitted_count
@@ -596,7 +609,8 @@ def build_task_execution_summary(task: Mapping[str, Any] | None) -> dict[str, An
                 elif _clean_text(item.get("parent_confirmation_level")) == "ui_author_only":
                     reply_parent_ui_confirmed += 1
                 visibility_status = _clean_text(item.get("visibility_status"))
-                if visibility_status in {"confirmed_local", "network_confirmed"}:
+                if (bool(item["public_confirmed"]) if "public_confirmed" in item
+                        else visibility_status in {"confirmed_local", "network_confirmed", "public_confirmed"}):
                     reply_visibility_confirmed += 1
                 elif visibility_status == "submitted_unconfirmed" or item.get("submitted_unconfirmed"):
                     item_unconfirmed += 1

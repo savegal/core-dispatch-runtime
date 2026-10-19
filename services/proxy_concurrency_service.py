@@ -6,6 +6,7 @@ import logging
 from typing import Optional
 from config.settings import get_settings
 from services.redis_service import get_redis_client
+from services.log_sanitizer import sanitize_url
 
 logger = logging.getLogger("services.proxy_concurrency_service")
 settings = get_settings()
@@ -51,7 +52,7 @@ def can_use_proxy(proxy_str: str) -> bool:
             
         return int(count) < settings.MAX_TASKS_PER_PROXY
     except Exception as e:
-        logger.error(f"Error checking proxy usage for {proxy_str[:30]}...: {e}")
+        logger.error(f"Error checking proxy usage for {sanitize_url(proxy_str, max_length=80)}: {e}")
         return True # Fail open to avoid blocking everything on Redis error
 
 def increment_proxy_usage(proxy_str: str) -> bool:
@@ -77,10 +78,10 @@ def increment_proxy_usage(proxy_str: str) -> bool:
         if new_count > settings.MAX_TASKS_PER_PROXY:
             # Over limit, revert
             redis_client.decr(key)
-            logger.debug(f"Proxy {proxy_str[:30]}... usage limit reached ({new_count-1} -> {new_count}), reverted.")
+            logger.debug(f"Proxy {sanitize_url(proxy_str, max_length=80)} usage limit reached ({new_count-1} -> {new_count}), reverted.")
             return False
             
-        logger.debug(f"Proxy {proxy_str[:30]}... usage incremented to {new_count}")
+        logger.debug(f"Proxy {sanitize_url(proxy_str, max_length=80)} usage incremented to {new_count}")
         return True
     except Exception as e:
         logger.error(f"Error incrementing proxy usage: {e}")
@@ -103,7 +104,7 @@ def decrement_proxy_usage(proxy_str: str):
         if new_count < 0:
             redis_client.set(key, 0)
             
-        logger.debug(f"Proxy {proxy_str[:30]}... usage decremented to {max(0, new_count)}")
+        logger.debug(f"Proxy {sanitize_url(proxy_str, max_length=80)} usage decremented to {max(0, new_count)}")
     except Exception as e:
         logger.error(f"Error decrementing proxy usage: {e}")
 
@@ -117,7 +118,7 @@ def increment_proxy_fail(proxy_str: str) -> None:
         key = _get_fail_key(proxy_str)
         new_count = redis_client.incr(key)
         redis_client.expire(key, _PROXY_FAIL_TTL)
-        logger.debug(f"Proxy {proxy_str[:30]}... fail count incremented to {new_count}")
+        logger.debug(f"Proxy {sanitize_url(proxy_str, max_length=80)} fail count incremented to {new_count}")
     except Exception as e:
         logger.error(f"Error incrementing proxy fail counter: {e}")
 

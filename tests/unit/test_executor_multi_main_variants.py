@@ -1,7 +1,46 @@
 import pytest
 import inspect
+import copy
 
 from executor import executor
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize("published,expected,replies,status", [
+    (6, 9, 0, "partial"), (9, 9, 0, "success"), (0, 9, 0, "fail"), (3, 3, 1, "partial"),
+])
+def test_merge_preserves_already_aggregated_user_schema_result(monkeypatch, published, expected, replies, status):
+    from executor import user_schema
+    from services.task_execution_ledger import build_url_execution_ledger
+
+    monkeypatch.setattr(user_schema._settings, "TIKTOK_NETWORK_FIRST", True)
+    monkeypatch.setattr(user_schema._settings, "TIKTOK_NETWORK_IMPL_READY", True)
+    result = user_schema.UserSchemaResult(expected_main_publications=expected, expected_reply_variants=replies)
+    result.published_mains = [user_schema.PublishedMain(
+        text=f"main {index}", comment_id=str(7696976534629237517 + index), network_confirmed=True,
+        local_confirmed=False, method="http_user_schema", account_id=index + 1, tiktok_username="demo",
+    ) for index in range(published)]
+    if not published:
+        result.error = "no_main_published"
+    source = result.to_dict()
+    original = copy.deepcopy(source)
+    assert source["status"] == status
+
+    merged = executor._merge_full_variant_results([source])
+
+    assert merged["status"] == status
+    assert merged["error"] == source["error"]
+    assert merged["publication_complete"] == source["publication_complete"]
+    assert merged["engagement"]["main"]["expected"] == expected
+    assert merged["engagement"]["main"]["submitted"] == published
+    assert merged["engagement"]["main"]["missing"] == expected - published
+    assert executor._url_result_counts_as_success(merged) is (status == "success")
+    ledger = build_url_execution_ledger(merged)
+    assert ledger["summary"]["main"]["expected"] == expected
+    assert ledger["summary"]["main"]["submitted"] == published
+    assert source == original
+    merged["engagement"]["main"]["expected"] = -1
+    assert source == original
 
 
 @pytest.mark.unit
@@ -15,6 +54,23 @@ def test_main_variants_for_url_publishes_up_to_three_unique_variants():
     )
 
     assert variants == ["one", "two", "three"]
+
+
+@pytest.mark.unit
+def test_merge_preserves_aggregate_counts_while_enforcing_fatal_reply_failure():
+    source = {
+        "status": "success", "core_status": "success", "publication_complete": True,
+        "error": "remaining_main_comments_not_visible_after_four_accounts",
+        "engagement": {"main": {"expected": 9, "submitted": 6, "missing": 3,
+                                  "variants_published": [{"comment_id": str(index)} for index in range(6)]}},
+    }
+    merged = executor._merge_full_variant_results([source])
+    assert merged["status"] == "fail"
+    assert merged["core_status"] == "fail"
+    assert merged["publication_complete"] is False
+    assert merged["engagement"]["main"]["expected"] == 9
+    assert merged["engagement"]["main"]["submitted"] == 6
+    assert not executor._url_result_counts_as_success(merged)
 
 
 @pytest.mark.unit
@@ -44,7 +100,7 @@ def test_main_variants_for_url_can_keep_legacy_single_variant():
 
 
 @pytest.mark.unit
-def test_merge_full_variant_results_marks_partial_as_submitted_unconfirmed():
+def test_merge_full_variant_results_marks_partial_as_incomplete():
     merged = executor._merge_full_variant_results(
         [
             {
@@ -72,11 +128,13 @@ def test_merge_full_variant_results_marks_partial_as_submitted_unconfirmed():
         ]
     )
 
-    assert merged["status"] == "submitted_unconfirmed"
+    assert merged["status"] == "partial"
+    assert merged["publication_complete"] is False
     assert merged["comment_id"] == "cid_1"
     assert merged["main_variants_summary"] == {"total": 2, "submitted": 1, "failed": 1}
     assert merged["warnings"][0]["code"] == "main_variant_partial"
     assert merged["engagement"]["main_variants"][1]["error"] == "input_not_found"
+    assert merged["engagement"]["main"]["complete"] is False
 
 
 @pytest.mark.unit
@@ -104,7 +162,17 @@ def test_process_task_counts_submitted_unconfirmed_as_successful_url_with_warnin
 
     assert executor._URL_SUCCESS_STATUSES == {"success", "submitted_unconfirmed"}
     assert executor._URL_UNCONFIRMED_STATUSES == {"submitted_unconfirmed"}
-    assert "if result_status in _URL_SUCCESS_STATUSES" in source
+    assert "if _url_result_counts_as_success(result_dict)" in source
+    assert executor._url_result_counts_as_success(
+        {"status": "submitted_unconfirmed", "publication_complete": True}
+    ) is True
+    assert executor._url_result_counts_as_success(
+        {
+            "status": "submitted_unconfirmed",
+            "error": "reply_publication_incomplete",
+            "publication_complete": False,
+        }
+    ) is False
 
 
 def test_reply_visibility_exhaustion_is_fatal_for_remaining_order_urls():

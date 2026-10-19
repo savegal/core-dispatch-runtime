@@ -816,7 +816,8 @@ def recover_stuck_tasks(db: Session, timeout_seconds: int = TASK_TIMEOUT_SECONDS
                 task.status = "error"
                 task.error_reason = (
                     f"Задача зависла в статусе 'in_progress' более {timeout_seconds // 60} минут "
-                    f"(с {old_updated_at}). Не была начата обработка. Возможные причины: нет активных аккаунтов, "
+                    f"(с {old_updated_at}). Не завершена обработка ни одной ссылки; отдельные действия могли быть выполнены. "
+                    f"Возможные причины: нет активных аккаунтов, "
                     f"воркер остановлен, ошибки подключения."
                 )
                 

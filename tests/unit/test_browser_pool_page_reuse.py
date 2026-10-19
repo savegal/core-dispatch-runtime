@@ -8,6 +8,11 @@ from executor import browser_pool
 from executor.browser_pool import BrowserPool
 
 
+@pytest.fixture(autouse=True)
+def proxy_mode(monkeypatch):
+    monkeypatch.setattr(browser_pool.settings, "USE_PROXY", True)
+
+
 class DummyPage:
     def __init__(self, url: str = "https://www.tiktok.com/@demo/video/1"):
         self.url = url
@@ -33,6 +38,7 @@ class DummyContext:
 
     async def new_page(self):
         page = DummyPage(url="about:blank")
+        page.context = self
         self.pages.append(page)
         return page
 
@@ -59,12 +65,20 @@ class LaunchProbeContext:
     def __init__(self):
         self.pages = []
         self._closed = False
+        self.init_scripts = []
+
+    def on(self, *_args):
+        pass
+
+    async def new_cdp_session(self, _page):
+        from unittest.mock import AsyncMock, Mock
+        return SimpleNamespace(send=AsyncMock(), on=Mock())
 
     def set_default_timeout(self, _timeout):
         return None
 
     async def add_init_script(self, _script):
-        return None
+        self.init_scripts.append(_script)
 
     async def set_extra_http_headers(self, _headers):
         return None
@@ -77,6 +91,8 @@ class LaunchProbeContext:
 
     async def new_page(self):
         page = LaunchProbePage(url="about:blank")
+        page.context = self
+        page.on = lambda *_: None
         self.pages.append(page)
         return page
 
@@ -89,6 +105,9 @@ class LaunchProbeBrowser:
         self.contexts = []
         self.new_context_options = []
         self.closed = False
+
+    def is_connected(self):
+        return not self.closed
 
     async def new_context(self, **_options):
         self.new_context_options.append(dict(_options))
@@ -126,6 +145,141 @@ class WarmupProbeBrowser(LaunchProbeBrowser):
         context = WarmupProbeContext()
         self.contexts.append(context)
         return context
+
+
+@pytest.fixture
+def isolated_acquire(monkeypatch):
+    from executor import tiktok_client
+
+    monkeypatch.setattr(tiktok_client, "_get_cookies_for_account", lambda _account: "[]")
+    monkeypatch.setattr(tiktok_client, "parse_cookies", lambda _raw: [])
+    monkeypatch.setattr(browser_pool.settings, "HUMAN_LIKE_BEHAVIOR", False)
+    return SimpleNamespace(id=1, label="driver-test", proxy=None, user_agent=None, country_code="US")
+
+
+@pytest.mark.asyncio
+async def test_direct_mode_ignores_saved_proxy_in_browser_launch(monkeypatch, isolated_acquire):
+    from unittest.mock import AsyncMock
+
+    monkeypatch.setattr(browser_pool.settings, "USE_PROXY", False)
+    isolated_acquire.proxy = "http://unused.invalid:9999"
+    launch = AsyncMock(return_value=LaunchProbeBrowser())
+    pool = BrowserPool(max_browsers=1)
+    pool._playwright = SimpleNamespace(chromium=SimpleNamespace(launch=launch))
+
+    await pool.get_page_for_account(isolated_acquire)
+
+    assert "proxy" not in launch.await_args.kwargs
+    assert "--no-proxy-server" in launch.await_args.kwargs["args"]
+    assert pool._account_browser_ids[isolated_acquire.id] == "direct"
+    assert isolated_acquire.proxy is None
+    await pool.close_all()
+
+
+@pytest.mark.asyncio
+async def test_acquire_restarts_dead_driver_on_same_account(monkeypatch, isolated_acquire):
+    from unittest.mock import AsyncMock
+
+    pool = BrowserPool(max_browsers=1)
+    dead_browser = LaunchProbeBrowser()
+    dead_browser.new_context = AsyncMock(side_effect=RuntimeError(
+        "Browser.new_context: Connection closed while reading from the driver"
+    ))
+    old = SimpleNamespace(chromium=SimpleNamespace(launch=AsyncMock(return_value=dead_browser)), stop=AsyncMock())
+    healthy_browser = LaunchProbeBrowser()
+    fresh = SimpleNamespace(chromium=SimpleNamespace(launch=AsyncMock(return_value=healthy_browser)), stop=AsyncMock())
+    starter = SimpleNamespace(start=AsyncMock(return_value=fresh))
+    monkeypatch.setattr(browser_pool, "async_playwright", lambda: starter)
+    pool._playwright = old
+    pool._register_browser("direct", dead_browser, None)
+
+    context, page = await pool.get_page_for_account(isolated_acquire)
+
+    assert page._pool_account_id == isolated_acquire.id
+    assert pool._playwright is fresh
+    assert pool._browsers == {"direct": healthy_browser}
+    assert pool._contexts == {1: context}
+    old.stop.assert_awaited_once()
+    starter.start.assert_awaited_once()
+    dead_browser.new_context.assert_awaited_once()
+    assert pool._browser_inflight_acquires == {}
+
+
+@pytest.mark.asyncio
+async def test_acquire_discards_disconnected_browser_with_cached_contexts(monkeypatch, isolated_acquire):
+    from unittest.mock import AsyncMock
+
+    pool = BrowserPool(max_browsers=1)
+    dead_browser = LaunchProbeBrowser()
+    dead_browser.closed = True
+    stale_context = LaunchProbeContext()
+    dead_browser.contexts.append(stale_context)  # This property does not raise.
+    healthy_browser = LaunchProbeBrowser()
+    runtime = SimpleNamespace(chromium=SimpleNamespace(launch=AsyncMock(return_value=healthy_browser)), stop=AsyncMock())
+    pool._playwright = runtime
+    pool._register_browser("direct", dead_browser, None)
+    pool._contexts[1] = stale_context
+    pool._account_browser_ids[1] = "direct"
+    pool._context_last_used[1] = datetime.now(timezone.utc)
+
+    context, _page = await pool.get_page_for_account(isolated_acquire)
+
+    assert context is not stale_context
+    assert pool._browsers["direct"] is healthy_browser
+    assert pool._contexts[1] is context
+    runtime.stop.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_acquire_driver_recovery_is_bounded(monkeypatch, isolated_acquire):
+    from unittest.mock import AsyncMock
+
+    pool = BrowserPool(max_browsers=1)
+    runtimes = []
+
+    async def start():
+        chromium = SimpleNamespace(launch=AsyncMock(side_effect=RuntimeError(
+            "BrowserType.launch: Connection closed while reading from the driver"
+        )))
+        runtime = SimpleNamespace(chromium=chromium, stop=AsyncMock())
+        runtimes.append(runtime)
+        return runtime
+
+    monkeypatch.setattr(browser_pool, "async_playwright", lambda: SimpleNamespace(start=start))
+    with pytest.raises(browser_pool.TikTokClientError, match="Browser driver unavailable after recovery"):
+        await pool.get_page_for_account(isolated_acquire)
+    assert len(runtimes) == 4
+    assert pool._playwright is None
+    assert pool._browsers == {}
+    assert pool._browser_inflight_acquires == {}
+
+
+@pytest.mark.asyncio
+async def test_concurrent_runtime_start_and_late_disconnect_preserve_replacement(monkeypatch):
+    from unittest.mock import AsyncMock
+
+    pool = BrowserPool(max_browsers=1)
+    fresh = SimpleNamespace(chromium=object(), stop=AsyncMock())
+    old = SimpleNamespace(chromium=object(), stop=AsyncMock())
+
+    async def start():
+        await asyncio.sleep(0.01)
+        return fresh
+
+    starter = SimpleNamespace(start=AsyncMock(side_effect=start))
+    monkeypatch.setattr(browser_pool, "async_playwright", lambda: starter)
+    pool._playwright = old
+    await asyncio.gather(pool._reset_disconnected_runtime(old), pool._reset_disconnected_runtime(old))
+    await asyncio.gather(pool._ensure_playwright(), pool._ensure_playwright())
+    healthy_context = LaunchProbeContext()
+    pool._contexts[2] = healthy_context
+    await pool._reset_disconnected_runtime(old)
+
+    old.stop.assert_awaited_once()
+    fresh.stop.assert_not_awaited()
+    starter.start.assert_awaited_once()
+    assert pool._playwright is fresh
+    assert pool._contexts[2] is healthy_context
 
 
 @pytest.mark.unit
@@ -173,11 +327,32 @@ def test_resource_blocking_honors_media_toggle(monkeypatch):
         "xhr",
         "https://www.tiktok.com/api/comment/list/?aweme_id=123",
     ) is False
+    assert browser_pool._should_abort_resource(
+        "fetch",
+        "https://mcs.tiktokv.com/v1/list",
+    ) is False
+    assert browser_pool._should_abort_resource(
+        "fetch",
+        "https://mon.tiktokv.com/monitor_browser/collect/batch/",
+    ) is False
+    assert browser_pool._should_abort_resource(
+        "fetch",
+        "https://www.tiktok.com/api/recommend/item_list/?aid=1988",
+    ) is False
 
 
 @pytest.mark.unit
 @pytest.mark.asyncio
-async def test_get_page_for_account_blocks_service_workers_when_media_blocked(monkeypatch):
+@pytest.mark.parametrize("country_code, idc, proxy_country, locale, timezone_id", [
+    ("US", None, None, "en-US", "America/New_York"),
+    ("IL", None, None, "he-IL", "Asia/Jerusalem"),
+    (None, "alisg", None, "en-SG", "Asia/Singapore"),
+    ("US", "useast5", "PL", "pl-PL", "Europe/Warsaw"),
+    (None, None, None, "en", "UTC"),
+])
+async def test_get_page_for_account_blocks_service_workers_when_media_blocked(
+    monkeypatch, country_code, idc, proxy_country, locale, timezone_id,
+):
     from executor import tiktok_client
 
     pool = BrowserPool(max_browsers=1)
@@ -195,7 +370,9 @@ async def test_get_page_for_account_blocks_service_workers_when_media_blocked(mo
     monkeypatch.setattr(pool, "initialize", noop_initialize)
     monkeypatch.setattr(pool, "_playwright", SimpleNamespace(chromium=FakeChromium()))
     monkeypatch.setattr(tiktok_client, "_get_cookies_for_account", lambda _account: "[]")
-    monkeypatch.setattr(tiktok_client, "parse_cookies", lambda _raw: [])
+    monkeypatch.setattr(tiktok_client, "parse_cookies", lambda _raw: [
+        {"name": "tt-target-idc", "value": idc, "domain": ".tiktok.com", "path": "/"},
+    ] if idc else [])
     monkeypatch.setattr(
         tiktok_client,
         "_normalize_proxy_for_playwright",
@@ -206,10 +383,17 @@ async def test_get_page_for_account_blocks_service_workers_when_media_blocked(mo
 
     try:
         await pool.get_page_for_account(
-            SimpleNamespace(id=1, label="a1", proxy="http://proxy-a:8000", user_agent=None, country_code="US")
+            SimpleNamespace(id=1, label="a1", proxy="http://proxy-a:8000", user_agent=None,
+                            country_code=country_code, proxy_country_code=proxy_country)
         )
 
         assert launched_browsers[0].new_context_options[0]["service_workers"] == "block"
+        options = launched_browsers[0].new_context_options[0]
+        if country_code or proxy_country or idc:
+            assert options["locale"] == locale
+            assert options["timezone_id"] == timezone_id
+        else:
+            assert "locale" not in options and "timezone_id" not in options
     finally:
         await pool.close_all()
 
@@ -296,14 +480,115 @@ def test_desktop_window_args_sync_window_and_viewport(monkeypatch):
 
 
 @pytest.mark.unit
-def test_mobile_window_args_do_not_force_desktop_window(monkeypatch):
+def test_legacy_mobile_user_agent_still_gets_desktop_window(monkeypatch):
     monkeypatch.setattr(browser_pool.settings, "PLAYWRIGHT_SYNC_WINDOW_WITH_VIEWPORT", True, raising=False)
 
     args = browser_pool._desktop_window_args_for_account(
         SimpleNamespace(proxy="http://proxy.example:8000", user_agent="Mozilla/5.0 iPhone Mobile")
     )
 
-    assert args == []
+    assert any(arg.startswith("--window-size=") for arg in args)
+    assert "--force-device-scale-factor=1" in args
+
+
+@pytest.mark.unit
+def test_desktop_hardware_profiles_are_stable_and_vary_by_account():
+    profiles = [browser_pool._desktop_hardware_profile_for_account(SimpleNamespace(id=i)) for i in range(1, 51)]
+    for account_id, profile in enumerate(profiles, 1):
+        assert profile == browser_pool._desktop_hardware_profile_for_account(SimpleNamespace(id=account_id, proxy="changed"))
+        assert (profile["width"], profile["height"]) in browser_pool._DESKTOP_RESOLUTIONS
+        assert profile["hardwareConcurrency"] in (4, 6, 8, 12, 16)
+        assert profile["deviceMemory"] in (4, 8)
+        assert (profile["webglVendor"], profile["webglRenderer"]) in browser_pool._DESKTOP_WEBGL_PAIRS
+        assert "Direct3D11" in profile["webglRenderer"]
+    for field in profiles[0]:
+        assert len({profile[field] for profile in profiles}) > 1
+
+
+@pytest.mark.unit
+def test_desktop_hardware_profile_survives_different_python_hash_seeds():
+    import json
+    import os
+    import subprocess
+    import sys
+
+    results = []
+    for seed in ("1", "99"):
+        child = subprocess.run([
+            sys.executable, "-c",
+            "import json; from types import SimpleNamespace; from executor.browser_pool import _desktop_hardware_profile_for_account; "
+            "print(json.dumps(_desktop_hardware_profile_for_account(SimpleNamespace(id=1219))))",
+        ], env={**os.environ, "PYTHONHASHSEED": seed}, capture_output=True, text=True, check=True, timeout=20)
+        results.append(json.loads(child.stdout))
+    assert results[0] == results[1]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("human_like,mobile", [(False, False), (True, False), (True, True)])
+async def test_account_context_installs_matching_desktop_hardware_only(monkeypatch, isolated_acquire, human_like, mobile):
+    from unittest.mock import AsyncMock
+    import json
+
+    monkeypatch.setattr(browser_pool.settings, "USE_PROXY", False)
+    monkeypatch.setattr(browser_pool.settings, "HUMAN_LIKE_BEHAVIOR", human_like)
+    monkeypatch.setattr(browser_pool.settings, "PLAYWRIGHT_SYNC_WINDOW_WITH_VIEWPORT", True)
+    monkeypatch.setattr(browser_pool.settings, "PLAYWRIGHT_WINDOW_EXTRA_HEIGHT", 90)
+    devices = {}
+    if mobile:
+        isolated_acquire.user_agent = "Mozilla/5.0 iPhone Mobile"
+        devices = {"iPhone 13": {
+            "user_agent": isolated_acquire.user_agent,
+            "viewport": {"width": 390, "height": 664},
+            "screen": {"width": 390, "height": 844},
+            "is_mobile": True, "has_touch": True, "device_scale_factor": 3,
+            "default_browser_type": "webkit",
+        }}
+    browser = LaunchProbeBrowser()
+    launch = AsyncMock(return_value=browser)
+    pool = BrowserPool(max_browsers=1)
+    pool._playwright = SimpleNamespace(chromium=SimpleNamespace(launch=launch), stop=AsyncMock(), devices=devices)
+    try:
+        context, _ = await pool.get_page_for_account(isolated_acquire)
+        options = browser.new_context_options[0]
+        profile = browser_pool._desktop_hardware_profile_for_account(isolated_acquire)
+        hardware_scripts = [script for script in context.init_scripts if json.dumps(profile) in script]
+        assert len(hardware_scripts) == 1
+        assert not options["is_mobile"] and not options["has_touch"]
+        assert "default_browser_type" not in options
+        assert "timezone_id" not in options and "locale" not in options
+        size = {"width": profile["width"], "height": profile["height"]}
+        assert options["screen"] == size
+        assert options["viewport"] == {"width": profile["width"], "height": profile["height"] - 90}
+        assert f'--window-size={profile["width"]},{profile["height"]}' in launch.call_args.kwargs["args"]
+    finally:
+        await pool.close_all()
+
+
+@pytest.mark.asyncio
+async def test_hardware_script_installation_failure_closes_context_and_fails_acquire(monkeypatch, isolated_acquire):
+    from unittest.mock import AsyncMock
+
+    context = LaunchProbeContext()
+
+    async def init(script):
+        if "installAccountIdentity" in script:
+            raise RuntimeError("hardware init installation failed")
+
+    context.add_init_script = init
+    browser = LaunchProbeBrowser()
+    browser.contexts.append(context)
+    browser.new_context = AsyncMock(return_value=context)
+    pool = BrowserPool(max_browsers=1)
+    pool._playwright = SimpleNamespace(chromium=SimpleNamespace(launch=AsyncMock(return_value=browser)), stop=AsyncMock())
+    monkeypatch.setattr(browser_pool.settings, "USE_PROXY", False)
+    try:
+        with pytest.raises(Exception, match="hardware init installation failed"):
+            await pool.get_page_for_account(isolated_acquire)
+        assert context._closed
+        assert isolated_acquire.id not in pool._contexts
+        assert not context.pages
+    finally:
+        await pool.close_all()
 
 
 @pytest.mark.unit
@@ -552,6 +837,91 @@ async def test_get_page_for_account_reuses_available_page(monkeypatch):
     assert reused_context is context
     assert reused_page is page
     assert reused_page._pool_available is False
+
+
+@pytest.mark.unit
+@pytest.mark.asyncio
+async def test_get_page_for_account_replaces_idle_context_after_proxy_change(monkeypatch):
+    from executor import tiktok_client
+
+    pool = BrowserPool(max_browsers=2)
+    old_proxy = "http://old-proxy:8000"
+    new_proxy = "http://new-proxy:9000"
+    old_browser_id = pool._make_browser_id(old_proxy)
+    old_page = DummyPage(url="about:blank")
+    old_page._pool_available = True
+    old_context = DummyContext([old_page])
+    old_browser = LaunchProbeBrowser()
+    old_browser.contexts.append(old_context)
+    pool._contexts[1] = old_context
+    pool._context_last_used[1] = datetime.now(timezone.utc)
+    pool._account_browser_ids[1] = old_browser_id
+    pool._browsers[old_browser_id] = old_browser
+    pool._browser_proxy_keys[old_browser_id] = old_proxy
+    launched_options = []
+
+    class FakeChromium:
+        async def launch(self, **options):
+            launched_options.append(dict(options))
+            return LaunchProbeBrowser()
+
+    async def noop_initialize():
+        return None
+
+    monkeypatch.setattr(pool, "initialize", noop_initialize)
+    monkeypatch.setattr(pool, "_playwright", SimpleNamespace(chromium=FakeChromium()))
+    monkeypatch.setattr(tiktok_client, "_get_cookies_for_account", lambda _account: "[]")
+    monkeypatch.setattr(tiktok_client, "parse_cookies", lambda _raw: [])
+    monkeypatch.setattr(
+        tiktok_client,
+        "_normalize_proxy_for_playwright",
+        lambda proxy: {"server": proxy} if proxy else None,
+    )
+    monkeypatch.setattr(browser_pool.settings, "HUMAN_LIKE_BEHAVIOR", False, raising=False)
+
+    new_context, new_page = await pool.get_page_for_account(
+        SimpleNamespace(
+            id=1,
+            label="a1",
+            proxy=new_proxy,
+            user_agent=None,
+            country_code="US",
+        )
+    )
+
+    assert old_context._closed is True
+    assert old_browser.closed is True
+    assert new_context is not old_context
+    assert new_page not in old_context.pages
+    assert launched_options[0]["proxy"]["server"] == new_proxy
+    assert pool._account_browser_ids[1] == pool._make_browser_id(new_proxy)
+
+
+@pytest.mark.unit
+@pytest.mark.asyncio
+async def test_get_page_for_account_refuses_proxy_change_while_context_busy(monkeypatch):
+    pool = BrowserPool(max_browsers=2)
+    old_proxy = "http://old-proxy:8000"
+    busy_page = DummyPage(url="https://www.tiktok.com/@demo/video/1")
+    busy_page._pool_available = False
+    context = DummyContext([busy_page])
+    pool._contexts[1] = context
+    pool._context_last_used[1] = datetime.now(timezone.utc)
+    pool._account_browser_ids[1] = pool._make_browser_id(old_proxy)
+
+    async def noop_initialize():
+        return None
+
+    monkeypatch.setattr(pool, "initialize", noop_initialize)
+
+    with pytest.raises(browser_pool.TikTokClientError, match="proxy changed.*busy"):
+        await pool.get_page_for_account(
+            SimpleNamespace(id=1, proxy="http://new-proxy:9000")
+        )
+
+    assert context._closed is False
+    assert busy_page.is_closed() is False
+    assert pool._contexts[1] is context
 
 
 @pytest.mark.unit

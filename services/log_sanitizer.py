@@ -44,10 +44,13 @@ def sanitize_url(value: str, max_length: int = 160) -> str:
     if not value:
         return value
 
+    raw_value = str(value)
+    has_explicit_scheme = "://" in raw_value
+    parse_value = raw_value if has_explicit_scheme else f"//{raw_value}"
     try:
-        parsed = urlparse(value)
+        parsed = urlparse(parse_value)
     except Exception:
-        return sanitize_string(str(value), max_length=max_length)
+        return sanitize_string(raw_value, max_length=max_length)
 
     netloc = parsed.netloc
     if "@" in netloc:
@@ -72,6 +75,8 @@ def sanitize_url(value: str, max_length: int = 160) -> str:
             parsed.fragment,
         )
     )
+    if not has_explicit_scheme and sanitized.startswith("//"):
+        sanitized = sanitized[2:]
     if len(sanitized) > max_length:
         sanitized = sanitized[:max_length] + "...***REDACTED***"
     return sanitized

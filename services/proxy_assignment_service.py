@@ -11,6 +11,7 @@ from typing import Any, Dict, Optional
 from config.settings import get_settings
 from services.proxy_filter_utils import apply_proxy_type_filter
 from services.proxy_health_service import get_bad_proxy_set
+from services.log_sanitizer import sanitize_url
 from services.account_service import (
     ACCOUNT_LANE_RETIRE,
     ERROR_THRESHOLD,
@@ -71,7 +72,10 @@ def _get_active_proxies(
     force_proxy_type_filter: Optional[str] = None,
 ) -> tuple[list[Proxy], Optional[str]]:
     normalized_force_filter = _normalize_proxy_type_filter(force_proxy_type_filter)
-    query = db.query(Proxy).filter(Proxy.status.in_(["active", "slow", "unknown"]))
+    query = db.query(Proxy).filter(
+        Proxy.status.in_(["active", "slow", "unknown"]),
+        Proxy.dedicated_user_id.is_(None),
+    )
     if normalized_force_filter == "mobile":
         query = query.filter(Proxy.is_mobile == "Y")
     elif normalized_force_filter == "residential":
@@ -409,7 +413,10 @@ def assign_proxies_to_accounts(
             _active_proxies_cache.pop(cache_key, None)
 
     if active_proxies is None:
-        query = db.query(Proxy).filter(Proxy.status.in_(["active", "slow", "unknown"]))
+        query = db.query(Proxy).filter(
+            Proxy.status.in_(["active", "slow", "unknown"]),
+            Proxy.dedicated_user_id.is_(None),
+        )
         if normalized_force_filter == "mobile":
             query = query.filter(Proxy.is_mobile == "Y")
         elif normalized_force_filter == "residential":
@@ -529,7 +536,7 @@ def assign_proxies_to_accounts(
 
         logger.info(
             "Assigned proxy %s to account %s (test_shared=%s, reusable=%s)",
-            proxy.proxy[:30],
+            sanitize_url(proxy.proxy, max_length=80),
             account.id,
             test_shared_residential,
             _proxy_can_be_reused(proxy),

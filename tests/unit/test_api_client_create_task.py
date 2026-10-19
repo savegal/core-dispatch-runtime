@@ -344,3 +344,35 @@ async def test_full_access_methods_clear_all_user_cache_without_telegram_id(monk
 
     assert client._user_cache == {}
     assert client._access_cache == {}
+
+
+@pytest.mark.unit
+@pytest.mark.asyncio
+@pytest.mark.parametrize("kind", ["full", "engagement_only"])
+async def test_create_task_allows_identical_new_orders_and_reuses_explicit_request(monkeypatch, kind):
+    client = APIClient()
+    headers_seen = []
+
+    async def fake_request(method, endpoint, json=None, headers=None, **kwargs):
+        headers_seen.append(headers["X-Idempotency-Key"])
+        assert json["settings"]["client_task_fingerprint"] == headers_seen[-1]
+        return {"task_id": len(headers_seen), "status": "pending"}
+
+    monkeypatch.setattr(client, "_request", fake_request)
+    payload = dict(
+        user_id=1, main_comment="same comment", text_variants=["same comment"] * 3,
+        video_urls=["https://www.tiktok.com/@demo/video/1234567890123456789"],
+        kind=kind, engagement_comment_text="same target",
+        settings={"client_task_fingerprint": "old-template-fingerprint"},
+    )
+    try:
+        first = await client.create_task(**payload)
+        second = await client.create_task(**payload)
+        assert first["task_id"] != second["task_id"]
+        assert headers_seen[0] != headers_seen[1]
+        third = await client.create_task(**payload, idempotency_key="explicit-retry")
+        repeat = await client.create_task(**payload, idempotency_key="explicit-retry")
+        assert repeat["task_id"] == third["task_id"]
+        assert len(headers_seen) == 3
+    finally:
+        await client.close()

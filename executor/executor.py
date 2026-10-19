@@ -60,6 +60,11 @@ from services.account_service import (
 )
 from services.proxy_replacement_service import mark_proxy_as_slow_and_replace, reset_proxy_fail_count
 from services.proxy_concurrency_service import increment_proxy_fail, should_block_proxy
+from services.dedicated_proxy_service import (
+    activate_dedicated_proxy_for_user,
+    get_current_dedicated_proxy,
+    reset_dedicated_proxy,
+)
 from services.log_service import log
 from executor.tiktok_client import post_comment, post_reply, quick_validate_account, verify_comment_visible, TikTokClientError
 from executor.comment_result import CommentResult
@@ -148,6 +153,11 @@ _executor_activity_lock = threading.Lock()
 _executor_activity_payload: dict[str, Any] = {"status": "ok"}
 _URL_SUCCESS_STATUSES = {"success", "submitted_unconfirmed"}
 _URL_UNCONFIRMED_STATUSES = {"submitted_unconfirmed"}
+_URL_INCOMPLETE_ERRORS = {
+    "main_publication_incomplete",
+    "reply_publication_incomplete",
+    "main_variant_partial",
+}
 _REPLY_VISIBILITY_EXHAUSTED_ERRORS = {
     "remaining_main_comments_not_visible_after_four_accounts",
     "remaining_main_comments_not_visible_after_ip_rotation",
@@ -159,6 +169,58 @@ def _reply_visibility_exhausted(result: dict | None) -> bool:
     if not isinstance(result, dict):
         return False
     return str(result.get("error") or "") in _REPLY_VISIBILITY_EXHAUSTED_ERRORS
+
+
+def _url_result_counts_as_success(result: dict | None) -> bool:
+    """Accept only a fully submitted URL, even for legacy unconfirmed rows."""
+    if not isinstance(result, dict) or result.get("status") not in _URL_SUCCESS_STATUSES:
+        return False
+    visibility = result.get("main_visibility") or {}
+    if visibility.get("enabled") and visibility.get("status") != "confirmed":
+        return False
+    reply_visibility = result.get("reply_publication_visibility") or {}
+    if reply_visibility.get("enabled") and reply_visibility.get("status") not in {"confirmed", "not_requested"}:
+        return False
+    error = str(result.get("error") or "")
+    if error in _URL_INCOMPLETE_ERRORS or error.startswith("main_variant_partial"):
+        return False
+    if result.get("publication_complete") is False:
+        return False
+    engagement = result.get("engagement")
+    if isinstance(engagement, dict):
+        for section_name in ("main", "replies"):
+            section = engagement.get(section_name)
+            if isinstance(section, dict) and section.get("complete") is False:
+                return False
+    return True
+
+
+def _visibility_result_has_receipts(result) -> bool:
+    """A resumed verification order must not blindly republish accepted writes."""
+    if not isinstance(result, dict):
+        return False
+    reply_report = result.get("reply_publication_visibility") or {}
+    enabled = ((result.get("main_visibility") or {}).get("enabled")
+               or (reply_report.get("enabled") and reply_report.get("status") != "not_requested"))
+    if not enabled:
+        return False
+    main = (result.get("engagement") or {}).get("main") or {}
+    replies = ((result.get("engagement") or {}).get("replies") or {}).get("items") or []
+    return (any(isinstance(item, dict) and item.get("network_confirmed") and item.get("comment_id")
+                for item in main.get("variants_published", []))
+            or bool(main.get("network_confirmed") and main.get("comment_id"))
+            or any(isinstance(item, dict) and (item.get("reply_comment_id") or item.get("reply_id")) for item in replies))
+
+
+def _visibility_resume_error(result) -> str:
+    if (result.get("main_visibility") or {}).get("enabled") and (result.get("main_visibility") or {}).get("status") != "confirmed":
+        return "main_visibility_unconfirmed"
+    if ((result.get("reply_publication_visibility") or {}).get("enabled")
+            and (result.get("reply_publication_visibility") or {}).get("status") not in {"confirmed", "not_requested"}):
+        return "reply_visibility_unconfirmed"
+    return str(result.get("error") or "reply_publication_incomplete")
+
+
 _GLOBAL_TASK_LOCK_WAIT_LOG_INTERVAL = 30.0
 _last_global_task_lock_wait_log_at = 0.0
 
@@ -600,8 +662,21 @@ def _merge_full_variant_results(variant_results: list[dict]) -> dict:
             "engagement": {"main_variants": []},
         }
 
-    accepted_statuses = {"success", "submitted_unconfirmed"}
-    accepted = [item for item in variant_results if item.get("status") in accepted_statuses]
+    if len(variant_results) == 1:
+        engagement = variant_results[0].get("engagement")
+        main = engagement.get("main") if isinstance(engagement, dict) else None
+        if isinstance(main, dict) and isinstance(main.get("variants_published"), list):
+            # User-schema already aggregates every account slot and text. The
+            # legacy merger counts one result per text, so re-merging this row
+            # would turn 6/9 publications into 0/1 and replace partial with fail.
+            aggregated = copy.deepcopy(variant_results[0])
+            if _reply_visibility_exhausted(aggregated):
+                aggregated["status"] = "fail"
+                aggregated["core_status"] = "fail"
+                aggregated["publication_complete"] = False
+            return aggregated
+
+    accepted = [item for item in variant_results if _url_result_counts_as_success(item)]
     fatal_reply_visibility_result = next(
         (item for item in variant_results if _reply_visibility_exhausted(item)),
         None,
@@ -636,11 +711,13 @@ def _merge_full_variant_results(variant_results: list[dict]) -> dict:
         merged["status"] = "fail"
         merged["core_status"] = "fail"
         merged["error"] = fatal_reply_visibility_result.get("error")
+        merged["publication_complete"] = False
     elif accepted_count:
-        merged["status"] = "success" if all_success else "submitted_unconfirmed"
-        merged["core_status"] = merged["status"]
         if failed_count:
+            merged["status"] = "partial"
+            merged["core_status"] = "partial"
             merged["error"] = "main_variant_partial"
+            merged["publication_complete"] = False
             warnings = list(merged.get("warnings") or [])
             warnings.append(
                 {
@@ -650,10 +727,15 @@ def _merge_full_variant_results(variant_results: list[dict]) -> dict:
             )
             merged["warnings"] = warnings
             merged["has_warnings"] = True
+        else:
+            merged["status"] = "success" if all_success else "submitted_unconfirmed"
+            merged["core_status"] = merged["status"]
+            merged["publication_complete"] = True
     else:
         merged["status"] = "fail"
         merged["core_status"] = "fail"
         merged["error"] = merged.get("error") or "all_main_variants_failed"
+        merged["publication_complete"] = False
 
     merged["main_variants"] = summaries
     merged["main_variants_summary"] = {
@@ -665,6 +747,12 @@ def _merge_full_variant_results(variant_results: list[dict]) -> dict:
     if isinstance(engagement, dict):
         engagement["main_variants"] = summaries
         engagement["main_variants_summary"] = merged["main_variants_summary"]
+        main_summary = engagement.get("main")
+        if isinstance(main_summary, dict):
+            main_summary["expected"] = total
+            main_summary["submitted"] = accepted_count
+            main_summary["missing"] = failed_count
+            main_summary["complete"] = failed_count == 0 and accepted_count == total
     return merged
 
 
@@ -983,15 +1071,21 @@ def handle_account_error(
         if account.proxy:
             try:
                 increment_proxy_fail(account.proxy)
-                is_timeout = error_classification.category in [ErrorCategory.PROXY_TIMEOUT]
-                mark_proxy_as_slow_and_replace(
-                    db, 
-                    account.id, 
-                    account.proxy, 
-                    timeout_error=is_timeout
-                )
-                db.refresh(account)
-                logger.info(f"Replaced proxy for account {account.id} due to: {description}")
+                if get_current_dedicated_proxy() is not None:
+                    logger.warning(
+                        "Dedicated proxy failed for account %s; strict routing forbids fallback/replacement",
+                        account.id,
+                    )
+                else:
+                    is_timeout = error_classification.category in [ErrorCategory.PROXY_TIMEOUT]
+                    mark_proxy_as_slow_and_replace(
+                        db,
+                        account.id,
+                        account.proxy,
+                        timeout_error=is_timeout,
+                    )
+                    db.refresh(account)
+                    logger.info(f"Replaced proxy for account {account.id} due to: {description}")
             except Exception as e:
                 logger.error(f"Failed to replace proxy for account {account.id}: {e}")
         # Мягкая ошибка - не сразу меняем статус
@@ -1002,8 +1096,11 @@ def handle_account_error(
         # Страница не загрузилась - пробуем заменить прокси, мягкая ошибка
         if account.proxy:
             try:
-                mark_proxy_as_slow_and_replace(db, account.id, account.proxy, timeout_error=True)
-                db.refresh(account)
+                if get_current_dedicated_proxy() is None:
+                    mark_proxy_as_slow_and_replace(db, account.id, account.proxy, timeout_error=True)
+                    db.refresh(account)
+                else:
+                    increment_proxy_fail(account.proxy)
             except Exception:
                 pass
         mark_soft_error(db, account.id, description)
@@ -1050,6 +1147,7 @@ def process_task(task_id: int) -> None:
     # ИСПРАВЛЕНО: Используем синхронную версию БД для executor (работает в отдельных потоках)
     # TODO: В будущем перейти на AsyncSession для полной асинхронности
     db: Session = next(get_sync_db())
+    dedicated_proxy_token = None
     task_start_time = time.time()
     task_start_monotonic = time.monotonic()
     task_timeout_seconds = max(1, int(getattr(settings, "TASK_PROCESSING_TIMEOUT", 1800) or 1800))
@@ -1217,6 +1315,7 @@ def process_task(task_id: int) -> None:
             pool_owner_user_id: int | None = int(task.user_id)
         else:
             pool_owner_user_id = None
+            dedicated_proxy_token = activate_dedicated_proxy_for_user(db, int(task.user_id))
         text_variants = task_settings.get("text_variants") or [task.main_comment]
         text_variants = [t for t in text_variants if t]
         if not text_variants:
@@ -1246,7 +1345,7 @@ def process_task(task_id: int) -> None:
         # дубликаты комментариев на тех URL, где основа уже отработала.
         # Раньше при повторе цикл стартовал с idx=0 и повторно публиковал
         # main + replies на видео, где основа уже отработала.
-        # Теперь resume пропускает только public-confirmed success.
+        # Незавершённая проверка с сохранёнными квитанциями также не запускает повторную рассылку.
         previous_url_results = (task.settings or {}).get("url_results") or {}
         url_results = dict(previous_url_results)  # carry forward existing rows
         failed_urls = []
@@ -1254,7 +1353,7 @@ def process_task(task_id: int) -> None:
         successful_urls_list = list(
             url
             for url, row in previous_url_results.items()
-            if isinstance(row, dict) and row.get("status") in _URL_SUCCESS_STATUSES
+            if _url_result_counts_as_success(row)
         )
         successful_urls = len(successful_urls_list)
 
@@ -1423,7 +1522,7 @@ def process_task(task_id: int) -> None:
             existing_row = previous_url_results.get(video_url)
             if (
                 isinstance(existing_row, dict)
-                and existing_row.get("status") in _URL_SUCCESS_STATUSES
+                and (_url_result_counts_as_success(existing_row) or _visibility_result_has_receipts(existing_row))
             ):
                 logger.info(
                     f"Task {task_id}, URL {idx+1}: skipping — already processed "
@@ -1432,6 +1531,13 @@ def process_task(task_id: int) -> None:
                 )
                 # progress отражает позицию в списке, не количество новых публикаций
                 task.progress = idx + 1
+                if not _url_result_counts_as_success(existing_row):
+                    resume_error = _visibility_resume_error(existing_row)
+                    if resume_error in {"main_visibility_unconfirmed", "reply_visibility_unconfirmed"}:
+                        unconfirmed_urls.append(video_url)
+                    failed_urls.append(video_url)
+                    has_errors = True
+                    error_messages.append(f"{video_url}: {resume_error}")
                 db.commit()
                 continue
 
@@ -1505,6 +1611,13 @@ def process_task(task_id: int) -> None:
                         started_at=started_at,
                         ended_at=ended_at
                     )
+                    from executor.reply_visibility import verify_order_reply_visibility
+                    with browser_pool_task_scope(task_id):
+                        result_dict = loop.run_until_complete(verify_order_reply_visibility(
+                            db, task, video_url, result_dict, pool_owner_user_id=pool_owner_user_id,
+                            stop_requested=task_stop_requested_now,
+                        ))
+                    task_settings = task.settings or {}
                     result_dict = normalize_url_result_for_timeout(result_dict)
                     url_results[video_url] = result_dict
                     
@@ -1518,7 +1631,7 @@ def process_task(task_id: int) -> None:
                     
                     # Проверяем успешность по статусу из унифицированного формата
                     result_status = result_dict.get("status")
-                    if result_status in _URL_SUCCESS_STATUSES:
+                    if _url_result_counts_as_success(result_dict):
                         successful_urls += 1
                         successful_urls_list.append(video_url)
                         if result_status in _URL_UNCONFIRMED_STATUSES:
@@ -1540,6 +1653,9 @@ def process_task(task_id: int) -> None:
                             f"{likes_str}"
                         )
                     else:
+                        if (result_dict.get("reply_publication_visibility") or {}).get("enabled"):
+                            unconfirmed_urls.append(video_url)
+                            error_messages.append(f"{video_url}: {result_dict.get('error') or 'reply_visibility_unconfirmed'}")
                         failed_urls.append(video_url)
                         has_errors = True
                         engagement = result_dict.get("engagement", {})
@@ -1625,14 +1741,16 @@ def process_task(task_id: int) -> None:
                 started_at = datetime.now(timezone.utc).isoformat()
                 
                 # HYBRID FULL: Используем execute_hybrid_full() для full заказов
-                from executor.engagement_engine import execute_hybrid_full, resolve_video_url
+                from executor.engagement_engine import execute_hybrid_full, resolve_order_video_url
                 loop = get_event_loop()
                 full_lock_source = video_url
                 try:
                     resolved_lock_url, resolved_lock_video_id = loop.run_until_complete(
-                        resolve_video_url(video_url)
+                        resolve_order_video_url(db, video_url, pool_owner_user_id)
                     )
                     full_lock_source = resolved_lock_video_id or resolved_lock_url or video_url
+                    if resolved_lock_video_id:
+                        video_url = resolved_lock_url
                 except Exception as lock_resolve_exc:
                     logger.debug(
                         "Task %s, URL %s: could not resolve video for lock key: %s",
@@ -1667,7 +1785,8 @@ def process_task(task_id: int) -> None:
                         COMMENTING_MODE_PARALLEL = "parallel"
                         COMMENTING_MODE_PARALLEL_6X1 = "parallel_6x1"
 
-                    if user_schema_active:
+                    from executor.main_visibility import main_visibility_enabled
+                    if user_schema_active or main_visibility_enabled(task_settings):
                         from executor.user_schema import (
                             execute_user_schema_full,
                             execute_user_schema_parallel,
@@ -1881,6 +2000,13 @@ def process_task(task_id: int) -> None:
                 result_dict["timing"] = result_dict.get("timing") or {}
                 result_dict["timing"]["started_at"] = started_at
                 result_dict["timing"]["ended_at"] = ended_at
+                from executor.reply_visibility import verify_order_reply_visibility
+                with browser_pool_task_scope(task_id):
+                    result_dict = loop.run_until_complete(verify_order_reply_visibility(
+                        db, task, video_url, result_dict, pool_owner_user_id=pool_owner_user_id,
+                        stop_requested=task_stop_requested_now,
+                    ))
+                task_settings = task.settings or {}
                 result_dict = normalize_url_result_for_timeout(result_dict)
                 url_results[video_url] = result_dict
                 
@@ -1895,7 +2021,7 @@ def process_task(task_id: int) -> None:
                 # Count submitted_unconfirmed as processed. It stays visible in
                 # url_results/warnings, but should not make the whole order fail.
                 result_status = result_dict.get("status")
-                if result_status in _URL_SUCCESS_STATUSES:
+                if _url_result_counts_as_success(result_dict):
                     successful_urls += 1
                     successful_urls_list.append(video_url)
                     if result_status in _URL_UNCONFIRMED_STATUSES:
@@ -1932,6 +2058,9 @@ def process_task(task_id: int) -> None:
                             f"{likes_str}"
                         )
                 else:
+                    if ((result_dict.get("main_visibility") or {}).get("enabled")
+                            or (result_dict.get("reply_publication_visibility") or {}).get("enabled")):
+                        unconfirmed_urls.append(video_url)
                     failed_urls.append(video_url)
                     has_errors = True
                     error_messages.append(
@@ -1949,8 +2078,11 @@ def process_task(task_id: int) -> None:
                         or replies_info.get("total", 0)
                     )
                     logger.warning(
-                        f"Task {task_id}, URL {idx+1}: HYBRID FULL failed. "
+                        f"Task {task_id}, URL {idx+1}: HYBRID FULL "
+                        f"{'partially completed' if result_status == 'partial' else 'failed'}. "
                         f"Status: {result_dict.get('status')}, Error: {result_dict.get('error')}, "
+                        f"Main: {engagement.get('main', {}).get('submitted', 0)}/"
+                        f"{engagement.get('main', {}).get('expected', 0)}, "
                         f"Replies: {replies_info.get('ok', 0)}/{replies_expected}, "
                         f"{likes_str}"
                     )
@@ -2240,6 +2372,7 @@ def process_task(task_id: int) -> None:
     
     finally:
         stop_watcher_stop.set()
+        reset_dedicated_proxy(dedicated_proxy_token)
         try:
             stop_watcher_thread.join(timeout=1.0)
         except Exception:
@@ -2416,6 +2549,11 @@ def run_executor():
             logger.info("Windows ProactorEventLoopPolicy установлена для поддержки subprocess")
         except Exception as e:
             logger.warning(f"Не удалось установить WindowsProactorEventLoopPolicy: {e}")
+
+    # The executor can be started without FastAPI, so it must ensure its own
+    # small compatibility migrations are present before worker queries begin.
+    from db.migrations import apply_pending_migrations
+    apply_pending_migrations(verbose=False)
     
     # Используем модульный shutdown_event executor'а.
     shutdown_event = _shutdown_event

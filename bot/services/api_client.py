@@ -642,6 +642,7 @@ class APIClient:
         engagement_username: Optional[str] = None,  # HYBRID: Username Ð°Ð²Ñ‚Ð¾Ñ€Ð° ÐºÐ¾Ð¼Ð¼ÐµÐ½Ñ‚Ð°Ñ€Ð¸Ñ
         engagement_comment_text: Optional[str] = None,  # HYBRID: Ð¢ÐµÐºÑÑ‚ ÐºÐ¾Ð¼Ð¼ÐµÐ½Ñ‚Ð°Ñ€Ð¸Ñ Ð´Ð»Ñ Ð¿Ð¾Ð¸ÑÐºÐ°
         replies: Optional[list[str]] = None,
+        idempotency_key: Optional[str] = None,
     ) -> dict:
         """Ð¡Ð¾Ð·Ð´Ð°Ñ‘Ñ‚ Ð·Ð°Ð´Ð°Ñ‡Ñƒ."""
         normalized_main_comment = self._meaningful_user_text(main_comment)
@@ -729,7 +730,9 @@ class APIClient:
         if normalized_reply3:
             json_data["reply3"] = normalized_reply3
         
-        task_fingerprint = self._build_task_fingerprint(json_data)
+        # A new call creates a new order even when its content is identical.
+        # Callers retrying one logical request can supply the same explicit key.
+        task_fingerprint = (idempotency_key or "").strip() or uuid.uuid4().hex
         now_ts = time.time()
         self._prune_recent_create_task_cache(now_ts)
         cached_result = self._create_task_recent.get(task_fingerprint)
@@ -745,8 +748,7 @@ class APIClient:
                 return result
             raise APIRequestError("Некорректный ответ API при создании заказа.")
 
-        if "client_task_fingerprint" not in json_data["settings"]:
-            json_data["settings"]["client_task_fingerprint"] = task_fingerprint
+        json_data["settings"]["client_task_fingerprint"] = task_fingerprint
 
         request_headers = {
             "X-Idempotency-Key": task_fingerprint
@@ -1094,9 +1096,12 @@ class APIClient:
         """Ð—Ð°ÐºÑ€Ñ‹Ð²Ð°ÐµÑ‚ HTTP ÐºÐ»Ð¸ÐµÐ½Ñ‚. Ð’Ñ‹Ð·Ñ‹Ð²Ð°ÐµÑ‚ÑÑ Ð¿Ñ€Ð¸ Ð·Ð°Ð²ÐµÑ€ÑˆÐµÐ½Ð¸Ð¸ Ñ€Ð°Ð±Ð¾Ñ‚Ñ‹ Ð±Ð¾Ñ‚Ð°."""
         await self._client.aclose()
 
-    async def list_task_templates(self, user_id: int) -> list:
+    async def list_task_templates(self, user_id: int, include_archived: bool = False) -> list:
         """ÐŸÐ¾Ð»ÑƒÑ‡Ð°ÐµÑ‚ ÑÐ¿Ð¸ÑÐ¾Ðº ÑˆÐ°Ð±Ð»Ð¾Ð½Ð¾Ð² Ð·Ð°Ð´Ð°Ñ‡."""
-        return await self._request("GET", f"/api/templates/task?user_id={user_id}")
+        url = f"/api/templates/task?user_id={user_id}"
+        if include_archived:
+            url += "&include_archived=true"
+        return await self._request("GET", url)
 
     async def create_task_template(
         self,

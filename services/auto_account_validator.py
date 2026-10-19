@@ -11,6 +11,8 @@ from sqlalchemy import select
 from db.database import get_sync_db
 from db.models import Account
 from services.cookie_validator import validate_accounts_batch
+from services.account_assignment import available_assignment_filter
+from services.account_service import _read_runtime_state
 from config.settings import get_settings
 
 logger = logging.getLogger("services.auto_account_validator")
@@ -19,6 +21,15 @@ settings = get_settings()
 # Глобальное состояние для отслеживания последней проверки
 _last_validation_time = None
 _validation_running = False
+
+
+def _get_validation_accounts(db, now, limit=50):
+    threshold = now - timedelta(minutes=30)
+    return db.execute(select(Account).where(
+        Account.status.in_(["active", "error"]),
+        (Account.last_validation_attempt_at.is_(None)) | (Account.last_validation_attempt_at < threshold),
+        available_assignment_filter(now),
+    ).order_by(Account.last_validation_attempt_at.asc().nulls_first(), Account.id.asc()).limit(limit)).scalars().all()
 
 
 def get_event_loop():
@@ -108,18 +119,7 @@ def auto_validate_accounts():
             # Получаем аккаунты для проверки:
             # 1. Статус active или error
             # 2. Не проверялись в последние 30 минут (или вообще не проверялись)
-            check_threshold = now - timedelta(minutes=30)
-            
-            result = db.execute(
-                select(Account).filter(
-                    Account.status.in_(["active", "error"]),
-                    (
-                        (Account.last_checked_at.is_(None)) |
-                        (Account.last_checked_at < check_threshold)
-                    )
-                ).limit(50)  # Ограничиваем количество для одной проверки
-            )
-            accounts = result.scalars().all()
+            accounts = _get_validation_accounts(db, now)
             
             if not accounts:
                 logger.debug("No accounts need validation (all checked recently)")
@@ -132,11 +132,24 @@ def auto_validate_accounts():
             inconclusive_count = 0
             error_count = 0
 
+            checked_sources = {account.id: (account.cookies, account.cookie_file, account.proxy) for account in accounts}
             validation_results = validate_accounts_sync(accounts)
             results_by_id = {item.get("account_id"): item for item in validation_results if isinstance(item, dict)}
 
             for account in accounts:
                 try:
+                    # An order/import may have changed this account while HTTP was in flight.
+                    db.refresh(account)
+                    if account.status not in ("active", "error"):
+                        continue
+                    if (account.cookies, account.cookie_file, account.proxy) != checked_sources[account.id]:
+                        continue
+                    lease = account.assignment_lease_until
+                    if lease is not None:
+                        if lease.tzinfo is None:
+                            lease = lease.replace(tzinfo=timezone.utc)
+                        if lease > datetime.now(timezone.utc):
+                            continue
                     label = (account.label or "")[:20]
                     logger.debug(f"Validating account {account.id} ({label})...")
 
@@ -147,7 +160,7 @@ def auto_validate_accounts():
                         "definitive": False,
                     }
                     now_check = datetime.now(timezone.utc)
-                    account.last_checked_at = now_check
+                    account.last_validation_attempt_at = now_check
 
                     status = str(validation.get("status") or "").lower()
                     error = str(validation.get("error") or "")[:200]
@@ -156,10 +169,12 @@ def auto_validate_accounts():
 
                     if is_valid:
                         valid_count += 1
-                        from services.account_validation_policy import handle_validation_success
-                        handle_validation_success(db, account)
-
-                        if account.status == "error":
+                        state = _read_runtime_state(account, now_check)
+                        account.validation_fail_count = 0
+                        account.last_validation_ok = now_check
+                        # HTTP validation has its own timestamp; preserve the runtime
+                        # timestamp used to measure existing CAPTCHA/network cooldowns.
+                        if not state["active_cooldown"]:
                             account.status = "active"
                             account.error_count_recent = 0
                             account.last_error = None
@@ -180,7 +195,8 @@ def auto_validate_accounts():
                             )
                     else:
                         inconclusive_count += 1
-                        account.last_error = f"Auto-validation inconclusive - {error or status or 'unknown'}"
+                        # Do not erase runtime/CAPTCHA reasons, extend their cooldown,
+                        # or mark good cookies dead because an HTTP check was ambiguous.
                         logger.info(
                             f"Account {account.id} ({label}) auto-validation inconclusive; "
                             "not bumping validation_fail_count"

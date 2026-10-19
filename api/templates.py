@@ -118,6 +118,12 @@ def _extract_template_variants(template: TaskTemplate) -> list[str]:
     return [main_comment] * 3
 
 
+def _is_archived_template(template: TaskTemplate) -> bool:
+    """Return whether a task template is intentionally hidden from normal lists."""
+    settings_payload = template.settings or {}
+    return bool(settings_payload.get("archived"))
+
+
 class TaskTemplateCreate(BaseModel):
     """Модель для создания шаблона задачи."""
     user_id: int
@@ -272,6 +278,7 @@ async def create_task_template(
 async def list_task_templates(
     request: Request,
     user_id: int = Query(...),
+    include_archived: bool = Query(False),
     db: AsyncSession = Depends(get_db),
     auth_user_id: int = Depends(verify_user_header),
 ):
@@ -284,6 +291,8 @@ async def list_task_templates(
             ).order_by(TaskTemplate.created_at.desc())
         )
         templates = result.scalars().all()
+        if not include_archived:
+            templates = [template for template in templates if not _is_archived_template(template)]
         return [TaskTemplateResponse.from_orm(t) for t in templates]
     except Exception as e:
         logger.error(f"Error listing task templates for user {user_id}: {e}", exc_info=True)

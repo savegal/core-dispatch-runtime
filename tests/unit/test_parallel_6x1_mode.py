@@ -9,8 +9,17 @@ from unittest.mock import AsyncMock
 
 import pytest
 
+@pytest.fixture(autouse=True)
+def legacy_dom_mode(monkeypatch):
+    """These legacy DOM/concurrency cases opt out; HTTP cases enable it explicitly."""
+    from config.settings import get_settings
+    monkeypatch.setattr(get_settings(), "TIKTOK_NETWORK_FIRST", False)
+
+
+
 
 def _configure_parallel_6x1(monkeypatch, user_schema) -> None:
+    monkeypatch.setattr(user_schema._settings, "USE_PROXY", True)
     monkeypatch.setattr(user_schema._settings, "PARALLEL_COMMENTING_TARGET_BROWSERS", 3, raising=False)
     monkeypatch.setattr(user_schema._settings, "PARALLEL_COMMENTING_MAX_BROWSERS", 3, raising=False)
     monkeypatch.setattr(user_schema._settings, "PARALLEL_6X1_MAX_BROWSERS", 3, raising=False)
@@ -51,7 +60,8 @@ def test_extend_main_account_reservation_keeps_existing_lease_alive():
 
 @pytest.mark.unit
 @pytest.mark.asyncio
-async def test_parallel_6x1_runs_two_strict_waves_and_replaces_failed_account(monkeypatch):
+@pytest.mark.parametrize("use_proxy", [True, False])
+async def test_parallel_6x1_runs_two_strict_waves_and_replaces_failed_account(monkeypatch, use_proxy):
     from db import database as db_database
     from executor import browser_pool, user_schema
 
@@ -151,6 +161,7 @@ async def test_parallel_6x1_runs_two_strict_waves_and_replaces_failed_account(mo
         return "198.51.100.2"
 
     _configure_parallel_6x1(monkeypatch, user_schema)
+    monkeypatch.setattr(user_schema._settings, "USE_PROXY", use_proxy)
     monkeypatch.setattr(db_database, "get_sync_db_context", fake_db_context)
     monkeypatch.setattr(user_schema, "get_free_account_for_main_comment", fake_get_main)
     monkeypatch.setattr(user_schema, "_try_main_account", fake_try_main)
@@ -192,6 +203,10 @@ async def test_parallel_6x1_runs_two_strict_waves_and_replaces_failed_account(mo
     assert [main.text for main in result.published_mains].count("m1") == 2
     assert [main.text for main in result.published_mains].count("m2") == 2
     assert [main.text for main in result.published_mains].count("m3") == 2
+
+    if not use_proxy:
+        assert not any(event[0] in {"lock", "rotate"} for event in events)
+        return
 
     rotate_index = events.index(("rotate", 77))
     first_wave_publish_indexes = [

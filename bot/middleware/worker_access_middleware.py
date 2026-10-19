@@ -9,6 +9,7 @@ from aiogram.types import TelegramObject, CallbackQuery, Message
 from aiogram.dispatcher.event.bases import SkipHandler
 from bot.services.api_client import api_client
 from bot.services.subscription_service import check_user_access, check_user_blocked
+from bot.services.telegram_utils import safe_callback_answer
 from bot.keyboards.common import get_access_denied_keyboard
 import logging
 
@@ -43,68 +44,69 @@ class WorkerAccessMiddleware(BaseMiddleware):
                 role=role,
                 use_cache=True
             )
-            if has_access:
-                return await handler(event, data)
-
-            is_blocked, _ = await check_user_blocked(user_id, user_backend_id)
-            is_pending = bool(user_data.get("is_pending_approval"))
-            if is_pending:
-                text = (
-                    "*⏳ Ожидайте одобрения администратором*\n\n"
-                    "Ваша заявка получена и отправлена администратору.\n"
-                    "Как только её рассмотрят — бот сразу станет доступен."
-                )
-            elif is_blocked:
-                text = (
-                    "*🔒 Доступ запрещён*\n\n"
-                    "Вы заблокированы администратором.\n"
-                    "Для разблокировки обратитесь к администратору."
-                )
-            else:
-                text = (
-                    "*Доступ не подтверждён*\n\n"
-                    "Бот не смог подтвердить активный доступ пользователя.\n"
-                    "Проверьте доступ ещё раз или обратитесь к администратору."
-                )
-
-            keyboard_for_pending = get_access_denied_keyboard(pending_approval=is_pending)
-
-            state = data.get("state")
-            if state:
-                await state.clear()
-
-            if isinstance(event, CallbackQuery):
-                try:
-                    await event.answer("Доступ запрещён", show_alert=True)
-                except Exception:
-                    pass
-
-                if event.message:
-                    try:
-                        await event.message.edit_text(
-                            text,
-                            reply_markup=keyboard_for_pending,
-                            parse_mode="Markdown"
-                        )
-                    except Exception:
-                        await event.message.answer(
-                            text,
-                            reply_markup=keyboard_for_pending,
-                            parse_mode="Markdown"
-                        )
-            else:
-                await event.answer(
-                    text,
-                    reply_markup=keyboard_for_pending,
-                    parse_mode="Markdown"
-                )
-            return
         except SkipHandler:
             raise
         except Exception as e:
             logger.error(f"Error checking worker access for user {user_id}: {e}", exc_info=True)
             if isinstance(event, CallbackQuery):
-                await event.answer("Ошибка проверки доступа", show_alert=True)
+                await safe_callback_answer(event, "Ошибка проверки доступа", show_alert=True)
             elif isinstance(event, Message):
                 await event.answer("Ошибка проверки доступа")
             return
+
+        # The handler is intentionally outside the access-check try/except. Its errors
+        # belong to the handler and must not be mislabeled as access failures or trigger
+        # a second answer to the same Telegram callback.
+        if has_access:
+            return await handler(event, data)
+
+        is_blocked, _ = await check_user_blocked(user_id, user_backend_id)
+        is_pending = bool(user_data.get("is_pending_approval"))
+        if is_pending:
+            text = (
+                "*⏳ Ожидайте одобрения администратором*\n\n"
+                "Ваша заявка получена и отправлена администратору.\n"
+                "Как только её рассмотрят — бот сразу станет доступен."
+            )
+        elif is_blocked:
+            text = (
+                "*🔒 Доступ запрещён*\n\n"
+                "Вы заблокированы администратором.\n"
+                "Для разблокировки обратитесь к администратору."
+            )
+        else:
+            text = (
+                "*Доступ не подтверждён*\n\n"
+                "Бот не смог подтвердить активный доступ пользователя.\n"
+                "Проверьте доступ ещё раз или обратитесь к администратору."
+            )
+
+        keyboard_for_pending = get_access_denied_keyboard(pending_approval=is_pending)
+
+        state = data.get("state")
+        if state:
+            await state.clear()
+
+        if isinstance(event, CallbackQuery):
+            await safe_callback_answer(event, "Доступ запрещён", show_alert=True)
+
+            if event.message:
+                try:
+                    await event.message.edit_text(
+                        text,
+                        reply_markup=keyboard_for_pending,
+                        parse_mode="Markdown"
+                    )
+                except Exception:
+                    await event.message.answer(
+                        text,
+                        reply_markup=keyboard_for_pending,
+                        parse_mode="Markdown"
+                    )
+        else:
+            await event.answer(
+                text,
+                reply_markup=keyboard_for_pending,
+                parse_mode="Markdown"
+            )
+        return

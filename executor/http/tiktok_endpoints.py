@@ -8,6 +8,7 @@ TikTok API Endpoints.
 """
 from typing import Optional, Dict, Any
 from urllib.parse import urlencode
+from executor.http.request_profile import _format_browser_version, resolve_request_geo
 
 
 class TikTokEndpoints:
@@ -23,6 +24,8 @@ class TikTokEndpoints:
         reply_id: Optional[str] = None,
         reply_to_reply_id: str = "0",
         video_url: Optional[str] = None,
+        runtime_profile: Optional[Dict[str, Any]] = None,
+        cookies: Optional[Dict[str, str]] = None,
         **extra_params
     ) -> str:
         """
@@ -40,14 +43,12 @@ class TikTokEndpoints:
         """
         params = {
             "aid": "1988",
-            "app_language": "ru-RU",
             "app_name": "tiktok_web",
             "aweme_id": aweme_id,
-            "browser_language": "ru-RU",
             "browser_name": "Mozilla",
             "browser_online": "true",
             "browser_platform": "Win32",
-            "browser_version": "5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/143.0.0.0 Safari/537.36",
+            "browser_version": _format_browser_version(),
             "channel": "tiktok_web",
             "cookie_enabled": "true",
             "data_collection_enabled": "true",
@@ -57,15 +58,11 @@ class TikTokEndpoints:
             "is_fullscreen": "false",
             "is_page_visible": "true",
             "os": "windows",
-            "priority_region": "US",
             "referer": "https://www.tiktok.com/",
-            "region": "US",
             "root_referer": "https://www.tiktok.com/",
             "text": text,
             "text_extra": "[]",
-            "tz_name": "Asia/Jerusalem",
             "user_is_login": "true",
-            "webcast_language": "ru-RU",
         }
         
         # Устанавливаем referer - если есть video_url, используем его, иначе базовый URL
@@ -86,6 +83,9 @@ class TikTokEndpoints:
         # Добавляем дополнительные параметры (msToken, X-Bogus, X-Gnarly, verifyFp и т.д.)
         # ВАЖНО: X-Bogus и X-Gnarly должны быть в query params, а не в headers
         params.update(extra_params)
+        params.update(resolve_request_geo(runtime_profile, cookies, extra_params))
+        params.pop("proxy_country_code", None)
+        params.pop("account_country_code", None)
         
         # Добавляем стандартные параметры если их нет
         if "WebIdLastTime" not in params:
@@ -94,9 +94,9 @@ class TikTokEndpoints:
         if "history_len" not in params:
             params["history_len"] = "8"
         if "screen_height" not in params:
-            params["screen_height"] = "864"
+            params["screen_height"] = "1080"
         if "screen_width" not in params:
-            params["screen_width"] = "1536"
+            params["screen_width"] = "1920"
         
         query_string = urlencode(params, doseq=True)
         return f"{TikTokEndpoints.API_BASE}/comment/publish/?{query_string}"
@@ -106,6 +106,8 @@ class TikTokEndpoints:
         aweme_id: str,
         cid: str,
         digg_type: int = 1,
+        runtime_profile: Optional[Dict[str, Any]] = None,
+        cookies: Optional[Dict[str, str]] = None,
         **extra_params
     ) -> str:
         """
@@ -122,14 +124,12 @@ class TikTokEndpoints:
         """
         params = {
             "aid": "1988",
-            "app_language": "ru-RU",
             "app_name": "tiktok_web",
             "aweme_id": aweme_id,
-            "browser_language": "ru-RU",
             "browser_name": "Mozilla",
             "browser_online": "true",
             "browser_platform": "Win32",
-            "browser_version": "5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/143.0.0.0 Safari/537.36",
+            "browser_version": _format_browser_version(),
             "channel": "tiktok_web",
             "channel_id": "0",
             "cid": cid,
@@ -144,19 +144,18 @@ class TikTokEndpoints:
             "is_page_visible": "true",
             "odinId": "",  # Будет заполнено из cookies
             "os": "windows",
-            "priority_region": "US",
             "referer": "https://www.tiktok.com/",
-            "region": "US",
             "root_referer": "https://www.tiktok.com/",
-            "tz_name": "Asia/Jerusalem",
             "user_is_login": "true",
             "verifyFp": "",  # Будет заполнено из cookies
-            "webcast_language": "ru-RU",
         }
         
         # Добавляем дополнительные параметры (msToken, X-Bogus, X-Gnarly и т.д.)
         # ВАЖНО: X-Bogus и X-Gnarly должны быть в query params, а не в headers
         params.update(extra_params)
+        params.update(resolve_request_geo(runtime_profile, cookies, extra_params))
+        params.pop("proxy_country_code", None)
+        params.pop("account_country_code", None)
         
         # Добавляем стандартные параметры если их нет
         if "WebIdLastTime" not in params:
@@ -165,9 +164,9 @@ class TikTokEndpoints:
         if "history_len" not in params:
             params["history_len"] = "7"
         if "screen_height" not in params:
-            params["screen_height"] = "864"
+            params["screen_height"] = "1080"
         if "screen_width" not in params:
-            params["screen_width"] = "1536"
+            params["screen_width"] = "1920"
         if "channel_id" not in params:
             params["channel_id"] = "0"
         

@@ -40,6 +40,7 @@ from executor.smart_finder import (
     find_comment_input_fast,
     find_submit_button_fast,
 )
+from services.log_sanitizer import sanitize_url
 
 logger = logging.getLogger("executor.tiktok_client_async")
 settings = get_settings()
@@ -484,6 +485,8 @@ def parse_cookies(raw: str) -> List[Dict[str, Any]]:
             else:
                 # Формат 1: преобразуем объект в массив
                 for name, value in data.items():
+                    if not name or value is None or isinstance(value, (dict, list)):
+                        continue
                     cookies.append({
                         "name": name,
                         "value": str(value),
@@ -519,7 +522,18 @@ def parse_cookies(raw: str) -> List[Dict[str, Any]]:
     if not cookies:
         raise TikTokClientError("No cookies found in string")
     
+    from services.cookie_validator import normalize_cookies_for_browser
+
+    cookies = normalize_cookies_for_browser(cookies, drop_stale_antifraud=True)
+    if not cookies:
+        raise TikTokClientError("No cookies found in string")
     return cookies
+
+
+def prepare_cookies_for_context(account: Account, raw_cookies: Optional[str] = None) -> List[Dict[str, Any]]:
+    from services.cookie_validator import prepare_cookies_for_context as _prepare_cookies
+    cookies_str = raw_cookies if raw_cookies is not None else _get_cookies_for_account(account)
+    return _prepare_cookies(account, cookies_str, parse_fn=parse_cookies)
 
 
 def _cookies_list_to_dict(cookies: List[Dict[str, Any]]) -> Dict[str, str]:
@@ -545,6 +559,9 @@ def _cookie_is_expired(cookie: Dict[str, Any]) -> bool:
         expires_value = float(expires_raw)
     except (TypeError, ValueError):
         return False
+
+    if expires_value <= 0:
+        return False  # Browser exports use -1 for session cookies.
 
     # Some exports store milliseconds or microseconds instead of seconds.
     if expires_value > 10**12:
@@ -738,7 +755,8 @@ async def quick_validate_account(account: Account, timeout: int | None = None) -
     
     logger.debug(
         f"[VALIDATE] Starting: account_id={account.id}, label={account.label[:20]}, "
-        f"timeout={timeout_seconds}s, proxy={account.proxy[:30] if account.proxy else 'none'}"
+        f"timeout={timeout_seconds}s, "
+        f"proxy={sanitize_url(account.proxy, max_length=80) if account.proxy else 'none'}"
     )
 
     fast_precheck_result, fast_precheck_reason = _fast_cookie_health_precheck(account)

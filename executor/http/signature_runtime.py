@@ -16,20 +16,13 @@ logger = logging.getLogger("executor.http.signature_runtime")
 _SIGNATURE_PARAM_KEYS = ("X-Bogus", "X-Gnarly", "a_bogus")
 _SIGNER_READY_JS = """
 () => {
-    if (
-        window.byted_acrawler &&
-        (
-            typeof window.byted_acrawler.sign === "function" ||
-            typeof window.byted_acrawler.frontierSign === "function"
-        )
-    ) {
-        return true;
-    }
+    // Only signed TikTok resource traffic proves the interceptor is active.
     try {
         const entries = performance.getEntriesByType("resource");
-        for (let i = entries.length - 1; i >= Math.max(0, entries.length - 30); i--) {
-            const name = String(entries[i].name || "");
-            if (name.includes("X-Bogus") || name.includes("a_bogus")) {
+        for (let i = entries.length - 1; i >= 0; i--) {
+            const url = new URL(String(entries[i].name || ""), location.href);
+            const isTikTok = url.hostname === "tiktok.com" || url.hostname.endsWith(".tiktok.com");
+            if (isTikTok && ["X-Bogus", "X-Gnarly"].every(key => url.searchParams.get(key))) {
                 return true;
             }
         }
@@ -37,6 +30,12 @@ _SIGNER_READY_JS = """
         // Ignore performance inspection failures.
     }
     return false;
+}
+"""
+_SIGNER_WAKE_JS = """
+() => {
+    try { window.scrollBy(0, 80); } catch (error) {}
+    try { window.dispatchEvent(new Event("mousemove")); } catch (error) {}
 }
 """
 
@@ -100,12 +99,15 @@ def build_unsigned_request_url(
     dynamic_params: Dict[str, Any],
     cookies: Optional[Dict[str, str]] = None,
     runtime_profile: Optional[Dict[str, Any]] = None,
+    *,
+    include_ms_token: bool = True,
 ) -> str:
     params, _ = profile.build_request_parts(
         dynamic_params,
         cookies,
         runtime_profile,
         include_cookie_signatures=False,
+        include_ms_token=include_ms_token,
     )
     return profile.build_url_from_params(params)
 
@@ -147,17 +149,34 @@ def borrow_signature_bundle_from_cookies(cookies: Optional[Dict[str, str]]) -> S
 
 
 async def wait_for_runtime_signer_ready(page: Optional[Page], timeout_ms: int = 1200) -> bool:
-    if page is None:
+    if page is None or not callable(getattr(page, "evaluate", None)):
         return False
-
-    try:
-        await page.wait_for_function(_SIGNER_READY_JS, timeout=timeout_ms)
-        return True
-    except Exception:
-        try:
-            return bool(await page.evaluate(_SIGNER_READY_JS))
-        except Exception:
+    # Patchright evaluate defaults to an isolated world, which cannot see the
+    # page's performance overrides. Poll explicitly in the main world.
+    loop = asyncio.get_running_loop()
+    deadline = loop.time() + max(0.001, timeout_ms / 1000)
+    wake_attempted = False
+    while True:
+        remaining = deadline - loop.time()
+        if remaining <= 0:
             return False
+        try:
+            if await asyncio.wait_for(page.evaluate(_SIGNER_READY_JS, isolated_context=False), timeout=remaining):
+                return True
+            if not wake_attempted and timeout_ms >= 200:
+                wake_attempted = True
+                remaining = deadline - loop.time()
+                if remaining <= 0:
+                    return False
+                await asyncio.wait_for(page.evaluate(_SIGNER_WAKE_JS, isolated_context=False), timeout=remaining)
+        except (AttributeError, TypeError):
+            return False
+        except Exception:
+            pass
+        remaining = deadline - loop.time()
+        if remaining <= 0:
+            return False
+        await asyncio.sleep(min(0.1, remaining))
 
 
 async def generate_runtime_signature_bundle(page: Optional[Page], unsigned_url: str) -> SignatureBundle:
@@ -258,7 +277,7 @@ async def generate_runtime_signature_bundle(page: Optional[Page], unsigned_url: 
     """
 
     try:
-        raw_result = await page.evaluate(js_code, unsigned_url)
+        raw_result = await asyncio.wait_for(page.evaluate(js_code, unsigned_url, isolated_context=False), timeout=2.0)
     except Exception as exc:
         logger.debug("[SIGN] Runtime signer evaluation failed", exc_info=True)
         return SignatureBundle(mode="unsigned", source="signer_error", signer_available=False, notes=str(exc)[:120])
@@ -384,25 +403,41 @@ async def resolve_request_signature(
     allow_cookie_fallback: bool,
 ) -> Tuple[Dict[str, Any], str, SignatureBundle]:
     clean_dynamic_params, explicit_bundle = split_explicit_signature_params(dynamic_params)
+    native_comment_request = page is not None and urlparse(profile.endpoint).path.rstrip("/") in {
+        "/api/comment/publish", "/api/comment/list", "/api/comment/list/reply",
+    }
     unsigned_url = build_unsigned_request_url(
         profile,
         clean_dynamic_params,
         cookies=cookies,
         runtime_profile=runtime_profile,
+        include_ms_token=True,
     )
 
     if explicit_bundle.has_any():
         return clean_dynamic_params, apply_signature_bundle_to_url(unsigned_url, explicit_bundle), explicit_bundle
 
+    if native_comment_request or (
+        profile.method.upper() == "POST" and urlparse(profile.endpoint).path.rstrip("/") == "/api/comment/publish"
+    ):
+        # Publish signatures must cover this request's query AND form body.
+        # A URL-only signer or a signature borrowed from a background GET cannot
+        # do that. The page's fetch interceptor signs the complete request.
+        return clean_dynamic_params, unsigned_url, SignatureBundle(
+            mode="browser_fetch" if page is not None else "unsigned",
+            source="window.fetch" if page is not None else "none",
+            notes="signature_delegated_to_page_interceptor" if page is not None else "publish_signature_fallback_disabled",
+        )
+
     runtime_bundle = await generate_runtime_signature_bundle(page, unsigned_url)
     if runtime_bundle.has_any():
         return clean_dynamic_params, apply_signature_bundle_to_url(unsigned_url, runtime_bundle), runtime_bundle
 
-    harvest_bundle = await harvest_signature_from_traffic(page)
+    harvest_bundle = SignatureBundle()
     if harvest_bundle.has_any():
         return clean_dynamic_params, apply_signature_bundle_to_url(unsigned_url, harvest_bundle), harvest_bundle
 
-    if allow_cookie_fallback:
+    if allow_cookie_fallback and page is None:
         cookie_bundle = borrow_signature_bundle_from_cookies(cookies)
         if cookie_bundle.has_any():
             return clean_dynamic_params, apply_signature_bundle_to_url(unsigned_url, cookie_bundle), cookie_bundle

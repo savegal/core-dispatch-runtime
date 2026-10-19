@@ -6,6 +6,14 @@ from unittest.mock import AsyncMock
 
 import pytest
 
+@pytest.fixture(autouse=True)
+def legacy_dom_mode(monkeypatch):
+    """Legacy recovery cases opt out; HTTP cases enable the transport explicitly."""
+    from config.settings import get_settings
+    monkeypatch.setattr(get_settings(), "TIKTOK_NETWORK_FIRST", False)
+
+
+
 import executor.engagement_engine as engagement_engine
 from db.models import Account, Proxy
 
@@ -50,10 +58,10 @@ class _WarmupPage:
         self.goto_calls += 1
         self.url = url
 
-    async def reload(self, wait_until="domcontentloaded"):
+    async def reload(self, wait_until="domcontentloaded", timeout=15000):
         self.reload_calls += 1
 
-    async def wait_for_load_state(self, state):
+    async def wait_for_load_state(self, state, timeout=None):
         return None
 
 
@@ -63,8 +71,9 @@ class _DummyContext:
 
 
 class _DummyHttpClient:
+    last_request_meta = {"comment_author": "tester"}
     async def publish_main_comment(self, **kwargs):
-        return True, "cid_main_123", None, None
+        return True, "7641761192486194454", None, None
 
 
 async def _async_tuple(*values):
@@ -88,6 +97,8 @@ async def test_attempt_main_comment_uses_warmup_resolved_aweme_id(db_session, mo
     path must use the aweme_id/current URL discovered by warmup instead of
     failing with missing_aweme_id on the original vt.tiktok.com URL.
     """
+    monkeypatch.setattr(engagement_engine.settings, "TIKTOK_NETWORK_FIRST", True)
+    monkeypatch.setattr(engagement_engine.settings, "TIKTOK_NETWORK_IMPL_READY", True)
     account = Account(id=20, label="main", status="active", cookies='{"sessionid":"x"}', proxy="http://proxy-main")
     resolved_url = "https://www.tiktok.com/@demo/video/7635267329407913230"
     captured = {}
@@ -112,7 +123,7 @@ async def test_attempt_main_comment_uses_warmup_resolved_aweme_id(db_session, mo
     class _CapturingHttpClient:
         async def publish_main_comment(self, **kwargs):
             captured.update(kwargs)
-            return True, "cid_main_123", None, None
+            return True, "7641761192486194454", None, None
 
     async def _fake_from_page(*args, **kwargs):
         return _CapturingHttpClient()
@@ -134,7 +145,7 @@ async def test_attempt_main_comment_uses_warmup_resolved_aweme_id(db_session, mo
         "task_176_main_a1",
     )
 
-    assert comment_id == "cid_main_123"
+    assert comment_id == "7641761192486194454"
     assert error is None
     assert stage == "http"
     assert captured["aweme_id"] == "7635267329407913230"
@@ -146,167 +157,71 @@ async def test_attempt_main_comment_uses_warmup_resolved_aweme_id(db_session, mo
 
 @pytest.mark.unit
 @pytest.mark.asyncio
-async def test_attempt_main_comment_falls_back_to_dom_when_signer_not_ready(db_session, monkeypatch):
-    account = Account(id=22, label="main", status="active", cookies='{"sessionid":"x"}', proxy="http://proxy-main")
-    resolved_url = "https://www.tiktok.com/@demo/video/7635267329407913230"
-    page = _WarmupPage([])
-    outcome = {}
-    failures = []
-    captured = {}
-    engagement_engine._HTTP_ACCOUNT_HEALTH.pop(account.id, None)
-
-    async def _fake_sleep(_seconds):
-        return None
-
-    async def _fake_create_page_for_account(_account):
-        return _DummyContext(), page
-
-    async def _fake_warmup_page_for_http(*args, **kwargs):
-        return (
-            {"sessionid": "x"},
-            False,
-            {
-                "reason_code": "signer_not_ready",
-                "missing_critical": [],
-                "current_url": resolved_url,
-                "signer_ready": False,
-            },
-        )
-
-    async def _unexpected_from_page(*args, **kwargs):
-        raise AssertionError("HTTP client should not be created when signer is not ready")
-
-    async def _fake_bootstrap_session(_page, video_url, **kwargs):
-        captured["bootstrap_video_url"] = video_url
-        return SimpleNamespace(
-            status="ok",
-            can_attempt_publish=True,
-            cookies={"sessionid": "x"},
-            auth_present=["sessionid"],
-        )
-
-    async def _fake_publish_comment_hybrid(*args, **kwargs):
-        return SimpleNamespace(
-            status="success",
-            comment_id="dom_comment_123",
-            dom_strategy="comment_box",
-            elapsed_seconds=1.0,
-            network_captured=True,
-        )
-
-    monkeypatch.setattr(engagement_engine, "get_http_execution_strategy", lambda *args, **kwargs: {"strategy": "http_first"})
-    monkeypatch.setattr(engagement_engine, "_should_skip_http_for_account", lambda *args, **kwargs: None)
-    monkeypatch.setattr(engagement_engine, "create_page_for_account", _fake_create_page_for_account)
-    monkeypatch.setattr(engagement_engine, "warmup_page_for_http", _fake_warmup_page_for_http)
-    monkeypatch.setattr(engagement_engine.PlaywrightHttpClient, "from_page", _unexpected_from_page)
-    monkeypatch.setattr(engagement_engine, "needs_enrichment", lambda *args, **kwargs: False)
-    monkeypatch.setattr(engagement_engine, "bootstrap_session", _fake_bootstrap_session)
-    monkeypatch.setattr(engagement_engine, "publish_comment_hybrid", _fake_publish_comment_hybrid)
-    monkeypatch.setattr(engagement_engine, "_register_runtime_success", lambda *args, **kwargs: None)
-    monkeypatch.setattr(engagement_engine, "_register_runtime_failure", lambda *args, **kwargs: failures.append(args))
-    monkeypatch.setattr(engagement_engine.asyncio, "sleep", _fake_sleep)
-
-    comment_id, error, stage = await engagement_engine.attempt_main_comment_on_account(
-        db_session,
-        account,
-        resolved_url,
-        "hello world",
-        178,
-        "task_178_main_a1",
-        outcome,
+@pytest.mark.parametrize("mode, failure, reason, expected_stage", [
+    (mode, failure, reason, stage)
+    for mode in ("main", "reply")
+    for failure, reason, stage in (
+        ("warmup", "captcha:slider", "warmup"),
+        ("pre_submit", "unsigned_profile_blocked", "http"),
+        ("health", "recent_warmup_failures", "http_health_gate"),
     )
-
-    assert comment_id == "dom_comment_123"
-    assert error is None
-    assert stage == "hybrid"
-    assert outcome["posted"] is True
-    assert outcome["network_confirmed"] is True
-    assert outcome["method"] == "hybrid_dom"
-    assert captured["bootstrap_video_url"] == resolved_url
-    assert failures == []
-    assert engagement_engine._HTTP_ACCOUNT_HEALTH[account.id]["success"] == 1
-    assert engagement_engine._HTTP_ACCOUNT_HEALTH[account.id]["warmup_fail"] == 0
-
-
-@pytest.mark.unit
-@pytest.mark.asyncio
-async def test_attempt_main_comment_falls_back_to_dom_when_http_never_sent_request(db_session, monkeypatch):
-    account = Account(id=24, label="main", status="active", cookies='{"sessionid":"x"}', proxy="http://proxy-main")
-    resolved_url = "https://www.tiktok.com/@demo/video/7635267329407913230"
+] + [("reply", "missing_parent", "parent_comment_id_required_for_http", "http")])
+async def test_http_strategy_stops_without_dom_on_preparation_failure(
+    db_session, monkeypatch, mode, failure, reason, expected_stage,
+):
+    monkeypatch.setattr(engagement_engine.settings, "TIKTOK_NETWORK_FIRST", True)
+    monkeypatch.setattr(engagement_engine.settings, "TIKTOK_NETWORK_IMPL_READY", True)
+    monkeypatch.setattr(engagement_engine.settings, "PARALLEL_COMMENTING_DOM_FIRST", False)
+    account = Account(id=24, label="http", status="active", cookies='{"sessionid":"x"}')
     page = _WarmupPage([])
-    failures = []
     engagement_engine._HTTP_ACCOUNT_HEALTH.pop(account.id, None)
-
-    async def _fake_sleep(_seconds):
-        return None
-
-    async def _fake_create_page_for_account(_account):
-        return _DummyContext(), page
-
-    async def _fake_warmup_page_for_http(*args, **kwargs):
-        return {"sessionid": "x", "msToken": "token"}, True, {
-            "reason_code": "ready",
-            "current_url": resolved_url,
-        }
-
-    class _PreSubmitHttpClient:
-        last_request_meta = {"request_attempted": False, "attempt_count": 0}
-
-        async def publish_main_comment(self, **kwargs):
-            return False, None, "unsigned_profile_blocked", None
-
-    async def _fake_from_page(*args, **kwargs):
-        return _PreSubmitHttpClient()
-
-    async def _fake_bootstrap_session(_page, video_url, **kwargs):
-        return SimpleNamespace(
-            status="ok",
-            can_attempt_publish=True,
-            cookies={"sessionid": "x"},
-            auth_present=["sessionid"],
-        )
-
-    async def _fake_publish_comment_hybrid(*args, **kwargs):
-        return SimpleNamespace(
-            status="success",
-            comment_id="dom_comment_after_presubmit",
-            dom_strategy="comment_box",
-            elapsed_seconds=1.0,
-            network_captured=True,
-        )
-
-    monkeypatch.setattr(engagement_engine, "get_http_execution_strategy", lambda *args, **kwargs: {"strategy": "http_first"})
-    monkeypatch.setattr(engagement_engine, "_should_skip_http_for_account", lambda *args, **kwargs: None)
-    monkeypatch.setattr(engagement_engine, "create_page_for_account", _fake_create_page_for_account)
-    monkeypatch.setattr(engagement_engine, "warmup_page_for_http", _fake_warmup_page_for_http)
-    monkeypatch.setattr(engagement_engine.PlaywrightHttpClient, "from_page", _fake_from_page)
-    monkeypatch.setattr(engagement_engine, "needs_enrichment", lambda *args, **kwargs: False)
-    monkeypatch.setattr(engagement_engine, "bootstrap_session", _fake_bootstrap_session)
-    monkeypatch.setattr(engagement_engine, "publish_comment_hybrid", _fake_publish_comment_hybrid)
-    monkeypatch.setattr(engagement_engine, "_register_runtime_success", lambda *args, **kwargs: None)
-    monkeypatch.setattr(engagement_engine, "_register_runtime_failure", lambda *args, **kwargs: failures.append(args))
-    monkeypatch.setattr(engagement_engine.asyncio, "sleep", _fake_sleep)
-
-    comment_id, error, stage = await engagement_engine.attempt_main_comment_on_account(
-        db_session,
-        account,
-        resolved_url,
-        "hello world",
-        180,
-        "task_180_main_a1",
+    monkeypatch.setattr(engagement_engine, "get_http_execution_strategy", lambda *_args: {"strategy": "http_first"})
+    monkeypatch.setattr(engagement_engine, "_should_skip_http_for_account", lambda *_args: reason if failure == "health" else None)
+    monkeypatch.setattr(engagement_engine, "create_page_for_account", AsyncMock(return_value=(_DummyContext(), page)))
+    warmup = AsyncMock(return_value=({"sessionid": "x"}, failure != "warmup", {
+        "reason_code": reason,
+        "current_url": page.url,
+    }))
+    monkeypatch.setattr(engagement_engine, "warmup_page_for_http", warmup)
+    client = SimpleNamespace(
+        last_request_meta={"request_attempted": False},
+        publish_main_comment=AsyncMock(return_value=(False, None, reason, None)),
+        reply_comment=AsyncMock(return_value=(False, None, reason, None, {})),
     )
+    monkeypatch.setattr(engagement_engine.PlaywrightHttpClient, "from_page", AsyncMock(return_value=client))
+    bootstrap = AsyncMock(side_effect=AssertionError("HTTP failure must not start DOM bootstrap"))
+    publish = AsyncMock(side_effect=AssertionError("HTTP failure must not click the DOM publisher"))
+    enrich = AsyncMock(side_effect=AssertionError("HTTP failure must not visit /foryou"))
+    monkeypatch.setattr(engagement_engine, "bootstrap_session", bootstrap)
+    monkeypatch.setattr(engagement_engine, "publish_comment_hybrid", publish)
+    monkeypatch.setattr(engagement_engine, "publish_reply_hybrid", publish)
+    monkeypatch.setattr(engagement_engine, "enrich_cookies_via_browser", enrich)
+    monkeypatch.setattr(engagement_engine, "_register_runtime_failure", lambda *_args, **_kwargs: None)
 
-    assert comment_id == "dom_comment_after_presubmit"
-    assert error is None
-    assert stage == "hybrid"
-    assert failures == []
-    assert engagement_engine._HTTP_ACCOUNT_HEALTH[account.id]["success"] == 1
-    assert engagement_engine._HTTP_ACCOUNT_HEALTH[account.id]["warmup_fail"] == 0
+    if mode == "main":
+        result = await engagement_engine.attempt_main_comment_on_account(
+            db_session, account, page.url, "test", 180, "task_180_main",
+        )
+    else:
+        result = await engagement_engine.attempt_reply_on_account(
+            db_session, account, page.url, "test", "parent", 180, "task_180_reply",
+            parent_comment_id=None if failure == "missing_parent" else "7641761192486194454",
+        )
+
+    assert result == (None, reason, expected_stage)
+    bootstrap.assert_not_awaited()
+    publish.assert_not_awaited()
+    enrich.assert_not_awaited()
+    if failure in {"health", "missing_parent"}:
+        warmup.assert_not_awaited()
+    assert page.is_closed() is (failure != "missing_parent")
 
 
 @pytest.mark.unit
 @pytest.mark.asyncio
 async def test_attempt_main_comment_stops_after_attempted_http_failure(db_session, monkeypatch):
+    monkeypatch.setattr(engagement_engine.settings, "TIKTOK_NETWORK_FIRST", True)
+    monkeypatch.setattr(engagement_engine.settings, "TIKTOK_NETWORK_IMPL_READY", True)
     account = Account(id=25, label="main", status="active", cookies='{"sessionid":"x"}', proxy="http://proxy-main")
     resolved_url = "https://www.tiktok.com/@demo/video/7635267329407913230"
     failures = []
@@ -360,68 +275,8 @@ async def test_attempt_main_comment_stops_after_attempted_http_failure(db_sessio
 
 @pytest.mark.unit
 @pytest.mark.asyncio
-async def test_attempt_main_comment_uses_dom_when_http_health_gate_skips_account(db_session, monkeypatch):
-    account = Account(id=23, label="main", status="active", cookies='{"sessionid":"x"}', proxy="http://proxy-main")
-    page = _WarmupPage([])
-
-    async def _fake_sleep(_seconds):
-        return None
-
-    async def _fake_create_page_for_account(_account):
-        return _DummyContext(), page
-
-    async def _unexpected_warmup_page_for_http(*args, **kwargs):
-        raise AssertionError("Warmup should not run when HTTP health gate skips the account")
-
-    async def _unexpected_from_page(*args, **kwargs):
-        raise AssertionError("HTTP client should not be created when HTTP health gate skips the account")
-
-    async def _fake_bootstrap_session(*args, **kwargs):
-        return SimpleNamespace(
-            status="ok",
-            can_attempt_publish=True,
-            cookies={"sessionid": "x"},
-            auth_present=["sessionid"],
-        )
-
-    async def _fake_publish_comment_hybrid(*args, **kwargs):
-        return SimpleNamespace(
-            status="success",
-            comment_id="dom_comment_456",
-            dom_strategy="comment_box",
-            elapsed_seconds=1.0,
-            network_captured=True,
-        )
-
-    monkeypatch.setattr(engagement_engine, "get_http_execution_strategy", lambda *args, **kwargs: {"strategy": "http_first"})
-    monkeypatch.setattr(engagement_engine, "_should_skip_http_for_account", lambda *args, **kwargs: "recent_warmup_failures")
-    monkeypatch.setattr(engagement_engine, "create_page_for_account", _fake_create_page_for_account)
-    monkeypatch.setattr(engagement_engine, "warmup_page_for_http", _unexpected_warmup_page_for_http)
-    monkeypatch.setattr(engagement_engine.PlaywrightHttpClient, "from_page", _unexpected_from_page)
-    monkeypatch.setattr(engagement_engine, "needs_enrichment", lambda *args, **kwargs: False)
-    monkeypatch.setattr(engagement_engine, "bootstrap_session", _fake_bootstrap_session)
-    monkeypatch.setattr(engagement_engine, "publish_comment_hybrid", _fake_publish_comment_hybrid)
-    monkeypatch.setattr(engagement_engine, "_register_runtime_success", lambda *args, **kwargs: None)
-    monkeypatch.setattr(engagement_engine, "_register_runtime_failure", lambda *args, **kwargs: None)
-    monkeypatch.setattr(engagement_engine.asyncio, "sleep", _fake_sleep)
-
-    comment_id, error, stage = await engagement_engine.attempt_main_comment_on_account(
-        db_session,
-        account,
-        "https://www.tiktok.com/@demo/video/7635267329407913230",
-        "hello world",
-        179,
-        "task_179_main_a1",
-    )
-
-    assert comment_id == "dom_comment_456"
-    assert error is None
-    assert stage == "hybrid"
-
-
-@pytest.mark.unit
-@pytest.mark.asyncio
 async def test_attempt_main_comment_does_not_mark_reauth_on_stealth_reject(db_session, monkeypatch):
+    monkeypatch.setattr(engagement_engine.settings, "TIKTOK_NETWORK_FIRST", False)
     account = Account(id=26, label="main", status="active", cookies='{"sid_guard":"x","ttwid":"y"}', proxy="http://proxy-main")
     failures = []
     reauth_marks = []
@@ -482,6 +337,7 @@ async def test_attempt_main_comment_does_not_mark_reauth_on_stealth_reject(db_se
 @pytest.mark.unit
 @pytest.mark.asyncio
 async def test_attempt_main_comment_recovers_dom_id_after_ambiguous_publish(db_session, monkeypatch):
+    monkeypatch.setattr(engagement_engine.settings, "TIKTOK_NETWORK_FIRST", False)
     account = Account(id=260, label="main", status="active", cookies='{"sid_guard":"x","ttwid":"y"}', proxy="http://proxy-main")
     failures = []
     successes = []
@@ -552,6 +408,7 @@ async def test_attempt_main_comment_recovers_dom_id_after_ambiguous_publish(db_s
 @pytest.mark.unit
 @pytest.mark.asyncio
 async def test_attempt_main_comment_accepts_local_dom_match_without_id(db_session, monkeypatch):
+    monkeypatch.setattr(engagement_engine.settings, "TIKTOK_NETWORK_FIRST", False)
     account = Account(id=262, label="main", status="active", cookies='{"sid_guard":"x","ttwid":"y"}', proxy="http://proxy-main")
     successes = []
     failures = []
@@ -621,6 +478,7 @@ async def test_attempt_main_comment_accepts_local_dom_match_without_id(db_sessio
 @pytest.mark.unit
 @pytest.mark.asyncio
 async def test_attempt_reply_recovers_dom_id_after_ambiguous_publish(db_session, monkeypatch):
+    monkeypatch.setattr(engagement_engine.settings, "TIKTOK_NETWORK_FIRST", False)
     account = Account(id=261, label="reply", status="active", cookies='{"sid_guard":"x","ttwid":"y"}', proxy="http://proxy-reply")
     failures = []
     successes = []
@@ -669,7 +527,7 @@ async def test_attempt_reply_recovers_dom_id_after_ambiguous_publish(db_session,
         "main text",
         183,
         "task_183_reply_a1",
-        parent_comment_id="parent_123",
+        parent_comment_id="7641761192486194000",
         outcome_dict=outcome,
     )
 
@@ -688,6 +546,7 @@ async def test_attempt_reply_recovers_dom_id_after_ambiguous_publish(db_session,
 @pytest.mark.unit
 @pytest.mark.asyncio
 async def test_attempt_reply_accepts_local_dom_match_without_id(db_session, monkeypatch):
+    monkeypatch.setattr(engagement_engine.settings, "TIKTOK_NETWORK_FIRST", False)
     account = Account(id=262, label="reply", status="active", cookies='{"sid_guard":"x","ttwid":"y"}', proxy="http://proxy-reply")
     failures = []
     successes = []
@@ -741,7 +600,7 @@ async def test_attempt_reply_accepts_local_dom_match_without_id(db_session, monk
         "main text",
         185,
         "task_185_reply_a1",
-        parent_comment_id="parent_123",
+        parent_comment_id="7641761192486194000",
         outcome_dict=outcome,
     )
 
@@ -761,6 +620,7 @@ async def test_attempt_reply_accepts_local_dom_match_without_id(db_session, monk
 @pytest.mark.unit
 @pytest.mark.asyncio
 async def test_attempt_main_comment_does_not_mark_reauth_when_input_hidden_by_captcha(db_session, monkeypatch):
+    monkeypatch.setattr(engagement_engine.settings, "TIKTOK_NETWORK_FIRST", False)
     account = Account(id=27, label="main", status="active", cookies='{"sid_guard":"x","ttwid":"y"}', proxy="http://proxy-main")
     failures = []
     reauth_marks = []
@@ -821,6 +681,7 @@ async def test_attempt_main_comment_does_not_mark_reauth_when_input_hidden_by_ca
 @pytest.mark.unit
 @pytest.mark.asyncio
 async def test_attempt_main_comment_does_not_mark_reauth_after_manual_captcha_clear_input_timeout(db_session, monkeypatch):
+    monkeypatch.setattr(engagement_engine.settings, "TIKTOK_NETWORK_FIRST", False)
     account = Account(id=28, label="main", status="active", cookies='{"sid_guard":"x","ttwid":"y"}', proxy="http://proxy-main")
     failures = []
     reauth_marks = []
@@ -881,8 +742,6 @@ async def test_attempt_main_comment_does_not_mark_reauth_after_manual_captcha_cl
 @pytest.mark.unit
 def test_http_account_health_success_resets_prior_warmup_failures():
     engagement_engine._HTTP_ACCOUNT_HEALTH.pop(909, None)
-    engagement_engine._HTTP_RUNTIME_SIGNER_HEALTH["warmup_fail"] = 0.0
-    engagement_engine._HTTP_RUNTIME_SIGNER_HEALTH["cooldown_until"] = 0.0
 
     for _ in range(engagement_engine.HTTP_SKIP_AFTER_WARMUP_FAILS):
         engagement_engine._record_http_account_result(909, "warmup_fail")
@@ -898,15 +757,13 @@ def test_http_account_health_success_resets_prior_warmup_failures():
 
 
 @pytest.mark.unit
-def test_http_runtime_signer_cooldown_skips_other_accounts_temporarily():
+def test_missing_global_signer_does_not_create_cross_account_cooldown():
     engagement_engine._HTTP_ACCOUNT_HEALTH.pop(910, None)
-    engagement_engine._HTTP_RUNTIME_SIGNER_HEALTH["warmup_fail"] = 0.0
-    engagement_engine._HTTP_RUNTIME_SIGNER_HEALTH["cooldown_until"] = 0.0
-
-    for _ in range(engagement_engine.HTTP_SIGNER_COOLDOWN_AFTER_WARMUP_FAILS):
+    for _ in range(engagement_engine.HTTP_SKIP_AFTER_WARMUP_FAILS + 1):
         engagement_engine._record_http_account_result(None, "warmup_fail")
 
-    assert engagement_engine._should_skip_http_for_account(910) == "runtime_signer_cooldown"
+    assert engagement_engine._should_skip_http_for_account(910) is None
+    assert engagement_engine._should_skip_http_for_account(None) is None
 
     engagement_engine._record_http_account_result(910, "success")
 
@@ -916,6 +773,7 @@ def test_http_runtime_signer_cooldown_skips_other_accounts_temporarily():
 @pytest.mark.unit
 @pytest.mark.asyncio
 async def test_attempt_main_comment_does_not_mark_reauth_when_input_missing_but_browser_logged_in(db_session, monkeypatch):
+    monkeypatch.setattr(engagement_engine.settings, "TIKTOK_NETWORK_FIRST", False)
     account = Account(id=29, label="main", status="active", cookies='{"sid_guard":"x","ttwid":"y"}', proxy="http://proxy-main")
     failures = []
     reauth_marks = []
@@ -979,6 +837,7 @@ async def test_attempt_main_comment_does_not_mark_reauth_when_input_missing_but_
 @pytest.mark.unit
 @pytest.mark.asyncio
 async def test_attempt_main_comment_cools_down_unknown_input_missing_immediately(db_session, monkeypatch):
+    monkeypatch.setattr(engagement_engine.settings, "TIKTOK_NETWORK_FIRST", False)
     account = Account(id=229, label="main", status="active", cookies='{"sid_guard":"x","ttwid":"y"}', proxy="http://proxy-main")
     failures = []
     reauth_marks = []
@@ -1045,6 +904,7 @@ async def test_attempt_main_comment_cools_down_unknown_input_missing_immediately
 @pytest.mark.unit
 @pytest.mark.asyncio
 async def test_repeated_input_missing_with_logged_in_ui_gets_runtime_cooldown(db_session, monkeypatch):
+    monkeypatch.setattr(engagement_engine.settings, "TIKTOK_NETWORK_FIRST", False)
     account = Account(id=129, label="main", status="active", cookies='{"sid_guard":"x","ttwid":"y"}', proxy="http://proxy-main")
     failures = []
     reauth_marks = []
@@ -1112,6 +972,7 @@ async def test_repeated_input_missing_with_logged_in_ui_gets_runtime_cooldown(db
 @pytest.mark.unit
 @pytest.mark.asyncio
 async def test_bootstrap_timeout_with_login_auth_is_runtime_failure_not_reauth(db_session, monkeypatch):
+    monkeypatch.setattr(engagement_engine.settings, "TIKTOK_NETWORK_FIRST", False)
     account = Account(id=130, label="main", status="active", cookies='{"sid_guard":"x"}', proxy="http://proxy-main")
     failures = []
     reauth_marks = []
@@ -1159,6 +1020,7 @@ async def test_bootstrap_timeout_with_login_auth_is_runtime_failure_not_reauth(d
 @pytest.mark.unit
 @pytest.mark.asyncio
 async def test_attempt_main_comment_marks_reauth_when_input_missing_and_browser_logged_out(db_session, monkeypatch):
+    monkeypatch.setattr(engagement_engine.settings, "TIKTOK_NETWORK_FIRST", False)
     account = Account(id=30, label="main", status="active", cookies='{"sid_guard":"x","ttwid":"y"}', proxy="http://proxy-main")
     reauth_marks = []
 
@@ -1235,11 +1097,11 @@ async def test_execute_hybrid_full_resolves_shortlink_before_attempts(db_session
 
     async def _fake_attempt_main_comment_on_account(db, account_arg, video_url, *args, **kwargs):
         captured["video_url"] = video_url
-        return "cid_main_123", None, "http"
+        return "7641761192486194454", None, "http"
 
     async def _fake_verify_comment_dom(*args, **kwargs):
         captured["verify_video_url"] = kwargs.get("video_url")
-        return True, "cid_main_123", "tester", "standard"
+        return True, "7641761192486194454", "tester", "standard"
 
     async def _fake_order_boost_likes(**kwargs):
         captured["boost_video_url"] = kwargs.get("video_url")
@@ -1253,7 +1115,8 @@ async def test_execute_hybrid_full_resolves_shortlink_before_attempts(db_session
                 "success": True,
                 "method": "http",
                 "error": None,
-                "reply_id": "reply_123",
+                "reply_id": "7641761192486194455",
+                "network_confirmed": True,
                 "visibility_status": "confirmed",
             }
         ]
@@ -1289,10 +1152,10 @@ async def test_execute_hybrid_full_releases_main_account_reservation_on_success(
     released = []
 
     async def _fake_attempt_main_comment_on_account(*args, **kwargs):
-        return "cid_main_123", None, "http"
+        return "7641761192486194454", None, "http"
 
     async def _fake_verify_comment_dom(*args, **kwargs):
-        return True, "cid_main_123", "main", "fast_precheck"
+        return True, "7641761192486194454", "main", "fast_precheck"
 
     async def _fake_order_boost_likes(**kwargs):
         return None, None
@@ -1411,7 +1274,8 @@ async def test_execute_hybrid_full_accepts_local_main_without_id_after_public_ve
                 "success": True,
                 "method": "http",
                 "error": None,
-                "reply_id": "reply_123",
+                "reply_id": "7641761192486194455",
+                "network_confirmed": True,
                 "visibility_status": "confirmed",
             }
         ]
@@ -1481,7 +1345,8 @@ async def test_execute_hybrid_full_replies_by_dom_when_public_main_has_no_id(db_
                 "success": True,
                 "method": "dom_text_parent",
                 "error": None,
-                "reply_id": "reply_123",
+                "reply_id": "7641761192486194455",
+                "network_confirmed": True,
                 "parent_confirmed": True,
                 "parent_confirmation_level": "ui_author_only",
                 "visibility_status": "confirmed_local",
@@ -1649,14 +1514,14 @@ async def test_engagement_only_full_flow_reports_submitted_unconfirmed_reply(db_
         db=db_session,
         video_url="https://www.tiktok.com/@demo/video/1234567890123456789",
         comment_text="target comment",
-        comment_id="parent_123",
+        comment_id="7641761192486194000",
         comment_author="main_author",
         replies=["reply one"],
         task_id=199,
     )
 
     assert attempts == [271]
-    assert resolved_parent_id == "parent_123"
+    assert resolved_parent_id == "7641761192486194000"
     assert resolved_author == "main_author"
     assert len(results) == 1
     assert results[0]["success"] is False
@@ -1726,7 +1591,7 @@ async def test_engagement_only_soft_submitted_reply_is_not_retried(db_session, m
             db=db_session,
             video_url="https://www.tiktok.com/@demo/video/1234567890123456789",
             comment_text="target comment",
-            comment_id="parent_123",
+            comment_id="7641761192486194000",
             comment_author="main_author",
             replies=["reply one"],
             task_id=200,
@@ -1804,6 +1669,7 @@ async def test_engagement_only_full_flow_runs_three_reply_variants_in_parallel(d
     monkeypatch.setattr(engagement_engine.settings, "PARALLEL_DYNAMIC_WORKER_POOL_ENABLED", True, raising=False)
     monkeypatch.setattr(engagement_engine.settings, "PARALLEL_COMMENTING_TARGET_BROWSERS", 4, raising=False)
     monkeypatch.setattr(engagement_engine.settings, "PARALLEL_COMMENTING_MAX_BROWSERS", 4, raising=False)
+    monkeypatch.setattr(engagement_engine.settings, "PARALLEL_REPLY_VARIANT_WORKERS", 3, raising=False)
     monkeypatch.setattr(db_database, "get_sync_db_context", _fake_db_context)
     monkeypatch.setattr(engagement_engine, "get_free_account_for_reply", _fake_get_free_account_for_reply)
     monkeypatch.setattr(user_schema, "_reply_with_variant_on_all_mains", _fake_reply_with_variant_on_all_mains)
@@ -1814,7 +1680,7 @@ async def test_engagement_only_full_flow_runs_three_reply_variants_in_parallel(d
         db=db_session,
         video_url="https://www.tiktok.com/@demo/video/1234567890123456789",
         comment_text="target comment",
-        comment_id="parent_123",
+        comment_id="7641761192486194000",
         comment_author="main_author",
         replies=["reply one", "reply two", "reply three"],
         task_id=202,
@@ -1823,7 +1689,7 @@ async def test_engagement_only_full_flow_runs_three_reply_variants_in_parallel(d
     assert started_variants == [1, 2, 3]
     assert capacity_requests == [4]
     assert close_calls == ["close"]
-    assert resolved_parent_id == "parent_123"
+    assert resolved_parent_id == "7641761192486194000"
     assert resolved_author == "main_author"
     assert [row["variant_index"] for row in results] == [1, 2, 3]
     assert all(row["success"] is True for row in results)
@@ -1898,7 +1764,7 @@ async def test_engagement_only_dynamic_disabled_uses_three_wide_batch_capacity(d
         db=db_session,
         video_url="https://www.tiktok.com/@demo/video/1234567890123456789",
         comment_text="target comment",
-        comment_id="parent_123",
+        comment_id="7641761192486194000",
         comment_author="main_author",
         replies=["reply one", "reply two", "reply three"],
         task_id=205,
@@ -2006,6 +1872,7 @@ async def test_engagement_only_full_flow_refills_worker_after_fast_failure(db_se
         )
 
     monkeypatch.setattr(db_database, "get_sync_db_context", _fake_db_context)
+    monkeypatch.setattr(engagement_engine.settings, "PARALLEL_REPLY_VARIANT_WORKERS", 3, raising=False)
     monkeypatch.setattr(engagement_engine, "get_free_account_for_reply", _fake_get_free_account_for_reply)
     monkeypatch.setattr(user_schema, "_reply_with_variant_on_all_mains", _fake_reply_with_variant_on_all_mains)
     monkeypatch.setattr(browser_pool, "ensure_thread_browser_pool_capacity", lambda _value: None)
@@ -2015,7 +1882,7 @@ async def test_engagement_only_full_flow_refills_worker_after_fast_failure(db_se
         db=db_session,
         video_url="https://www.tiktok.com/@demo/video/1234567890123456789",
         comment_text="target comment",
-        comment_id="parent_123",
+        comment_id="7641761192486194000",
         comment_author="main_author",
         replies=["reply one", "reply two", "reply three", "reply four"],
         task_id=203,
@@ -2100,6 +1967,7 @@ async def test_engagement_only_full_flow_balances_four_workers_across_two_proxie
 
     monkeypatch.setattr(engagement_engine.settings, "PARALLEL_COMMENTING_TARGET_BROWSERS", 4, raising=False)
     monkeypatch.setattr(engagement_engine.settings, "PARALLEL_COMMENTING_MAX_BROWSERS", 4, raising=False)
+    monkeypatch.setattr(engagement_engine.settings, "PARALLEL_REPLY_VARIANT_WORKERS", 4, raising=False)
     monkeypatch.setattr(db_database, "get_sync_db_context", _fake_db_context)
     monkeypatch.setattr(engagement_engine, "get_free_account_for_reply", _fake_get_free_account_for_reply)
     monkeypatch.setattr(user_schema, "_reply_with_variant_on_all_mains", _fake_reply_with_variant_on_all_mains)
@@ -2110,7 +1978,7 @@ async def test_engagement_only_full_flow_balances_four_workers_across_two_proxie
         db=db_session,
         video_url="https://www.tiktok.com/@demo/video/1234567890123456789",
         comment_text="target comment",
-        comment_id="parent_123",
+        comment_id="7641761192486194000",
         comment_author="main_author",
         replies=["reply one", "reply two", "reply three", "reply four"],
         task_id=204,
@@ -2189,7 +2057,7 @@ async def test_engagement_only_stops_after_four_empty_accounts_across_two_proxie
         db=db_session,
         video_url="https://www.tiktok.com/@demo/video/1234567890123456789",
         comment_text="target comment",
-        comment_id="parent_123",
+        comment_id="7641761192486194000",
         comment_author="main_author",
         replies=["reply one"],
         task_id=205,
@@ -2298,7 +2166,7 @@ async def test_engagement_only_resets_empty_account_quorum_when_parent_was_found
         db=db_session,
         video_url="https://www.tiktok.com/@demo/video/1234567890123456789",
         comment_text="target comment",
-        comment_id="parent_123",
+        comment_id="7641761192486194000",
         comment_author="main_author",
         replies=["reply one"],
         task_id=206,
@@ -2316,7 +2184,9 @@ async def test_engagement_only_resets_empty_account_quorum_when_parent_was_found
 
 @pytest.mark.unit
 @pytest.mark.asyncio
-async def test_engagement_only_rotates_mobile_proxy_after_two_empty_accounts(db_session, monkeypatch):
+@pytest.mark.parametrize("dynamic_pool", [False, True])
+@pytest.mark.parametrize("exhausted", [False, True])
+async def test_engagement_only_rotates_mobile_proxy_after_two_empty_accounts(db_session, monkeypatch, dynamic_pool, exhausted):
     import db.database as db_database
     import executor.browser_pool as browser_pool
     import executor.user_schema as user_schema
@@ -2338,7 +2208,7 @@ async def test_engagement_only_rotates_mobile_proxy_after_two_empty_accounts(db_
             cookies='{"sessionid":"x"}',
             proxy=proxy_value,
         )
-        for index in range(5)
+        for index in range(7)
     ]
     db_session.add(proxy)
     db_session.add_all(accounts)
@@ -2390,12 +2260,12 @@ async def test_engagement_only_rotates_mobile_proxy_after_two_empty_accounts(db_
         return user_schema.ReplyAttemptResult(
             replies=[],
             searched=True,
-            confident_empty_search=True,
+            confident_empty_search=exhausted,
             saw_comment_rows=True,
             parent_search_max_seen_rows=40,
             parent_search_last_row_count=40,
             parent_search_unique_rows_seen=20,
-            parent_search_exhausted=True,
+            parent_search_exhausted=exhausted,
             parent_search_scroll_container_scrollable=False,
         )
 
@@ -2404,6 +2274,7 @@ async def test_engagement_only_rotates_mobile_proxy_after_two_empty_accounts(db_
         rotation_after_attempts.append(len(attempts))
         return "37.47.100.11"
 
+    monkeypatch.setattr(engagement_engine.settings, "PARALLEL_DYNAMIC_WORKER_POOL_ENABLED", dynamic_pool, raising=False)
     monkeypatch.setattr(engagement_engine.settings, "MAX_RETRY_ACCOUNTS", 6, raising=False)
     monkeypatch.setattr(engagement_engine.settings, "PARALLEL_COMMENTING_TARGET_BROWSERS", 1, raising=False)
     monkeypatch.setattr(engagement_engine.settings, "PARALLEL_COMMENTING_MAX_BROWSERS", 1, raising=False)
@@ -2419,18 +2290,136 @@ async def test_engagement_only_rotates_mobile_proxy_after_two_empty_accounts(db_
         db=db_session,
         video_url="https://www.tiktok.com/@demo/video/1234567890123456789",
         comment_text="target comment",
-        comment_id="parent_123",
+        comment_id="7641761192486194000",
         comment_author="main_author",
         replies=["reply one"],
         task_id=2061,
     )
 
     assert len(attempts) == 5
-    assert rotation_after_attempts == [3]
+    assert rotation_after_attempts == ([3] if exhausted else [])
     assert any(
         row.get("error") == "remaining_main_comments_not_visible_after_four_accounts"
         for row in results
     )
+
+
+@pytest.mark.unit
+@pytest.mark.asyncio
+async def test_engagement_only_reply_worker_limit_avoids_third_selection_on_shared_proxy(
+    db_session,
+    monkeypatch,
+):
+    import db.database as db_database
+    import executor.browser_pool as browser_pool
+    import executor.user_schema as user_schema
+
+    shared_proxy = "http://proxy-shared:1000"
+    accounts = [
+        Account(
+            id=471 + index,
+            label=f"reply-shared-{index}",
+            status="active",
+            cookies='{"sessionid":"x"}',
+            proxy=shared_proxy,
+        )
+        for index in range(3)
+    ]
+    started: list[int] = []
+    first_two_started = asyncio.Event()
+    release_first_two = asyncio.Event()
+    selection_while_two_active = asyncio.Event()
+
+    @contextmanager
+    def _fake_db_context():
+        yield db_session
+
+    def _fake_get_free_account_for_reply(_db, exclude_ids=None, exclude_proxies=None, **_kwargs):
+        if len(started) >= 2 and not release_first_two.is_set():
+            selection_while_two_active.set()
+        excluded = set(exclude_ids or [])
+        excluded_proxies = set(exclude_proxies or [])
+        return next(
+            (
+                account
+                for account in accounts
+                if account.id not in excluded
+                and str(account.proxy or "").strip() not in excluded_proxies
+            ),
+            None,
+        )
+
+    async def _fake_reply_with_variant_on_all_mains(
+        _db,
+        reply_account,
+        _video_url,
+        pending_parent,
+        reply_text,
+        *,
+        variant_index,
+        **_kwargs,
+    ):
+        parent = pending_parent[0]
+        started.append(variant_index)
+        if len(started) == 2:
+            first_two_started.set()
+        if variant_index in {1, 2}:
+            await asyncio.wait_for(release_first_two.wait(), timeout=2)
+        return user_schema.ReplyAttemptResult(
+            replies=[
+                user_schema.ReplyOutcome(
+                    text=reply_text,
+                    variant_index=variant_index,
+                    matched_main_text=parent.text,
+                    parent_comment_id=parent.comment_id,
+                    success=True,
+                    method="hybrid_dom",
+                    error=None,
+                    account_id=reply_account.id,
+                    attempted=True,
+                )
+            ],
+            found_mains=[parent],
+            searched=True,
+        )
+
+    monkeypatch.setattr(engagement_engine.settings, "PARALLEL_DYNAMIC_WORKER_POOL_ENABLED", True, raising=False)
+    monkeypatch.setattr(engagement_engine.settings, "PARALLEL_COMMENTING_TARGET_BROWSERS", 3, raising=False)
+    monkeypatch.setattr(engagement_engine.settings, "PARALLEL_COMMENTING_MAX_BROWSERS", 3, raising=False)
+    monkeypatch.setattr(engagement_engine.settings, "PARALLEL_REPLY_VARIANT_WORKERS", 2, raising=False)
+    monkeypatch.setattr(engagement_engine.settings, "PARALLEL_MAX_ACTIVE_BROWSERS_PER_PROXY", 3, raising=False)
+    monkeypatch.setattr(engagement_engine.settings, "PARALLEL_REPLY_MAX_ACTIVE_BROWSERS_PER_PROXY", 2, raising=False)
+    monkeypatch.setattr(db_database, "get_sync_db_context", _fake_db_context)
+    monkeypatch.setattr(engagement_engine, "get_free_account_for_reply", _fake_get_free_account_for_reply)
+    monkeypatch.setattr(user_schema, "_reply_with_variant_on_all_mains", _fake_reply_with_variant_on_all_mains)
+    monkeypatch.setattr(browser_pool, "ensure_thread_browser_pool_capacity", lambda _value: None)
+    monkeypatch.setattr(browser_pool, "close_browser_pool", AsyncMock(return_value=None))
+
+    run_task = asyncio.create_task(
+        engagement_engine.execute_engagement_only_replies_via_full_flow(
+            db=db_session,
+            video_url="https://www.tiktok.com/@demo/video/1234567890123456789",
+            comment_text="target comment",
+            comment_id="7641761192486194000",
+            comment_author="main_author",
+            replies=["reply one", "reply two", "reply three"],
+            task_id=208,
+        )
+    )
+    try:
+        await asyncio.wait_for(first_two_started.wait(), timeout=1)
+        await asyncio.sleep(0.1)
+        assert started == [1, 2]
+        assert not selection_while_two_active.is_set()
+        release_first_two.set()
+        results, _resolved_parent_id, _resolved_author = await asyncio.wait_for(run_task, timeout=3)
+    finally:
+        if not run_task.done():
+            run_task.cancel()
+            await asyncio.gather(run_task, return_exceptions=True)
+
+    assert [row["variant_index"] for row in results] == [1, 2, 3]
+    assert all(row["success"] is True for row in results)
 
 
 @pytest.mark.unit
@@ -2520,7 +2509,7 @@ async def test_engagement_only_dynamic_capacity_defer_waits_before_reselecting(d
             db=db_session,
             video_url="https://www.tiktok.com/@demo/video/1234567890123456789",
             comment_text="target comment",
-            comment_id="parent_123",
+            comment_id="7641761192486194000",
             comment_author="main_author",
             replies=["reply one", "reply two", "reply three"],
             task_id=207,
@@ -2530,7 +2519,10 @@ async def test_engagement_only_dynamic_capacity_defer_waits_before_reselecting(d
         await asyncio.wait_for(capacity_deferred.wait(), timeout=1)
         await asyncio.sleep(0.05)
         calls_after_defer = len(selection_calls)
-        await asyncio.sleep(0.8)
+        # The old timer-only scheduler re-ran the same expensive account scan
+        # every 1.5 seconds while the first browser still occupied the proxy.
+        # Wait past that deadline and prove that selection stays event-driven.
+        await asyncio.sleep(1.8)
         assert len(selection_calls) == calls_after_defer
         release_first_reply.set()
         results, _resolved_parent_id, _resolved_author = await asyncio.wait_for(run_task, timeout=3)
@@ -2588,6 +2580,7 @@ async def test_engagement_only_dynamic_pool_marks_active_and_pending_replies_sto
 
     monkeypatch.setattr(engagement_engine.settings, "PARALLEL_COMMENTING_TARGET_BROWSERS", 3, raising=False)
     monkeypatch.setattr(engagement_engine.settings, "PARALLEL_COMMENTING_MAX_BROWSERS", 3, raising=False)
+    monkeypatch.setattr(engagement_engine.settings, "PARALLEL_REPLY_VARIANT_WORKERS", 3, raising=False)
     monkeypatch.setattr(db_database, "get_sync_db_context", _fake_db_context)
     monkeypatch.setattr(engagement_engine, "get_free_account_for_reply", _fake_get_free_account_for_reply)
     monkeypatch.setattr(user_schema, "_reply_with_variant_on_all_mains", _fake_reply_with_variant_on_all_mains)
@@ -2598,14 +2591,14 @@ async def test_engagement_only_dynamic_pool_marks_active_and_pending_replies_sto
         db=db_session,
         video_url="https://www.tiktok.com/@demo/video/1234567890123456789",
         comment_text="target comment",
-        comment_id="parent_123",
+        comment_id="7641761192486194000",
         comment_author="main_author",
         replies=["reply one", "reply two", "reply three", "reply four"],
         task_id=204,
         stop_requested=lambda: len(started) >= 3,
     )
 
-    assert resolved_parent_id == "parent_123"
+    assert resolved_parent_id == "7641761192486194000"
     assert resolved_author == "main_author"
     assert set(started) == {1, 2, 3}
     assert set(cancelled) == {1, 2, 3}
@@ -2650,13 +2643,13 @@ async def test_engagement_only_unexpected_reply_cancellation_reports_failure(db_
         db=db_session,
         video_url="https://www.tiktok.com/@demo/video/1234567890123456789",
         comment_text="target comment",
-        comment_id="parent_123",
+        comment_id="7641761192486194000",
         comment_author="main_author",
         replies=["reply one"],
         task_id=206,
     )
 
-    assert resolved_parent_id == "parent_123"
+    assert resolved_parent_id == "7641761192486194000"
     assert resolved_author == "main_author"
     assert len(results) == 1
     assert results[0]["variant_index"] == 1
@@ -2733,7 +2726,7 @@ async def test_engagement_only_terminal_surface_failure_reports_active_and_pendi
         db=db_session,
         video_url="https://www.tiktok.com/@demo/video/1234567890123456789",
         comment_text="target comment",
-        comment_id="parent_123",
+        comment_id="7641761192486194000",
         comment_author="main_author",
         replies=["reply one", "reply two", "reply three", "reply four", "reply five"],
         task_id=205,
@@ -2747,7 +2740,7 @@ async def test_engagement_only_terminal_surface_failure_reports_active_and_pendi
 
 @pytest.mark.unit
 @pytest.mark.asyncio
-async def test_engagement_only_reply_parent_search_is_text_first_with_author_hint(db_session, monkeypatch):
+async def test_engagement_only_reply_parent_search_requires_author_with_hint(db_session, monkeypatch):
     import executor.user_schema as user_schema
 
     accounts = [
@@ -2780,7 +2773,7 @@ async def test_engagement_only_reply_parent_search_is_text_first_with_author_hin
                 "allow_fallback": allow_parent_author_fallback,
             }
         )
-        if require_parent_author_match or allow_parent_author_fallback:
+        if not require_parent_author_match or allow_parent_author_fallback:
             return user_schema.ReplyAttemptResult(replies=[], searched=True)
         return user_schema.ReplyAttemptResult(
             replies=[
@@ -2795,8 +2788,8 @@ async def test_engagement_only_reply_parent_search_is_text_first_with_author_hin
                     account_id=reply_account.id,
                     attempted=True,
                     requested_parent_author="target_user",
-                    matched_parent_author="found_user",
-                    parent_author_match_mode="text",
+                    matched_parent_author="target_user",
+                    parent_author_match_mode="text_author",
                     author_fallback_used=False,
                     author_fallback_reason=None,
                 )
@@ -2819,13 +2812,13 @@ async def test_engagement_only_reply_parent_search_is_text_first_with_author_hin
     )
 
     assert calls == [
-        {"account_id": 281, "require_author": False, "allow_fallback": False},
+        {"account_id": 281, "require_author": True, "allow_fallback": False},
     ]
-    assert resolved_author == "found_user"
+    assert resolved_author == "target_user"
     assert results[0]["success"] is True
     assert results[0]["author_fallback_used"] is False
     assert results[0]["requested_parent_author"] == "target_user"
-    assert results[0]["matched_parent_author"] == "found_user"
+    assert results[0]["matched_parent_author"] == "target_user"
 
 
 @pytest.mark.unit
@@ -2886,7 +2879,7 @@ async def test_engagement_only_full_flow_stops_retries_after_stop_signal(db_sess
         db=db_session,
         video_url="https://www.tiktok.com/@demo/video/1234567890123456789",
         comment_text="target comment",
-        comment_id="parent_123",
+        comment_id="7641761192486194000",
         comment_author="main_author",
         replies=["reply one"],
         task_id=200,
@@ -2895,7 +2888,7 @@ async def test_engagement_only_full_flow_stops_retries_after_stop_signal(db_sess
 
     assert selected_accounts == [301]
     assert attempts == [(301, 1)]
-    assert resolved_parent_id == "parent_123"
+    assert resolved_parent_id == "7641761192486194000"
     assert resolved_author == "main_author"
     assert len(results) == 1
     assert results[0]["error"] == "stopped_by_user"
@@ -2924,7 +2917,7 @@ async def test_execute_engagement_only_skips_likes_when_replies_do_not_confirm_p
                 "parent_confirmation_level": "unconfirmed",
                 "visibility_status": "not_checked",
             }
-        ], "parent_123", "main_author"
+        ], "7641761192486194000", "main_author"
 
     async def _fake_order_boost_likes(**kwargs):
         boost_calls.append(kwargs)
@@ -2938,7 +2931,7 @@ async def test_execute_engagement_only_skips_likes_when_replies_do_not_confirm_p
         db_session,
         task,
         "https://www.tiktok.com/@demo/video/1234567890123456789",
-        comment_id="parent_123",
+        comment_id="7641761192486194000",
         username=None,
         comment_text="target comment",
         task_id=189,
@@ -2971,7 +2964,7 @@ async def test_execute_engagement_only_orders_likes_before_replies_when_target_k
                 "parent_confirmation_level": "ui_text_exact",
                 "visibility_status": "not_checked",
             }
-        ], "parent_123", "resolved_author"
+        ], "7641761192486194000", "resolved_author"
 
     async def _fake_order_boost_likes(**kwargs):
         call_order.append("likes")
@@ -2985,7 +2978,7 @@ async def test_execute_engagement_only_orders_likes_before_replies_when_target_k
         db_session,
         task,
         "https://www.tiktok.com/@demo/video/1234567890123456789",
-        comment_id="parent_123",
+        comment_id="7641761192486194000",
         username="main_author",
         comment_text="target comment",
         task_id=192,
@@ -3004,7 +2997,7 @@ async def test_execute_engagement_only_orders_likes_before_replies_when_target_k
             "ok": True,
             "error": None,
             "reply_count": 0,
-            "parent_key": "parent_123",
+            "parent_key": "7641761192486194000",
             "parent_text": "target comment",
             "selection_reason": "engagement_parent",
         }
@@ -3028,7 +3021,7 @@ async def test_execute_engagement_only_orders_likes_when_reply_confirms_parent(d
                 "parent_confirmation_level": "ui_text_exact",
                 "visibility_status": "not_checked",
             }
-        ], "parent_123", "main_author"
+        ], "7641761192486194000", "main_author"
 
     async def _fake_order_boost_likes(**kwargs):
         boost_calls.append(kwargs)
@@ -3042,7 +3035,7 @@ async def test_execute_engagement_only_orders_likes_when_reply_confirms_parent(d
         db_session,
         task,
         "https://www.tiktok.com/@demo/video/1234567890123456789",
-        comment_id="parent_123",
+        comment_id="7641761192486194000",
         username="main_author",
         comment_text="target comment",
         task_id=190,
@@ -3059,7 +3052,7 @@ async def test_execute_engagement_only_orders_likes_when_reply_confirms_parent(d
             "ok": True,
             "error": None,
             "reply_count": 0,
-            "parent_key": "parent_123",
+            "parent_key": "7641761192486194000",
             "parent_text": "target comment",
             "selection_reason": "engagement_parent",
         }
@@ -3091,7 +3084,7 @@ async def test_execute_engagement_only_skips_likes_without_replies(db_session, m
         db_session,
         task,
         "https://www.tiktok.com/@demo/video/1234567890123456789",
-        comment_id="parent_123",
+        comment_id="7641761192486194000",
         username="main_author",
         comment_text="target comment",
         task_id=191,
@@ -3141,6 +3134,8 @@ def _patch_main_publish_path(monkeypatch, account, *, verify_outcome):
     tuple to mean "always return that"; the tests assert on the number of
     calls separately so we don't need a sequence here.
     """
+    monkeypatch.setattr(engagement_engine.settings, "TIKTOK_NETWORK_FIRST", True)
+    monkeypatch.setattr(engagement_engine.settings, "TIKTOK_NETWORK_IMPL_READY", True)
     async def _fake_sleep(_seconds):
         return None
 
@@ -3211,16 +3206,14 @@ def test_parent_not_found_detection_handles_localized_status_messages():
 @pytest.mark.unit
 @pytest.mark.asyncio
 async def test_execute_hybrid_full_marks_verified_when_dom_confirms(db_session, monkeypatch):
-    """Happy path: HTTP publishes a main comment AND a viewer account observes
-    it via DOM. The whole task is marked verified=True / success=True with no
-    submitted_unconfirmed flag."""
+    """API receipts confirm the order without invoking a successful DOM observer."""
     account = Account(id=10, label="main", status="active", cookies='{"sessionid":"x"}', proxy="http://proxy-main")
     task = SimpleNamespace(reply1="reply one", reply2=None, reply3=None, settings={"reply_count": 1})
 
     verify_calls = _patch_main_publish_path(
         monkeypatch,
         account,
-        verify_outcome=(True, "cid_main_123", "tester", "standard"),
+        verify_outcome=(True, "7641761192486194454", "tester", "standard"),
     )
 
     async def _fake_execute_replies_http(*args, **kwargs):
@@ -3230,7 +3223,8 @@ async def test_execute_hybrid_full_marks_verified_when_dom_confirms(db_session, 
                 "success": True,
                 "method": "http",
                 "error": None,
-                "reply_id": "reply_123",
+                "reply_id": "7641761192486194455",
+                "network_confirmed": True,
                 "visibility_status": "confirmed",
             }
         ]
@@ -3245,15 +3239,14 @@ async def test_execute_hybrid_full_marks_verified_when_dom_confirms(db_session, 
         99,
     )
 
-    # New flow uses ONE verify_comment_dom call (with retry_schedule inside);
-    # we replaced the old 3-stage ladder so the count must be 1, not >=2.
-    assert verify_calls["count"] == 1
+    # Even an observer configured to report success must remain unused.
+    assert verify_calls["count"] == 0
     assert result.main_comment["verified"] is True
     assert result.main_comment["success"] is True
     assert result.main_comment.get("submitted_unconfirmed") is False
-    assert result.main_comment["comment_id"] == "cid_main_123"
+    assert result.main_comment["comment_id"] == "7641761192486194454"
     assert result.comment_author == "tester"
-    assert result.main_comment["verify_mode"] == "standard"
+    assert result.main_comment["verify_mode"] == "http_api_receipt"
     # Outcome wiring fix (was a pre-existing bug): the publish step must
     # set posted=True and network_confirmed=True so EngagementResult.to_dict()
     # classifies the URL as success rather than fail. Without this the
@@ -3299,7 +3292,7 @@ async def test_execute_hybrid_full_skips_likes_when_all_replies_fail(db_session,
     _patch_main_publish_path(
         monkeypatch,
         account,
-        verify_outcome=(True, "cid_main_123", "tester", "standard"),
+        verify_outcome=(True, "7641761192486194454", "tester", "standard"),
     )
 
     async def _fake_execute_replies_http(*args, **kwargs):
@@ -3335,13 +3328,7 @@ async def test_execute_hybrid_full_skips_likes_when_all_replies_fail(db_session,
 @pytest.mark.unit
 @pytest.mark.asyncio
 async def test_execute_hybrid_full_optimistic_continue_when_verify_fails(db_session, monkeypatch):
-    """When the publisher returns a comment_id but DOM viewers can't confirm
-    (TikTok lazy render / shadowbanned viewer), we MUST NOT abort — we mark
-    submitted_unconfirmed=True and let downstream replies + boost run.
-
-    This is the core P1 invariant. The previous behaviour was to exit the
-    whole task at this point, losing the boost order and any reply work even
-    though the main comment was actually published."""
+    """A negative observer fixture cannot override confirmed HTTP receipts."""
     account = Account(id=11, label="main", status="active", cookies='{"sessionid":"x"}', proxy="http://proxy-main")
     task = SimpleNamespace(reply1="reply one", reply2=None, reply3=None, settings={"reply_count": 1})
 
@@ -3358,7 +3345,8 @@ async def test_execute_hybrid_full_optimistic_continue_when_verify_fails(db_sess
                 "success": True,
                 "method": "http",
                 "error": None,
-                "reply_id": "reply_123",
+                "reply_id": "7641761192486194455",
+                "network_confirmed": True,
                 "visibility_status": "confirmed",
             }
         ]
@@ -3373,25 +3361,24 @@ async def test_execute_hybrid_full_optimistic_continue_when_verify_fails(db_sess
         100,
     )
 
-    assert verify_calls["count"] == 1
+    assert verify_calls["count"] == 0
     assert result.main_comment["success"] is True
-    assert result.main_comment["verified"] is False
-    assert result.main_comment.get("submitted_unconfirmed") is True
-    assert result.main_comment["comment_id"] == "cid_main_123"
+    assert result.main_comment["verified"] is True
+    assert result.main_comment.get("submitted_unconfirmed") is False
+    assert result.main_comment["comment_id"] == "7641761192486194454"
     # Outcome wiring: HTTP path always sets network_confirmed=True; without
     # this, to_dict() classifies the optimistic continue as plain "fail"
     # instead of "submitted_unconfirmed".
     assert result.main_comment["posted"] is True
     assert result.main_comment["network_confirmed"] is True
-    # Likes must wait for a publicly verified main comment. A comment_id alone
-    # can still be moderation-delayed or hidden, so we do not order likes here.
-    assert result.boost_order_id is None
-    assert result.boost_enabled is False
+    # Both planned publications have API receipts; DOM visibility is irrelevant.
+    assert result.boost_order_id == "boost_order_42"
+    assert result.boost_enabled is True
 
-    # End-to-end: to_dict must report submitted_unconfirmed (NOT fail).
+    # Complete HTTP receipts produce a successful order.
     payload = result.to_dict(source="manual", mode="full")
-    assert payload["status"] == "submitted_unconfirmed"
-    assert any(w.get("code") == "main_submitted_unconfirmed" for w in payload.get("warnings") or [])
+    assert payload["status"] == "success"
+    assert not any(w.get("code") == "main_submitted_unconfirmed" for w in payload.get("warnings") or [])
 
 
 @pytest.mark.unit
@@ -3422,7 +3409,7 @@ async def test_execute_hybrid_full_aborts_when_smart_check_invalidates_parent(db
     async def _fake_execute_replies_http(*args, **kwargs):
         # parent_unconfirmed must be propagated by execute_hybrid_full when
         # DOM verification failed.
-        assert kwargs.get("parent_unconfirmed") is True
+        assert kwargs.get("parent_unconfirmed") is False
         return [
             {
                 "text": "fast reply",
@@ -3468,7 +3455,8 @@ async def test_execute_hybrid_full_aborts_when_smart_check_invalidates_parent(db
 
 @pytest.mark.unit
 @pytest.mark.asyncio
-async def test_execute_replies_http_bypasses_http_for_dom_first_strategy(db_session, monkeypatch):
+async def test_execute_replies_http_uses_explicit_dom_mode(db_session, monkeypatch):
+    monkeypatch.setattr(engagement_engine.settings, "TIKTOK_NETWORK_FIRST", False)
     http_candidate = Account(id=21, label="reply-http", status="active", cookies='{"sessionid":"weak"}')
     fallback_account = Account(id=22, label="reply-dom", status="active", cookies='{"sessionid":"dom"}')
 
@@ -3512,7 +3500,7 @@ async def test_execute_replies_http_bypasses_http_for_dom_first_strategy(db_sess
     results = await engagement_engine.execute_replies_http(
         db_session,
         "https://www.tiktok.com/@user/video/1234567890123456789",
-        "parent_123",
+        "7641761192486194000",
         ["reply text"],
         task_id=7,
         main_comment_text="main comment",
@@ -3582,13 +3570,15 @@ async def test_execute_replies_http_uses_dom_parent_when_parent_id_missing(db_se
 @pytest.mark.unit
 @pytest.mark.asyncio
 async def test_execute_replies_http_uses_http_for_http_first_strategy(db_session, monkeypatch):
+    monkeypatch.setattr(engagement_engine.settings, "TIKTOK_NETWORK_FIRST", True)
+    monkeypatch.setattr(engagement_engine.settings, "TIKTOK_NETWORK_IMPL_READY", True)
     account = Account(id=31, label="reply-http", status="active", cookies='{"sessionid":"x"}', proxy="http://proxy-reply")
     http_calls = []
 
     class _ReplyHttpClient:
         async def reply_comment(self, **kwargs):
             http_calls.append(kwargs)
-            return True, "reply_http_123", None, None, {
+            return True, "7641761192486194456", None, None, {
                 "parent_confirmed": True,
                 "parent_confirmation_level": "network_exact",
             }
@@ -3619,7 +3609,7 @@ async def test_execute_replies_http_uses_http_for_http_first_strategy(db_session
     results = await engagement_engine.execute_replies_http(
         db_session,
         "https://www.tiktok.com/@user/video/1234567890123456789",
-        "parent_123",
+        "7641761192486194000",
         ["reply text"],
         task_id=8,
         main_comment_text="main comment",
@@ -3628,23 +3618,25 @@ async def test_execute_replies_http_uses_http_for_http_first_strategy(db_session
     assert len(results) == 1
     assert results[0]["success"] is True
     assert results[0]["method"] == "http"
-    assert results[0]["reply_id"] == "reply_http_123"
+    assert results[0]["reply_id"] == "7641761192486194456"
     assert results[0]["parent_confirmed"] is True
     assert results[0]["parent_confirmation_level"] == "network_exact"
     assert results[0]["attempts"] == 1
     assert results[0]["fallback_used"] is False
-    assert http_calls[0]["parent_comment_id"] == "parent_123"
+    assert http_calls[0]["parent_comment_id"] == "7641761192486194000"
     assert http_calls[0]["text"] == "reply text"
 
 
 @pytest.mark.unit
 @pytest.mark.asyncio
 async def test_execute_replies_http_preserves_unconfirmed_parent_meta(db_session, monkeypatch):
+    monkeypatch.setattr(engagement_engine.settings, "TIKTOK_NETWORK_FIRST", True)
+    monkeypatch.setattr(engagement_engine.settings, "TIKTOK_NETWORK_IMPL_READY", True)
     account = Account(id=32, label="reply-http", status="active", cookies='{"sessionid":"x"}', proxy="http://proxy-reply")
 
     class _ReplyHttpClient:
         async def reply_comment(self, **kwargs):
-            return True, "reply_http_unconfirmed", None, None, {
+            return True, "7641761192486194457", None, None, {
                 "parent_confirmed": False,
                 "parent_confirmation_level": "unconfirmed",
                 "response_parent_id": None,
@@ -3674,7 +3666,7 @@ async def test_execute_replies_http_preserves_unconfirmed_parent_meta(db_session
     results = await engagement_engine.execute_replies_http(
         db_session,
         "https://www.tiktok.com/@user/video/1234567890123456789",
-        "parent_123",
+        "7641761192486194000",
         ["reply text"],
         task_id=9,
         main_comment_text="main comment",
@@ -3685,7 +3677,7 @@ async def test_execute_replies_http_preserves_unconfirmed_parent_meta(db_session
     assert results[0]["success"] is False
     assert results[0]["submitted_unconfirmed"] is True
     assert results[0]["method"] == "http"
-    assert results[0]["reply_id"] == "reply_http_unconfirmed"
+    assert results[0]["reply_id"] == "7641761192486194457"
     assert results[0]["parent_confirmed"] is False
     assert results[0]["parent_confirmation_level"] == "unconfirmed"
     assert results[0]["visibility_status"] == "submitted_unconfirmed"
@@ -3724,7 +3716,7 @@ async def test_execute_replies_http_stops_after_local_reply_without_id(db_sessio
     results = await engagement_engine.execute_replies_http(
         db_session,
         "https://www.tiktok.com/@user/video/1234567890123456789",
-        "parent_123",
+        "7641761192486194000",
         ["reply text"],
         task_id=10,
         main_comment_text="main comment",
@@ -3784,7 +3776,7 @@ async def test_warmup_page_for_http_uses_resolved_username_video_url(monkeypatch
 
 @pytest.mark.unit
 @pytest.mark.asyncio
-async def test_warmup_page_for_http_fails_when_signer_never_becomes_ready(monkeypatch):
+async def test_warmup_page_for_http_rejects_missing_ttwid_independently_of_signer(monkeypatch):
     page = _WarmupPage(
         [
             {"name": "verifyFp", "value": "verify"},
@@ -3814,21 +3806,22 @@ async def test_warmup_page_for_http_fails_when_signer_never_becomes_ready(monkey
 
     assert cookies_dict["sessionid"] == "session"
     assert profile_valid is False
-    assert warmup_info["reason_code"] == "signer_not_ready"
+    assert warmup_info["reason_code"] == "missing_ttwid"
     assert warmup_info["signer_ready"] is False
-    assert warmup_info["degraded_http"] is True
-    assert page.reload_calls == 1
+    assert warmup_info["missing_critical"] == ["ttwid"]
+    assert page.reload_calls == 0
 
 
 @pytest.mark.unit
 @pytest.mark.asyncio
-async def test_warmup_page_for_http_retries_until_signer_is_ready(monkeypatch):
+async def test_warmup_page_for_http_waits_for_signer_even_with_early_ttwid(monkeypatch):
     page = _WarmupPage(
         [
             {"name": "verifyFp", "value": "verify"},
             {"name": "device_id", "value": "device"},
             {"name": "sessionid", "value": "session"},
             {"name": "msToken", "value": "mstoken"},
+            {"name": "ttwid", "value": "wid"},
         ]
     )
     signer_states = iter([False, True])
@@ -3856,5 +3849,24 @@ async def test_warmup_page_for_http_retries_until_signer_is_ready(monkeypatch):
     assert profile_valid is True
     assert warmup_info["reason_code"] == "ready"
     assert warmup_info["signer_ready"] is True
-    assert warmup_info["attempts"] == 2
-    assert page.reload_calls == 1
+    assert warmup_info["attempts"] == 1
+    assert page.reload_calls == 0
+
+
+@pytest.mark.unit
+@pytest.mark.asyncio
+@pytest.mark.parametrize("mode", ["main", "reply"])
+async def test_http_mode_rejects_dom_only_accounts_before_browser_creation(db_session, monkeypatch, mode):
+    monkeypatch.setattr(engagement_engine.settings, "TIKTOK_NETWORK_FIRST", True)
+    monkeypatch.setattr(engagement_engine.settings, "TIKTOK_NETWORK_IMPL_READY", True)
+    monkeypatch.setattr(engagement_engine.settings, "PARALLEL_COMMENTING_DOM_FIRST", False)
+    monkeypatch.setattr(engagement_engine, "get_http_execution_strategy", lambda *_args: {"strategy": "dom_first"})
+    create_page = AsyncMock(side_effect=AssertionError("An HTTP-ineligible account must not open a DOM browser"))
+    monkeypatch.setattr(engagement_engine, "create_page_for_account", create_page)
+    account = SimpleNamespace(id=999)
+    result = await engagement_engine._attempt_publish_on_account(
+        db_session, account, "https://www.tiktok.com/@demo/video/7635267329407913230",
+        "test", 180, "task_http", mode=mode, parent_comment_id="7641761192486194454",
+    )
+    assert result == (None, "cookies_not_http_ready", "strategy")
+    create_page.assert_not_awaited()

@@ -145,6 +145,8 @@ async def verify_comment_visible(
         found, find_info = await find_comment_in_list(
             page=page,
             expected_text=comment_text,
+            expected_author=expected_author,
+            require_author_match=bool(expected_author),
             max_scrolls=10,
             scroll_delay_ms=600
         )
@@ -160,6 +162,8 @@ async def verify_comment_visible(
         if found:
             info['found'] = True
             info['position'] = find_info.get('position')
+            info['comment_id'] = find_info.get('comment_id')
+            info['author'] = find_info.get('author')
             info['text_normalized'] = find_info.get('text_normalized', target)
             
             # ОБНОВЛЕНО: Извлекаем ID и автора из найденного комментария (Jan 2026)
@@ -174,15 +178,16 @@ async def verify_comment_visible(
                         comment_root = comment_roots[position]
                         
                         # Извлекаем ID комментария из корневого контейнера
-                        comment_id = await comment_root.get_attribute("data-cid") or \
-                                    await comment_root.get_attribute("data-id") or \
-                                    await comment_root.get_attribute("data-comment-id") or \
-                                    await comment_root.get_attribute("id")
-                        if comment_id:
-                            info['comment_id'] = str(comment_id)
+                        if not info.get('comment_id'):
+                            comment_id = await comment_root.get_attribute("data-cid") or \
+                                        await comment_root.get_attribute("data-id") or \
+                                        await comment_root.get_attribute("data-comment-id") or \
+                                        await comment_root.get_attribute("id")
+                            if comment_id:
+                                info['comment_id'] = str(comment_id)
                         
                         # Извлекаем автора (если нужен)
-                        if author_target or expected_author:
+                        if (author_target or expected_author) and not info.get('author'):
                             try:
                                 info['author'] = await comment_root.evaluate(r"""
                                     el => {
@@ -223,10 +228,13 @@ async def verify_comment_visible(
                 )
                 return False, info
             if expected_author and not info.get('author'):
+                info['found'] = False
+                info['author_missing'] = True
                 logger.warning(
-                    f"[VERIFY] Author not readable (DOM extraction failed), accepting by text match: "
+                    f"[VERIFY] Author not readable (DOM extraction failed), rejecting text-only match: "
                     f"expected={expected_author}, task_id={task_id}, account_id={account.id}"
                 )
+                return False, info
              
             logger.debug(
                 f"[VERIFY] Comment found: {task_info}account_id={account.id}, "
@@ -453,6 +461,8 @@ async def verify_with_retries(
             found, find_info = await find_comment_in_list(
                 page=page,
                 expected_text=main_comment_text,
+                expected_author=expected_author,
+                require_author_match=bool(require_author_match and expected_author),
                 max_scrolls=max_scrolls,
                 scroll_delay_ms=scroll_delay_ms,
                 min_match_ratio=text_match_ratio,

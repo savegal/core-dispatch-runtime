@@ -12,6 +12,9 @@ async def test_dismiss_cookie_banners_runs_targeted_cookie_cleanup(monkeypatch):
     calls = {"evaluate": 0, "slept": 0}
 
     class _Page:
+        async def evaluate_handle(self, _script):
+            return _Handle()
+
         async def evaluate(self, script):
             calls["evaluate"] += 1
             assert "allow cookies" in script.lower()
@@ -49,6 +52,35 @@ async def test_find_comment_input_smart_hard_limits_initial_open(monkeypatch):
     assert result.success is False
     assert result.reason == "comment_input_open_deadline"
     assert time.monotonic() - started < 0.5
+
+
+@pytest.mark.unit
+def test_find_comment_input_smart_propagates_main_mode_to_nested_openers():
+    source = inspect.getsource(dom_actions.find_comment_input_smart)
+
+    assert source.count("main_comment_aggressive=main_comment_aggressive") >= 2
+
+
+@pytest.mark.unit
+@pytest.mark.asyncio
+async def test_open_comment_section_cleanup_uses_shared_wall_clock_budget(monkeypatch):
+    calls = {"cookies": 0}
+
+    async def _hung_cleanup(_page):
+        await asyncio.Event().wait()
+
+    async def _unexpected_cookie_cleanup(_page):
+        calls["cookies"] += 1
+
+    monkeypatch.setattr(dom_actions, "suppress_keyboard_shortcuts_overlay", _hung_cleanup)
+    monkeypatch.setattr(dom_actions, "dismiss_cookie_banners", _unexpected_cookie_cleanup)
+
+    started = time.monotonic()
+    opened = await dom_actions.open_comment_section(object(), max_wait=0.05)
+
+    assert opened is False
+    assert calls["cookies"] == 0
+    assert time.monotonic() - started < 0.3
 
 
 @pytest.mark.unit
@@ -170,6 +202,9 @@ async def test_find_comment_input_smart_skip_initial_open_uses_existing_surface(
         pass
 
     class _Page:
+        async def evaluate_handle(self, _script):
+            return _Handle()
+
         async def evaluate(self, script):
             if script == dom_actions._JS_DIAGNOSE_PAGE:
                 return {
@@ -208,43 +243,23 @@ async def test_find_comment_input_smart_skip_initial_open_uses_existing_surface(
 
     assert input_handle is not None
     assert result.success is True
-    assert result.strategy == "trusted-smart-id-input"
+    assert result.strategy == "trusted-existing-atomic"
     assert calls == {"open": 0, "cookie": 0}
 
 
 @pytest.mark.unit
 @pytest.mark.asyncio
 async def test_find_comment_input_smart_uses_trusted_wrapper_before_broad_probes(monkeypatch):
-    calls = {"open": 0, "cookie": 0, "handle": 0, "query": []}
+    calls = {"open": 0, "cookie": 0, "handle": 0}
 
     class _Handle:
         async def bounding_box(self):
             return {"width": 200, "height": 0}
 
-    class _Wrapper:
-        async def query_selector(self, _selector):
-            return _Handle()
-
-        async def click(self, **_kwargs):
-            return None
-
     class _Page:
-        async def evaluate(self, script, *args):
-            if script.startswith("el => el.setAttribute"):
-                return None
-            raise AssertionError("already-open trusted wrapper should avoid broad JS")
-
-        async def query_selector(self, selector):
-            calls["query"].append(selector)
-            if selector == '[data-smart-id="comment-input"]':
-                return None
-            if selector.startswith('[data-e2e="comment-input"]'):
-                return _Wrapper()
-            return None
-
         async def evaluate_handle(self, _script):
             calls["handle"] += 1
-            raise AssertionError("trusted wrapper should return before broad handle scan")
+            return _Handle()
 
     async def _unexpected_open(*_args, **_kwargs):
         calls["open"] += 1
@@ -266,10 +281,10 @@ async def test_find_comment_input_smart_uses_trusted_wrapper_before_broad_probes
 
     assert input_handle is not None
     assert result.success is True
-    assert result.strategy == "trusted-comment-input-inner"
+    assert result.strategy == "trusted-existing-atomic"
     assert calls["open"] == 0
     assert calls["cookie"] == 0
-    assert calls["handle"] == 0
+    assert calls["handle"] == 1
 
 
 @pytest.mark.unit
@@ -310,7 +325,7 @@ async def test_find_comment_input_smart_skip_initial_open_uses_direct_resolver_b
 
     assert input_handle is not None
     assert result.success is True
-    assert result.strategy == "direct-existing-input"
+    assert result.strategy == "trusted-existing-atomic"
     assert calls == {"open": 0, "cookie": 0, "handle": 1}
 
 
@@ -354,13 +369,12 @@ async def test_find_comment_input_smart_surface_ready_fast_resolvers_get_real_bu
 
     assert input_handle is not None
     assert result.success is True
-    assert result.strategy == "direct-existing-input"
+    assert result.strategy == "trusted-existing-atomic"
     assert calls["timeouts"]
-    # Index 0 is the new cheap one-shot surface probe (runs first); the
-    # trusted-existing and surface-ready-direct probes keep their real budgets.
+    # Index 0 is the one-shot surface probe; index 1 is the atomic trusted
+    # resolver. It succeeds before the broader direct/unified fallbacks.
     assert 1.0 <= calls["timeouts"][0] <= 1.2
     assert 0.3 <= calls["timeouts"][1] <= 0.4
-    assert 0.5 <= calls["timeouts"][2] <= 0.8
 
 
 @pytest.mark.unit
@@ -372,10 +386,15 @@ async def test_find_comment_input_smart_main_aggressive_prefers_old_js_handle(mo
         async def evaluate(self, _script):
             return "main-aggressive-old-js"
 
+    class _NullHandle:
+        def as_element(self):
+            return None
+
     class _Page:
         async def evaluate_handle(self, script):
             calls["handle"] += 1
-            assert script == dom_actions._JS_FIND_COMMENT_INPUT_HANDLE
+            if script != dom_actions._JS_FIND_COMMENT_INPUT_HANDLE:
+                return _NullHandle()
             return _Handle()
 
         async def evaluate(self, script, *args):
@@ -404,28 +423,22 @@ async def test_find_comment_input_smart_main_aggressive_prefers_old_js_handle(mo
     assert input_handle is not None
     assert result.success is True
     assert result.strategy == "main-aggressive-old-js"
-    assert calls == {"handle": 1, "surface": 0}
+    assert calls == {"handle": 2, "surface": 0}
 
 
 @pytest.mark.unit
 @pytest.mark.asyncio
 async def test_find_comment_input_smart_main_aggressive_uses_trusted_existing_before_old_js(monkeypatch):
-    calls = {"query": [], "handle": 0, "surface": 0}
+    calls = {"handle": 0, "surface": 0}
 
     class _Handle:
         async def evaluate(self, _script):
             return None
 
     class _Page:
-        async def query_selector(self, selector):
-            calls["query"].append(selector)
-            if selector == '[data-smart-id="comment-input"]':
-                return _Handle()
-            return None
-
         async def evaluate_handle(self, _script):
             calls["handle"] += 1
-            raise AssertionError("trusted existing input should win before old JS")
+            return _Handle()
 
         async def evaluate(self, script, *args):
             if script == dom_actions._JS_COMMENT_SURFACE_STATE:
@@ -452,8 +465,8 @@ async def test_find_comment_input_smart_main_aggressive_uses_trusted_existing_be
 
     assert input_handle is not None
     assert result.success is True
-    assert result.strategy == "trusted-smart-id-input"
-    assert calls["handle"] == 0
+    assert result.strategy == "trusted-existing-atomic"
+    assert calls["handle"] == 1
     assert calls["surface"] == 0
 
 
@@ -706,6 +719,59 @@ async def test_open_comment_section_uses_real_mouse_click_for_trigger(monkeypatc
 
 
 @pytest.mark.unit
+@pytest.mark.asyncio
+async def test_open_comment_section_prefers_native_trigger_click(monkeypatch):
+    calls = {"native": 0, "mouse": 0, "synthetic": 0}
+
+    class _Trigger:
+        async def click(self, **kwargs):
+            calls["native"] += 1
+            assert kwargs["force"] is True
+            assert kwargs["timeout"] <= 850
+            assert kwargs["no_wait_after"] is True
+
+    class _Mouse:
+        async def click(self, *_args):
+            calls["mouse"] += 1
+
+    class _Page:
+        mouse = _Mouse()
+
+        async def evaluate(self, script):
+            if script == dom_actions._JS_COMMENT_SURFACE_STATE:
+                return {
+                    "input_visible": True,
+                    "comment_input_visible": True,
+                    "surface_visible": True,
+                }
+            return {"click": True, "x": 10, "y": 20, "w": 30, "h": 40}
+
+        async def query_selector(self, selector):
+            assert selector == '[data-smart-id="comment-open-trigger"]'
+            return _Trigger()
+
+        async def wait_for_selector(self, *_args, **_kwargs):
+            return object()
+
+    async def _fake_suppress(_page):
+        return 0
+
+    async def _fake_cookie(_page):
+        return 0
+
+    async def _unexpected_synthetic(_trigger):
+        calls["synthetic"] += 1
+        return True
+
+    monkeypatch.setattr(dom_actions, "suppress_keyboard_shortcuts_overlay", _fake_suppress)
+    monkeypatch.setattr(dom_actions, "dismiss_cookie_banners", _fake_cookie)
+    monkeypatch.setattr(dom_actions, "_dispatch_untrusted_mouse_click", _unexpected_synthetic)
+
+    assert await dom_actions.open_comment_section(_Page(), require_input=True) is True
+    assert calls == {"native": 1, "mouse": 0, "synthetic": 0}
+
+
+@pytest.mark.unit
 def test_cookie_banner_cleanup_is_persistent_but_not_attribute_noisy():
     script = dom_actions._JS_DISMISS_COOKIE_BANNERS
 
@@ -746,6 +812,19 @@ def test_open_comment_section_main_fast_recognizes_cyrillic_comment_tabs():
 
 
 @pytest.mark.unit
+def test_open_comment_section_main_fast_prioritizes_current_viewport_video_icon():
+    script = dom_actions._JS_OPEN_COMMENTS_MAIN_FAST
+
+    stable_icon = script.index("const viewportCommentIcons")
+    broad_tabs = script.index("const tabCandidates")
+    assert stable_icon < broad_tabs
+    assert '[data-e2e="comment-icon"][role="button"]' in script
+    assert "r.bottom > 0 && r.top < window.innerHeight" in script
+    assert "current_viewport_video: true" in script
+    assert "main_fast_existing_comment_list" in script
+
+
+@pytest.mark.unit
 def test_comment_surface_state_detects_open_comment_panel_without_input():
     script = dom_actions._JS_COMMENT_SURFACE_STATE
 
@@ -769,6 +848,16 @@ def test_comment_surface_state_recovers_renamed_list_wrapper_from_comment_rows()
     assert "scroll_height" in script
     assert "data-smart-comment-surface-opened" in script
     assert "data-smart-comment-scroll-opened" in script
+
+
+@pytest.mark.unit
+def test_comment_surface_state_finds_current_tiktok_scrollable_parent():
+    script = dom_actions._JS_COMMENT_SURFACE_STATE
+
+    assert "chosenList.el.parentElement" in script
+    assert "sameCommentColumn" in script
+    assert "overflowBonus = 400" in script
+    assert "[chosenList.el, ...descendants, ...ancestors]" in script
 
 
 @pytest.mark.unit
@@ -870,6 +959,8 @@ def test_page_diagnostic_reports_comment_trigger_candidates():
     assert "commentTriggerCandidates" in script
     assert "aria-label" in script
     assert "button, [role=\"button\"]" in script
+    assert "loadingCandidates" in script
+    assert "aria-busy=\"true\"" in script
 
 
 @pytest.mark.unit
@@ -1135,8 +1226,11 @@ async def test_open_reply_box_accepts_bonded_composer_after_click(monkeypatch):
     class _Page:
         async def evaluate(self, script, args=None):
             if script == dom_actions._JS_OPEN_REPLY:
+                self.clicked = True
                 return {"clicked": True, "strategy": "parent-anchor-reply", "anchorToken": "anchor-1"}
             if script == dom_actions._JS_FIND_REPLY_INPUT:
+                if not getattr(self, "clicked", False):
+                    return {"found": False, "reason": "reply_composer_triple_not_found"}
                 assert args == ["anchor-1", "parent", ""]
                 return {
                     "found": True,
@@ -1163,6 +1257,127 @@ async def test_open_reply_box_accepts_bonded_composer_after_click(monkeypatch):
     assert result.success is True
     assert result.anchor_token == "anchor-1"
     assert result.strategy == "parent-anchor-reply+reply-composer-between_parent_and_next_row"
+
+
+@pytest.mark.unit
+@pytest.mark.asyncio
+async def test_open_reply_box_uses_lightweight_exact_anchor_click_before_full_search(monkeypatch):
+    calls = []
+
+    class _Page:
+        async def evaluate(self, script, args=None):
+            calls.append(script)
+            if script == dom_actions._JS_OPEN_REPLY_BY_ANCHOR:
+                assert args == "anchor-1"
+                return {
+                    "clicked": True,
+                    "strategy": "parent-anchor-fast-canonical",
+                    "anchorToken": "anchor-1",
+                }
+            if script == dom_actions._JS_FIND_REPLY_INPUT:
+                if dom_actions._JS_OPEN_REPLY_BY_ANCHOR not in calls:
+                    return {"found": False, "reason": "reply_composer_triple_not_found"}
+                assert args == ["anchor-1", "parent", ""]
+                return {
+                    "found": True,
+                    "strategy": "reply-composer-between_parent_and_next_row",
+                    "anchorToken": "anchor-1",
+                }
+            if script == dom_actions._JS_OPEN_REPLY:
+                raise AssertionError("full text search must not run after exact anchor click")
+            raise AssertionError("unexpected script")
+
+        async def wait_for_selector(self, *_args, **_kwargs):
+            return None
+
+    async def _fake_sleep(_seconds):
+        return None
+
+    monkeypatch.setattr(dom_actions.asyncio, "sleep", _fake_sleep)
+
+    result = await dom_actions.open_reply_box(
+        _Page(),
+        parent_comment_text="parent",
+        parent_anchor_token="anchor-1",
+        max_attempts=1,
+    )
+
+    assert result.success is True
+    assert result.anchor_token == "anchor-1"
+    assert result.strategy.startswith("parent-anchor-fast-canonical+")
+    assert calls[:2] == [dom_actions._JS_FIND_REPLY_INPUT, dom_actions._JS_OPEN_REPLY_BY_ANCHOR]
+    assert dom_actions._JS_OPEN_REPLY not in calls
+
+
+@pytest.mark.unit
+@pytest.mark.asyncio
+async def test_open_reply_box_prefers_native_click_on_exact_current_tiktok_reply(monkeypatch):
+    calls = {"button_query": None, "native_click": 0, "js_open": 0}
+
+    class _Button:
+        @property
+        def first(self):
+            return self
+
+        async def click(self, **kwargs):
+            calls["native_click"] += 1
+            assert kwargs == {"timeout": 1200, "force": True, "no_wait_after": True}
+
+    class _Row:
+        def locator(self, selector):
+            calls["button_query"] = selector
+            return _Button()
+
+    class _Page:
+        def locator(self, selector):
+            assert selector == '[data-smart-parent-anchor="anchor-1"]'
+            return _Row()
+
+        async def evaluate(self, script, args=None):
+            if script in {dom_actions._JS_OPEN_REPLY_BY_ANCHOR, dom_actions._JS_OPEN_REPLY}:
+                calls["js_open"] += 1
+                raise AssertionError("native exact-parent click must win")
+            if script == dom_actions._JS_FIND_REPLY_INPUT:
+                if not calls["native_click"]:
+                    return {"found": False, "reason": "reply_composer_triple_not_found"}
+                assert args == ["anchor-1", "parent", ""]
+                return {
+                    "found": True,
+                    "strategy": "reply-composer-between_parent_and_next_row",
+                    "anchorToken": "anchor-1",
+                }
+            raise AssertionError("unexpected script")
+
+        async def wait_for_selector(self, *_args, **_kwargs):
+            return None
+
+    async def _fake_sleep(_seconds):
+        return None
+
+    monkeypatch.setattr(dom_actions.asyncio, "sleep", _fake_sleep)
+
+    result = await dom_actions.open_reply_box(
+        _Page(),
+        parent_comment_text="parent",
+        parent_anchor_token="anchor-1",
+        max_attempts=1,
+    )
+
+    assert result.success is True
+    assert result.strategy.startswith("parent-anchor-native-canonical+")
+    assert calls["native_click"] == 1
+    assert calls["js_open"] == 0
+    assert 'p[role="button"][data-e2e="comment-reply-1"]' in calls["button_query"]
+
+
+@pytest.mark.unit
+def test_open_reply_box_retry_scroll_uses_actual_tiktok_scroll_parent():
+    source = inspect.getsource(dom_actions.open_reply_box)
+
+    assert 'data-smart-comment-list-batch-scroll="1"' in source
+    assert 'data-smart-comment-list-active-scroll="1"' in source
+    assert '[class*="DivCommentMain"]' in source
+    assert "candidate && candidate.parentElement" in source
 
 
 @pytest.mark.unit
@@ -1276,6 +1491,14 @@ def test_open_reply_box_prefers_parent_dom_anchor_before_text_search():
 
 
 @pytest.mark.unit
+def test_fast_reply_anchor_selector_matches_current_tiktok_reply_control():
+    script = dom_actions._JS_OPEN_REPLY_BY_ANCHOR
+
+    assert 'p[role="button"][data-e2e="comment-reply-1"]' in script
+    assert "parent-anchor-fast-canonical" in script
+
+
+@pytest.mark.unit
 def test_reply_input_finder_requires_live_parent_anchor_scope():
     script = dom_actions._JS_FIND_REPLY_INPUT
     handle_script = "".join(dom_actions._JS_FIND_REPLY_INPUT_HANDLE)
@@ -1345,12 +1568,15 @@ def test_reply_post_finder_does_not_fallback_to_global_comment_markers():
     assert "label.includes('gif')" in optimistic_source
     assert "label.includes('photo')" in optimistic_source
     assert "st.pointerEvents === 'none'" in optimistic_source
-    assert "Boolean(iconNearInput)" not in optimistic_source
+    assert "Boolean(iconNearInput)" in optimistic_source
+    assert "r.bottom >= inputRect.top - 22" in optimistic_source
+    assert "r.left >= inputRect.left + Math.max(45, inputRect.width * 0.45)" in optimistic_source
     assert "'path'," not in optimistic_source
     assert "const strictSendMarker = (el) =>" in optimistic_source
     assert "'button, [role=\"button\"], [data-e2e*=\"comment-post\"], [data-e2e*=\"send\"], [data-smart-reply-post=\"1\"], div[tabindex=\"0\"]'" in optimistic_source
     assert "if (interactive) return usable(interactive) ? interactive : null" in optimistic_source
     assert "if (strictSendMarker(raw) && usable(raw)) return raw" in optimistic_source
+    assert "if (looksSend(raw) && usable(raw.parentElement)) return raw.parentElement" in optimistic_source
     assert "role: el.getAttribute && el.getAttribute('role')" in optimistic_source
     assert "ariaLabel: el.getAttribute && el.getAttribute('aria-label')" in optimistic_source
     assert "dataE2e: el.getAttribute && el.getAttribute('data-e2e')" in optimistic_source
@@ -1414,6 +1640,22 @@ def test_main_comment_input_paths_prefer_main_marker():
     assert "data-smart-main-input" in dom_actions._JS_COMMENT_INPUT_TEXT_MATCH
     assert "document.querySelector('[data-smart-main-input=\"1\"]')" in wait_source
     assert "'[data-smart-main-input=\"1\"]'" in typing_source
+
+
+@pytest.mark.unit
+def test_main_post_finders_reject_reply_scoped_buttons():
+    find_script = dom_actions._JS_FIND_POST_BUTTON
+    wait_source = inspect.getsource(dom_actions.wait_for_post_button_enabled)
+
+    assert "const replyScoped = (el) =>" in find_script
+    assert "].find(el => !replyScoped(el))" in find_script
+    assert "if (replyScoped(el)) continue" in find_script
+    assert "data-smart-main-post" in find_script
+
+    assert "const explicitlyReplyScoped = (el) =>" in wait_source
+    assert "const mainPostCandidates = () =>" in wait_source
+    assert "visible(el) && !explicitlyReplyScoped(el)" in wait_source
+    assert "el.setAttribute('data-smart-main-post', '1')" in wait_source
 
 
 @pytest.mark.unit

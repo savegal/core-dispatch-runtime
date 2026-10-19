@@ -253,7 +253,8 @@ async def detect_captcha(page: Page, wait_ms: int = 1000) -> tuple[bool, Optiona
                     }
                 }
 
-                const structuralCandidates = [...document.body.querySelectorAll('body > div, body > section, body > aside')]
+                // During navigation the document can exist before its body.
+                const structuralCandidates = [...document.querySelectorAll('body > div, body > section, body > aside')]
                     .filter(visible)
                     .filter((el) => {
                         try {

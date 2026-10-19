@@ -234,6 +234,16 @@ def test_extract_tiktok_username_does_not_use_broad_profile_link_fallback():
 
 
 @pytest.mark.unit
+def test_extract_tiktok_username_ignores_viewed_page_subject_state():
+    source = inspect.getsource(extract_tiktok_username)
+
+    assert "state?.default?.['webapp.user-detail']" not in source
+    assert "state?.props?.pageProps?.userInfo?.user?.uniqueId" not in source
+    assert "state?.props?.pageProps?.serverCode?.user?.uniqueId" not in source
+    assert "webapp.app-context" in source
+
+
+@pytest.mark.unit
 def test_bootstrap_result_carries_tiktok_username_field():
     res = BootstrapResult(status="ready", tiktok_username="erjowkaaa")
     assert res.tiktok_username == "erjowkaaa"

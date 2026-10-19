@@ -10,6 +10,7 @@ from bot.services.validators import parse_links, validate_video_url
 from bot.services.api_client import APIRequestError, api_client
 from bot.services.drafts import get_draft, set_links, reset_draft, save_draft
 from bot.services.subscription_service import check_user_access
+from bot.services.telegram_utils import safe_callback_answer
 from bot.services.user_utils import get_user_backend_id
 from bot.services.error_handlers import get_task_creation_error_message
 from bot.services.formatting import Emoji, markdown_inline_code
@@ -28,6 +29,7 @@ from bot.services.template_utils import (
 )
 from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton
 from bot.keyboards.templates import get_template_choice_keyboard, get_template_preview_keyboard, format_template_preview
+from bot.services.main_visibility_ui import CALLBACK_PREFIX as VISIBILITY_CALLBACK_PREFIX, set_visibility_option, visibility_keyboard, REPLY_CALLBACK_PREFIX, set_reply_visibility_option
 from bot.keyboards.common import get_access_denied_keyboard
 from bot.state.order_states import OrderStates
 from bot.utils.markdown_escape import escape_markdown_simple
@@ -37,6 +39,16 @@ settings = get_settings()
 MAX_REPLIES = settings.MAX_REPLIES
 logger = logging.getLogger('bot.quick_order')
 router = Router()
+
+
+@router.callback_query(F.data.startswith(REPLY_CALLBACK_PREFIX))
+async def quick_order_reply_visibility_option(callback: CallbackQuery, state: FSMContext):
+    await set_reply_visibility_option(callback, state)
+
+
+@router.callback_query(F.data.startswith(VISIBILITY_CALLBACK_PREFIX))
+async def quick_order_visibility_option(callback: CallbackQuery, state: FSMContext):
+    await set_visibility_option(callback, state)
 
 ACCOUNT_POOL_MODE_SHARED = 'shared'
 ACCOUNT_POOL_MODE_PERSONAL = 'personal'
@@ -340,6 +352,12 @@ async def select_template(callback: CallbackQuery, state: FSMContext):
             [InlineKeyboardButton(text='Изменить шаблон', callback_data=f'quicktpl:edit:{template_id}')],
             [InlineKeyboardButton(text='◀️ Назад', callback_data='quicktpl:back_to_choice')]
         ])
+        state_data = await state.get_data()
+        keyboard = visibility_keyboard(
+            keyboard,
+            bool(state_data.get('verify_main_visibility', False)),
+            bool(state_data.get('verify_reply_visibility', False)),
+        )
         await callback.message.edit_text(preview_text, reply_markup=keyboard, parse_mode='Markdown')
         await callback.answer()
     except Exception as e:
@@ -408,7 +426,7 @@ async def start_edit_existing_template(callback: CallbackQuery, state: FSMContex
             reply_count=reply_count,
         )
         preview_text = await _template_preview_text(template, reply_count=reply_count)
-        await callback.message.edit_text(preview_text, reply_markup=get_template_preview_keyboard(template_id, reply_count=reply_count), parse_mode='Markdown')
+        await callback.message.edit_text(preview_text, reply_markup=get_template_preview_keyboard(template_id, reply_count=reply_count, verify_main_visibility=bool((await state.get_data()).get("verify_main_visibility", False)), verify_reply_visibility=bool((await state.get_data()).get("verify_reply_visibility", False))), parse_mode='Markdown')
         await callback.answer()
     except Exception as e:
         logger.error(f'Error starting edit template: {e}', exc_info=True)
@@ -657,6 +675,8 @@ def _build_new_template_preview_text_and_keyboard(
     links: list,
     likes_label: str = "выключены",
     template_type: str = "full",
+    verify_main_visibility: bool = False,
+    verify_reply_visibility: bool = False,
 ) -> tuple[str, InlineKeyboardMarkup]:
     """Общий строитель preview-текста и клавиатуры для нового шаблона/заказа."""
     replies_only = template_type == "replies_only"
@@ -701,6 +721,8 @@ def _build_new_template_preview_text_and_keyboard(
             [InlineKeyboardButton(text=f'{Emoji.CANCEL} Отмена', callback_data='quicktpl:cancel')]
         ])
 
+    if has_videos:
+        keyboard = visibility_keyboard(keyboard, verify_main_visibility, verify_reply_visibility)
     return preview_text, keyboard
 
 
@@ -725,6 +747,8 @@ async def show_new_template_preview_from_callback(callback: CallbackQuery, state
             draft.links or [],
             likes_label=await get_likes_display_label_for_replies(reply_count),
             template_type=template_type,
+            verify_main_visibility=bool(state_data.get('verify_main_visibility', False)),
+            verify_reply_visibility=bool(state_data.get('verify_reply_visibility', False)),
         )
         await callback.message.edit_text(preview_text, reply_markup=keyboard, parse_mode='Markdown')
         await state.set_state(None)
@@ -750,6 +774,8 @@ async def show_new_template_preview(message: Message, state: FSMContext):
             draft.links or [],
             likes_label=await get_likes_display_label_for_replies(reply_count),
             template_type=template_type,
+            verify_main_visibility=bool(state_data.get('verify_main_visibility', False)),
+            verify_reply_visibility=bool(state_data.get('verify_reply_visibility', False)),
         )
         await message.answer(preview_text, reply_markup=keyboard, parse_mode='Markdown')
         await state.set_state(None)
@@ -956,6 +982,8 @@ async def confirm_new_template(callback: CallbackQuery, state: FSMContext):
                 'rotate_accounts': True,
                 'origin': 'quick_order'
             }
+            task_settings['verify_main_visibility'] = bool(state_data.get('verify_main_visibility', False))
+            task_settings['verify_reply_visibility'] = bool(state_data.get('verify_reply_visibility', False))
             task_settings['text_variants'] = text_variants
             if not return_to_new_videos:
                 task_settings['account_pool_mode'] = account_pool_mode
@@ -1068,7 +1096,7 @@ async def set_reply_count(callback: CallbackQuery, state: FSMContext):
             edited_text_variants=edited_text_variants,
             edited_replies=edited_replies,
         )
-        await callback.message.edit_text(preview_text, reply_markup=get_template_preview_keyboard(template_id, reply_count=reply_count), parse_mode='Markdown')
+        await callback.message.edit_text(preview_text, reply_markup=get_template_preview_keyboard(template_id, reply_count=reply_count, verify_main_visibility=bool((await state.get_data()).get("verify_main_visibility", False)), verify_reply_visibility=bool((await state.get_data()).get("verify_reply_visibility", False))), parse_mode='Markdown')
         await callback.answer()
     except Exception as e:
         logger.error(f'Error setting reply count: {e}', exc_info=True)
@@ -1150,7 +1178,7 @@ async def save_edited_comment(message: Message, state: FSMContext):
             edited_text_variants=edited_text_variants,
             edited_replies=edited_replies,
         )
-        await message.answer(preview_text, reply_markup=get_template_preview_keyboard(template_id, reply_count=reply_count), parse_mode='Markdown')
+        await message.answer(preview_text, reply_markup=get_template_preview_keyboard(template_id, reply_count=reply_count, verify_main_visibility=bool((await state.get_data()).get("verify_main_visibility", False)), verify_reply_visibility=bool((await state.get_data()).get("verify_reply_visibility", False))), parse_mode='Markdown')
         await state.set_state(None)
     except Exception as e:
         logger.error(f'Error saving edited comment: {e}', exc_info=True)
@@ -1283,7 +1311,7 @@ async def finish_editing_replies(message: Message, state: FSMContext):
             edited_text_variants=edited_text_variants,
             edited_replies=edited_replies,
         )
-        await message.answer(preview_text, reply_markup=get_template_preview_keyboard(template_id, reply_count=reply_count), parse_mode='Markdown')
+        await message.answer(preview_text, reply_markup=get_template_preview_keyboard(template_id, reply_count=reply_count, verify_main_visibility=bool((await state.get_data()).get("verify_main_visibility", False)), verify_reply_visibility=bool((await state.get_data()).get("verify_reply_visibility", False))), parse_mode='Markdown')
         await state.set_state(None)
     except Exception as e:
         logger.error(f'Error finishing edit replies: {e}', exc_info=True)
@@ -1348,6 +1376,8 @@ async def confirm_template(callback: CallbackQuery, state: FSMContext):
             'rotate_accounts': template.get('settings', {}).get('rotate_accounts', True),
             'origin': 'quick_order',
             'account_pool_mode': account_pool_mode,
+            'verify_main_visibility': bool(state_data.get('verify_main_visibility', False)),
+            'verify_reply_visibility': bool(state_data.get('verify_reply_visibility', False)),
             # Привязка к шаблону — нужна для деталей заказа / повтора / аналитики.
             'template_id': template_id,
             'template_name': template.get('name') or 'Без названия',
@@ -1459,11 +1489,14 @@ async def noop_handler(callback: CallbackQuery):
 @router.callback_query(F.data == 'quicktpl:back_to_choice')
 async def back_to_template_choice(callback: CallbackQuery, state: FSMContext):
     """Возврат к выбору шаблона с сохранением прогресса."""
+    # Stop Telegram's loading spinner before backend/template requests. If the
+    # callback already expired, navigation can still continue via message edit.
+    await safe_callback_answer(callback)
     try:
         user_id = callback.from_user.id
         user_backend_id = await get_user_backend_id(user_id)
         if not user_backend_id:
-            await callback.answer('Ошибка загрузки данных', show_alert=True)
+            await safe_callback_answer(callback, 'Ошибка загрузки данных', show_alert=True)
             return
         state_data = await state.get_data()
         current_comment = state_data.get('main_comment')
@@ -1485,7 +1518,6 @@ async def back_to_template_choice(callback: CallbackQuery, state: FSMContext):
         templates = filter_full_templates(templates)
         if not templates:
             await callback.message.edit_text('У вас пока нет шаблонов.')
-            await callback.answer()
             return
         draft = get_draft(user_id)
         links_count = len(draft.links) if draft.links else 0
@@ -1493,10 +1525,9 @@ async def back_to_template_choice(callback: CallbackQuery, state: FSMContext):
         keyboard, page, total_pages = get_template_choice_keyboard(templates, page=current_page)
         page_info = f' (стр. {page + 1}/{total_pages})' if total_pages > 1 else ''
         await callback.message.edit_text(f'Найдено ссылок: {links_count}\n\nВыберите шаблон комментария{page_info}:', reply_markup=keyboard, parse_mode='Markdown')
-        await callback.answer()
     except Exception as e:
         logger.error(f'Error going back to template choice: {e}', exc_info=True)
-        await callback.answer('Ошибка', show_alert=True)
+        await safe_callback_answer(callback, 'Ошибка', show_alert=True)
 
 @router.callback_query(F.data == 'quicktpl:cancel')
 async def cancel_template_choice(callback: CallbackQuery, state: FSMContext):

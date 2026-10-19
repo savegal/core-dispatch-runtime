@@ -13,6 +13,7 @@ from sqlalchemy import and_, or_
 from db.models import Account, Proxy
 from typing import Optional
 from config.settings import get_settings
+from services.log_sanitizer import sanitize_url
 
 settings = get_settings()
 logger = logging.getLogger("services.proxy_replacement")
@@ -62,6 +63,7 @@ def replace_slow_proxy_for_account(
     # Строим базовый запрос
     base_query = db.query(Proxy).filter(
         Proxy.status.in_(["active", "slow"]),
+        Proxy.dedicated_user_id.is_(None),
         ~Proxy.proxy.in_(used_proxy_strings) if used_proxy_strings else True
     )
     
@@ -119,7 +121,8 @@ def replace_slow_proxy_for_account(
     
     logger.info(
         f"Auto-replaced proxy for account {account_id} ({account.label[:20]}): "
-        f"{old_proxy[:30] if old_proxy else None} -> {new_proxy.proxy[:30]}{geo_info}"
+        f"{sanitize_url(old_proxy, max_length=80) if old_proxy else None} -> "
+        f"{sanitize_url(new_proxy.proxy, max_length=80)}{geo_info}"
     )
     
     return True
@@ -148,7 +151,12 @@ def mark_proxy_as_slow_and_replace(
     """
     # ИСПРАВЛЕНО: Просто логируем ошибку прокси, но не меняем его статус
     error_type = "timeout" if timeout_error else "error"
-    logger.info(f"Replacing proxy {proxy_string[:30]} for account {account_id} due to {error_type}")
+    logger.info(
+        "Replacing proxy %s for account %s due to %s",
+        sanitize_url(str(proxy_string or ""), max_length=80),
+        account_id,
+        error_type,
+    )
     
     # Заменяем прокси у аккаунта (с учётом гео если включено)
     return replace_slow_proxy_for_account(
@@ -165,5 +173,8 @@ def reset_proxy_fail_count(db: Session, proxy_string: str) -> None:
     так как прокси больше не имеют счетчиков ошибок.
     """
     # Прокси больше не имеют fail_count и status, поэтому просто логируем
-    logger.debug(f"reset_proxy_fail_count called for {proxy_string[:30]} (no-op, proxies have no status)")
+    logger.debug(
+        "reset_proxy_fail_count called for %s (no-op, proxies have no status)",
+        sanitize_url(str(proxy_string or ""), max_length=80),
+    )
     pass

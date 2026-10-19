@@ -12,7 +12,7 @@ from hashlib import sha1
 from typing import Any, Mapping
 
 
-LEDGER_VERSION = 2
+LEDGER_VERSION = 4
 _EVENT_LIMIT = 80
 _PREVIEW_LIMIT = 90
 _VIDEO_SUCCESS_STATUSES = {"success", "submitted_unconfirmed", "done"}
@@ -61,6 +61,8 @@ def _status_is_submitted(item: Mapping[str, Any]) -> bool:
 
 
 def _status_is_confirmed(item: Mapping[str, Any]) -> bool:
+    if "public_confirmed" in item:
+        return item.get("public_confirmed") is True
     visibility_status = _lower(item.get("visibility_status"))
     return bool(
         item.get("success")
@@ -170,8 +172,19 @@ def _cid_alias(value: Any) -> str | None:
     return f"cid:{_hash_key(cid)}"
 
 
+def _stable_target_alias(value: Any) -> str | None:
+    target_id = _clean(value)
+    if not target_id:
+        return None
+    return f"target:{_hash_key(target_id)}"
+
+
 def _target_aliases(item: Mapping[str, Any]) -> list[str]:
     aliases: list[str] = []
+    for value in (item.get("parent_target_id"), item.get("target_id")):
+        alias = _stable_target_alias(value)
+        if alias and alias not in aliases:
+            aliases.append(alias)
     for value in (item.get("parent_comment_id"), item.get("comment_id")):
         alias = _cid_alias(value)
         if alias and alias not in aliases:
@@ -212,9 +225,12 @@ def _seed_parent_targets_from_main(main: Mapping[str, Any]) -> tuple[dict[str, d
         text = variant.get("text")
         cid = variant.get("comment_id")
         account_id = _safe_int(variant.get("account_id"))
+        target_id = _clean(variant.get("target_id"))
+        requested_author = _clean(variant.get("tiktok_username")).lstrip("@") or None
         aliases = [
             alias
             for alias in (
+                _stable_target_alias(target_id),
                 _cid_alias(cid),
                 _text_alias(text),
             )
@@ -224,7 +240,9 @@ def _seed_parent_targets_from_main(main: Mapping[str, Any]) -> tuple[dict[str, d
             alias_counts[alias] += 1
 
         text_identity = _lower(text)
-        if cid:
+        if target_id:
+            identity = target_id
+        elif cid:
             identity = cid
         elif account_id or text_identity:
             identity = f"{account_id}:{text_identity}"
@@ -238,8 +256,10 @@ def _seed_parent_targets_from_main(main: Mapping[str, Any]) -> tuple[dict[str, d
                 {
                     "key": key,
                     "label": label,
-                    "requested_author": None,
+                    "target_id": target_id or None,
+                    "requested_author": requested_author,
                     "matched_authors": [],
+                    "comment_ids": [_clean(cid)] if _clean(cid) else [],
                     "attempted": 0,
                     "submitted": 0,
                     "confirmed": 0,
@@ -275,7 +295,10 @@ def _build_main_summary(main: Mapping[str, Any], events: list[dict[str, Any]], a
     for index, variant in enumerate(variants, start=1):
         if not isinstance(variant, Mapping):
             continue
-        variant_confirmed = bool(variant.get("network_confirmed") or variant.get("local_confirmed"))
+        variant_confirmed = (
+            bool(variant["public_confirmed"]) if "public_confirmed" in variant
+            else bool(variant.get("network_confirmed") or variant.get("local_confirmed"))
+        )
         verified += 1 if variant_confirmed else 0
         network_confirmed += 1 if variant.get("network_confirmed") else 0
         local_confirmed += 1 if variant.get("local_confirmed") else 0
@@ -413,8 +436,10 @@ def _build_reply_summary(
             {
                 "key": target_key,
                 "label": _target_label(item),
+                "target_id": _clean(item.get("parent_target_id") or item.get("target_id")) or None,
                 "requested_author": _clean(item.get("requested_parent_author")).lstrip("@") or None,
                 "matched_authors": [],
+                "comment_ids": [],
                 "attempted": 0,
                 "submitted": 0,
                 "confirmed": 0,
@@ -432,6 +457,12 @@ def _build_reply_summary(
             target["requested_author"] = requested_author
         if matched_author and matched_author not in target["matched_authors"]:
             target["matched_authors"].append(matched_author)
+        observed_parent_id = _clean(item.get("parent_comment_id"))
+        if observed_parent_id and observed_parent_id not in target["comment_ids"]:
+            target["comment_ids"].append(observed_parent_id)
+        stable_target_id = _clean(item.get("parent_target_id") or item.get("target_id"))
+        if stable_target_id and not target.get("target_id"):
+            target["target_id"] = stable_target_id
         target["attempted"] += 1 if item_attempted else 0
         target["submitted"] += 1 if item_submitted else 0
         target["confirmed"] += 1 if item_confirmed else 0
@@ -483,7 +514,8 @@ def _build_reply_summary(
 
     final_attempted = aggregate_attempted or item_attempted_count
     final_submitted = aggregate_submitted or item_submitted_count
-    final_confirmed = aggregate_confirmed or item_confirmed_count
+    checked_publicly = any(isinstance(item, Mapping) and "public_confirmed" in item for item in items)
+    final_confirmed = item_confirmed_count if checked_publicly else aggregate_confirmed or item_confirmed_count
     final_unconfirmed = aggregate_unconfirmed or item_unconfirmed_count
     final_failed = aggregate_failed or item_failed_count
 
@@ -513,6 +545,18 @@ def _build_reply_summary(
 
 
 def _build_likes_summary(likes: Mapping[str, Any], events: list[dict[str, Any]]) -> dict[str, Any]:
+    if not bool(likes.get("enabled")):
+        return {
+            "enabled": False,
+            "requested": False,
+            "quantity": 0,
+            "target_mode": _clean(likes.get("target_mode")) or None,
+            "orders_total": 0,
+            "orders_ok": 0,
+            "orders_failed": 0,
+            "targets": [],
+            "error": None,
+        }
     orders = likes.get("orders") if isinstance(likes.get("orders"), list) else []
     targets: list[dict[str, Any]] = []
     ok_count = 0
@@ -561,6 +605,92 @@ def _build_likes_summary(likes: Mapping[str, Any], events: list[dict[str, Any]])
     }
 
 
+def _build_attempt_summary(
+    result: Mapping[str, Any],
+    events: list[dict[str, Any]],
+    account_signals: dict[int, dict[str, Any]],
+) -> tuple[dict[str, Any], list[dict[str, Any]]]:
+    source = result.get("execution_attempts")
+    raw_attempts = source if isinstance(source, list) else []
+    rows: list[dict[str, Any]] = []
+    reasons: Counter[str] = Counter()
+    failed = 0
+    submitted = 0
+    for raw in raw_attempts:
+        if not isinstance(raw, Mapping):
+            continue
+        success = bool(raw.get("success"))
+        submitted_count = max(0, _safe_int(raw.get("submitted")))
+        reason = _clean(raw.get("reason")) or ("success" if success else "unknown_failure")
+        category = None if success else _error_category(reason)
+        row = {
+            "phase": _clean(raw.get("phase")) or "unknown",
+            "account_id": _safe_int(raw.get("account_id")) or None,
+            "attempt": max(1, _safe_int(raw.get("attempt"), 1)),
+            "variant_index": _safe_int(raw.get("variant_index")) or None,
+            "success": success,
+            "submitted": submitted_count,
+            "reason": _preview(reason, 240),
+            "error_category": category,
+        }
+        if "searched" in raw:
+            row["searched"] = bool(raw.get("searched"))
+        if "scanned_rows" in raw:
+            row["scanned_rows"] = max(0, _safe_int(raw.get("scanned_rows")))
+        rows.append(row)
+        reasons[reason] += 1
+        failed += 0 if success else 1
+        submitted += submitted_count
+        _record_account_signal(
+            account_signals,
+            raw.get("account_id"),
+            attempted=True,
+            submitted=submitted_count > 0,
+            unconfirmed=submitted_count > 0 and not success,
+            error=reason if not success else None,
+        )
+        _add_event(events, {"type": "account_attempt", **row})
+    return (
+        {
+            "total": len(rows),
+            "successful": len(rows) - failed,
+            "failed": failed,
+            "submitted": submitted,
+            "reasons": dict(reasons),
+        },
+        rows,
+    )
+
+
+def visibility_checks_complete(result: Mapping[str, Any]) -> bool:
+    for key in ("main_visibility", "reply_publication_visibility"):
+        report = result.get(key)
+        if isinstance(report, Mapping) and report.get("enabled"):
+            allowed = {"confirmed", "not_requested"} if key == "reply_publication_visibility" else {"confirmed"}
+            if report.get("status") not in allowed:
+                return False
+    return True
+
+
+def _result_is_success_like(result: Mapping[str, Any], status: str) -> bool:
+    if status not in _VIDEO_SUCCESS_STATUSES:
+        return False
+    if not visibility_checks_complete(result):
+        return False
+    error = _lower(result.get("error"))
+    if error in {"main_publication_incomplete", "reply_publication_incomplete", "main_variant_partial"}:
+        return False
+    if error.startswith("main_variant_partial") or result.get("publication_complete") is False:
+        return False
+    engagement = result.get("engagement")
+    if isinstance(engagement, Mapping):
+        for section_name in ("main", "replies"):
+            section = engagement.get(section_name)
+            if isinstance(section, Mapping) and section.get("complete") is False:
+                return False
+    return True
+
+
 def build_url_execution_ledger(result: Mapping[str, Any] | None, *, url: str | None = None) -> dict[str, Any]:
     """Builds a ledger for a single URL result."""
     result = result if isinstance(result, Mapping) else {}
@@ -575,6 +705,7 @@ def build_url_execution_ledger(result: Mapping[str, Any] | None, *, url: str | N
     main_summary = _build_main_summary(main, events, account_signals)
     reply_summary, coverage = _build_reply_summary(replies, main, events, account_signals)
     likes_summary = _build_likes_summary(likes, events)
+    attempt_summary, attempt_rows = _build_attempt_summary(result, events, account_signals)
 
     error_counter: Counter[str] = Counter(
         str(event.get("error_category"))
@@ -591,11 +722,12 @@ def build_url_execution_ledger(result: Mapping[str, Any] | None, *, url: str | N
         "scope": "url",
         "url_hash": _hash_key(url) if url else None,
         "status": status,
-        "success_like": status in _VIDEO_SUCCESS_STATUSES,
+        "success_like": _result_is_success_like(result, status),
         "summary": {
             "main": main_summary,
             "replies": reply_summary,
             "likes": likes_summary,
+            "attempts": attempt_summary,
         },
         "coverage": coverage,
         "health_signals": {
@@ -604,6 +736,7 @@ def build_url_execution_ledger(result: Mapping[str, Any] | None, *, url: str | N
             "error_categories": dict(error_counter),
             "accounts": list(account_signals.values())[:20],
         },
+        "attempts": attempt_rows,
         "events": events,
     }
 
@@ -640,6 +773,8 @@ def build_task_execution_ledger(url_results: Mapping[str, Any] | None) -> dict[s
     main_total: dict[str, int] = defaultdict(int)
     reply_total: dict[str, int] = defaultdict(int)
     likes_total: dict[str, int] = defaultdict(int)
+    attempts_total: dict[str, int] = defaultdict(int)
+    attempt_reasons: Counter[str] = Counter()
     likes_targets: list[dict[str, Any]] = []
     error_counter: Counter[str] = Counter()
     parent_targets_total = 0
@@ -673,6 +808,7 @@ def build_task_execution_ledger(url_results: Mapping[str, Any] | None) -> dict[s
         main = summary.get("main") if isinstance(summary.get("main"), Mapping) else {}
         replies = summary.get("replies") if isinstance(summary.get("replies"), Mapping) else {}
         likes = summary.get("likes") if isinstance(summary.get("likes"), Mapping) else {}
+        attempts = summary.get("attempts") if isinstance(summary.get("attempts"), Mapping) else {}
         _sum_into(main_total, main, ("expected", "submitted", "verified", "unconfirmed", "failed"))
         _sum_into(
             reply_total,
@@ -692,6 +828,9 @@ def build_task_execution_ledger(url_results: Mapping[str, Any] | None) -> dict[s
             ),
         )
         _sum_into(likes_total, likes, ("quantity", "orders_total", "orders_ok", "orders_failed"))
+        _sum_into(attempts_total, attempts, ("total", "successful", "failed", "submitted"))
+        for reason, count in (attempts.get("reasons") or {}).items():
+            attempt_reasons[str(reason)] += _safe_int(count)
         for target in likes.get("targets") or []:
             if isinstance(target, Mapping):
                 likes_targets.append(dict(target))
@@ -737,6 +876,10 @@ def build_task_execution_ledger(url_results: Mapping[str, Any] | None) -> dict[s
             "likes": {
                 **dict(likes_total),
                 "targets": likes_targets,
+            },
+            "attempts": {
+                **dict(attempts_total),
+                "reasons": dict(attempt_reasons),
             },
         },
         "coverage": {

@@ -20,6 +20,8 @@ MIGRATION_MODULES: List[str] = [
     "add_task_kind_migration",
     "add_user_video_notifications_enabled_migration",
     "add_user_full_access_override_migration",
+    "add_dedicated_user_proxy_migration",
+    "add_account_assignment_migration",
     "add_monitor_scheduler_migration",
     "add_adaptive_monitoring_migration",
 ]

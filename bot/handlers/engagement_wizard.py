@@ -24,14 +24,23 @@ from bot.keyboards.common import get_access_denied_keyboard
 from bot.services.formatting import markdown_inline_code
 from bot.utils.markdown_escape import escape_markdown_simple
 from services.likes_config import BOOST_LIKES_DEFAULT, coerce_likes_quantity
+from services.comment_search import normalize_search_phrase
 import logging
 import re
+
+from bot.services.main_visibility_ui import REPLY_CALLBACK_PREFIX, reply_visibility_keyboard, set_reply_visibility_option
 
 logger = logging.getLogger("bot.engagement_wizard")
 router = Router()
 config = load_config()
 settings = get_settings()
 ENGAGEMENT_TEMPLATES_PER_PAGE = 8
+
+
+@router.callback_query(F.data.startswith(REPLY_CALLBACK_PREFIX))
+async def engagement_reply_visibility_option(callback: CallbackQuery, state: FSMContext):
+    await set_reply_visibility_option(callback, state)
+
 
 
 def _mono_preview(text: object, limit: int) -> str:
@@ -171,7 +180,8 @@ async def start_engagement_wizard(callback: CallbackQuery, state: FSMContext):
         await callback.message.edit_text(
             "*⚡ Только ответы*\n\n"
             "Этот тип заказа работает с *уже существующим* комментарием: главные комментарии не публикуются.\n"
-            "Лучше указывать username автора: так софт сначала ищет точный текст именно у этого автора.\n\n"
+            "Софт отвечает на первый найденный комментарий со словом или фразой из вашего запроса. "
+            "Регистр и смайлики не учитываются. Можно ограничить поиск username автора.\n\n"
             "🔗 *Шаг 1:* Отправьте ссылку на видео TikTok:",
             reply_markup=InlineKeyboardMarkup(inline_keyboard=[
                 [InlineKeyboardButton(text="❌ Отмена", callback_data="menu:main")]
@@ -205,9 +215,10 @@ async def process_video_url(message: Message, state: FSMContext):
         
         await message.answer(
             "*⚡ Только ответы*\n\n"
-            "🔍 *Шаг 2:* Отправьте username автора и текст комментария.\n\n"
-            "Лучший формат: `@username: текст комментария`\n"
-            "Можно отправить только текст, но с username поиск точнее.",
+            "🔍 *Шаг 2:* Отправьте слово или фразу для поиска.\n\n"
+            "Например: `где посмотреть` — найдём первый комментарий с этой фразой.\n"
+            "Регистр и смайлики игнорируются; слова должны идти подряд.\n"
+            "Для поиска у конкретного автора: `@username: где посмотреть`.",
             reply_markup=InlineKeyboardMarkup(inline_keyboard=[
                 [InlineKeyboardButton(text="❌ Отмена", callback_data="menu:main")]
             ]),
@@ -228,6 +239,9 @@ async def process_comment_text(message: Message, state: FSMContext):
         
         if not comment_text:
             await message.answer("❌ Текст комментария не может быть пустым.")
+            return
+        if not normalize_search_phrase(comment_text):
+            await message.answer("❌ Укажите слово или фразу: одних смайликов недостаточно для поиска.")
             return
         
         await state.update_data(
@@ -685,7 +699,7 @@ async def show_engagement_preview(message_or_callback: Message | CallbackQuery, 
         preview_text = "*⚡ Только ответы · подтверждение*\n\n"
         preview_text += f"🔗 *Видео:* {escape_markdown_simple((video_url or '')[:70])}{'...' if video_url and len(video_url) > 70 else ''}\n\n"
 
-        preview_text += "🔍 *Поиск:* точный текст комментария\n"
+        preview_text += "🔍 *Поиск:* первое совпадение слова/фразы, без регистра и смайликов\n"
         preview_text += f"📝 *Текст:* {_mono_preview(comment_text, 120)}\n"
         preview_text += "👤 *Автор:* не проверяем\n\n"
 
@@ -725,7 +739,7 @@ async def show_engagement_preview(message_or_callback: Message | CallbackQuery, 
         rows.append(
             [InlineKeyboardButton(text="❌ Отмена", callback_data="menu:main")]
         )
-        keyboard = InlineKeyboardMarkup(inline_keyboard=rows)
+        keyboard = reply_visibility_keyboard(InlineKeyboardMarkup(inline_keyboard=rows), bool(data.get("verify_reply_visibility", False)))
         
         if isinstance(message_or_callback, Message):
             await message_or_callback.answer(preview_text, reply_markup=keyboard, parse_mode="Markdown")
@@ -818,8 +832,8 @@ async def confirm_engagement_order(callback: CallbackQuery, state: FSMContext):
             await state.clear()
             return
 
-        if not comment_text:
-            await callback.answer("Не хватает текста комментария. Начните заново.", show_alert=True)
+        if not normalize_search_phrase(comment_text):
+            await callback.answer("Укажите слово или фразу для поиска, а не только смайлики. Начните заново.", show_alert=True)
             await state.clear()
             return
 
@@ -870,6 +884,7 @@ async def confirm_engagement_order(callback: CallbackQuery, state: FSMContext):
 
         task_settings = {
             "origin": "engagement_only",
+            "verify_reply_visibility": bool(data.get("verify_reply_visibility", False)),
             "reply_count": len(replies),
             "replies": replies,
             "delays": True,
@@ -877,7 +892,7 @@ async def confirm_engagement_order(callback: CallbackQuery, state: FSMContext):
             "rotate_accounts": True,
             "account_pool_mode": account_pool_mode,
             "engagement_comment_text": comment_text,
-            "comment_text_match": "exact",
+            "comment_text_match": "phrase",
             "boost_likes_enabled": effective_likes_enabled,
         }
         if data.get("username"):

@@ -20,6 +20,14 @@ def test_sanitize_url_redacts_query_secrets_and_credentials():
     assert "keep=ok" in safe
 
 
+def test_sanitize_url_redacts_scheme_less_proxy_credentials():
+    safe = sanitize_url("proxy-user:proxy-pass@10.0.0.5:8080")
+
+    assert "proxy-user" not in safe
+    assert "proxy-pass" not in safe
+    assert safe.endswith("@10.0.0.5:8080")
+
+
 def test_setup_logging_keeps_httpx_request_logs_below_info():
     setup_logging(level="INFO")
 

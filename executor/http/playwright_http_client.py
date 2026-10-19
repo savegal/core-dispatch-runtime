@@ -1,16 +1,22 @@
 """
-Playwright HTTP Client - HTTP-клиент на основе Playwright APIRequestContext.
+Playwright HTTP Client - HTTP-клиент с транспортом через window.fetch страницы.
 
 Использует живые cookies и headers из browser context для выполнения запросов к TikTok API.
 Это более надежный подход, чем попытка генерировать подписи вручную.
 """
 import logging
 import json
+import asyncio
+from urllib.parse import parse_qs, urlparse
 from typing import Optional, Dict, Any, Tuple
 from datetime import datetime, timezone
 from patchright.async_api import APIRequestContext, Page, BrowserContext
 from executor.http.request_profile import RequestProfile
+from executor.http.execution_policy import valid_comment_id
+from services.execution_attempts import track_publication_requests
 from executor.http.signature_runtime import resolve_request_signature
+from executor.http.request_evidence import observe_request_security, resolve_security_evidence
+from services.cookie_validator import normalize_cookie_records
 from executor.http.retry_policy import (
     RetryPolicy, HttpErrorType, classify_http_error,
     STANDARD_POLICY
@@ -18,6 +24,41 @@ from executor.http.retry_policy import (
 
 logger = logging.getLogger("executor.http.playwright_client")
 _SHORTLINK_HOST_MARKERS = ("vt.tiktok.com", "vm.tiktok.com")
+_PAGE_FETCH_JS = """
+async ({url, method, headers, form_data, timeout_ms}) => {
+    const controller = new AbortController();
+    let timedOut = false;
+    const timer = setTimeout(() => {
+        timedOut = true;
+        controller.abort();
+    }, timeout_ms);
+    try {
+        const options = {
+            method,
+            headers,
+            credentials: "include",
+            signal: controller.signal,
+        };
+        if (method !== "GET" && method !== "HEAD") {
+            options.body = new URLSearchParams(form_data).toString();
+            options.headers = {...headers, "content-type": "application/x-www-form-urlencoded; charset=UTF-8"};
+        }
+        // Use the live page function so its interceptor sees the POST body.
+        const response = await window.fetch(url, options);
+        return {
+            status: response.status,
+            url: response.url,
+            headers: Object.fromEntries(response.headers.entries()),
+            text: await response.text(),
+        };
+    } catch (error) {
+        if (timedOut) throw new Error("Request timeout during window.fetch");
+        throw error;
+    } finally {
+        clearTimeout(timer);
+    }
+}
+"""
 
 
 def mask_cookies(cookies: Dict[str, str]) -> Dict[str, str]:
@@ -60,13 +101,15 @@ def _extract_comment_id(response_data: Optional[Dict[str, Any]]) -> Optional[str
     Supports:
     - {"comment": {"cid"/"comment_id"/"id": ...}}
     - {"data": {"comment": {...}}}
-    - {"data": {"cid"/"comment_id"/"id": ...}}
-    - {"cid"/"comment_id"/"id": ...}
+    - {"data": {"cid"/"comment_id": ...}}
+    - {"cid"/"comment_id": ...}
+
+    Generic envelope IDs can identify a request rather than a comment.
     """
     if not isinstance(response_data, dict):
         return None
 
-    containers: list[Dict[str, Any]] = [response_data]
+    containers: list[Dict[str, Any]] = []
 
     comment_data = response_data.get("comment")
     if isinstance(comment_data, dict):
@@ -74,17 +117,53 @@ def _extract_comment_id(response_data: Optional[Dict[str, Any]]) -> Optional[str
 
     data = response_data.get("data")
     if isinstance(data, dict):
-        containers.append(data)
         nested_comment = data.get("comment")
         if isinstance(nested_comment, dict):
             containers.append(nested_comment)
+        containers.append(data)
+    containers.append(response_data)
 
     for container in containers:
-        for key in ("cid", "comment_id", "id"):
+        keys = ("cid", "comment_id", "id") if container is comment_data or container is (data.get("comment") if isinstance(data, dict) else None) else ("cid", "comment_id")
+        for key in keys:
             comment_id = _normalize_identifier(container.get(key))
-            if comment_id:
+            if valid_comment_id(comment_id):
                 return comment_id
 
+    return None
+
+
+def _extract_comment_author(response_data: Optional[Dict[str, Any]]) -> Optional[str]:
+    """Read the published comment's author from either supported API envelope."""
+    if not isinstance(response_data, dict):
+        return None
+    data = response_data.get("data")
+    for envelope in (response_data, data):
+        if not isinstance(envelope, dict):
+            continue
+        comment = envelope.get("comment")
+        user = comment.get("user") if isinstance(comment, dict) else None
+        if not isinstance(user, dict):
+            continue
+        for name in ("unique_id", "username"):
+            value = user.get(name)
+            if isinstance(value, str) and value.strip():
+                return value.strip()
+    return None
+
+
+def _extract_comment_user_id(response_data):
+    if not isinstance(response_data, dict):
+        return None
+    for envelope in (response_data, response_data.get("data")):
+        if not isinstance(envelope, dict):
+            continue
+        comment = envelope.get("comment")
+        user = comment.get("user") if isinstance(comment, dict) else None
+        if isinstance(user, dict):
+            value = user.get("uid") or user.get("user_id_str") or user.get("user_id")
+            if value is not None and str(value).strip():
+                return str(value).strip()
     return None
 
 
@@ -165,7 +244,7 @@ def _extract_reply_network_metadata(response_data: Optional[Dict[str, Any]]) -> 
     if not isinstance(response_data, dict):
         return metadata
 
-    containers: list[Dict[str, Any]] = [response_data]
+    containers: list[Dict[str, Any]] = []
 
     comment_data = response_data.get("comment")
     if isinstance(comment_data, dict):
@@ -173,10 +252,11 @@ def _extract_reply_network_metadata(response_data: Optional[Dict[str, Any]]) -> 
 
     data = response_data.get("data")
     if isinstance(data, dict):
-        containers.append(data)
         nested_comment = data.get("comment")
         if isinstance(nested_comment, dict):
             containers.append(nested_comment)
+        containers.append(data)
+    containers.append(response_data)
 
     for container in containers:
         if metadata["direct_parent_id"] is None:
@@ -230,6 +310,166 @@ def _classify_api_response_error(response_data: Optional[Dict[str, Any]]) -> Tup
     return HttpErrorType.API_ERROR, message
 
 
+_ACCOUNT_WEB_IDENTITY_CACHE: Dict[int, Dict[str, str]] = {}
+
+
+def extract_web_identity_from_cookies(cookies: Any) -> Dict[str, str]:
+    """Extract persisted (device_id, odin_id, web_id_last_time) metadata from Account.cookies."""
+    if not cookies:
+        return {}
+    parsed: Dict[str, Any] = {}
+    if isinstance(cookies, dict):
+        parsed = cookies
+    else:
+        try:
+            from services.cookie_validator import parse_cookies_to_dict
+            parsed = parse_cookies_to_dict(str(cookies))
+        except Exception:
+            parsed = {}
+    if not isinstance(parsed, dict):
+        return {}
+    out: Dict[str, str] = {}
+    device_id = _normalize_identifier(parsed.get("device_id") or parsed.get("device-id"))
+    odin_id = _normalize_identifier(
+        parsed.get("odinId") or parsed.get("odin_id") or parsed.get("odin_tt")
+    )
+    wid_time = _normalize_identifier(
+        parsed.get("WebIdLastTime") or parsed.get("web_id_last_time")
+    )
+    if device_id:
+        out["device_id"] = device_id
+    if odin_id:
+        out["odin_id"] = odin_id
+    if wid_time:
+        out["web_id_last_time"] = wid_time
+    return out
+
+
+def seed_web_identity_from_account(account: Any, context: Any = None) -> Dict[str, str]:
+    """Restore persisted web identity from Account.cookies into in-memory cache and context."""
+    if account is None:
+        return {}
+    account_id = getattr(account, "id", None)
+    raw_cookies = getattr(account, "cookies", None)
+    if not raw_cookies and getattr(account, "cookie_file", None):
+        try:
+            from services.cookie_validator import get_cookies_for_account
+            raw_cookies = get_cookies_for_account(account)
+        except Exception:
+            raw_cookies = None
+    seeded = extract_web_identity_from_cookies(raw_cookies)
+    if not seeded:
+        return {}
+    merged: Dict[str, str] = dict(seeded)
+    if account_id is not None:
+        try:
+            acct_cached = _ACCOUNT_WEB_IDENTITY_CACHE.get(int(account_id))
+            if isinstance(acct_cached, dict):
+                for k, v in acct_cached.items():
+                    if v:
+                        merged[k] = str(v)
+            _ACCOUNT_WEB_IDENTITY_CACHE[int(account_id)] = dict(merged)
+        except (TypeError, ValueError):
+            pass
+    if context is not None:
+        ctx_cached = getattr(context, "_account_web_identity", None)
+        if isinstance(ctx_cached, dict):
+            for k, v in ctx_cached.items():
+                if v:
+                    merged[k] = str(v)
+        try:
+            setattr(context, "_account_web_identity", dict(merged))
+        except Exception:
+            pass
+    return merged
+
+
+def get_cached_web_identity(
+    account_id: Optional[int],
+    context: Any = None,
+    account: Any = None,
+) -> Dict[str, str]:
+    """Return cached (device_id, odin_id, web_id_last_time) for an account or browser context."""
+    if account is None and context is not None:
+        account = getattr(context, "_pool_account_obj", None)
+    if account is not None:
+        acct_id = account_id if account_id is not None else getattr(account, "id", None)
+        cached_entry = None
+        if acct_id is not None:
+            try:
+                cached_entry = _ACCOUNT_WEB_IDENTITY_CACHE.get(int(acct_id))
+            except (TypeError, ValueError):
+                cached_entry = None
+        if not isinstance(cached_entry, dict) or not (
+            cached_entry.get("device_id") and cached_entry.get("web_id_last_time")
+        ):
+            seed_web_identity_from_account(account, context=context)
+
+    merged: Dict[str, str] = {}
+    if account_id is not None:
+        try:
+            acct_cached = _ACCOUNT_WEB_IDENTITY_CACHE.get(int(account_id))
+            if isinstance(acct_cached, dict):
+                merged.update({k: str(v) for k, v in acct_cached.items() if v})
+        except (TypeError, ValueError):
+            pass
+    if context is not None:
+        ctx_cached = getattr(context, "_account_web_identity", None)
+        if isinstance(ctx_cached, dict):
+            merged.update({k: str(v) for k, v in ctx_cached.items() if v})
+    return merged
+
+
+def cache_web_identity(
+    account_id: Optional[int],
+    identity: Optional[Dict[str, Any]],
+    *,
+    context: Any = None,
+    account: Any = None,
+) -> Dict[str, str]:
+    """Persist (device_id, odin_id, web_id_last_time) on the context and per-account cache."""
+    if account is None and context is not None:
+        account = getattr(context, "_pool_account_obj", None)
+    if account_id is None and account is not None:
+        account_id = getattr(account, "id", None)
+    existing = get_cached_web_identity(account_id, context, account=account)
+    if not isinstance(identity, dict):
+        return existing
+    new_device_id = _normalize_identifier(identity.get("device_id"))
+    new_odin_id = _normalize_identifier(
+        identity.get("odin_id") or identity.get("odinId") or identity.get("odin_tt")
+    )
+    new_wid_time = _normalize_identifier(
+        identity.get("web_id_last_time") or identity.get("WebIdLastTime")
+    )
+    explicit_wid_time = bool(identity.get("_web_id_last_time_explicit"))
+
+    device_changed = bool(
+        new_device_id and existing.get("device_id") and new_device_id != existing.get("device_id")
+    )
+    updated = {} if device_changed else dict(existing)
+
+    if new_device_id:
+        updated["device_id"] = new_device_id
+    if new_odin_id:
+        updated["odin_id"] = new_odin_id
+    if new_wid_time:
+        if explicit_wid_time or device_changed or "web_id_last_time" not in updated:
+            updated["web_id_last_time"] = new_wid_time
+
+    if context is not None and updated:
+        try:
+            setattr(context, "_account_web_identity", dict(updated))
+        except Exception:
+            pass
+    if account_id is not None and updated:
+        try:
+            _ACCOUNT_WEB_IDENTITY_CACHE[int(account_id)] = dict(updated)
+        except (TypeError, ValueError):
+            pass
+    return updated
+
+
 async def _extract_runtime_profile(page: Page) -> Dict[str, Any]:
     current_url = None
     try:
@@ -251,23 +491,51 @@ async def _extract_runtime_profile(page: Page) -> Dict[str, Any]:
                     ? locale.split("-").slice(-1)[0].toUpperCase()
                     : null;
                 let nextRegion = null;
+                let deviceId = null;
+                let odinId = null;
+                let webIdLastTime = null;
+                let webIdLastTimeExplicit = false;
                 try {
+                    const universal = window.__UNIVERSAL_DATA_FOR_REHYDRATION__ || null;
+                    const scope = universal?.__DEFAULT_SCOPE__ || null;
+                    const appCtx = scope?.["webapp.app-context"] || scope?.["webapp.a-context"] || null;
                     const nextData = window.__NEXT_DATA__ || null;
+                    const pageProps = nextData?.props?.pageProps || null;
+                    const nextAppCtx = pageProps?.appContext || pageProps?.webappContext || null;
                     nextRegion =
-                        nextData?.props?.pageProps?.webappContext?.region ||
-                        nextData?.props?.pageProps?.appContext?.region ||
-                        nextData?.props?.pageProps?.region ||
+                        appCtx?.region ||
+                        nextAppCtx?.region ||
+                        pageProps?.region ||
                         null;
+                    const rawWid = appCtx?.wid || appCtx?.webId || nextAppCtx?.wid || nextAppCtx?.webId || null;
+                    if (rawWid && String(rawWid).trim()) {
+                        deviceId = String(rawWid).trim();
+                    }
+                    const rawOdin = appCtx?.odinId || nextAppCtx?.odinId || null;
+                    if (rawOdin && String(rawOdin).trim()) {
+                        odinId = String(rawOdin).trim();
+                    }
+                    const rawWidTime = appCtx?.wid_ct || appCtx?.webIdCreatedTime || nextAppCtx?.wid_ct || nextAppCtx?.webIdCreatedTime || null;
+                    if (rawWidTime && String(rawWidTime).trim()) {
+                        webIdLastTime = String(rawWidTime).trim();
+                        webIdLastTimeExplicit = true;
+                    } else if (deviceId || odinId || appCtx || nextAppCtx) {
+                        if (!window.__tt_web_id_last_time) {
+                            window.__tt_web_id_last_time = String(Math.floor(Date.now() / 1000));
+                        }
+                        webIdLastTime = window.__tt_web_id_last_time;
+                    }
                 } catch (error) {
                     nextRegion = null;
                 }
-                return {
+                const out = {
                     current_url: window.location.href,
                     user_agent: navigator.userAgent || null,
                     browser_language: navigator.language || null,
                     languages: Array.isArray(navigator.languages) ? navigator.languages : [],
                     locale,
                     region: nextRegion || localeRegion,
+                    ssr_region: nextRegion ? String(nextRegion).trim().toUpperCase() : null,
                     timezone: Intl.DateTimeFormat().resolvedOptions().timeZone || null,
                     platform: navigator.platform || null,
                     sec_ch_ua_platform: uaData && uaData.platform ? uaData.platform : null,
@@ -284,13 +552,50 @@ async def _extract_runtime_profile(page: Page) -> Dict[str, Any]:
                     cookie_enabled: !!navigator.cookieEnabled,
                     browser_online: typeof navigator.onLine === "boolean" ? navigator.onLine : true
                 };
-            }"""
+                if (deviceId) out.device_id = deviceId;
+                if (odinId) out.odin_id = odinId;
+                if (webIdLastTime) out.web_id_last_time = webIdLastTime;
+                if (webIdLastTimeExplicit) out._web_id_last_time_explicit = true;
+                return out;
+            }""",
+            isolated_context=False,
         )
     except Exception:
         profile = {}
 
     if not isinstance(profile, dict):
         profile = {}
+    context = getattr(page, "context", None)
+    account_obj = getattr(page, "_pool_account_obj", None) or getattr(context, "_pool_account_obj", None)
+    account_id = (
+        getattr(page, "_pool_account_id", None)
+        or getattr(context, "_pool_account_id", None)
+        or getattr(account_obj, "id", None)
+    )
+    cached_identity = cache_web_identity(account_id, profile, context=context, account=account_obj)
+    if account_obj is not None and (cached_identity.get("device_id") or cached_identity.get("web_id_last_time")):
+        try:
+            from services.cookie_persistence_service import save_warmed_cookies_for_account
+            save_warmed_cookies_for_account(account_obj, {}, context=context)
+        except Exception:
+            pass
+    profile.pop("_web_id_last_time_explicit", None)
+    for key in ("device_id", "odin_id", "web_id_last_time"):
+        if cached_identity.get(key):
+            profile[key] = cached_identity[key]
+    ssr_region = str(profile.get("ssr_region") or "").strip().upper()
+    if len(ssr_region) == 2 and ssr_region.isalpha() and ssr_region.isascii():
+        profile["ssr_region"] = ssr_region
+        if context is not None:
+            try:
+                setattr(context, "_account_ssr_region", ssr_region)
+            except Exception:
+                pass
+    else:
+        profile.pop("ssr_region", None)
+    proxy_in_use = getattr(context, "_account_proxy_in_use", None)
+    if isinstance(proxy_in_use, bool):
+        profile["proxy_in_use"] = proxy_in_use
     if current_url and not profile.get("current_url"):
         profile["current_url"] = current_url
     return profile
@@ -331,7 +636,7 @@ class PlaywrightHttpClient:
             host = (urlparse(video_url).netloc or "").lower()
             if any(marker in host for marker in _SHORTLINK_HOST_MARKERS):
                 current_url = str((runtime_profile or {}).get("current_url") or "").strip()
-                if current_url and "/video/" in current_url:
+                if current_url and ("/video/" in current_url or "/photo/" in current_url):
                     return current_url
         except Exception:
             return video_url
@@ -391,28 +696,6 @@ class PlaywrightHttpClient:
         )
         return any(marker in haystack for marker in suspicious_response_markers)
 
-    @staticmethod
-    def _should_block_unsigned_publish(
-        profile: RequestProfile,
-        signature_mode: str,
-        *,
-        page_present: bool,
-        signer_available: bool,
-    ) -> bool:
-        """
-        Blocks sensitive publish requests when a live page-based signer failed to
-        produce any usable signature.
-
-        WHY: for comment publish/reply we already have DOM fallback. Sending a
-        page-backed unsigned POST is usually lower-quality than failing fast and
-        letting the orchestrator choose the safer path.
-        """
-        if not page_present:
-            return False
-        if not profile.require_signature_on_page_path:
-            return False
-        return signature_mode == "unsigned" and signer_available
-    
     @classmethod
     async def from_page(cls, page: Page, retry_policy: Optional[RetryPolicy] = None) -> "PlaywrightHttpClient":
         """
@@ -462,7 +745,7 @@ class PlaywrightHttpClient:
         runtime_profile_override: Optional[Dict[str, Any]] = None
     ) -> Tuple[bool, Optional[Dict[str, Any]], Optional[str], Optional[HttpErrorType]]:
         """
-        Выполняет HTTP-запрос через Playwright APIRequestContext.
+        Выполняет запрос через window.fetch страницы, либо APIRequestContext без page.
         
         Args:
             profile: RequestProfile с шаблоном запроса
@@ -479,40 +762,11 @@ class PlaywrightHttpClient:
             "method": profile.method,
             "request_attempted": False,
             "attempt_count": 0,
+            "transport": "window.fetch" if self.page is not None else "request_context.fetch",
         }
         effective_runtime_profile = runtime_profile_override or self.runtime_profile
-        dynamic_params, url, signature_bundle = await resolve_request_signature(
-            page=self.page,
-            profile=profile,
-            dynamic_params=dynamic_params,
-            cookies=cookies,
-            runtime_profile=effective_runtime_profile,
-            allow_cookie_fallback=self.page is None,
-        )
-        headers = profile.build_headers(cookies, user_agent, runtime_profile=effective_runtime_profile)
-        form_data = profile.build_form_data(
-            dynamic_params,
-            cookies,
-            runtime_profile=effective_runtime_profile,
-            include_cookie_signatures=False,
-        )
-        request_signature_meta = {
-            "mode": signature_bundle.mode,
-            "source": signature_bundle.source,
-            "has_x_bogus": bool(signature_bundle.x_bogus),
-            "has_x_gnarly": bool(signature_bundle.x_gnarly),
-            "has_a_bogus": bool(signature_bundle.a_bogus),
-            "has_form_body": bool(form_data),
-            "signer_available": signature_bundle.signer_available,
-            "notes": signature_bundle.notes,
-        }
-        self.last_request_meta = {
-            "endpoint": profile.endpoint,
-            "method": profile.method,
-            "signature": dict(request_signature_meta),
-            "request_attempted": False,
-            "attempt_count": 0,
-        }
+        base_dynamic_params = dict(dynamic_params)
+        request_signature_meta = {}
 
         def _attach_request_meta(payload: Optional[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
             if not isinstance(payload, dict):
@@ -522,44 +776,45 @@ class PlaywrightHttpClient:
             enriched["__request_meta"] = dict(self.last_request_meta)
             return enriched
         
-        # Маскируем cookies для логирования
-        masked_cookies = mask_cookies(cookies or {})
-        
-        logger.debug(
-            f"[HTTP] {profile.method} {profile.endpoint} | "
-            f"correlation_id={correlation_id}, "
-            f"dynamic_params={list(dynamic_params.keys())}, "
-            f"form_keys={list(form_data.keys())}, "
-            f"cookies_keys={list(masked_cookies.keys())}, "
-            f"signature_mode={signature_bundle.mode}, "
-            f"signature_source={signature_bundle.source}, "
-            f"has_x_bogus={bool(signature_bundle.x_bogus)}, "
-            f"has_x_gnarly={bool(signature_bundle.x_gnarly)}, "
-            f"has_a_bogus={bool(signature_bundle.a_bogus)}"
-        )
-
-        if self._should_block_unsigned_publish(
-            profile,
-            signature_bundle.mode,
-            page_present=self.page is not None,
-            signer_available=signature_bundle.signer_available,
-        ):
-            error_msg = (
-                "HTTP publish blocked: runtime signer did not produce a usable "
-                "signature for a sensitive endpoint"
-            )
-            logger.warning(
-                f"[HTTP] Blocking unsigned sensitive request | "
-                f"correlation_id={correlation_id}, "
-                f"endpoint={profile.endpoint}, "
-                f"signature_source={signature_bundle.source}, "
-                f"signer_available={signature_bundle.signer_available}, "
-                f"notes={signature_bundle.notes}"
-            )
-            return False, None, error_msg, HttpErrorType.API_ERROR
-        
         for attempt in range(self.retry_policy.max_retries + 1):
             try:
+                attempt_cookies = dict(cookies or {})
+                if self.page is not None:
+                    live_cookies = normalize_cookie_records(await self.page.context.cookies())
+                    attempt_cookies.update(live_cookies)
+                attempt_params, url, signature_bundle = await resolve_request_signature(
+                    page=self.page,
+                    profile=profile,
+                    dynamic_params=dict(base_dynamic_params),
+                    cookies=attempt_cookies,
+                    runtime_profile=effective_runtime_profile,
+                    allow_cookie_fallback=self.page is None,
+                )
+                headers = profile.build_headers(attempt_cookies, user_agent, runtime_profile=effective_runtime_profile)
+                form_data = profile.build_form_data(
+                    attempt_params,
+                    attempt_cookies,
+                    runtime_profile=effective_runtime_profile,
+                    include_cookie_signatures=False,
+                )
+                request_signature_meta = {
+                    "mode": signature_bundle.mode,
+                    "source": signature_bundle.source,
+                    "has_x_bogus": bool(signature_bundle.x_bogus),
+                    "has_x_gnarly": bool(signature_bundle.x_gnarly),
+                    "has_a_bogus": bool(signature_bundle.a_bogus),
+                    "has_form_body": bool(form_data),
+                    "signer_available": signature_bundle.signer_available,
+                    "notes": signature_bundle.notes,
+                }
+                self.last_request_meta["signature"] = dict(request_signature_meta)
+                logger.debug(
+                    "[HTTP] %s %s | correlation_id=%s attempt=%s dynamic_params=%s form_keys=%s "
+                    "cookies_keys=%s signature_mode=%s signature_source=%s",
+                    profile.method, profile.endpoint, correlation_id, attempt + 1,
+                    list(attempt_params), list(form_data), list(mask_cookies(attempt_cookies)),
+                    signature_bundle.mode, signature_bundle.source,
+                )
                 self.last_request_meta["attempt_count"] = int(
                     self.last_request_meta.get("attempt_count") or 0
                 ) + 1
@@ -569,29 +824,79 @@ class PlaywrightHttpClient:
                 retry_timeout = 30000  # 30 секунд для retry
                 timeout_to_use = base_timeout if attempt == 0 else retry_timeout
                 
-                # Выполняем запрос через Playwright request context
-                # Playwright автоматически использует cookies из context
-                self.last_request_meta["request_attempted"] = True
                 self.last_request_meta["timeout_ms"] = timeout_to_use
-                response = await self.request_context.fetch(
-                    url,
-                    method=profile.method,
-                    headers=headers,
-                    form=form_data or None,
-                    timeout=timeout_to_use
-                )
+                if self.page is not None:
+                    # Browser-managed headers and cookies come from the live page.
+                    browser_headers = {
+                        key.lower(): value for key, value in headers.items()
+                        if key.lower() in {"accept", "tt-csrf-token", "content-type"}
+                    }
+                    if profile.method.upper() not in {"GET", "HEAD"}:
+                        browser_headers["content-type"] = "application/x-www-form-urlencoded; charset=UTF-8"
+                    detach = track_publication_requests(self.page, self.last_request_meta, flag="request_attempted")
+                    try:
+                        with observe_request_security(self.page, url, profile.method) as wire_evidence:
+                            browser_response = await self.page.evaluate(
+                                _PAGE_FETCH_JS,
+                                {
+                                    "url": url,
+                                    "method": profile.method.upper(),
+                                    "headers": browser_headers,
+                                    "form_data": form_data,
+                                    "timeout_ms": timeout_to_use,
+                                },
+                                isolated_context=False,
+                            )
+                        # A returned HTTP response also proves a dispatch for
+                        # minimal page adapters without request event support.
+                        self.last_request_meta["request_attempted"] = True
+                    finally:
+                        detach()
+                    response_headers = browser_response["headers"]
+                    status_code = browser_response["status"]
+                    response_url = browser_response.get("url")
+                    security = resolve_security_evidence(wire_evidence, response_url)
+                    self.last_request_meta.update(security)
+                    self.last_request_meta["observed_security_params"] = security["security_params"]
+                else:
+                    self.last_request_meta["request_attempted"] = True
+                    response = await self.request_context.fetch(
+                        url,
+                        method=profile.method,
+                        headers=headers,
+                        form=form_data or None,
+                        timeout=timeout_to_use,
+                    )
+                    response_headers = response.headers
+                    status_code = response.status
                 
                 # ИСПРАВЛЕНО: Проверяем Content-Type ответа перед парсингом
                 # Если TikTok вернул HTML (капча/WAF/редирект) - сразу классифицируем как FORBIDDEN/CAPTCHA
-                content_type = response.headers.get("content-type", "").lower()
-                status_code = response.status
+                content_type = response_headers.get("content-type", "").lower()
                 self.last_request_meta["response_status"] = status_code
                 self.last_request_meta["response_content_type"] = content_type
                 
                 # Получаем тело ответа
                 try:
-                    response_body = await response.text()
+                    response_body = browser_response["text"] if self.page is not None else await response.text()
+                    self.last_request_meta["response_body_len"] = len(response_body or "")
+                    logger.info(
+                        "[HTTP_RESPONSE] correlation_id=%s transport=%s attempt=%s status=%s body_len=%s security_params=%s security_params_source=%s",
+                        correlation_id, self.last_request_meta["transport"], attempt + 1, status_code,
+                        len(response_body or ""), self.last_request_meta.get("observed_security_params"),
+                        self.last_request_meta.get("security_params_source", "unavailable"),
+                    )
                     
+                    if status_code == 200 and not str(response_body or "").strip() and profile.endpoint == "/api/comment/publish/":
+                        error_type = HttpErrorType.FORBIDDEN
+                        error_msg = "TikTok stealth-reject: empty JSON response (body_len=0). Publication was not confirmed."
+                        redirected = any(marker in str(self._page_url_hint(self.page) or "").lower() for marker in ("/login", "/signup", "/verify", "/auth", "/messages", "/inbox"))
+                        if self.page is not None and attempt == 0 and self.retry_policy.max_retries > 0 and not redirected:
+                            self.last_request_meta["empty_body_retry_count"] = 1
+                            await asyncio.sleep(2.0)
+                            continue
+                        return False, None, error_msg, error_type
+
                     # ИСПРАВЛЕНО: Если Content-Type не JSON - это капча/WAF/редирект
                     if "application/json" not in content_type and status_code == 200:
                         # HTML ответ при 200 - это обычно капча или WAF
@@ -682,7 +987,7 @@ class PlaywrightHttpClient:
                                 "TikTok stealth-reject: empty JSON response "
                                 f"(body_len={len(response_body) if response_body else 0}, "
                                 f"content_type={content_type}). "
-                                "Session likely invalid for this endpoint."
+                                "Publication was not confirmed."
                             )
                             logger.warning(
                                 f"[HTTP] Stealth-reject detected | "
@@ -690,6 +995,15 @@ class PlaywrightHttpClient:
                                 f"page_url={current_page_url}, "
                                 f"redirected_page_state={redirected_page_state}"
                             )
+                            if (
+                                self.page is not None and attempt == 0 and self.retry_policy.max_retries > 0
+                                and not response_body.strip() and not redirected_page_state
+                                and profile.method.upper() == "POST" and "/api/comment/publish/" in profile.endpoint
+                            ):
+                                self.last_request_meta["empty_body_retry_count"] = 1
+                                logger.warning("[HTTP] Empty response; one HTTP retry after 2s initialization delay | correlation_id=%s", correlation_id)
+                                await asyncio.sleep(2.0)
+                                continue
                             return False, None, error_msg, error_type
                         if redirected_page_state:
                             error_type = HttpErrorType.FORBIDDEN
@@ -702,7 +1016,7 @@ class PlaywrightHttpClient:
                         if not self.retry_policy.should_retry(error_type, attempt):
                             return False, None, error_msg, error_type
                         continue
-                    elif status_code_in_body != 0:
+                    elif type(status_code_in_body) is not int or status_code_in_body != 0:
                         error_type, error_msg = _classify_api_response_error(response_data)
                         logger.warning(
                             f"[HTTP] API error in response | "
@@ -731,9 +1045,12 @@ class PlaywrightHttpClient:
                         has_confirmation = _extract_comment_id(response_data) is not None
                     
                     if has_confirmation:
+                        if profile.endpoint == "/api/comment/publish/":
+                            self.last_request_meta["comment_author"] = _extract_comment_author(response_data)
+                            self.last_request_meta["comment_author_uid"] = _extract_comment_user_id(response_data)
                         response_data = _attach_request_meta(response_data)
                         logger.info(
-                            f"[HTTP] Success (verified) | "
+                            f"[HTTP] Success (API receipt) | "
                             f"correlation_id={correlation_id}, "
                             f"method={profile.method}, "
                             f"endpoint={profile.endpoint}, "
@@ -743,37 +1060,12 @@ class PlaywrightHttpClient:
                         return True, response_data, None, None
                     else:
                         # status_code==0, но нет подтверждающих данных - подозрительно
-                        recovered_comment_id: Optional[str] = None
-                        is_publish_endpoint = profile.endpoint == "/api/comment/publish/"
-                        is_reply_request = bool(dynamic_params.get("reply_id"))
-                        if is_publish_endpoint and not is_reply_request:
-                            recovered_comment_id = await _recover_main_comment_id_via_dom(
-                                self.page,
-                                str(dynamic_params.get("text") or ""),
-                            )
-                            if recovered_comment_id:
-                                enriched_response = _inject_comment_id(
-                                    response_data,
-                                    recovered_comment_id,
-                                    confirmation_source="dom_recovery_after_http",
-                                )
-                                enriched_response = _attach_request_meta(enriched_response)
-                                logger.info(
-                                    f"[HTTP] Success via DOM confirmation recovery | "
-                                    f"correlation_id={correlation_id}, "
-                                    f"endpoint={profile.endpoint}, "
-                                    f"comment_id={recovered_comment_id[:20]}, "
-                                    f"signature_mode={signature_bundle.mode}"
-                                )
-                                return True, enriched_response, None, None
-
                         error_type = HttpErrorType.API_ERROR
                         error_msg = "Response OK but missing confirmation data (comment_id)"
                         logger.warning(
                             f"[HTTP] Missing confirmation in response | "
                             f"correlation_id={correlation_id}, "
                             f"response_keys={list(response_data.keys())[:10]}, "
-                            f"dom_recovered={bool(recovered_comment_id)}, "
                             f"signature_mode={signature_bundle.mode}"
                         )
                         if self._should_abort_local_retries(error_type, error_msg):
@@ -819,7 +1111,6 @@ class PlaywrightHttpClient:
                             f"attempt={attempt+1}/{self.retry_policy.max_retries+1}, "
                             f"error_type={error_type.value}"
                         )
-                        import asyncio
                         await asyncio.sleep(delay)
                     
             except Exception as e:
@@ -848,7 +1139,6 @@ class PlaywrightHttpClient:
                         f"correlation_id={correlation_id}, "
                         f"attempt={attempt+1}/{self.retry_policy.max_retries+1}"
                     )
-                    import asyncio
                     await asyncio.sleep(delay)
         
         return False, None, error_msg or "Max retries exceeded", error_type
@@ -1044,7 +1334,7 @@ class PlaywrightHttpClient:
                         f"direct_parent_id={str(response_parent_id)[:40] if response_parent_id else 'None'}, "
                         f"reply_to_reply_id={str(response_reply_to_reply_id)[:40] if response_reply_to_reply_id else 'None'}, "
                         f"root_comment_id={str(response_root_comment_id)[:40] if response_root_comment_id else 'None'}. "
-                        f"Treating as soft success and delegating strict parent confirmation to DOM fallback/verify."
+                        f"Publication returned an ID; parent confirmation remains unconfirmed."
                     )
 
             return True, comment_id, None, None, {
@@ -1078,7 +1368,7 @@ class PlaywrightHttpClient:
         **extra_params
     ) -> Tuple[bool, Optional[str], Optional[str], Optional[HttpErrorType]]:
         """
-        Публикует главный комментарий через HTTP (fallback на случай если DOM не работает).
+        Публикует главный комментарий через HTTP в контексте текущей страницы.
         
         Args:
             aweme_id: ID видео
@@ -1125,6 +1415,8 @@ class PlaywrightHttpClient:
             comment_id = _extract_comment_id(response_data)
             if not comment_id:
                 return False, None, "Response OK but missing comment_id", HttpErrorType.API_ERROR
+            self.last_request_meta["comment_author"] = _extract_comment_author(response_data)
+            self.last_request_meta["comment_author_uid"] = _extract_comment_user_id(response_data)
             return True, comment_id, None, None
         else:
             return False, None, error_msg, error_type

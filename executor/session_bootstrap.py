@@ -8,6 +8,7 @@ from typing import Dict, List, Optional
 
 from patchright.async_api import Page
 from executor.dom_actions import dismiss_cookie_banners
+from services.cookie_validator import normalize_cookie_records
 
 logger = logging.getLogger("executor.session_bootstrap")
 
@@ -86,8 +87,10 @@ async def extract_tiktok_username(page: Page) -> Optional[str]:
     """Возвращает реальный TikTok username залогиненного аккаунта.
 
     Ищется в нескольких источниках (в порядке надёжности):
-      1. window.__UNIVERSAL_DATA_FOR_REHYDRATION__ или __NEXT_DATA__
-         (uniqueId/secUid живут в user store)
+      1. Authenticated app-context in window.__UNIVERSAL_DATA_FOR_REHYDRATION__
+         or __NEXT_DATA__. Page-subject stores are deliberately ignored: on a
+         video/profile page they describe the creator being viewed, not the
+         account that owns the current browser session.
       2. Header avatar link href "/@username" (если рендерилась шапка)
       3. Cookie passport_csrf_token / sid_guard НЕ содержат username, поэтому
          не используем.
@@ -104,16 +107,16 @@ async def extract_tiktok_username(page: Page) -> Optional[str]:
                         const next = window.__NEXT_DATA__ || null;
                         const state = universal || next;
                         if (!state) return null;
-                        // typical paths in TikTok SPA state
+                        // Only authenticated app-context paths are safe here.
+                        // webapp.user-detail/pageProps.userInfo/serverCode.user
+                        // describe the viewed page subject and can point at the
+                        // video creator instead of the logged-in commenter.
                         const candidates = [
-                            state?.default?.['webapp.user-detail']?.userInfo?.user?.uniqueId,
                             state?.default?.['webapp.app-context']?.user?.uniqueId,
                             state?.['webapp.app-context']?.user?.uniqueId,
-                            state?.props?.pageProps?.serverCode?.user?.uniqueId,
-                            state?.props?.pageProps?.userInfo?.user?.uniqueId,
-                            state?.props?.initialProps?.$user?.uniqueId,
                             state?.props?.pageProps?.appContext?.user?.uniqueId,
                             state?.props?.pageProps?.webappContext?.user?.uniqueId,
+                            state?.props?.initialProps?.$user?.uniqueId,
                         ];
                         for (const c of candidates) {
                             if (typeof c === 'string' && c.trim()) return c.trim();
@@ -517,12 +520,21 @@ async def get_browser_login_state(page: Page) -> dict:
                         && st.opacity !== '0';
                 };
 
-                const textOf = (el) => (
-                    ((el && (el.innerText || el.textContent)) || '')
-                        .replace(/\s+/g, ' ')
-                        .trim()
-                        .toLowerCase()
-                );
+                // Reject ordinary feed text before any layout-dependent read.
+                // Previously every div/span walked up to 20 ancestors twice.
+                const rawTextCache = new WeakMap();
+                const visibleTextCache = new WeakMap();
+                const normalize = (text) => String(text || '').replace(/\s+/g, ' ').trim().toLowerCase();
+                const rawTextOf = (el) => {
+                    if (!el) return '';
+                    if (!rawTextCache.has(el)) rawTextCache.set(el, normalize(el.textContent));
+                    return rawTextCache.get(el);
+                };
+                const textOf = (el) => {
+                    if (!el) return '';
+                    if (!visibleTextCache.has(el)) visibleTextCache.set(el, normalize(el.innerText || el.textContent));
+                    return visibleTextCache.get(el);
+                };
 
                 const labelOf = (el) => [
                     textOf(el),
@@ -580,14 +592,11 @@ async def get_browser_login_state(page: Page) -> dict:
                         'span',
                         'p',
                     ].join(','))
-                ].filter(visible).filter((el) => {
-                    if (inCookieContext(el)) return false;
-                    const label = labelOf(el);
-                    const visibleText = textOf(el);
+                ].filter((el) => {
+                    const visibleText = rawTextOf(el);
                     const dataE2e = (el.getAttribute('data-e2e') || '').toLowerCase();
                     const aria = (el.getAttribute('aria-label') || '').toLowerCase();
                     if (!visibleText && !dataE2e && !aria && !(el.getAttribute('href') || '')) return false;
-                    if (visibleText.length > 90) return false;
                     const loginLabels = [
                         'log in',
                         'login',
@@ -618,12 +627,15 @@ async def get_browser_login_state(page: Page) -> dict:
                     const matches = (value) => loginLabels.some((needle) => (
                         value === needle || value.startsWith(needle + ' ') || value.startsWith(needle + '\n')
                     ));
-                    return matches(visibleText)
-                        || matches(aria)
-                        || dataE2e.includes('login-button')
-                        || dataE2e === 'login'
-                        || label.includes('/login')
-                        || label.includes('/signup');
+                    const href = (el.getAttribute('href') || '').toLowerCase();
+                    const metadataMatch = matches(aria) || dataE2e.includes('login-button')
+                        || dataE2e === 'login' || href.includes('/login') || href.includes('/signup');
+                    // Hidden descendants can precede the rendered label. Use
+                    // a permissive text-only prefilter, then the visible label.
+                    if (!loginLabels.some(needle => visibleText.includes(needle)) && !metadataMatch) return false;
+                    if (!visible(el) || inCookieContext(el)) return false;
+                    const renderedText = textOf(el);
+                    return renderedText.length <= 90 && (matches(renderedText) || metadataMatch);
                 });
 
                 const stateText = [
@@ -656,16 +668,16 @@ async def get_browser_login_state(page: Page) -> dict:
 
                 const commentLoginNodes = [
                     ...document.querySelectorAll('button, a, [role="button"], div, span, p')
-                ].filter(visible).filter((el) => {
-                    if (inCookieContext(el)) return false;
-                    const t = textOf(el);
+                ].filter((el) => {
+                    const t = rawTextOf(el);
                     if (!t || t.length > 120) return false;
-                    return t.includes('log in to comment')
+                    const matches = (t) => t.includes('log in to comment')
                         || t.includes('login to comment')
                         || t.includes('log in to view comments')
                         || t.includes('log in to reply')
                         || t.includes('log in to like')
                         || t.includes('sign in to comment');
+                    return matches(t) && visible(el) && !inCookieContext(el) && matches(textOf(el));
                 });
 
                 const loggedInSelectors = [
@@ -692,6 +704,8 @@ async def get_browser_login_state(page: Page) -> dict:
 
                 const navSignals = [];
                 for (const el of document.querySelectorAll('a, button, [role="button"]')) {
+                    const raw = rawTextOf(el);
+                    if (raw !== 'messages' && !raw.includes('notifications')) continue;
                     if (!visible(el)) continue;
                     const text = textOf(el);
                     if (text === 'messages' || text.includes('notifications')) {
@@ -858,7 +872,7 @@ async def bootstrap_session(
         except Exception:
             break
 
-        cookies = {c["name"]: c["value"] for c in cookies_list}
+        cookies = normalize_cookie_records(cookies_list)
         generated = [name for name in GENERATED_COOKIES if name in cookies]
         auth = [name for name in AUTH_COOKIES if name in cookies]
 
@@ -932,7 +946,7 @@ async def bootstrap_session(
 
     try:
         cookies_list = await page.context.cookies()
-        cookies = {c["name"]: c["value"] for c in cookies_list}
+        cookies = normalize_cookie_records(cookies_list)
         result.cookies = cookies
         result.generated_present = [name for name in GENERATED_COOKIES if name in cookies]
         result.auth_present = [name for name in AUTH_COOKIES if name in cookies]

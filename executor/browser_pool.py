@@ -9,18 +9,31 @@ import hashlib
 import logging
 import re
 import threading
-from typing import Optional, Dict, Tuple
+from typing import Optional, Dict, Tuple, Any
 from datetime import datetime, timezone, timedelta
 from patchright.async_api import async_playwright, Playwright, Browser, BrowserContext, Page
 from db.models import Account
 from config.settings import get_settings
 from executor.tiktok_client import TikTokClientError
+from executor.browser_errors import is_driver_connection_closed
+from executor.dom_actions import _JS_SUPPRESS_KEYBOARD_SHORTCUTS_OVERLAY
 from executor.socks5_to_http_proxy import (
     cleanup_idle_local_http_proxies,
     get_local_http_proxy_for_socks5,
     release_local_http_proxy_for_socks5,
 )
 from services.metrics import set_gauge
+from services.cookie_validator import (
+    normalize_cookie_records,
+    normalize_cookies_for_browser,
+    prepare_cookies_for_context,
+)
+from executor.http.request_profile import resolve_request_geo
+from executor.device_profiles import (
+    RESOLUTIONS as _DESKTOP_RESOLUTIONS,
+    WINDOWS_GPUS as _DESKTOP_WEBGL_PAIRS,
+    desktop_hardware, build_device_profile, install_device_profile, prepare_device_page,
+)
 
 logger = logging.getLogger("executor.browser_pool")
 
@@ -43,6 +56,17 @@ _TIKTOK_VIDEO_HOST_MARKERS = (
     "v19-",
     "v26-",
 )
+_TIKTOK_BACKGROUND_API_MARKERS = (
+    "/api/recommend/",
+    "/api/post/item_list/",
+    "/api/im/",
+    "/api/fullpage/",
+)
+_TIKTOK_TELEMETRY_HOST_MARKERS = (
+    "mon.tiktokv.com",
+    "mcs.tiktokv.com",
+    "log.tiktokv.com",
+)
 
 _current_task_id: contextvars.ContextVar[int | None] = contextvars.ContextVar(
     "browser_pool_current_task_id",
@@ -59,6 +83,13 @@ def _looks_like_blockable_video_url(url: str | None) -> bool:
     if any(marker in safe_url for marker in _TIKTOK_VIDEO_URL_MARKERS):
         return True
     return any(marker in safe_url for marker in _TIKTOK_VIDEO_HOST_MARKERS)
+
+
+def _looks_like_blockable_background_request(url: str | None) -> bool:
+    # Never abort TikTok telemetry (mcs/mon/log.tiktokv.com) or background API
+    # endpoints (/api/recommend/, etc.): blocking them prevents webmssdk from
+    # completing its handshake/signing and triggers empty_body shadow-bans.
+    return False
 
 
 def _should_abort_resource(resource_type: str | None, url: str | None = None) -> bool:
@@ -87,128 +118,12 @@ def browser_pool_task_scope(task_id: int | None):
         _current_task_id.reset(token)
 
 
-_TIKTOK_SHORTCUTS_SUPPRESS_INIT_SCRIPT = r"""
-(() => {
-    const hasMarker = (txt) => {
-        txt = String(txt || '');
-        if (txt.includes('Introducing keyboard shortcuts')) return true;
-        const lower = txt.toLowerCase();
-        if (
-            lower.includes('browse your feed') &&
-            (lower.includes('scroll') || lower.includes('arrows on the right') || lower.includes('got it'))
-        ) return true;
-        return txt.includes('Go to previous video')
-            && txt.includes('Go to next video')
-            && txt.includes('Mute / unmute video')
-            && txt.includes('Play / Pause');
-    };
-
-    const kill = (el) => {
-        if (!el || el === document.body || el === document.documentElement) return 0;
-        try {
-            el.setAttribute('data-teletan-init-killed-shortcuts', '1');
-            el.style.setProperty('pointer-events', 'none', 'important');
-            el.style.setProperty('visibility', 'hidden', 'important');
-            el.style.setProperty('opacity', '0', 'important');
-            el.style.setProperty('display', 'none', 'important');
-            el.style.setProperty('z-index', '-1', 'important');
-            try { el.remove(); } catch (_) {}
-            return 1;
-        } catch (_) { return 0; }
-    };
-
-    const boundedOverlay = (el) => {
-        if (!el || !el.getBoundingClientRect) return false;
-        const r = el.getBoundingClientRect();
-        if (!(r.width > 120 && r.height > 80)) return false;
-        if (r.width > window.innerWidth * 0.95 || r.height > window.innerHeight * 0.95) return false;
-        if (r.x > window.innerWidth * 0.35 && r.y > window.innerHeight * 0.15) return true;
-        const st = getComputedStyle(el);
-        const z = parseInt(st.zIndex || '0', 10);
-        return st.position === 'fixed' || st.position === 'absolute' || z > 10;
-    };
-    const safeMarkerNode = (el) => {
-        if (!el || !el.getBoundingClientRect) return false;
-        const r = el.getBoundingClientRect();
-        if (r.width > window.innerWidth * 0.75 || r.height > window.innerHeight * 0.75) return false;
-        return r.width >= 20 && r.height >= 12;
-    };
-
-    const setSeen = () => {
-        try {
-            const keys = [
-                'tiktok_keyboard_shortcuts_seen',
-                'keyboard_shortcuts_seen',
-                'keyboardShortcutsSeen',
-                'keyboard_shortcuts_modal_seen',
-                'video_keyboard_shortcuts_seen',
-                'shortcut_guide_seen',
-                'shortcutGuideSeen',
-                'tiktok_shortcuts_guide_seen',
-                'webapp_keyboard_shortcuts_seen',
-                'tiktok_feed_navigation_guide_seen',
-                'feed_navigation_guide_seen',
-                'webapp_feed_navigation_guide_seen',
-                'tiktok_video_navigation_guide_seen',
-            ];
-            for (const k of keys) {
-                localStorage.setItem(k, '1');
-                sessionStorage.setItem(k, '1');
-            }
-        } catch (_) {}
-    };
-
-    const killOnce = () => {
-        setSeen();
-        let count = 0;
-        try {
-            for (const node of [...document.querySelectorAll('body *')]) {
-                const txt = node.innerText || node.textContent || '';
-                if (!hasMarker(txt)) continue;
-                let cur = node;
-                for (let i = 0; i < 10 && cur && cur !== document.body && cur !== document.documentElement; i++, cur = cur.parentElement) {
-                    const curTxt = cur.innerText || cur.textContent || '';
-                    if (!hasMarker(curTxt)) continue;
-                    if (boundedOverlay(cur)) count += kill(cur);
-                    else if (i <= 1 && safeMarkerNode(cur)) {
-                        try {
-                            cur.style.setProperty('pointer-events', 'none', 'important');
-                            cur.style.setProperty('visibility', 'hidden', 'important');
-                            cur.style.setProperty('opacity', '0', 'important');
-                            count++;
-                        } catch (_) {}
-                    }
-                }
-            }
-        } catch (_) {}
-        return count;
-    };
-
-    try {
-        if (!window.__teletanKeyboardShortcutsKillerInstalled) {
-            window.__teletanKeyboardShortcutsKillerInstalled = true;
-            window.__teletanKillKeyboardShortcuts = killOnce;
-            try {
-                const observer = new MutationObserver(() => { try { killOnce(); } catch (_) {} });
-                observer.observe(document.documentElement || document.body, {childList: true, subtree: true, attributes: true});
-                window.__teletanKeyboardShortcutsObserver = observer;
-            } catch (_) {}
-            try { setInterval(() => { try { killOnce(); } catch (_) {} }, 250); } catch (_) {}
-            try {
-                document.addEventListener('keydown', (e) => {
-                    if (e && (e.key === '?' || e.key === 'F1')) {
-                        e.preventDefault();
-                        e.stopPropagation();
-                        e.stopImmediatePropagation();
-                        setTimeout(killOnce, 0);
-                    }
-                }, true);
-            } catch (_) {}
-        }
-        killOnce();
-    } catch (_) {}
-})();
-"""
+# Use the same bounded DOM handler at document startup and during publication.
+# The previous private copy scanned layout text on every attribute mutation and
+# every 250 ms, even after the normal DOM handler had been fixed.
+_TIKTOK_SHORTCUTS_SUPPRESS_INIT_SCRIPT = (
+    "(" + _JS_SUPPRESS_KEYBOARD_SHORTCUTS_OVERLAY.strip() + ")();"
+)
 
 settings = get_settings()
 
@@ -256,18 +171,21 @@ async def _install_resource_blocking_routes(context: BrowserContext, account_id:
 
 def _positive_int_setting(name: str, default: int, *, minimum: int = 1, maximum: int = 10000) -> int:
     try:
-        value = int(getattr(settings, name, default) or default)
+        raw = getattr(settings, name, default)
+        value = default if raw is None else int(raw)
     except (TypeError, ValueError):
         value = default
     return max(minimum, min(maximum, value))
 
 
-def _is_mobile_user_agent(user_agent: str | None) -> bool:
-    user_agent_lower = (user_agent or "").lower()
-    return any(marker in user_agent_lower for marker in ["iphone", "android", "mobile", "ipad", "tablet"])
+def _desktop_hardware_profile_for_account(account) -> dict:
+    return desktop_hardware(account)
 
 
 def _desktop_viewport_size_for_account(account) -> tuple[int, int]:
+    if getattr(account, "id", None) is not None:
+        profile = _desktop_hardware_profile_for_account(account)
+        return profile["width"], profile["height"]
     has_proxy = bool(getattr(account, "proxy", None) and str(account.proxy).strip())
     if has_proxy:
         return (
@@ -281,12 +199,12 @@ def _desktop_viewport_size_for_account(account) -> tuple[int, int]:
 
 
 def _desktop_window_args_for_account(account) -> list[str]:
-    if _is_mobile_user_agent(getattr(account, "user_agent", None)):
-        return []
     if not bool(getattr(settings, "PLAYWRIGHT_SYNC_WINDOW_WITH_VIEWPORT", True)):
         return []
     width, height = _desktop_viewport_size_for_account(account)
     extra_height = _positive_int_setting("PLAYWRIGHT_WINDOW_EXTRA_HEIGHT", 90, minimum=0, maximum=240)
+    if getattr(account, "id", None) is not None:
+        extra_height = 0
     return [
         f"--window-size={width},{height + extra_height}",
         "--force-device-scale-factor=1",
@@ -353,6 +271,7 @@ class BrowserPool:
             max_browsers: Максимальное количество одновременно открытых браузеров (None = из settings)
         """
         self._lock = asyncio.Lock()
+        self._runtime_lock = asyncio.Lock()
         configured_max = max_browsers or settings.MAX_CONCURRENT_BROWSERS
         self.max_browsers = max(1, int(configured_max or 1))
         self._playwright: Optional[Playwright] = None
@@ -381,51 +300,50 @@ class BrowserPool:
         )
     
     async def _ensure_playwright(self):
-        """
-        ИСПРАВЛЕНО: Вспомогательный метод для гарантированной инициализации Playwright.
-        Должен вызываться внутри блокировки _lock.
-        
-        КРИТИЧНО: Этот метод НЕ создает новую блокировку, а использует существующую.
-        Все операции с Playwright должны быть атомарными внутри одной блокировки.
-        """
-        # ИСПРАВЛЕНО: Простая проверка - если Playwright None, создаем новый
+        # Acquires for different proxies run outside _lock. Serialize the
+        # asynchronous start itself, not just the assignment of its result.
+        async with self._runtime_lock:
+            await self._ensure_playwright_locked()
+
+    async def _reset_disconnected_runtime(self, failed_playwright: Optional[Playwright]) -> None:
+        async with self._lock:
+            async with self._runtime_lock:
+                # A late error from another acquire must not stop a replacement
+                # driver that has already recovered successfully.
+                if self._playwright is not failed_playwright or failed_playwright is None:
+                    return
+                self._playwright = None
+                proxy_sources = list(self._browser_proxy_keys.values())
+                self._browsers.clear()
+                self._browser_proxy_keys.clear()
+                self._contexts.clear()
+                self._context_last_used.clear()
+                self._account_browser_ids.clear()
+                self._sync_pool_metrics()
+                for proxy_source in proxy_sources:
+                    try:
+                        release_local_http_proxy_for_socks5(proxy_source)
+                    except Exception as exc:
+                        logger.debug("Disconnected driver proxy cleanup failed: %s", exc)
+                try:
+                    await asyncio.wait_for(failed_playwright.stop(), timeout=3.0)
+                except Exception as exc:
+                    logger.debug("Disconnected browser driver cleanup failed: %s", exc)
+                logger.warning("Browser driver disconnected; cleared stale pool handles for recovery")
+
+    async def _ensure_playwright_locked(self):
+        """Start the thread-local driver while holding the runtime lock."""
         if self._playwright is None:
             try:
-                logger.debug("Creating new Playwright instance...")
-                
-                # ИСПРАВЛЕНО: Используем глобальный синхронный lock для синхронизации создания Playwright
-                # Это предотвращает ситуации, когда несколько потоков одновременно создают Playwright
-                # и один из них может получить None из-за race condition
-                # Сначала проверяем с lock, затем создаем async, затем присваиваем с lock
-                should_create = False
-                with _playwright_init_lock:
-                    if self._playwright is None:
-                        should_create = True
-                
-                if should_create:
-                    # Создаем Playwright вне lock (async операция)
-                    playwright_instance = await async_playwright().start()
-                    if playwright_instance is None:
-                        raise TikTokClientError("Failed to start Playwright (returned None)")
-                    
-                    # Присваиваем с lock для защиты от race condition
-                    with _playwright_init_lock:
-                        # Двойная проверка - возможно другой поток уже создал
-                        if self._playwright is None:
-                            self._playwright = playwright_instance
-                            logger.info("Browser pool initialized")
-                        else:
-                            # Другой поток уже создал, используем его и закрываем наш
-                            logger.debug("Playwright was initialized by another thread, closing duplicate")
-                            try:
-                                await playwright_instance.stop()
-                            except Exception:
-                                pass
-            except Exception as e:
-                logger.error(f"Failed to initialize Playwright: {e}")
+                playwright_instance = await async_playwright().start()
+                if playwright_instance is None:
+                    raise TikTokClientError("Failed to start Playwright (returned None)")
+                self._playwright = playwright_instance
+                logger.info("Browser pool initialized")
+            except Exception as exc:
                 self._playwright = None
-                raise TikTokClientError(f"Failed to initialize Playwright: {str(e)[:200]}")
-        
+                raise TikTokClientError(f"Failed to initialize Playwright: {str(exc)[:200]}") from exc
+
         # ИСПРАВЛЕНО: Проверяем валидность Playwright атомарно
         # Проверяем наличие chromium атрибута
         if not hasattr(self._playwright, 'chromium') or self._playwright.chromium is None:
@@ -718,6 +636,7 @@ class BrowserPool:
                 self._sync_pool_metrics()
                 return True
 
+            await self._persist_context_cookies_before_close(context, account_id)
             try:
                 await context.close()
             except Exception as exc:
@@ -728,6 +647,25 @@ class BrowserPool:
             await self._cleanup_unused_browsers()
             self._sync_pool_metrics()
             return True
+
+    async def _persist_context_cookies_before_close(
+        self,
+        context: Any,
+        account_id: Optional[int] = None,
+    ) -> None:
+        """Best-effort flush of rotated cookies and JS web identity to DB before context close."""
+        account = getattr(context, "_pool_account_obj", None)
+        if account is None:
+            return
+        try:
+            from services.cookie_persistence_service import synchronize_browser_cookies
+            await synchronize_browser_cookies(context, account)
+        except Exception as exc:
+            logger.debug(
+                "Could not flush cookies before closing context account=%s: %s",
+                account_id or getattr(account, "id", None),
+                exc,
+            )
 
     async def close_context_for_account(self, account_id: int, *, reason: str | None = None) -> bool:
         """Close and forget one account context from the current pool."""
@@ -748,6 +686,7 @@ class BrowserPool:
                 account_id_int,
                 reason or "account_context_close",
             )
+            await self._persist_context_cookies_before_close(context, account_id_int)
             try:
                 pages = [page for page in context.pages if not page.is_closed()]
             except Exception:
@@ -773,6 +712,8 @@ class BrowserPool:
         for account_id, mapped_browser_id in list(self._account_browser_ids.items()):
             if mapped_browser_id == browser_id:
                 self._account_browser_ids.pop(account_id, None)
+                self._contexts.pop(account_id, None)
+                self._context_last_used.pop(account_id, None)
 
         if browser:
             try:
@@ -825,6 +766,7 @@ class BrowserPool:
             # это заметно ускоряет shutdown и не держит лишнюю память.
             for account_id, context in list(self._contexts.items()):
                 try:
+                    await self._persist_context_cookies_before_close(context, account_id)
                     pages = [page for page in context.pages if not page.is_closed()]
                     if pages:
                         await asyncio.gather(
@@ -913,6 +855,7 @@ class BrowserPool:
                 continue
             if account_id in self._contexts:
                 try:
+                    await self._persist_context_cookies_before_close(self._contexts[account_id], account_id)
                     await self._contexts[account_id].close()
                 except Exception as e:
                     logger.debug(f"Error closing old context for account {account_id}: {e}")
@@ -968,6 +911,9 @@ class BrowserPool:
         Raises:
             TikTokClientError: При ошибке создания контекста
         """
+        if not settings.USE_PROXY:
+            from services.dedicated_proxy_service import apply_dedicated_proxy
+            apply_dedicated_proxy(account)
         if not _browser_id_lock_held:
             account_proxy_for_lock = str(getattr(account, "proxy", "") or "").strip()
             proxy_source_for_lock = account_proxy_for_lock or None
@@ -999,12 +945,52 @@ class BrowserPool:
                 # Проверяем, есть ли уже контекст для этого аккаунта
                 if account_id in self._contexts:
                     context = self._contexts[account_id]
+                    requested_proxy = str(getattr(account, "proxy", "") or "").strip()
+                    requested_browser_id = self._make_browser_id(requested_proxy or None)
+                    mapped_browser_id = self._account_browser_ids.get(account_id)
+                    mapped_browser = self._browsers.get(mapped_browser_id)
+                    if mapped_browser is not None and not mapped_browser.is_connected():
+                        await self._close_browser(mapped_browser_id, reason="disconnected context owner")
+                        context = None
+                    if (
+                        context is not None
+                        and mapped_browser_id
+                        and mapped_browser_id != requested_browser_id
+                    ):
+                        # A Playwright context cannot change its browser-level
+                        # proxy. Reusing this account context after a DB proxy
+                        # reassignment would silently send TikTok traffic through
+                        # the old IP. Never interrupt an active page; otherwise
+                        # retire the stale context/browser before acquiring the
+                        # account on its currently assigned proxy.
+                        if self._context_has_busy_pages(account_id):
+                            raise TikTokClientError(
+                                f"Account {account_id} proxy changed while its browser context is busy"
+                            )
+                        logger.info(
+                            "Account %s proxy assignment changed; replacing stale browser context %s -> %s",
+                            account_id,
+                            mapped_browser_id,
+                            requested_browser_id,
+                        )
+                        try:
+                            await context.close()
+                        except Exception as close_error:
+                            logger.debug(
+                                "Error closing stale proxy context for account %s: %s",
+                                account_id,
+                                close_error,
+                            )
+                        self._contexts.pop(account_id, None)
+                        self._context_last_used.pop(account_id, None)
+                        self._account_browser_ids.pop(account_id, None)
+                        await self._cleanup_unused_browsers()
+                        context = None
                     # ИСПРАВЛЕНО: Проверяем, не закрыт ли контекст и не стал ли он None
                     if context is None:
                         logger.debug(f"Context for account {account_id} is None, creating new one")
-                        del self._contexts[account_id]
-                        if account_id in self._context_last_used:
-                            del self._context_last_used[account_id]
+                        self._contexts.pop(account_id, None)
+                        self._context_last_used.pop(account_id, None)
                         self._account_browser_ids.pop(account_id, None)
                     else:
                         try:
@@ -1032,6 +1018,7 @@ class BrowserPool:
 
                             # Создаём новую страницу
                             page = await context.new_page()
+                            await prepare_device_page(page)
                             self._mark_page_in_use(page, account_id)
                             self._sync_pool_metrics()
                             return context, page
@@ -1061,10 +1048,11 @@ class BrowserPool:
             # Импортируем функцию создания контекста из универсального клиента
             from executor.tiktok_client import _get_cookies_for_account, parse_cookies, _normalize_proxy_for_playwright
             
+            playwright_instance = self._playwright
             try:
                 # Получаем cookies
                 cookies_str = _get_cookies_for_account(account)
-                cookies_list = parse_cookies(cookies_str)
+                cookies_list = prepare_cookies_for_context(account, cookies_str, parse_fn=parse_cookies)
                 
                 # Находим или создаём браузер
                 # ИСПРАВЛЕНО: Используем отдельный браузер для каждого прокси
@@ -1111,8 +1099,9 @@ class BrowserPool:
                     browser = self._browsers[browser_id]
                     # Проверяем, что браузер ещё подключен
                     try:
-                        # Пробуем получить список контекстов - если браузер закрыт, это вызовет ошибку
-                        _ = browser.contexts
+                        # contexts is a cached list; only is_connected reports a disconnect.
+                        if not browser.is_connected():
+                            raise TikTokClientError("Browser is disconnected")
                     except Exception as e:
                         # Браузер закрыт или отключен, удаляем его и создадим новый
                         logger.debug(f"Browser {browser_id} is closed or disconnected: {e}, creating new one")
@@ -1165,6 +1154,8 @@ class BrowserPool:
                     
                     # WebRTC args применяются ВСЕГДА, не только при наличии прокси
                     launch_options.setdefault("args", [])
+                    if not proxy_source:
+                        launch_options["args"].append("--no-proxy-server")
                     # Headless через --headless=new (полный Chromium, а не headless-shell)
                     if settings.PLAYWRIGHT_HEADLESS:
                         launch_options["args"].append("--headless=new")
@@ -1179,28 +1170,16 @@ class BrowserPool:
                         "--no-default-browser-check",
                         "--disable-infobars",
                         "--disable-popup-blocking",
-                        "--ignore-certificate-errors",
 
-                        # ── WebRTC — отключаем утечку IP ───────────────────────────────────
-                        # `--disable-webrtc` полностью убирает WebRTC API → не будет
-                        # ICE candidates, не будет gathering реального LAN/WAN IP
-                        # вокруг прокси.
-                        "--disable-webrtc",
-                        "--disable-webrtc-hw-encoding",
-                        # WebRtcHideLocalIpsWithMdns ставился ранее в `disable-features`,
-                        # но имя фичи означает «скрывать local IP» — выключать её = РАСКРЫВАТЬ.
-                        # Поскольку весь WebRTC уже выключен, этот флаг не имеет эффекта
-                        # и убран как мёртвая (потенциально вводящая в заблуждение) опция.
+                        # ── WebRTC — предотвращаем утечку IP без удаления RTCPeerConnection ──
+                        "--force-webrtc-ip-handling-policy=disable_non_proxied_udp",
+                        "--enforce-webrtc-ip-permission-check",
 
                         # ── Производительность ─────────────────────────────────────────────
                         "--disable-dev-shm-usage",
                         "--no-sandbox",
                         "--disable-gpu-sandbox",
                     ])
-                    
-                    # Таймаут только для прокси (чтобы не ждать долго при проблемах с прокси)
-                    if "proxy" in launch_options:
-                        launch_options["args"].append("--timeout=60000")
                     
                     try:
                         logger.debug(f"Launching browser for account {account.id} with browser_id {browser_id}")
@@ -1272,6 +1251,9 @@ class BrowserPool:
                                 
                                 # Вызываем launch() с максимально свежей ссылкой
                                 browser = await final_chromium.launch(**launch_options)
+                                playwright_instance = final_check
+                                if self._playwright is not playwright_instance:
+                                    raise TikTokClientError("Driver connection closed during browser acquisition")
                                 break  # Успешно запустили браузер
                             except (AttributeError, TypeError) as launch_error:
                                 error_str = str(launch_error)
@@ -1398,8 +1380,9 @@ class BrowserPool:
                 # ИСПРАВЛЕНО: Дополнительная проверка перед созданием контекста
                 # Проверяем, что браузер действительно подключен и работает
                 try:
-                    # Пробуем получить список контекстов - это проверит, что браузер жив
-                    _ = browser.contexts
+                    # contexts remains readable even after a driver disconnect.
+                    if not browser.is_connected():
+                        raise TikTokClientError("Browser is disconnected")
                 except Exception as e:
                     # Браузер мертв, удаляем его и пробуем создать новый
                     logger.warning(f"Browser {browser_id} is dead before context creation: {e}, removing and retrying")
@@ -1408,88 +1391,32 @@ class BrowserPool:
                     # ИСПРАВЛЕНО: Передаем счетчик попыток
                     raise _RetryPageAcquire()
                 
-                # ИСПРАВЛЕНО: Определяем locale и timezone из country_code аккаунта
-                # Маппинг country_code -> (locale, timezone)
-                country_to_locale_tz = {
-                    "US": ("en-US", "America/New_York"),
-                    "GB": ("en-GB", "Europe/London"),
-                    "DE": ("de-DE", "Europe/Berlin"),
-                    "FR": ("fr-FR", "Europe/Paris"),
-                    "RU": ("ru-RU", "Europe/Moscow"),
-                    "UA": ("uk-UA", "Europe/Kyiv"),
-                    "PL": ("pl-PL", "Europe/Warsaw"),
-                    "IT": ("it-IT", "Europe/Rome"),
-                    "ES": ("es-ES", "Europe/Madrid"),
-                    "NL": ("nl-NL", "Europe/Amsterdam"),
-                    "CA": ("en-CA", "America/Toronto"),
-                    "AU": ("en-AU", "Australia/Sydney"),
-                    "JP": ("ja-JP", "Asia/Tokyo"),
-                    "KR": ("ko-KR", "Asia/Seoul"),
-                    "CN": ("zh-CN", "Asia/Shanghai"),
-                    "IN": ("en-IN", "Asia/Kolkata"),
-                    "BR": ("pt-BR", "America/Sao_Paulo"),
-                    "MX": ("es-MX", "America/Mexico_City"),
-                }
+                geo = resolve_request_geo(
+                    runtime_profile={
+                        "proxy_in_use": bool(proxy_source),
+                        "proxy_country_code": getattr(account, "proxy_country_code", None),
+                        "account_country_code": getattr(account, "country_code", None),
+                    },
+                    cookies=normalize_cookie_records(cookies_list),
+                )
+                locale = geo.get("browser_language")
                 
-                # Определяем locale и timezone
-                locale = "en-US"
-                timezone_id = "America/New_York"
-                if account.country_code:
-                    country_upper = account.country_code.upper()
-                    if country_upper in country_to_locale_tz:
-                        locale, timezone_id = country_to_locale_tz[country_upper]
-                
-                # КРИТИЧНО: Определяем тип устройства для эмуляции (Device Fingerprint)
-                # Проверяем user_agent аккаунта на наличие мобильных индикаторов
-                user_agent_lower = (account.user_agent or "").lower()
-                is_mobile_ua = any(marker in user_agent_lower for marker in ["iphone", "android", "mobile", "ipad", "tablet"])
-                
-                # КРИТИЧНО: Используем playwright.devices для эмуляции реального устройства
-                # Это предотвращает детект через navigator.maxTouchPoints, screen resolution, hardware concurrency
-                device_profile = None
-                if is_mobile_ua:
-                    # Мобильное устройство - используем iPhone 13
-                    try:
-                        # КРИТИЧНО: devices доступен через статический словарь в модуле playwright
-                        # Импортируем devices из playwright.sync_api или используем через async_playwright
-                        from patchright.sync_api import devices
-                        if "iPhone 13" in devices:
-                            device_profile = devices["iPhone 13"]
-                            logger.debug(f"Using iPhone 13 device profile for account {account.id} (mobile user_agent detected)")
-                        else:
-                            # Пробуем другие варианты iPhone
-                            for device_name in ["iPhone 13 Pro", "iPhone 12", "iPhone 13 Pro Max"]:
-                                if device_name in devices:
-                                    device_profile = devices[device_name]
-                                    logger.debug(f"Using {device_name} device profile for account {account.id} (mobile user_agent detected)")
-                                    break
-                    except (AttributeError, KeyError, ImportError) as e:
-                        logger.debug(f"Device profile not available ({e}), falling back to custom mobile profile")
-                        device_profile = None
-                
-                # Формируем context_options
-                context_options = {
-                    "locale": locale,
-                    "timezone_id": timezone_id,
-                }
-                
-                # КРИТИЧНО: Если есть device_profile - используем его (он уже содержит user_agent, viewport, deviceScaleFactor, hasTouch)
-                if device_profile:
-                    context_options.update(device_profile)
-                else:
-                    # Desktop - используем стандартные настройки
-                    import random as _random
-                    _chrome_versions = ["131.0.0.0", "132.0.0.0", "133.0.0.0", "134.0.0.0", "135.0.0.0"]
-                    _chrome_ver = _random.choice(_chrome_versions)
-                    context_options["user_agent"] = (
-                        account.user_agent or
-                        f"Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-                        f"(KHTML, like Gecko) Chrome/{_chrome_ver} Safari/537.36"
-                    )
-                    # Desktop не имеет touch-событий
-                    viewport_width, viewport_height = _desktop_viewport_size_for_account(account)
-                    context_options["viewport"] = {"width": viewport_width, "height": viewport_height}
-                
+                device = build_device_profile(
+                    account, getattr(playwright_instance, "devices", {}),
+                    getattr(browser, "version", None),
+                    _positive_int_setting("PLAYWRIGHT_WINDOW_EXTRA_HEIGHT", 90, minimum=0, maximum=240),
+                )
+                context_options = dict(device["options"])
+                # A direct connection uses Chromium's system timezone/locale.
+                # Account country and IDC hints only describe a proxied route.
+                if proxy_source:
+                    if locale:
+                        context_options["locale"] = locale
+                    if geo.get("tz_name"):
+                        context_options["timezone_id"] = geo["tz_name"]
+                logger.debug("Account %s device family=%s preset=%s", account.id,
+                             device["identity"]["family"], device["identity"]["preset"])
+
                 # КРИТИЧНО: Отключаем WebRTC для предотвращения утечки реального IP
                 # permissions=[] запрещает камеру/микрофон, что предотвращает WebRTC запросы
                 context_options["permissions"] = []  # Отключаем все permissions (включая geolocation для безопасности)
@@ -1517,7 +1444,8 @@ class BrowserPool:
                 
                 # ИСПРАВЛЕНО: Финальная проверка жизнеспособности браузера
                 try:
-                    _ = browser.contexts
+                    if not browser.is_connected():
+                        raise TikTokClientError("Browser is disconnected")
                 except Exception as e:
                     logger.warning(f"Browser {browser_id} is dead right before context creation: {e}, removing and retrying")
                     await self._close_browser(browser_id, reason="browser died before context creation")
@@ -1527,48 +1455,6 @@ class BrowserPool:
                 context = None
                 try:
                     context = await browser.new_context(**context_options)
-                    # Anti-detect init script — выполняется ДО любого JS на странице
-                    try:
-                        await context.add_init_script("""
-                            Object.defineProperty(navigator, 'webdriver', { get: () => undefined, configurable: true });
-                            if (!window.chrome) {
-                                window.chrome = {
-                                    runtime: { connect: () => {}, sendMessage: () => {} },
-                                    loadTimes: function() { return {}; },
-                                    csi: function() { return {}; },
-                                    app: { isInstalled: false },
-                                };
-                            }
-                            Object.defineProperty(navigator, 'plugins', {
-                                get: () => {
-                                    const plugins = [
-                                        { name: 'Chrome PDF Plugin', filename: 'internal-pdf-viewer', description: 'Portable Document Format' },
-                                        { name: 'Chrome PDF Viewer', filename: 'mhjfbmdgcfjbbpaeojofohoefgiehjai', description: '' },
-                                        { name: 'Native Client', filename: 'internal-nacl-plugin', description: '' },
-                                    ];
-                                    plugins.refresh = () => {};
-                                    plugins.item = (i) => plugins[i];
-                                    plugins.namedItem = (n) => plugins.find(p => p.name === n);
-                                    Object.setPrototypeOf(plugins, PluginArray.prototype);
-                                    return plugins;
-                                },
-                                configurable: true,
-                            });
-                            Object.defineProperty(navigator, 'languages', { get: () => ['en-US', 'en'], configurable: true });
-                            const _oq = window.navigator.permissions ? window.navigator.permissions.query : null;
-                            if (_oq) {
-                                window.navigator.permissions.query = (p) => (
-                                    p.name === 'notifications' ?
-                                        Promise.resolve({ state: Notification.permission }) : _oq(p)
-                                );
-                            }
-                            ['cdc_adoQpoasnfa76pfcZLmcfl_Array','cdc_adoQpoasnfa76pfcZLmcfl_Promise',
-                             'cdc_adoQpoasnfa76pfcZLmcfl_Symbol','__selenium_evaluate','__webdriver_evaluate',
-                             '__driver_evaluate','__webdriver_script_fn','__$webdriverAsyncExecutor',
-                             '__lastWatirAlert','__lastWatirConfirm','__lastWatirPrompt'].forEach(k => { try { delete window[k]; } catch(_) {} });
-                        """)
-                    except Exception as _init_err:
-                        logger.debug("Anti-detect init script failed: %s", _init_err)
                 except Exception as e:
                     # ИСПРАВЛЕНО: Обрабатываем все ошибки при создании контекста, включая TargetClosedError при shutdown
                     error_msg = str(e).lower()
@@ -1607,6 +1493,20 @@ class BrowserPool:
                 if context is None:
                     raise TikTokClientError(f"Failed to create browser context for account {account.id}")
 
+                context._account_proxy_in_use = bool(proxy_source)
+                context._pool_account_id = account.id
+                context._pool_account_obj = account
+                try:
+                    from executor.http.playwright_http_client import seed_web_identity_from_account
+                    seeded_identity = seed_web_identity_from_account(account, context=context)
+                    if seeded_identity.get("web_id_last_time"):
+                        await context.add_init_script(
+                            f"window.__tt_web_id_last_time = {json.dumps(str(seeded_identity['web_id_last_time']))};"
+                        )
+                except Exception:
+                    pass
+                await install_device_profile(context, device)
+
                 await _install_resource_blocking_routes(context, account.id)
                 context.set_default_timeout(settings.PLAYWRIGHT_TIMEOUT)
 
@@ -1622,6 +1522,7 @@ class BrowserPool:
                 accept_language_map = {
                     "en-US": "en-US,en;q=0.9",
                     "en-GB": "en-GB,en;q=0.9",
+                    "en-SG": "en-SG,en;q=0.9",
                     "de-DE": "de-DE,de;q=0.9,en;q=0.8",
                     "fr-FR": "fr-FR,fr;q=0.9,en;q=0.8",
                     "ru-RU": "ru-RU,ru;q=0.9,en;q=0.8",
@@ -1638,11 +1539,19 @@ class BrowserPool:
                     "en-IN": "en-IN,en;q=0.9",
                     "pt-BR": "pt-BR,pt;q=0.9,en;q=0.8",
                     "es-MX": "es-MX,es;q=0.9,en;q=0.8",
+                    "he-IL": "he-IL,he;q=0.9,en;q=0.8",
+                    "tr-TR": "tr-TR,tr;q=0.9,en;q=0.8",
+                    "kk-KZ": "kk-KZ,kk;q=0.9,ru;q=0.8,en;q=0.7",
                 }
-                accept_language = accept_language_map.get(locale, "en-US,en;q=0.9")
-                await context.set_extra_http_headers({
-                    "Accept-Language": accept_language
-                })
+                if proxy_source and locale:
+                    if locale in accept_language_map:
+                        accept_language = accept_language_map[locale]
+                    elif "-" in locale:
+                        primary_lang = locale.split("-")[0].lower()
+                        accept_language = f"{locale},en;q=0.9" if primary_lang == "en" else f"{locale},{primary_lang};q=0.9,en;q=0.8"
+                    else:
+                        accept_language = locale
+                    await context.set_extra_http_headers({"Accept-Language": accept_language})
                 
                 # Добавляем cookies
                 if cookies_list:
@@ -1655,6 +1564,7 @@ class BrowserPool:
                             raise TikTokClientError(f"Failed to add cookies: {cookie_error}")
 
                         temp_page = await context.new_page()
+                        await prepare_device_page(temp_page)
                         try:
                             wait_until_mode = "domcontentloaded"
                             timeout_for_proxy = settings.PLAYWRIGHT_TIMEOUT * 1.5
@@ -1672,121 +1582,9 @@ class BrowserPool:
                         finally:
                             await temp_page.close()
 
-                # ИСПРАВЛЕНО: Добавляем скрипты для маскировки НА КОНТЕКСТ, а не на временную страницу
-                # КРИТИЧНО: context.add_init_script применяется ко ВСЕМ страницам контекста
-                if settings.HUMAN_LIKE_BEHAVIOR:
-                    # УЛУЧШЕННАЯ МАСКИРОВКА (Stealth V2)
-                    # Включает:
-                    # 1. Скрытие webdriver
-                    # 2. Правильная эмуляция plugins (пустой список вместо [1..5])
-                    # 3. Шум для Canvas (уникализация отпечатка)
-                    # 4. Шум для WebGL (уникализация видеокарты)
-                    # 5. Маскировка разрешений и WebRTC
-                    await context.add_init_script("""
-                        // 1. Hide Webdriver
-                        Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
-                        
-                        // 2. Fix Plugins (Emulate empty list correctly)
-                        const mockPlugins = [];
-                        Object.defineProperty(navigator, 'plugins', { get: () => mockPlugins });
-                        Object.defineProperty(navigator, 'mimeTypes', { get: () => [] });
-                        
-                        // 3. Fix Languages
-                        Object.defineProperty(navigator, 'languages', { 
-                            get: () => ['en-US', 'en', 'ru-RU', 'ru'] 
-                        });
-                        
-                        // 4. Chrome Runtime Mock
-                        window.chrome = { runtime: {} };
-                        
-                        // 5. Permissions Mock
-                        const originalQuery = window.navigator.permissions.query;
-                        window.navigator.permissions.query = (parameters) => (
-                            parameters.name === 'notifications' ?
-                                Promise.resolve({ state: Notification.permission }) :
-                                originalQuery(parameters)
-                        );
-                        
-                        // 6. WebRTC Disable (Logic remains same)
-                        const originalRTCPeerConnection = window.RTCPeerConnection;
-                        if (originalRTCPeerConnection) {
-                            window.RTCPeerConnection = function(...args) {
-                                const pc = new originalRTCPeerConnection(...args);
-                                const originalCreateDataChannel = pc.createDataChannel;
-                                pc.createDataChannel = function() { throw new Error('WebRTC is disabled'); };
-                                return pc;
-                            };
-                            if (window.RTCPeerConnection.prototype) {
-                                window.RTCPeerConnection.prototype.getStats = () => Promise.resolve(new Map());
-                            }
-                        }
-
-                        // === CANVAS NOISE ===
-                        // Уникализируем рендеринг канваса, добавляя незаметный шум
-                        (function() {
-                            const shift = {
-                                'r': Math.floor(Math.random() * 10) - 5,
-                                'g': Math.floor(Math.random() * 10) - 5,
-                                'b': Math.floor(Math.random() * 10) - 5,
-                                'a': Math.floor(Math.random() * 10) - 5
-                            };
-                            // toDataURL noise
-                            const originalToDataURL = HTMLCanvasElement.prototype.toDataURL;
-                            HTMLCanvasElement.prototype.toDataURL = function(...args) {
-                                const ctx = this.getContext('2d');
-                                if (ctx) {
-                                    // Рисуем невидимый шум перед экспортом
-                                    const width = this.width;
-                                    const height = this.height;
-                                    const imageData = ctx.getImageData(0, 0, width, height);
-                                    // Модифицируем всего пару пикселей
-                                    for (let i = 0; i < Math.min(10, imageData.data.length); i += 4) {
-                                        imageData.data[i] = imageData.data[i] + shift.r;
-                                        imageData.data[i+1] = imageData.data[i+1] + shift.g;
-                                        imageData.data[i+2] = imageData.data[i+2] + shift.b;
-                                    }
-                                    ctx.putImageData(imageData, 0, 0);
-                                }
-                                return originalToDataURL.apply(this, args);
-                            };
-                            
-                            // getImageData noise
-                            const originalGetImageData = CanvasRenderingContext2D.prototype.getImageData;
-                            CanvasRenderingContext2D.prototype.getImageData = function(...args) {
-                                const imageData = originalGetImageData.apply(this, args);
-                                for (let i = 0; i < Math.min(100, imageData.data.length); i += 4) {
-                                     imageData.data[i] = imageData.data[i] + shift.r; // R
-                                     imageData.data[i+1] = imageData.data[i+1] + shift.g; // G
-                                     imageData.data[i+2] = imageData.data[i+2] + shift.b; // B
-                                }
-                                return imageData;
-                            };
-                        })();
-
-                        // === WEBGL NOISE ===
-                        // Уникализируем параметры видеокарты
-                        (function() {
-                            const config = {
-                                random: {
-                                    value: function() { return Math.random() }
-                                }
-                            };
-                            
-                            const getParameter = WebGLRenderingContext.prototype.getParameter;
-                            WebGLRenderingContext.prototype.getParameter = function(parameter) {
-                                // Spoof unmasked info to generic values or random
-                                if (parameter === 37445) { // UNMASKED_VENDOR_WEBGL
-                                    return 'Intel Inc.';
-                                }
-                                if (parameter === 37446) { // UNMASKED_RENDERER_WEBGL
-                                    return 'Intel Iris OpenGL Engine'; 
-                                }
-                                return getParameter.apply(this, [parameter]);
-                            };
-                        })();
-                    """)
-                
                 # Сохраняем контекст
+                if self._playwright is not playwright_instance:
+                    raise TikTokClientError("Driver connection closed during context acquisition")
                 self._contexts[account_id] = context
                 self._context_last_used[account_id] = datetime.now(timezone.utc)
                 self._account_browser_ids[account_id] = browser_id
@@ -1800,6 +1598,7 @@ class BrowserPool:
                 # stable on long worker runs.
                 try:
                     page = await context.new_page()
+                    await prepare_device_page(page)
                 except Exception as new_page_err:
                     logger.warning(
                         "new_page() failed for account %s — closing orphan context: %s",
@@ -1816,6 +1615,8 @@ class BrowserPool:
                     raise
                 self._mark_page_in_use(page, account_id)
                 await _log_page_window_metrics(page, account_id)
+                if self._playwright is not playwright_instance:
+                    raise TikTokClientError("Driver connection closed during page acquisition")
                 return context, page
                 
             except _RetryPageAcquire:
@@ -1826,11 +1627,23 @@ class BrowserPool:
                     retry_count,
                 )
                 continue
-            except TikTokClientError:
-                raise
             except Exception as e:
                 error_msg = str(e).lower()
                 full_error = str(e)
+
+                if is_driver_connection_closed(e):
+                    await self._reset_disconnected_runtime(playwright_instance)
+                    if retry_count < 3:
+                        retry_count += 1
+                        logger.warning(
+                            "Retrying account %s page acquisition after driver disconnect (retry=%s)",
+                            account_id, retry_count,
+                        )
+                        continue
+                    raise TikTokClientError(f"Browser driver unavailable after recovery: {full_error[:200]}") from e
+
+                if isinstance(e, TikTokClientError):
+                    raise
 
                 # Close orphan Playwright context: it was created via new_context()
                 # but never registered in self._contexts (failure between init
@@ -1863,7 +1676,8 @@ class BrowserPool:
                         browser = self._browsers[browser_id]
                         # Проверяем, не закрыт ли браузер
                         try:
-                            _ = browser.contexts
+                            if not browser.is_connected():
+                                raise TikTokClientError("Browser is disconnected")
                         except Exception:
                             # Браузер закрыт, удаляем его
                             logger.debug(f"Removing closed browser {browser_id} after context creation error")
@@ -1883,10 +1697,7 @@ class BrowserPool:
 import threading
 _thread_local = threading.local()
 
-# Глобальный синхронный lock для синхронизации инициализации Playwright между потоками
-# Это дополнительная защита от race conditions при создании Playwright экземпляров
-# Используем threading.Lock() т.к. он работает между разными потоками и event loops
-_playwright_init_lock = threading.Lock()
+
 
 def _get_thread_local_pool() -> Optional[BrowserPool]:
     """Получает thread-local browser pool."""

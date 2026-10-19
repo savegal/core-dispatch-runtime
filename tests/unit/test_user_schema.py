@@ -5,6 +5,14 @@
 в словарь для UI и решение по статусу заказа.
 """
 import pytest
+
+@pytest.fixture(autouse=True)
+def legacy_dom_mode(monkeypatch):
+    """These legacy DOM/concurrency cases opt out; HTTP cases enable it explicitly."""
+    from config.settings import get_settings
+    monkeypatch.setattr(get_settings(), "TIKTOK_NETWORK_FIRST", False)
+
+
 from types import SimpleNamespace
 
 import executor.user_schema as user_schema
@@ -162,7 +170,7 @@ def test_user_schema_preserves_non_fail_error_for_unconfirmed_result():
 
 
 @pytest.mark.unit
-def test_user_schema_status_unconfirmed_when_any_recorded_reply_failed():
+def test_user_schema_status_partial_when_any_recorded_reply_failed():
     res = UserSchemaResult(boost_enabled=False, boost_quantity=0)
     res.published_mains.append(
         PublishedMain(
@@ -192,7 +200,8 @@ def test_user_schema_status_unconfirmed_when_any_recorded_reply_failed():
 
     dct = res.to_dict()
 
-    assert dct["status"] == "submitted_unconfirmed"
+    assert dct["status"] == "partial"
+    assert dct["publication_complete"] is False
     assert dct["error"] == "reply_publication_incomplete"
 
 
@@ -229,7 +238,7 @@ def test_user_schema_reply_submitted_unconfirmed_without_visibility_is_attempted
 
     dct = res.to_dict()
 
-    assert dct["status"] == "submitted_unconfirmed"
+    assert dct["status"] == "partial"
     assert dct["error"] == "reply_publication_incomplete"
     assert dct["engagement"]["main"]["submitted_unconfirmed"] is False
     assert dct["engagement"]["main"]["visibility_status"] == "public_confirmed"
@@ -243,7 +252,96 @@ def test_user_schema_reply_submitted_unconfirmed_without_visibility_is_attempted
 
 
 @pytest.mark.unit
-def test_user_schema_status_unconfirmed_when_requested_reply_never_recorded():
+def test_user_schema_complete_soft_submitted_reply_stays_unconfirmed_not_partial():
+    res = UserSchemaResult(
+        boost_enabled=False,
+        boost_quantity=0,
+        expected_main_publications=1,
+        expected_reply_variants=1,
+        main_found_by_observer=True,
+    )
+    res.published_mains.append(
+        PublishedMain(
+            text="m1",
+            comment_id="cid",
+            network_confirmed=True,
+            local_confirmed=True,
+            method="hybrid_dom",
+            account_id=10,
+            tiktok_username=None,
+        )
+    )
+    res.replies.append(
+        ReplyOutcome(
+            text="r1",
+            variant_index=1,
+            matched_main_text="m1",
+            parent_comment_id="cid",
+            success=False,
+            method="hybrid_dom",
+            error="no_network_response_after_publish_request",
+            account_id=20,
+            attempted=True,
+            submitted_unconfirmed=True,
+            soft_submitted=True,
+        )
+    )
+
+    payload = res.to_dict()
+
+    assert payload["status"] == "submitted_unconfirmed"
+    assert payload["publication_complete"] is True
+    assert payload["engagement"]["replies"]["submitted"] == 0
+    assert payload["engagement"]["replies"]["completion_evidence"] == 1
+    assert payload["engagement"]["replies"]["missing"] == 0
+
+
+@pytest.mark.unit
+def test_duplicate_reply_records_do_not_complete_two_parent_targets():
+    res = UserSchemaResult(
+        boost_enabled=False,
+        boost_quantity=0,
+        expected_main_publications=2,
+        expected_reply_variants=1,
+        main_found_by_observer=True,
+    )
+    for index in (1, 2):
+        res.published_mains.append(
+            PublishedMain(
+                text=f"m{index}",
+                comment_id=f"cid-{index}",
+                network_confirmed=True,
+                local_confirmed=True,
+                method="hybrid_dom",
+                account_id=10 + index,
+                tiktok_username=None,
+            )
+        )
+    for account_id in (20, 21):
+        res.replies.append(
+            ReplyOutcome(
+                text="r1",
+                variant_index=1,
+                matched_main_text="m1",
+                parent_comment_id="cid-1",
+                success=True,
+                method="hybrid_dom",
+                error=None,
+                account_id=account_id,
+                attempted=True,
+                parent_target_id="account:11:text:m1",
+            )
+        )
+
+    payload = res.to_dict()
+
+    assert payload["status"] == "partial"
+    assert payload["engagement"]["replies"]["submitted"] == 1
+    assert payload["engagement"]["replies"]["missing"] == 1
+
+
+@pytest.mark.unit
+def test_user_schema_status_partial_when_requested_reply_never_recorded():
     res = UserSchemaResult(boost_enabled=False, boost_quantity=0)
     res.expected_reply_variants = 1
     res.published_mains.append(
@@ -261,7 +359,8 @@ def test_user_schema_status_unconfirmed_when_requested_reply_never_recorded():
 
     dct = res.to_dict()
 
-    assert dct["status"] == "submitted_unconfirmed"
+    assert dct["status"] == "partial"
+    assert dct["publication_complete"] is False
     assert dct["error"] == "reply_publication_incomplete"
     assert dct["engagement"]["replies"]["requested_variants"] == 1
 
@@ -334,6 +433,18 @@ def test_user_schema_reply_summary_reports_matrix_expected_submissions():
         )
     )
     res.main_found_by_observer = True
+    for idx in range(2, 10):
+        res.published_mains.append(
+            PublishedMain(
+                text=f"m{idx}",
+                comment_id=f"cid-{idx}",
+                network_confirmed=True,
+                local_confirmed=True,
+                method="hybrid_dom",
+                account_id=10 + idx,
+                tiktok_username=None,
+            )
+        )
     for idx in range(1, 10):
         res.replies.append(
             ReplyOutcome(
@@ -352,7 +463,8 @@ def test_user_schema_reply_summary_reports_matrix_expected_submissions():
     dct = res.to_dict()
     replies = dct["engagement"]["replies"]
 
-    assert dct["status"] == "submitted_unconfirmed"
+    assert dct["status"] == "partial"
+    assert dct["publication_complete"] is False
     assert dct["error"] == "reply_publication_incomplete"
     assert replies["requested_variants"] == 3
     assert replies["expected_per_variant"] == 9

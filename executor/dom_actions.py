@@ -569,8 +569,11 @@ _JS_RESOLVE_COMMENT_INPUT_HANDLE = r"""
 _JS_FIND_POST_BUTTON = r"""
 () => {
     document
-        .querySelectorAll('[data-smart-id="comment-post"], [data-smart-id="comment-post-ready"]')
-        .forEach(el => el.removeAttribute('data-smart-id'));
+        .querySelectorAll('[data-smart-id="comment-post"], [data-smart-id="comment-post-ready"], [data-smart-main-post]')
+        .forEach(el => {
+            el.removeAttribute('data-smart-id');
+            el.removeAttribute('data-smart-main-post');
+        });
 
     const visible = (el) => {
         if (!el || !el.getBoundingClientRect) return false;
@@ -586,6 +589,30 @@ _JS_FIND_POST_BUTTON = r"""
                el.getAttribute('aria-disabled') === 'true' ||
                el.classList.contains('disabled') ||
                parseFloat(st.opacity || '1') < 0.5;
+    };
+
+    const replyScoped = (el) => {
+        for (let cur = el, depth = 0; cur && cur !== document.body && depth < 8; cur = cur.parentElement, depth++) {
+            if (cur.getAttribute && (
+                cur.getAttribute('data-smart-reply-input') ||
+                cur.getAttribute('data-smart-reply-composer') ||
+                cur.getAttribute('data-smart-reply-post') ||
+                cur.getAttribute('data-smart-reply-anchor-token')
+            )) return true;
+            const label = [
+                cur.getAttribute && (cur.getAttribute('data-e2e') || ''),
+                cur.getAttribute && (cur.getAttribute('aria-label') || ''),
+                cur.getAttribute && (cur.getAttribute('class') || ''),
+                cur.id || '',
+            ].join(' ').toLowerCase();
+            if (
+                label.includes('replycommenteditor') ||
+                label.includes('reply-comment-editor') ||
+                label.includes('reply-composer') ||
+                label.includes('comment-reply')
+            ) return true;
+        }
+        return false;
     };
 
     const clickTargetFor = (raw, opts = {}) => {
@@ -615,13 +642,14 @@ _JS_FIND_POST_BUTTON = r"""
         return null;
     };
 
-    const dataE2e = document.querySelector(
+    const dataE2e = [...document.querySelectorAll(
         '[data-e2e="comment-post"], [data-e2e*="comment-post"], [data-e2e="post-comment-button"]'
-    );
+    )].find(el => !replyScoped(el));
     if (dataE2e) {
         const target = clickTargetFor(dataE2e, {allowUpperViewport: true});
-        if (target) {
+        if (target && !replyScoped(target)) {
             target.setAttribute('data-smart-id', 'comment-post');
+            target.setAttribute('data-smart-main-post', '1');
             return {
                 found: true,
                 strategy: target === dataE2e ? 'data-e2e' : 'data-e2e-clickable-ancestor',
@@ -630,8 +658,9 @@ _JS_FIND_POST_BUTTON = r"""
                 targetPointerEvents: getComputedStyle(target).pointerEvents,
             };
         }
-        if (visible(dataE2e)) {
+        if (visible(dataE2e) && !replyScoped(dataE2e)) {
             dataE2e.setAttribute('data-smart-id', 'comment-post');
+            dataE2e.setAttribute('data-smart-main-post', '1');
             return {
                 found: true,
                 strategy: 'data-e2e-pointer-events-none',
@@ -649,11 +678,13 @@ _JS_FIND_POST_BUTTON = r"""
         ...document.querySelectorAll('div[tabindex="0"]'),
     ];
     for (const el of buttons) {
+        if (replyScoped(el)) continue;
         const text = (((el.textContent || '') + ' ' + (el.getAttribute('aria-label') || '')).trim()).toLowerCase();
         if (postKeywords.some(k => text.includes(k))) {
             const target = clickTargetFor(el);
-            if (target) {
+            if (target && !replyScoped(target)) {
                 target.setAttribute('data-smart-id', 'comment-post');
+                target.setAttribute('data-smart-main-post', '1');
                 return { found: true, strategy: 'text-heuristic' };
             }
         }
@@ -677,8 +708,44 @@ _JS_FIND_POST_BUTTON = r"""
 }
 """
 
+# Shared by reply composer discovery and every reply-send recovery path.
+# Geometry/old bindings cannot turn an explicitly labelled reaction into Send.
+_JS_REPLY_SEND_CONTROL_GUARD = r"""
+    const isNonSendReplyControl = (raw) => {
+        if (!raw || !raw.getAttribute) return false;
+        const editorSelector = '[contenteditable="true"], textarea, input, [role="textbox"]';
+        if (raw.matches(editorSelector) || raw.querySelector(editorSelector)) return true;
+        const interactive = raw.closest('button, [role="button"], div[tabindex="0"], a');
+        const nodes = new Set([raw]);
+        if (interactive) nodes.add(interactive);
+        // Include icon wrappers, but never the draft or the whole comment row.
+        for (let cur = raw.parentElement, depth = 0; cur && depth < 2; cur = cur.parentElement, depth++) {
+            if (cur.querySelector(editorSelector)) break;
+            nodes.add(cur);
+            if (cur === interactive) break;
+        }
+        const metadata = [...nodes].flatMap(node =>
+            ['data-e2e', 'data-testid', 'aria-label', 'title', 'class']
+                .map(attr => node.getAttribute(attr) || '')
+        ).join(' ').replace(/([a-z])([A-Z])/g, '$1 $2').toLowerCase();
+        const control = interactive || raw;
+        const text = (control.innerText || control.textContent || '').trim().toLowerCase();
+        const label = metadata + ' ' + (text.length <= 100 ? text : '');
+        if (/(?:^|[\s_-])(?:unlike|likes?|liked|digg|share|repost|follow|unfollow|bookmark|save|collect|favorites?|favourites?)(?=$|[\s_-])/.test(label)) return true;
+        if (/(?:^|[\s_-])(?:нравится|лайк|лайки|поделиться|подписаться|сохранить|репост)(?=$|[\s_-])/.test(label)) return true;
+        // Reply opens a thread; a reply-send control may legitimately have
+        // "Reply" in its class, so only reject the action's explicit label/id.
+        return [...nodes].some(node => {
+            const e2e = (node.getAttribute('data-e2e') || '').toLowerCase();
+            const action = (node.getAttribute('aria-label') || node.getAttribute('title') || '').trim().toLowerCase();
+            return /^comment-reply(?:-\d+)?$/.test(e2e) || /^(?:reply|ответить)$/.test(action);
+        }) || /^(?:reply|ответить)$/.test(text);
+    };
+"""
+
 _JS_FIND_REPLY_INPUT = r"""
 ([parentAnchorToken, expectedParentText, expectedParentId]) => {
+    __REPLY_SEND_CONTROL_GUARD__
     document
         .querySelectorAll('[data-smart-reply-input], [data-smart-reply-composer], [data-smart-reply-post], [data-smart-reply-anchor-token]')
         .forEach(el => {
@@ -807,7 +874,14 @@ _JS_FIND_REPLY_INPUT = r"""
     const isSearchOrAuth = (el) => {
         let cur = el;
         for (let depth = 0; depth < 8 && cur && cur !== document.body && cur !== document.documentElement; depth++, cur = cur.parentElement) {
-            const label = labelOf(cur);
+            // Comment text is user content, not evidence of a login/search UI.
+            // Reading ancestor innerText here rejected every editor in a list
+            // containing a comment such as "search", "login" or "password".
+            const label = [
+                cur.id || '', String(cur.className || ''),
+                ...['data-e2e', 'aria-label', 'placeholder', 'data-placeholder', 'name', 'type']
+                    .map(attr => cur.getAttribute && (cur.getAttribute(attr) || '')),
+            ].join(' ').toLowerCase();
             if (
                 label.includes('search') ||
                 label.includes('captcha') ||
@@ -874,7 +948,7 @@ _JS_FIND_REPLY_INPUT = r"""
     };
     const clickTargetFor = (raw, composerRect, inputRect, options = {}) => {
         const allowDisabled = Boolean(options && options.allowDisabled);
-        if (!raw) return null;
+        if (!raw || isNonSendReplyControl(raw)) return null;
         const candidates = [
             raw,
             raw.closest && raw.closest('button'),
@@ -885,7 +959,7 @@ _JS_FIND_REPLY_INPUT = r"""
         ].filter(Boolean);
         const seen = new Set();
         for (const el of candidates) {
-            if (!el || seen.has(el) || !visible(el)) continue;
+            if (!el || seen.has(el) || !visible(el) || isNonSendReplyControl(el)) continue;
             seen.add(el);
             const r = el.getBoundingClientRect();
             if (!r || r.width > 360 || r.height > 160) continue;
@@ -914,6 +988,7 @@ _JS_FIND_REPLY_INPUT = r"""
             ...root.querySelectorAll('svg')
         ];
         for (const raw of rawButtons) {
+            if (isNonSendReplyControl(raw)) continue;
             const label = labelOf(raw);
             const rawRect = raw.getBoundingClientRect ? raw.getBoundingClientRect() : null;
             const iconNearInput = rawRect && inputRect &&
@@ -1012,6 +1087,11 @@ _JS_FIND_REPLY_INPUT = r"""
         if (!visible(editor) && !(raw && visible(raw)) && !(editor.parentElement && visible(editor.parentElement))) continue;
         const rect = editorRect(editor, raw);
         if (!rect || rect.width < 40 || rect.height < 4) continue;
+        const ownerAnchor = editor.closest && editor.closest('[data-smart-parent-anchor]');
+        if (ownerAnchor && ownerAnchor !== anchor) {
+            rejected.push({ reason: 'other_parent_composer', rect: rectObj(rect) });
+            continue;
+        }
         const inParentSubtree = anchor.contains(editor) || anchor.contains(raw);
         const boundedBelowParent =
             rect.top >= anchorRect.bottom - 28 &&
@@ -1023,7 +1103,10 @@ _JS_FIND_REPLY_INPUT = r"""
             rejected.push({ reason: 'outside_parent_bounds', rect: rectObj(rect) });
             continue;
         }
-        if (looksMainComposer(editor, raw, rect)) {
+        // Inline reply editors may reuse data-e2e="comment-input" and the
+        // default "Add a comment" placeholder. Their exact parent subtree is
+        // stronger evidence than this generic label; global inputs still fail.
+        if (!inParentSubtree && looksMainComposer(editor, raw, rect)) {
             rejected.push({ reason: 'global_main_composer', rect: rectObj(rect) });
             continue;
         }
@@ -1119,7 +1202,7 @@ _JS_FIND_REPLY_INPUT = r"""
         rejected: rejected.slice(-8),
     });
 }
-"""
+""".replace("__REPLY_SEND_CONTROL_GUARD__", _JS_REPLY_SEND_CONTROL_GUARD)
 
 _JS_FIND_REPLY_INPUT_HANDLE = (
     "([parentAnchorToken, expectedParentText, expectedParentId]) => {\n"
@@ -1542,6 +1625,7 @@ async def atomic_set_comment_text(
 
 _JS_FIND_REPLY_POST_BUTTON = r"""
 () => {
+    __REPLY_SEND_CONTROL_GUARD__
     document
         .querySelectorAll('[data-smart-id="comment-post"], [data-smart-id="comment-post-ready"]')
         .forEach(el => {
@@ -1563,7 +1647,7 @@ _JS_FIND_REPLY_POST_BUTTON = r"""
             parseFloat(st.opacity || '1') < 0.5;
     };
     const clickTargetFor = (raw, allowDisabled = false) => {
-        if (!raw) return null;
+        if (!raw || isNonSendReplyControl(raw)) return null;
         const candidates = [
             raw,
             raw.closest('button'),
@@ -1576,7 +1660,7 @@ _JS_FIND_REPLY_POST_BUTTON = r"""
         for (const el of candidates) {
             if (seen.has(el)) continue;
             seen.add(el);
-            if (!visible(el)) continue;
+            if (!visible(el) || isNonSendReplyControl(el)) continue;
             const r = el.getBoundingClientRect();
             if (r.width > 360 || r.height > 140) continue;
             if (getComputedStyle(el).pointerEvents === 'none') continue;
@@ -1604,6 +1688,7 @@ _JS_FIND_REPLY_POST_BUTTON = r"""
     if (
         input &&
         markedPost &&
+        !isNonSendReplyControl(markedPost) &&
         visible(markedPost) &&
         (!markedComposer || markedComposer.contains(markedPost)) &&
         !disabled(markedPost)
@@ -1666,7 +1751,7 @@ _JS_FIND_REPLY_POST_BUTTON = r"""
 
     return { found: false, reason: input ? 'reply_post_not_found_near_input' : 'reply_input_missing_for_post' };
 }
-"""
+""".replace("__REPLY_SEND_CONTROL_GUARD__", _JS_REPLY_SEND_CONTROL_GUARD)
 
 _JS_FIND_REPLY_POST_BUTTON_HANDLE = (
     "() => {\n"
@@ -1679,7 +1764,7 @@ _JS_FIND_REPLY_POST_BUTTON_HANDLE = (
     "    }\n"
     "    try { window.__smartReplyPostProbeState = result || null; } catch (_) {}\n"
     "    if (!result || !result.found) return null;\n"
-    "    const marked = document.querySelector('[data-smart-reply-post=\"1\"]');\n"
+    "    const marked = document.querySelector('[data-smart-id=\"comment-post\"][data-smart-reply-post=\"1\"]');\n"
     "    if (!marked) {\n"
     "        try { window.__smartReplyPostProbeState = { ...result, found: false, reason: 'reply_marked_post_missing_after_probe' }; } catch (_) {}\n"
     "        return null;\n"
@@ -1949,6 +2034,48 @@ _JS_OPEN_COMMENTS_MAIN_FAST = r"""
         '[class*="CommentList"], [class*="DivCommentListContainer"]'
     );
     const listVisible = visible(list);
+    if (listVisible) {
+        return {
+            input_pending: true,
+            list_visible: true,
+            main_fast: true,
+            action: 'main_fast_existing_comment_list',
+        };
+    }
+
+    // Current TikTok feed pages keep multiple videos mounted. Pick the stable
+    // comment-icon belonging to the video actually intersecting the viewport;
+    // a simple DOM-first match can click a previous/off-screen feed card.
+    const viewportCommentIcons = Array.from(
+        document.querySelectorAll('[data-e2e="comment-icon"][role="button"], [data-e2e="comment-icon"]')
+    ).filter((el) => {
+        if (!visible(el)) return false;
+        const r = el.getBoundingClientRect();
+        return r.bottom > 0 && r.top < window.innerHeight && r.right > 0 && r.left < window.innerWidth;
+    }).sort((a, b) => {
+        const ar = a.getBoundingClientRect();
+        const br = b.getBoundingClientRect();
+        const centerY = window.innerHeight / 2;
+        return Math.abs((ar.top + ar.bottom) / 2 - centerY) - Math.abs((br.top + br.bottom) / 2 - centerY);
+    });
+    if (viewportCommentIcons.length) {
+        const clickTarget = viewportCommentIcons[0];
+        clickTarget.setAttribute('data-smart-id', 'comment-open-trigger');
+        const r = clickTarget.getBoundingClientRect();
+        return {
+            click: true,
+            comment_icon: true,
+            current_viewport_video: true,
+            main_fast: true,
+            target_tag: clickTarget.tagName,
+            target_aria: clickTarget.getAttribute('aria-label'),
+            target_text: (clickTarget.innerText || clickTarget.textContent || '').trim().slice(0, 80),
+            x: r.x,
+            y: r.y,
+            w: r.width,
+            h: r.height,
+        };
+    }
 
     const normalize = (value) => String(value || '').replace(/\s+/g, ' ').trim().toLowerCase();
     const labelsOf = (el) => {
@@ -2305,14 +2432,34 @@ _JS_COMMENT_SURFACE_STATE = r"""
             if (!isRealScrollContainer(node)) return -1;
             const rect = node.getBoundingClientRect();
             const strongItems = visibleNodes(node, strongItemSelectors).length;
-            return strongItems * 1000 + Math.min(node.clientHeight, 1200) + Math.min(rect.width, 800);
+            let overflowBonus = 0;
+            try {
+                const style = getComputedStyle(node);
+                if (/(auto|scroll|overlay)/i.test(`${style.overflowY || ''} ${style.overflow || ''}`)) {
+                    overflowBonus = 400;
+                }
+            } catch (_) {}
+            return strongItems * 1000 + overflowBonus + Math.min(node.clientHeight, 1200) + Math.min(rect.width, 800);
         };
         let scrollNode = chosenList.el;
         try {
             const descendants = Array.from(chosenList.el.querySelectorAll('*')).filter(visible);
-            const candidates = [chosenList.el, ...descendants]
+            const ancestors = [];
+            const chosenRect = chosenList.el.getBoundingClientRect();
+            for (let cur = chosenList.el.parentElement, depth = 0;
+                cur && cur !== document.body && cur !== document.documentElement && depth < 7;
+                cur = cur.parentElement, depth++) {
+                if (!visible(cur)) continue;
+                const rect = cur.getBoundingClientRect();
+                const sameCommentColumn =
+                    rect.left >= chosenRect.left - Math.max(100, chosenRect.width * 0.4) &&
+                    rect.right <= Math.min(window.innerWidth + 4, chosenRect.right + Math.max(180, chosenRect.width * 0.6)) &&
+                    rect.width <= Math.max(760, chosenRect.width * 1.9);
+                if (sameCommentColumn) ancestors.push(cur);
+            }
+            const candidates = [chosenList.el, ...descendants, ...ancestors]
                 .map((node) => ({ node, score: scoreScrollNode(node) }))
-                .filter((item) => item.score >= 0)
+                .filter((item) => item.score >= 0 && visibleNodes(item.node, strongItemSelectors).length > 0)
                 .sort((a, b) => b.score - a.score);
             scrollNode = candidates.length ? candidates[0].node : chosenList.el;
         } catch (_) {}
@@ -2386,21 +2533,20 @@ _JS_DISMISS_COOKIE_BANNERS = r"""
     const lowerTextOf = (el) => textOf(el).toLowerCase();
 
     const cookieTextMarkers = [
-        'cookie',
-        'cookies',
         'allow cookies',
+        'accept cookies',
         'optional cookies',
+        'cookie policy',
         'cookies policy',
+        'use cookies',
+        'uses cookies',
         'tiktok uses cookies',
         'manage your choices',
         'essential cookies',
-        'consent',
-        'gdpr',
-        '\u30af\u30c3\u30ad\u30fc',
-        '\ucfe0\ud0a4',
-        '\u997c\u5e72',
-        '\u96b1\u79c1',
-        '\u9690\u79c1'
+        '\u30af\u30c3\u30ad\u30fc\u3092\u8a31\u53ef',
+        '\ucfe0\ud0a4 \ud5c8\uc6a9',
+        '\u96b1\u79c1\u8a2d\u5b9a',
+        '\u9690\u79c1\u8bbe\u7f6e'
     ];
 
     const acceptTextMarkers = [
@@ -2435,16 +2581,23 @@ _JS_DISMISS_COOKIE_BANNERS = r"""
         (el && el.getAttribute && (el.getAttribute('aria-label') || '')) || '',
     ].join(' ').toLowerCase();
 
+    const contentSelector = '[data-e2e*="comment" i], [data-smart-id*="comment" i], ' +
+        '[data-smart-parent-anchor], [contenteditable="true"], textarea, ' +
+        '[data-e2e*="video-desc" i], [data-e2e="browse-video-desc"]';
+    const isUserContent = (el) => Boolean(el && el.closest && el.closest(contentSelector));
     const looksLikeCookieElement = (el) => {
+        if (isUserContent(el)) return false;
         const label = tagClassId(el);
-        const text = lowerTextOf(el);
-        return cookieTextMarkers.some(marker => text.includes(marker) || label.includes(marker))
-            || label.includes('cookie')
-            || label.includes('consent')
-            || label.includes('gdpr');
+        if (/cookie|consent|gdpr/.test(label)) return true;
+        // Generic words in a caption (e.g. "Cookie Dough") are not consent UI.
+        // Avoid innerText/layout reads of large page containers on every mutation.
+        if (el.querySelector && el.querySelector(contentSelector + ', video')) return false;
+        const text = String(el.textContent || '').trim().toLowerCase();
+        return text.length <= 2000 && cookieTextMarkers.some(marker => text.includes(marker));
     };
 
     const hasCookieContext = (el) => {
+        if (isUserContent(el)) return false;
         let cur = el;
         for (let depth = 0; depth < 20 && cur && cur !== document.body && cur !== document.documentElement; depth++, cur = cur.parentElement) {
             if (looksLikeCookieElement(cur)) return true;
@@ -2495,7 +2648,7 @@ _JS_DISMISS_COOKIE_BANNERS = r"""
         const buttons = nodes.filter((el) => {
             const tag = (el.tagName || '').toLowerCase();
             const role = (el.getAttribute && el.getAttribute('role')) || '';
-            return (tag === 'button' || role === 'button') && visible(el);
+            return (tag === 'button' || role === 'button') && !isUserContent(el) && hasAcceptLabel(el) && visible(el);
         });
         for (const button of buttons) {
             if (hasAcceptLabel(button) && hasCookieContext(button)) {
@@ -2522,7 +2675,7 @@ _JS_DISMISS_COOKIE_BANNERS = r"""
             })
         ];
         for (const el of candidates) {
-            if (!visible(el)) continue;
+            if (!looksLikeCookieElement(el) || !visible(el)) continue;
             const r = el.getBoundingClientRect();
             const text = lowerTextOf(el);
             const isBottomBand = r.width > window.innerWidth * 0.55 && r.height > 70 && r.top > window.innerHeight * 0.55;
@@ -2530,7 +2683,7 @@ _JS_DISMISS_COOKIE_BANNERS = r"""
             const hasAcceptButton = nestedButtons.some(hasAcceptLabel);
             const looksCookie = looksLikeCookieElement(el);
             if (!looksCookie && !(isBottomBand && hasAcceptButton)) continue;
-            if (el.querySelector && el.querySelector('[data-e2e*="comment" i], [data-smart-id*="comment" i], [contenteditable="true"], textarea')) {
+            if (isUserContent(el) || (el.querySelector && el.querySelector(contentSelector))) {
                 continue;
             }
 
@@ -2554,8 +2707,16 @@ _JS_DISMISS_COOKIE_BANNERS = r"""
         if (!window.__teletanCookieBannerKillerInstalled) {
             window.__teletanCookieBannerKillerInstalled = true;
             try {
+                // React can produce dozens of mutations while mounting/typing.
+                // Coalesce them so housekeeping does not monopolize the renderer.
+                let cleanupScheduled = false;
                 window.__teletanCookieBannerObserver = new MutationObserver(() => {
-                    try { window.__teletanCookieBannerCleanup(); } catch (_) {}
+                    if (cleanupScheduled) return;
+                    cleanupScheduled = true;
+                    setTimeout(() => {
+                        cleanupScheduled = false;
+                        try { window.__teletanCookieBannerCleanup(); } catch (_) {}
+                    }, 250);
                 });
                 window.__teletanCookieBannerObserver.observe(document.documentElement || document.body, {
                     subtree: true,
@@ -2633,6 +2794,35 @@ _JS_DIAGNOSE_PAGE = r"""
                     tag: el.tagName,
                     visible: visible(el),
                     text: (el.innerText || el.textContent || '').trim().slice(0, 40),
+                    w: Math.round(r.width),
+                    h: Math.round(r.height),
+                });
+                if (result.length >= 8) break;
+            }
+            return result;
+        })(),
+        loadingCandidates: (() => {
+            const selectors = [
+                '[aria-busy="true"]',
+                '[data-e2e*="loading" i]',
+                '[class*="loading" i]',
+                '[class*="spinner" i]',
+                '[class*="skeleton" i]',
+            ];
+            const result = [];
+            const seen = new Set();
+            for (const el of document.querySelectorAll(selectors.join(','))) {
+                if (seen.has(el)) continue;
+                seen.add(el);
+                const r = el.getBoundingClientRect();
+                const st = getComputedStyle(el);
+                const visible = r.width > 0 && r.height > 0 && st.display !== 'none' && st.visibility !== 'hidden';
+                if (!visible) continue;
+                result.push({
+                    tag: el.tagName,
+                    e2e: el.getAttribute('data-e2e'),
+                    ariaBusy: el.getAttribute('aria-busy'),
+                    className: String(el.className || '').slice(0, 120),
                     w: Math.round(r.width),
                     h: Math.round(r.height),
                 });
@@ -2810,6 +3000,82 @@ _JS_DISMISS_OVERLAYS = r"""
 }
 """
 
+_JS_OPEN_REPLY_BY_ANCHOR = r"""
+(parentAnchorToken) => {
+    const url = window.location.pathname || '';
+    if (url.includes('/messages') || url.includes('/login') || url.includes('/verify')) {
+        return { clicked: false, reason: 'redirected', url };
+    }
+
+    const token = String(parentAnchorToken || '').trim();
+    if (!token) return { clicked: false, reason: 'parent_anchor_token_missing' };
+    const cssEscape = (value) => {
+        try {
+            if (window.CSS && typeof window.CSS.escape === 'function') {
+                return window.CSS.escape(String(value || ''));
+            }
+        } catch (_) {}
+        return String(value || '').replace(/\\/g, '\\\\').replace(/"/g, '\\"');
+    };
+    const anchor = document.querySelector(
+        `[data-smart-parent-anchor="${cssEscape(token)}"]`
+    );
+    if (!anchor) return { clicked: false, reason: 'parent_anchor_not_found' };
+
+    // A timed-out native click may already have mounted the inline editor,
+    // before its Post control hydrates. Do not toggle Reply again in that gap.
+    const pendingEditor = [...anchor.querySelectorAll(
+        '[contenteditable="true"], textarea, [role="textbox"]'
+    )].find((el) => {
+        const owner = el.closest('[data-smart-parent-anchor]');
+        if (owner !== anchor || !el.closest('[data-e2e*="comment-input"], [data-smart-reply-composer="1"]')) return false;
+        // TikTok also renders legitimate video/comment panels in dialogs.
+        // Reject authentication/challenge containers by identity, not role alone.
+        if (el.closest('[data-e2e*="login"], [data-e2e*="captcha"], [class*="login" i], [class*="captcha" i]')) return false;
+        const r = el.getBoundingClientRect();
+        const style = getComputedStyle(el);
+        return r.width > 0 && r.height > 0 && style.display !== 'none' && style.visibility !== 'hidden';
+    });
+    if (pendingEditor) {
+        return { clicked: true, strategy: 'parent-anchor-editor-pending', anchorToken: token };
+    }
+
+    // Current TikTok web DOM (verified 2026-08-27) renders the action as a
+    // <p role="button" data-e2e="comment-reply-1">.  Keep this first pass
+    // deliberately tiny: the parent scanner already selected and marked the
+    // exact top-level row, so recompiling/running the full text-search script
+    // before every Reply click only adds latency and another failure surface.
+    const candidates = [
+        ...anchor.querySelectorAll(
+            'p[role="button"][data-e2e="comment-reply-1"], ' +
+            '[role="button"][data-e2e="comment-reply-1"], ' +
+            '[data-e2e="comment-reply-1"]'
+        )
+    ];
+    const reply = candidates.find((el) => {
+        if (!el || !el.getBoundingClientRect) return false;
+        const r = el.getBoundingClientRect();
+        const style = getComputedStyle(el);
+        return r.width > 0 && r.height > 0 &&
+            style.display !== 'none' && style.visibility !== 'hidden';
+    });
+    if (!reply) return { clicked: false, reason: 'reply_button_not_found_in_anchor' };
+
+    try {
+        anchor.scrollIntoView({ block: 'center', behavior: 'instant' });
+        reply.click();
+        return {
+            clicked: true,
+            strategy: 'parent-anchor-fast-canonical',
+            anchorToken: token,
+        };
+    } catch (error) {
+        return { clicked: false, reason: String(error) };
+    }
+}
+"""
+
+
 _JS_OPEN_REPLY = r"""
 ([parentCommentId, parentText, parentAnchorToken]) => {
     const url = window.location.pathname || '';
@@ -2856,6 +3122,11 @@ _JS_OPEN_REPLY = r"""
         // never carries a number).
         if (/\d/.test(text) && /(repl|ответ|відповід)/.test(text)) return true;
         return false;
+    };
+    const crossesParentBoundary = (root, target) => {
+        if (!root || root === document.body || root === document.documentElement) return true;
+        return [...root.querySelectorAll('[data-e2e="comment-level-1"], [data-smart-parent-anchor]')]
+            .some(node => node !== target && !node.contains(target) && !target.contains(node));
     };
     const clickReplyInside = (root, strategy) => {
         if (!root) return null;
@@ -2910,6 +3181,7 @@ _JS_OPEN_REPLY = r"""
                 roots.push(cur);
             }
             for (const root of roots) {
+                if (crossesParentBoundary(root, el)) break;
                 const strategy = root === el ? 'parent-anchor' : 'parent-anchor-parent';
                 const parentResult = clickReplyInside(root, strategy);
                 if (parentResult) return parentResult;
@@ -2955,6 +3227,7 @@ _JS_OPEN_REPLY = r"""
         }
         if (anyIdEl && rootMatchesNeedle(anyIdEl)) {
             for (let cur = anyIdEl.parentElement, depth = 0; cur && depth < 4; cur = cur.parentElement, depth++) {
+                if (crossesParentBoundary(cur, anyIdEl)) break;
                 const result = clickReplyInside(cur, 'comment-id-parent');
                 if (result) return result;
             }
@@ -3002,11 +3275,13 @@ _JS_OPEN_REPLY = r"""
 
             for (const root of roots) {
                 if (!root || triedRoots.has(root)) continue;
+                if (crossesParentBoundary(root, node)) break;
                 triedRoots.add(root);
                 try { root.scrollIntoView({ block: 'center', behavior: 'instant' }); } catch (e) {}
                 const result = clickReplyInside(root, 'parent-text-match');
                 if (result) return result;
                 for (let cur = root.parentElement, depth = 0; cur && depth < 4; cur = cur.parentElement, depth++) {
+                    if (crossesParentBoundary(cur, node)) break;
                     const parentResult = clickReplyInside(cur, 'parent-text-match-parent');
                     if (parentResult) return parentResult;
                 }
@@ -3420,6 +3695,12 @@ _JS_SUPPRESS_KEYBOARD_SHORTCUTS_OVERLAY = r"""
         } catch (_) {}
     };
 
+    const contentSelector = '[data-e2e*="comment" i], [data-smart-parent-anchor], ' +
+        '[contenteditable="true"], textarea, [data-e2e*="video-desc" i]';
+    const containsUserContent = (el) => Boolean(el && (
+        (el.closest && el.closest(contentSelector)) ||
+        (el.querySelector && el.querySelector(contentSelector))
+    ));
     const killOnce = () => {
         setSeenFlags();
         let count = 0;
@@ -3427,13 +3708,16 @@ _JS_SUPPRESS_KEYBOARD_SHORTCUTS_OVERLAY = r"""
         // 1) Kill marker-containing bounded popup nodes and their bounded parents.
         const all = [...document.querySelectorAll('body *')];
         for (const node of all) {
-            if (!isVisible(node)) continue;
-            const txt = node.innerText || node.textContent || '';
+            // Read text before geometry: the old order forced style/layout
+            // checks for every ordinary row four times per second.
+            const txt = node.textContent || '';
             if (!hasMarker(txt)) continue;
+            if (containsUserContent(node) || !isVisible(node)) continue;
 
             let cur = node;
             for (let depth = 0; depth < 10 && cur && cur !== document.body && cur !== document.documentElement; depth++, cur = cur.parentElement) {
-                const curTxt = cur.innerText || cur.textContent || '';
+                if (containsUserContent(cur)) continue;
+                const curTxt = cur.textContent || '';
                 if (!hasMarker(curTxt)) continue;
 
                 if (boundedOverlay(cur)) {
@@ -3463,7 +3747,8 @@ _JS_SUPPRESS_KEYBOARD_SHORTCUTS_OVERLAY = r"""
         for (const [x, y] of points) {
             let el = document.elementFromPoint(x, y);
             for (let depth = 0; depth < 10 && el && el !== document.body && el !== document.documentElement; depth++, el = el.parentElement) {
-                const txt = el.innerText || el.textContent || '';
+                if (containsUserContent(el)) continue;
+                const txt = el.textContent || '';
                 if (hasMarker(txt)) {
                     if (boundedOverlay(el)) count += kill(el, 'remove');
                     else if (depth <= 1 && safeMarkerNode(el)) {
@@ -3483,13 +3768,19 @@ _JS_SUPPRESS_KEYBOARD_SHORTCUTS_OVERLAY = r"""
     };
 
     try {
+        window.__teletanKillKeyboardShortcuts = killOnce;
         if (!window.__teletanKeyboardShortcutsKillerInstalled) {
             window.__teletanKeyboardShortcutsKillerInstalled = true;
-            window.__teletanKillKeyboardShortcuts = killOnce;
 
             try {
+                let cleanupScheduled = false;
                 const observer = new MutationObserver(() => {
-                    try { killOnce(); } catch (_) {}
+                    if (cleanupScheduled) return;
+                    cleanupScheduled = true;
+                    setTimeout(() => {
+                        cleanupScheduled = false;
+                        try { window.__teletanKillKeyboardShortcuts(); } catch (_) {}
+                    }, 250);
                 });
                 observer.observe(document.documentElement || document.body, {
                     subtree: true,
@@ -3502,8 +3793,8 @@ _JS_SUPPRESS_KEYBOARD_SHORTCUTS_OVERLAY = r"""
 
             try {
                 window.__teletanKeyboardShortcutsInterval = setInterval(() => {
-                    try { killOnce(); } catch (_) {}
-                }, 250);
+                    try { window.__teletanKillKeyboardShortcuts(); } catch (_) {}
+                }, 1500);
             } catch (_) {}
 
             try {
@@ -3639,6 +3930,9 @@ async def _click_comment_trigger_fallback(
 ) -> bool:
     """Extra robust opener for TikTok layouts where JS scoring picks a stale node."""
     selectors = [
+        '[role="button"][data-e2e="comment-icon"]',
+        '[data-e2e="comment-icon"]',
+        '[data-e2e="comment-count"]',
         'button:has([data-e2e="comment-icon"])',
         'button:has([data-e2e="comment-count"])',
         '[role="button"]:has([data-e2e="comment-icon"])',
@@ -3656,8 +3950,6 @@ async def _click_comment_trigger_fallback(
         '[aria-label*="תגובות" i]',
         '[aria-label*="תגובה" i]',
         '[data-e2e="comments"]',
-        '[data-e2e="comment-icon"]',
-        '[data-e2e="comment-count"]',
     ]
     tried_boxes: set[tuple[int, int, int, int]] = set()
     diag: dict[str, Any] = {
@@ -3789,7 +4081,7 @@ async def _click_comment_trigger_fallback(
                 if click_timeout is None:
                     diag["budget_expired"] = True
                     break
-                await candidate.click(timeout=click_timeout, force=True)
+                await candidate.click(timeout=click_timeout, force=True, no_wait_after=True)
                 diag["playwright_clicks"] += 1
                 sleep_for = 1.0
                 remaining = _remaining_seconds()
@@ -3930,17 +4222,53 @@ async def open_comment_section(
     """
     import time as _time
 
-    # Do NOT run global dismiss_overlays() here.
-    # TikTok desktop comment UI can live inside/near overlay-like wrappers.
-    # A global sweep can hide or make the comment panel non-interactive.
-    # Only suppress the known keyboard-shortcuts popup; actual clicks use force/targeted logic.
-    await suppress_keyboard_shortcuts_overlay(page)
-    await dismiss_cookie_banners(page)
     started = _time.monotonic()
     deadline = started + max(0.1, max_wait)
 
     def _remaining() -> float:
         return max(0.0, deadline - _time.monotonic())
+
+    async def _hard_bounded(awaitable: Any, timeout: float) -> Any:
+        task = asyncio.ensure_future(awaitable)
+        done, _pending = await asyncio.wait({task}, timeout=max(0.0, timeout))
+        if task in done:
+            return task.result()
+        task.cancel()
+
+        def _consume_result(done_task: asyncio.Task) -> None:
+            try:
+                done_task.exception()
+            except (asyncio.CancelledError, Exception):
+                pass
+
+        task.add_done_callback(_consume_result)
+        raise asyncio.TimeoutError
+
+    # Do NOT run global dismiss_overlays() here.
+    # TikTok desktop comment UI can live inside/near overlay-like wrappers.
+    # A global sweep can hide or make the comment panel non-interactive.
+    # The parallel-main caller has already run the guarded captcha/login
+    # preflight and clicks the canonical trigger through JavaScript/force.  Its
+    # old unconditional overlay + cookie sweeps added several browser round
+    # trips before the first click and could stall for tens of seconds under
+    # concurrent load.  Keep them for the broader legacy/reply opener, but let
+    # the main fast path try the real TikTok control immediately.
+    if not main_comment_aggressive:
+        for cleanup_name, cleanup_factory in (
+            ("shortcuts", lambda: suppress_keyboard_shortcuts_overlay(page)),
+            ("cookies", lambda: dismiss_cookie_banners(page)),
+        ):
+            remaining = _remaining()
+            if remaining <= 0:
+                logger.info("[DOM] Comment opener budget exhausted during %s cleanup", cleanup_name)
+                return False
+            try:
+                await _hard_bounded(cleanup_factory(), remaining)
+            except asyncio.TimeoutError:
+                logger.info("[DOM] Comment opener %s cleanup reached the shared deadline", cleanup_name)
+                return False
+            except Exception as exc:
+                logger.debug("[DOM] Comment opener %s cleanup failed: %s", cleanup_name, exc)
 
     def _bounded_timeout_ms(cap_ms: int, *, floor_ms: int = 50) -> Optional[int]:
         remaining = _remaining()
@@ -4317,12 +4645,22 @@ async def open_comment_section(
                 h = float(result.get("h") or 0)
                 clicked = False
                 if trigger:
-                    clicked = await _dispatch_untrusted_mouse_click(trigger)
+                    # Use a real browser click first. TikTok's current
+                    # role=button comment trigger responds immediately to a
+                    # trusted pointer click, while dispatchEvent()/el.click()
+                    # can be ignored even though they report no exception.
+                    try:
+                        native_click_timeout = _bounded_timeout_ms(850, floor_ms=100)
+                        if native_click_timeout is not None:
+                            await trigger.click(timeout=native_click_timeout, force=True, no_wait_after=True)
+                            clicked = True
+                    except Exception:
+                        clicked = False
                 if not clicked and w > 0 and h > 0:
                     await page.mouse.click(x + w / 2, y + h / 2)
                     clicked = True
                 if not clicked and trigger:
-                    await _dispatch_untrusted_mouse_click(trigger)
+                    clicked = await _dispatch_untrusted_mouse_click(trigger)
             except Exception:
                 try:
                     if not trigger:
@@ -4566,6 +4904,7 @@ async def open_reply_box(
     parent_comment_id: Optional[str] = None,
     parent_anchor_token: Optional[str] = None,
     max_attempts: Optional[int] = None,
+    prefer_dom_click: bool = False,
 ) -> DomActionResult:
     started = time.monotonic()
     has_anchor = bool(parent_comment_id or parent_comment_text or parent_anchor_token)
@@ -4578,6 +4917,108 @@ async def open_reply_box(
     max_attempts = max(1, min(max_attempts, default_attempts))
     fast_mode = max_attempts <= 3
 
+    async def _probe_reply_composer(token: str, wait_seconds: float = 0.0) -> dict[str, Any]:
+        deadline = time.monotonic() + wait_seconds
+        last_probe: dict[str, Any] = {"found": False, "reason": "reply_composer_not_resolved"}
+        # Bound both time and iterations (including when tests replace sleep).
+        for probe_index in range(1 + int(wait_seconds / 0.12)):
+            try:
+                value = await asyncio.wait_for(
+                    page.evaluate(
+                        _JS_FIND_REPLY_INPUT,
+                        [token, parent_comment_text or "", parent_comment_id or ""],
+                    ),
+                    timeout=min(0.65, max(0.05, deadline - time.monotonic())) if wait_seconds else 0.65,
+                )
+                last_probe = value if isinstance(value, dict) else last_probe
+            except asyncio.TimeoutError:
+                if last_probe.get("reason") == "reply_composer_not_resolved":
+                    last_probe = {"found": False, "reason": "reply_composer_probe_timeout"}
+            except Exception as exc:
+                return {"found": False, "reason": f"reply_composer_probe_exception:{str(exc)[:80]}"}
+            if last_probe.get("found"):
+                return last_probe
+            if last_probe.get("reason") in {
+                "parent_anchor_text_mismatch", "parent_anchor_id_mismatch", "redirected",
+            }:
+                break
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                break
+            await asyncio.sleep(min(0.12, remaining))
+        return last_probe
+
+    if parent_anchor_token:
+        existing = await _probe_reply_composer(parent_anchor_token)
+        if existing.get("found"):
+            return DomActionResult(
+                True,
+                strategy=f"reply-already-open+{existing.get('strategy') or 'reply-composer'}",
+                anchor_token=existing.get("anchorToken") or parent_anchor_token,
+                elapsed_seconds=time.monotonic() - started,
+            )
+        if existing.get("reason") in {"parent_anchor_text_mismatch", "parent_anchor_id_mismatch"}:
+            return DomActionResult(
+                False, reason=existing["reason"], anchor_token=parent_anchor_token,
+                elapsed_seconds=time.monotonic() - started,
+            )
+
+    async def _click_exact_parent_reply_native() -> Optional[dict[str, Any]]:
+        if not parent_anchor_token:
+            return None
+        click_started = False
+        try:
+            safe_token = str(parent_anchor_token).replace('\\', '\\\\').replace('"', '\\"')
+            row = page.locator(f'[data-smart-parent-anchor="{safe_token}"]')
+            button = row.locator(
+                'p[role="button"][data-e2e="comment-reply-1"], '
+                '[role="button"][data-e2e="comment-reply-1"], '
+                '[data-e2e="comment-reply-1"]'
+            ).first
+            # Locator.click resolves the current row, scrolls and clicks in one
+            # driver command. Five separate handle commands used up the outer
+            # 4s deadline and kept stale nodes when React remounted the row.
+            logger.info(
+                "[REPLY_OPEN] stage=native_click_started anchor=%s elapsed=%.2fs",
+                parent_anchor_token, time.monotonic() - started,
+            )
+            # Reply is an inline action. Readiness is the exact parent's
+            # composer, not completion of unrelated navigation signals.
+            click_started = True
+            await button.click(timeout=1200, force=True, no_wait_after=True)
+            logger.info(
+                "[REPLY_OPEN] stage=native_click_completed anchor=%s elapsed=%.2fs",
+                parent_anchor_token, time.monotonic() - started,
+            )
+            return {
+                "clicked": True,
+                "strategy": "parent-anchor-native-canonical",
+                "anchorToken": parent_anchor_token,
+            }
+        except asyncio.CancelledError:
+            logger.info(
+                "[REPLY_OPEN] stage=native_click_cancelled anchor=%s click_started=%s elapsed=%.2fs",
+                parent_anchor_token, click_started, time.monotonic() - started,
+            )
+            raise
+        except Exception as exc:
+            logger.info(
+                "[REPLY_OPEN] stage=native_click_failed anchor=%s error=%s elapsed=%.2fs",
+                parent_anchor_token, str(exc)[:120], time.monotonic() - started,
+            )
+            # The click can reach React before the driver reports a timeout.
+            # A second click may close that newly opened editor.
+            if click_started:
+                ready = await _probe_reply_composer(parent_anchor_token, 0.65)
+                if ready.get("found"):
+                    return {
+                        "clicked": True,
+                        "strategy": "parent-anchor-native-composer-after-error",
+                        "anchorToken": ready.get("anchorToken") or parent_anchor_token,
+                        "composerProbe": ready,
+                    }
+            return None
+
     for attempt in range(max_attempts):
         if attempt > 0:
             try:
@@ -4585,12 +5026,31 @@ async def open_reply_box(
                     ([attempt, maxAttempts]) => {
                         const candidates = [
                             ...document.querySelectorAll(
-                                '[data-e2e="comment-list"], [class*="CommentList"], [class*="CommentContainer"]'
+                                '[data-smart-comment-list-batch-scroll="1"], ' +
+                                '[data-smart-comment-list-active-scroll="1"], ' +
+                                '[data-smart-comment-scroll-opened="1"], ' +
+                                '[data-e2e="comment-list"], [class*="CommentList"], ' +
+                                '[class*="DivCommentMain"], [class*="CommentContainer"]'
                             )
                         ];
-                        const list = candidates.find((el) => {
+                        const scrollable = (el) => {
                             try { return el.scrollHeight > el.clientHeight + 20; } catch (_) { return false; }
-                        }) || candidates[0];
+                        };
+                        let list = candidates.find(scrollable) || null;
+                        if (!list) {
+                            for (const candidate of candidates) {
+                                for (let cur = candidate && candidate.parentElement, depth = 0;
+                                    cur && cur !== document.body && cur !== document.documentElement && depth < 7;
+                                    cur = cur.parentElement, depth++) {
+                                    if (scrollable(cur)) {
+                                        list = cur;
+                                        break;
+                                    }
+                                }
+                                if (list) break;
+                            }
+                        }
+                        list = list || candidates[0];
                         if (list) {
                             if (attempt >= maxAttempts - 1) {
                                 list.scrollTop = 0;
@@ -4607,10 +5067,38 @@ async def open_reply_box(
             await asyncio.sleep(0.35 if fast_mode else 0.8)
 
         try:
-            result = await page.evaluate(
-                _JS_OPEN_REPLY,
-                [parent_comment_id or "", parent_comment_text or "", parent_anchor_token or ""],
-            )
+            result = None
+            if attempt == 0 and parent_anchor_token and not prefer_dom_click:
+                result = await _click_exact_parent_reply_native()
+            if result is None and attempt == 0 and parent_anchor_token:
+                try:
+                    logger.info(
+                        "[REPLY_OPEN] stage=dom_click_started anchor=%s recovery=%s elapsed=%.2fs",
+                        parent_anchor_token, prefer_dom_click, time.monotonic() - started,
+                    )
+                    fast_result = await page.evaluate(
+                        _JS_OPEN_REPLY_BY_ANCHOR,
+                        parent_anchor_token,
+                    )
+                    logger.info(
+                        "[REPLY_OPEN] stage=dom_click_completed anchor=%s strategy=%s reason=%s elapsed=%.2fs",
+                        parent_anchor_token,
+                        fast_result.get('strategy') if isinstance(fast_result, dict) else None,
+                        fast_result.get('reason') if isinstance(fast_result, dict) else 'invalid_result',
+                        time.monotonic() - started,
+                    )
+                except Exception:
+                    fast_result = None
+                if isinstance(fast_result, dict) and (
+                    fast_result.get("clicked")
+                    or fast_result.get("reason") == "redirected"
+                ):
+                    result = fast_result
+            if result is None:
+                result = await page.evaluate(
+                    _JS_OPEN_REPLY,
+                    [parent_comment_id or "", parent_comment_text or "", parent_anchor_token or ""],
+                )
         except Exception as exc:
             return DomActionResult(False, reason=str(exc)[:120], elapsed_seconds=time.monotonic() - started)
 
@@ -4642,26 +5130,20 @@ async def open_reply_box(
             )
 
         if isinstance(result, dict) and result.get("clicked"):
-            # Wait for the bonded reply composer rather than any contenteditable.
-            # Success means parent anchor + reply input + send button are connected.
-            try:
-                await page.wait_for_selector(
-                    '[data-e2e="comment-input"], [data-e2e*="reply"] [contenteditable="true"], div[contenteditable="true"]',
-                    state="attached",
-                    timeout=1800 if fast_mode else 2500,
-                )
-            except Exception:
-                # Fallback: give TikTok at least 0.7s even if selector never appears
-                await asyncio.sleep(0.45 if fast_mode else 0.7)
-            anchor_token = parent_anchor_token or result.get("anchorToken") or ""
-            try:
-                scoped_input = await page.evaluate(
-                    _JS_FIND_REPLY_INPUT,
-                    [anchor_token, parent_comment_text or "", parent_comment_id or ""],
-                )
-            except Exception as exc:
-                scoped_input = {"found": False, "reason": f"reply_composer_probe_exception:{str(exc)[:80]}"}
+            # The global main input is already attached before the click. It
+            # cannot serve as a readiness signal for React's new reply editor.
+            # Poll the exact parent/input/post triple without clicking again.
+            anchor_token = result.get("anchorToken") or parent_anchor_token or ""
+            scoped_input = result.get("composerProbe") or await _probe_reply_composer(
+                anchor_token, 1.2 if fast_mode else 2.0,
+            )
             if not (isinstance(scoped_input, dict) and scoped_input.get("found")):
+                logger.info(
+                    "[REPLY_OPEN] clicked=%s strategy=%s anchor=%s reason=%s rejected=%s elapsed=%.2fs",
+                    True, result.get("strategy"), anchor_token,
+                    scoped_input.get("reason"), scoped_input.get("rejected", []),
+                    time.monotonic() - started,
+                )
                 return DomActionResult(
                     False,
                     reason=(scoped_input or {}).get("reason") or "reply_composer_not_resolved",
@@ -4749,8 +5231,6 @@ async def ensure_click_target_clear(page: Page, element: Any) -> bool:
     if element is None:
         return False
     try:
-        await suppress_keyboard_shortcuts_overlay(page)
-
         result = await page.evaluate(
             r"""
             (el) => {
@@ -5056,58 +5536,80 @@ async def find_comment_input_smart(
         return None, None
 
     async def _trusted_existing_input_probe() -> tuple[Optional[Any], Optional[str]]:
-        """Very cheap grab when open_comment_section/surface state already proved composer visibility."""
-        selectors = (
-            '[data-smart-id="comment-input"]',
-            '[data-e2e="comment-input"]',
-            '[data-e2e*="comment-input"]',
-            '[data-e2e*="CommentInput"]',
-        )
+        """Bind a proved main composer in one browser round trip.
 
-        async def _inner_editor_or_self(handle: Any, selector: str) -> tuple[Any, str]:
-            if selector == '[data-smart-id="comment-input"]':
-                return handle, "trusted-smart-id-input"
-            try:
-                inner = await handle.query_selector(
-                    'div[contenteditable="true"], [contenteditable="true"], textarea, [role="textbox"]'
-                )
-            except Exception:
-                inner = None
-            if inner:
-                return inner, "trusted-comment-input-inner"
-            return handle, "trusted-comment-input-wrapper"
-
-        async def _has_usable_box(candidate: Any, wrapper: Any) -> bool:
-            for node in (candidate, wrapper):
-                if not node:
-                    continue
-                try:
-                    box = await node.bounding_box()
-                except Exception:
-                    box = None
-                if box and box.get("width", 0) > 30 and box.get("height", 0) > 4:
-                    return True
-            return False
-
-        for selector in selectors:
-            try:
-                handle = await page.query_selector(selector)
-            except Exception:
-                handle = None
-            if not handle:
-                continue
-            candidate, strategy = await _inner_editor_or_self(handle, selector)
-            if (
-                selector == '[data-smart-id="comment-input"]'
-                or strategy == "trusted-comment-input-inner"
-                or await _has_usable_box(candidate, handle)
-            ):
-                try:
-                    await candidate.evaluate("el => el.setAttribute('data-smart-id', 'comment-input')")
-                except Exception:
-                    pass
-                return candidate, strategy
-        return None, None
+        The previous implementation made up to four ``query_selector`` calls,
+        then another inner-selector/bounding-box/evaluate chain.  With several
+        Patchright pages active, even the first round trip can consume the
+        whole 0.8s recovery budget although TikTok's composer is visibly open.
+        Resolve and validate the exact editable atomically in page JavaScript.
+        """
+        try:
+            handle = await page.evaluate_handle(
+                r"""
+                () => {
+                    const visible = (node) => {
+                        if (!node || !node.getBoundingClientRect) return false;
+                        const r = node.getBoundingClientRect();
+                        const st = getComputedStyle(node);
+                        return r.width > 30 && r.height > 4 &&
+                            st.display !== 'none' && st.visibility !== 'hidden';
+                    };
+                    const realEditor = (node) => Boolean(node && (
+                        node.isContentEditable ||
+                        node.getAttribute('contenteditable') === 'true' ||
+                        node.getAttribute('role') === 'textbox' ||
+                        node.tagName === 'TEXTAREA' ||
+                        node.tagName === 'INPUT'
+                    ));
+                    const wrappers = [
+                        ...document.querySelectorAll(
+                            '[data-smart-id="comment-input"], ' +
+                            '[data-e2e="comment-input"], ' +
+                            '[data-e2e*="comment-input"], ' +
+                            '[data-e2e*="CommentInput"]'
+                        )
+                    ];
+                    for (const wrapper of wrappers) {
+                        const inner = wrapper.querySelector && wrapper.querySelector(
+                            'div[contenteditable="true"], [contenteditable="true"], textarea, [role="textbox"]'
+                        );
+                        const candidate = realEditor(wrapper) ? wrapper : inner;
+                        if (!candidate || (!visible(candidate) && !visible(wrapper))) continue;
+                        // Inline replies use the same comment-input attribute.
+                        // A main composer probe must not bind their draft (or an
+                        // authentication editor) and later retire a good page
+                        // when the mandatory main-focus guard rejects it.
+                        if (candidate.closest(
+                            '[data-smart-parent-anchor], [data-smart-reply-composer], ' +
+                            '[data-smart-reply-input], [data-e2e*="reply" i]'
+                        )) continue;
+                        let rejected = false;
+                        for (let cur = candidate, depth = 0;
+                            cur && cur !== document.body && depth < 8;
+                            cur = cur.parentElement, depth++) {
+                            const label = [cur.id, String(cur.className || ''),
+                                cur.getAttribute('data-e2e'), cur.getAttribute('aria-label'),
+                                cur.getAttribute('placeholder')].filter(Boolean).join(' ').toLowerCase();
+                            if (/reply|search|captcha|verification|challenge|login|sign[ -]?in|signup|(^|[^a-z])auth([^a-z]|$)/.test(label)) {
+                                rejected = true;
+                                break;
+                            }
+                        }
+                        if (rejected) continue;
+                        try { candidate.setAttribute('data-smart-id', 'comment-input'); } catch (_) {}
+                        return candidate;
+                    }
+                    return null;
+                }
+                """
+            )
+        except Exception:
+            return None, None
+        element = _as_element_handle(handle)
+        if not element:
+            return None, None
+        return element, "trusted-existing-atomic"
 
     async def _direct_existing_input_probe() -> tuple[Optional[Any], Optional[str]]:
         """Fast path for already-open TikTok comment panels.
@@ -5239,7 +5741,7 @@ async def find_comment_input_smart(
                             box = await inner.bounding_box()
                             if not box or box.get("height", 0) <= 5:
                                 try:
-                                    await wrapper.click(timeout=800, force=True)
+                                    await wrapper.click(timeout=800, force=True, no_wait_after=True)
                                     await asyncio.sleep(0.12)
                                     inner_refresh = await wrapper.query_selector(
                                         'div[contenteditable="true"], [contenteditable="true"], textarea, [role="textbox"]'
@@ -5520,7 +6022,7 @@ async def find_comment_input_smart(
         try:
             input_handle, strategy = await _bounded_call(
                 "comment_input_main_aggressive_trusted_existing",
-                min(0.45 if aggressive else 0.65, max(0.1, _remaining())),
+                min(1.5 if aggressive else 1.8, max(0.1, _remaining())),
                 _trusted_existing_input_probe,
             )
         except asyncio.TimeoutError:
@@ -5691,6 +6193,7 @@ async def find_comment_input_smart(
                     max_wait=min(1.6 if aggressive else 3.0, initial_open_budget),
                     require_input=True,
                     aggressive=aggressive,
+                    main_comment_aggressive=main_comment_aggressive,
                 ),
             )
         except asyncio.TimeoutError:
@@ -6101,6 +6604,7 @@ async def find_comment_input_smart(
                         max_wait=min(1.2 if aggressive else 2.0, retry_open_budget),
                         require_input=True,
                         aggressive=aggressive,
+                        main_comment_aggressive=main_comment_aggressive,
                     ),
                 )
             except asyncio.TimeoutError:
@@ -6295,34 +6799,37 @@ async def find_reply_composer_for_parent(
             score = None
             diagnostics: Dict[str, Any] = {}
             try:
-                meta = await input_handle.evaluate(
-                    """
-                    el => ({
-                        strategy: el.getAttribute('data-smart-reply-strategy') || 'reply-scoped-handle',
-                        score: el.getAttribute('data-smart-reply-score') || null
-                    })
-                    """
-                )
-                if isinstance(meta, dict):
-                    strategy = meta.get("strategy") or strategy
-                    score = meta.get("score")
-            except Exception:
-                pass
-            try:
                 state = await page.evaluate("() => window.__smartReplyComposerProbeState || window.__smartReplyInputProbeState || null")
                 if isinstance(state, dict):
+                    if state.get("anchorToken") and state["anchorToken"] != token:
+                        last_reason = "reply_target_anchor_changed"
+                        continue
                     diagnostics = state
                     strategy = state.get("strategy") or strategy
                     score = state.get("score") or score
             except Exception:
                 diagnostics = {}
             try:
-                composer_handle_raw = await page.evaluate_handle(
-                    "() => document.querySelector('[data-smart-reply-composer=\"1\"]')"
+                # Independent handle reads share a round trip; the old five
+                # sequential commands exceeded the 2.5s recovery budget even
+                # when the editor was already ready. Keep both reads tied to
+                # this parent, so another binding cannot supply its Post.
+                composer_handle_raw, post_handle_raw = await asyncio.gather(
+                    page.evaluate_handle(
+                        "token => [...document.querySelectorAll('[data-smart-reply-composer=\"1\"]')]"
+                        ".find(el => el.getAttribute('data-smart-reply-anchor-token') === token) || null",
+                        token,
+                    ),
+                    page.evaluate_handle(
+                        "token => [...document.querySelectorAll('[data-smart-reply-post=\"1\"]')]"
+                        ".find(el => el.getAttribute('data-smart-reply-anchor-token') === token) || null",
+                        token,
+                    ),
+                    return_exceptions=True,
                 )
-                post_handle_raw = await page.evaluate_handle(
-                    "() => document.querySelector('[data-smart-reply-post=\"1\"]')"
-                )
+                for handle_result in (composer_handle_raw, post_handle_raw):
+                    if isinstance(handle_result, BaseException):
+                        raise handle_result
             except Exception as exc:
                 last_reason = f"reply_target_handle_exception:{str(exc)[:80]}"
                 await asyncio.sleep(0.2)
@@ -6483,9 +6990,13 @@ async def find_reply_send_candidate_for_optimistic_click(
             result = await page.evaluate(
                 r"""
                 ([expectedText]) => {
+                    __REPLY_SEND_CONTROL_GUARD__
                     document
-                        .querySelectorAll('[data-smart-id="comment-post-ready"]')
-                        .forEach(el => el.removeAttribute('data-smart-id'));
+                        .querySelectorAll('[data-smart-id="comment-post-ready"], [data-smart-main-post]')
+                        .forEach(el => {
+                            el.removeAttribute('data-smart-id');
+                            el.removeAttribute('data-smart-main-post');
+                        });
 
                     const visible = (el) => {
                         if (!el || !el.getBoundingClientRect) return false;
@@ -6616,20 +7127,30 @@ async def find_reply_send_candidate_for_optimistic_click(
                             compact === '@';
                     };
                     const looksSend = (raw) => {
-                        if (!raw || isAccessory(raw)) return false;
+                        if (!raw || isNonSendReplyControl(raw) || isAccessory(raw)) return false;
                         if (raw.getAttribute && raw.getAttribute('data-smart-reply-post') === '1') return true;
+                        const r = raw.getBoundingClientRect ? raw.getBoundingClientRect() : null;
                         const label = buttonLabel(raw);
+                        // TikTok's current reply arrow can be a label-less SVG.
+                        // The strict enabled-gate already recognises this exact
+                        // geometry; optimistic recovery must use the same rule or
+                        // it reports "candidate_not_found" for a visible arrow.
+                        const iconNearInput = r && inputRect &&
+                            r.bottom >= inputRect.top - 22 &&
+                            r.top <= inputRect.bottom + 22 &&
+                            r.left >= inputRect.left + Math.max(45, inputRect.width * 0.45);
                         return label.includes('comment-post') ||
                             label.includes('post') ||
                             label.includes('send') ||
                             label.includes('submit') ||
                             label.includes('\u043e\u043f\u0443\u0431\u043b') ||
-                            label.includes('\u043e\u0442\u043f\u0440\u0430\u0432');
+                            label.includes('\u043e\u0442\u043f\u0440\u0430\u0432') ||
+                            Boolean(iconNearInput);
                     };
                     const targetFor = (raw, scope) => {
-                        if (!raw) return null;
+                        if (!raw || isNonSendReplyControl(raw)) return null;
                         const usable = (el) => {
-                            if (!el || !scope.contains(el) || !visible(el)) return false;
+                            if (!el || !scope.contains(el) || !visible(el) || isNonSendReplyControl(el)) return false;
                             const r = el.getBoundingClientRect();
                             if (r.width > 360 || r.height > 160) return false;
                             const st = getComputedStyle(el);
@@ -6652,6 +7173,11 @@ async def find_reply_send_candidate_for_optimistic_click(
                         if (strictSendMarker(raw.parentElement) && usable(raw.parentElement)) return raw.parentElement;
                         const grandparent = raw.parentElement && raw.parentElement.parentElement;
                         if (strictSendMarker(grandparent) && usable(grandparent)) return grandparent;
+                        // A geometry-qualified, non-accessory icon inside the
+                        // exact bonded composer is safe even without aria/data-e2e.
+                        if (looksSend(raw) && usable(raw)) return raw;
+                        if (looksSend(raw) && usable(raw.parentElement)) return raw.parentElement;
+                        if (looksSend(raw) && usable(grandparent)) return grandparent;
                         return null;
                     };
 
@@ -6691,6 +7217,10 @@ async def find_reply_send_candidate_for_optimistic_click(
                         .map(item => ({ raw: item.raw, scope: item.scope, target: targetFor(item.raw, item.scope) }))
                         .filter(item => item.target)
                         .sort((a, b) => {
+                            // Exhaust the bonded composer before expanding to
+                            // a comment row with unrelated icons farther right.
+                            const scopeOrder = scopeCandidates.indexOf(a.scope) - scopeCandidates.indexOf(b.scope);
+                            if (scopeOrder) return scopeOrder;
                             const ar = a.target.getBoundingClientRect();
                             const br = b.target.getBoundingClientRect();
                             return (br.right || br.left || 0) - (ar.right || ar.left || 0);
@@ -6733,7 +7263,7 @@ async def find_reply_send_candidate_for_optimistic_click(
                         scopeCount: scopeCandidates.length,
                     };
                 }
-                """,
+                """.replace("__REPLY_SEND_CONTROL_GUARD__", _JS_REPLY_SEND_CONTROL_GUARD),
                 [expected_text or ""],
             )
         except Exception as exc:
@@ -6826,6 +7356,7 @@ async def wait_for_post_button_enabled(
         try:
             result = await page.evaluate(r"""
                 ([replyScoped, expectedText]) => {
+                    __REPLY_SEND_CONTROL_GUARD__
                     document
                         .querySelectorAll('[data-smart-id="comment-post-ready"]')
                         .forEach(el => el.removeAttribute('data-smart-id'));
@@ -6845,9 +7376,9 @@ async def wait_for_post_button_enabled(
                     };
 
                     const clickTargetFor = (raw) => {
-                        if (!raw) return null;
+                        if (!raw || (replyScoped && isNonSendReplyControl(raw))) return null;
                         const usable = (el) => {
-                            if (!el || !visible(el)) return false;
+                            if (!el || !visible(el) || (replyScoped && isNonSendReplyControl(el))) return false;
                             const r = el.getBoundingClientRect();
                             if (r.width > 360 || r.height > 140) return false;
                             if (getComputedStyle(el).pointerEvents === 'none') return false;
@@ -6914,7 +7445,7 @@ async def wait_for_post_button_enabled(
                     };
 
                     const looksReplyPost = (raw, inputRect) => {
-                        if (!raw) return false;
+                        if (!raw || isNonSendReplyControl(raw)) return false;
                         if (isAccessoryReplyIcon(raw)) return false;
                         if (raw.getAttribute && raw.getAttribute('data-smart-reply-post') === '1') return true;
                         const r = raw.getBoundingClientRect ? raw.getBoundingClientRect() : null;
@@ -6983,16 +7514,65 @@ async def wait_for_post_button_enabled(
                         return rawButtons;
                     };
 
+                    const explicitlyReplyScoped = (el) => {
+                        for (let cur = el, depth = 0; cur && cur !== document.body && depth < 8; cur = cur.parentElement, depth++) {
+                            if (cur.getAttribute && (
+                                cur.getAttribute('data-smart-reply-input') ||
+                                cur.getAttribute('data-smart-reply-composer') ||
+                                cur.getAttribute('data-smart-reply-post') ||
+                                cur.getAttribute('data-smart-reply-anchor-token')
+                            )) return true;
+                            const label = [
+                                cur.getAttribute && (cur.getAttribute('data-e2e') || ''),
+                                cur.getAttribute && (cur.getAttribute('aria-label') || ''),
+                                cur.getAttribute && (cur.getAttribute('class') || ''),
+                                cur.id || '',
+                            ].join(' ').toLowerCase();
+                            if (
+                                label.includes('replycommenteditor') ||
+                                label.includes('reply-comment-editor') ||
+                                label.includes('reply-composer') ||
+                                label.includes('comment-reply')
+                            ) return true;
+                        }
+                        return false;
+                    };
+
+                    const mainPostCandidates = () => {
+                        const selectors = [
+                            '[data-smart-main-post="1"]',
+                            '[data-smart-id="comment-post-ready"]',
+                            '[data-smart-id="comment-post"]',
+                            '[data-e2e="comment-post"]',
+                            '[data-e2e*="comment-post"]',
+                            '[data-e2e="post-comment-button"]',
+                        ].join(', ');
+                        const input =
+                            document.querySelector('[data-smart-main-input="1"]:not([data-smart-reply-input="1"])') ||
+                            document.querySelector(
+                                '[data-smart-id="comment-input"]:not([data-smart-reply-input="1"]):not([data-smart-reply-anchor-token])'
+                            ) ||
+                            document.querySelector('[data-e2e="comment-input"]');
+                        for (let cur = input, depth = 0; cur && cur !== document.body && depth < 8; cur = cur.parentElement, depth++) {
+                            if (!cur.querySelectorAll) continue;
+                            const local = [...cur.querySelectorAll(selectors)].filter(
+                                el => visible(el) && !explicitlyReplyScoped(el)
+                            );
+                            if (local.length) return local;
+                        }
+                        // A main input was resolved but no bonded Post button was
+                        // found near it. Only explicit main markers are safe at
+                        // document scope; a generic comment-post may belong to a
+                        // currently open reply composer.
+                        return [...document.querySelectorAll(
+                            '[data-smart-main-post="1"], [data-smart-id="comment-post-ready"]'
+                        )].filter(el => visible(el) && !explicitlyReplyScoped(el));
+                    };
+
                     const rawCandidates = (
                         replyScoped
                             ? replyPostCandidates()
-                            : [
-                                document.querySelector('[data-smart-id="comment-post-ready"]'),
-                                document.querySelector('[data-smart-id="comment-post"]'),
-                                document.querySelector('[data-e2e="comment-post"]'),
-                                document.querySelector('[data-e2e*="comment-post"]'),
-                                document.querySelector('[data-e2e="post-comment-button"]'),
-                            ]
+                            : mainPostCandidates()
                     ).filter(Boolean);
 
                     const placeholderMarkers = [
@@ -7085,6 +7665,8 @@ async def wait_for_post_button_enabled(
                                 el.setAttribute('data-smart-reply-post', '1');
                                 el.setAttribute('data-smart-reply-post-strategy', 'reply-enabled-refind');
                                 el.setAttribute('data-smart-reply-post-target', el.tagName || '');
+                            } else {
+                                el.setAttribute('data-smart-main-post', '1');
                             }
                             return {
                                 ready: true,
@@ -7141,7 +7723,7 @@ async def wait_for_post_button_enabled(
                     }
                     return { ready: false, reason: 'button_not_found', inputText: inputText.substring(0, 80) };
                 }
-            """, [reply_scoped, expected_text])
+            """.replace("__REPLY_SEND_CONTROL_GUARD__", _JS_REPLY_SEND_CONTROL_GUARD), [reply_scoped, expected_text])
 
             if isinstance(result, dict):
                 if result.get("ready"):
@@ -8418,13 +9000,13 @@ async def type_into_comment(
 
         try:
             if attempt == 0:
-                await editor.click(timeout=1800, force=True)
+                await editor.click(timeout=1800, force=True, no_wait_after=True)
             elif attempt == 1:
                 box = await editor.bounding_box()
                 if box:
                     await page.mouse.click(box["x"] + box["width"] / 2, box["y"] + box["height"] / 2)
                 else:
-                    await editor.click(timeout=1800, force=True)
+                    await editor.click(timeout=1800, force=True, no_wait_after=True)
             elif attempt == 2:
                 await editor.evaluate(
                     r"""

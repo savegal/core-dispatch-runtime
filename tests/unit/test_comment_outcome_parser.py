@@ -6,6 +6,77 @@ import executor.comment_outcome as comment_outcome
 
 
 @pytest.mark.unit
+@pytest.mark.asyncio
+@pytest.mark.parametrize("initial_match", [False, True])
+@pytest.mark.parametrize("failure,expected_error,failed_reads", [
+    ("Connection closed while reading from the driver", "browser_target_closed", 1),
+    ("Target page, context or browser has been closed", "browser_target_closed", 1),
+    ("Execution context was destroyed", "scan_failed", 3),
+])
+async def test_batch_search_does_not_report_exhaustion_after_failed_dom_reads(
+    monkeypatch, initial_match, failure, expected_error, failed_reads,
+):
+    from unittest.mock import AsyncMock
+
+    class Scope:
+        def __init__(self):
+            self.top = 0
+
+        async def evaluate(self, script, *_args):
+            if "scrollTop +=" in script:
+                self.top += 450
+            if "=> ({top:" in script:
+                return {"top": self.top, "height": 5000, "client": 500}
+
+    class Page:
+        url = "https://www.tiktok.com/@fixture/video/123"
+
+        def __init__(self):
+            self.scope = Scope()
+            self.scans = 0
+
+        async def query_selector(self, _selector):
+            return self.scope
+
+        async def evaluate(self, _script, args=None):
+            if not isinstance(args, dict) or "scanToken" not in args:
+                return {"selector": '[data-smart-comment-surface-opened="1"]',
+                        "scroll_container_scrollable": True, "items": 2, "strong_items": 2}
+            self.scans += 1
+            if initial_match and self.scans == 1:
+                return {"rows": [{"text": "found parent", "anchorToken": "parent-1", "position": 0}],
+                        "scopeMissing": False, "scrollTop": 0}
+            raise RuntimeError(failure)
+
+    monkeypatch.setattr(comment_outcome, "detect_captcha", AsyncMock(return_value=(False, None)))
+    page = Page()
+    partial = {}
+    found, info = await comment_outcome.find_comments_in_list_batch(
+        page, ["found parent", "missing parent"], max_scrolls=64,
+        scroll_delay_ms=0, ensure_open=False, strict_scope=True, partial_found_sink=partial,
+    )
+
+    assert page.scans == int(initial_match) + failed_reads
+    assert info["error"] == expected_error
+    assert info["scan_failures"] == failed_reads
+    assert not info.get("search_exhausted")
+    assert not info.get("scroll_limit_reached")
+    assert bool(found) == initial_match
+    assert found == partial
+
+
+@pytest.mark.unit
+def test_normalize_text_preserves_semantic_emoji_joiners_and_skin_tones():
+    assert comment_outcome.normalize_text("👨‍👩‍👧") != comment_outcome.normalize_text("👨👩👧")
+    assert comment_outcome.normalize_text("👍🏻") != comment_outcome.normalize_text("👍🏿")
+
+
+@pytest.mark.unit
+def test_normalize_text_ignores_visual_variation_selectors():
+    assert comment_outcome.normalize_text("❤️") == comment_outcome.normalize_text("❤")
+
+
+@pytest.mark.unit
 def test_extract_publish_fields_top_level_comment():
     payload = {
         "status_code": 0,
@@ -84,15 +155,6 @@ def test_parent_search_marks_rows_with_dom_anchor_tokens():
     assert "data-smart-parent-anchor" in joined
     assert "getAttribute('data-smart-parent-anchor')" in joined
     assert '"anchor_token": row.get("anchorToken")' in joined
-
-
-@pytest.mark.unit
-def test_parent_search_scans_bounded_comment_containers_before_broad_roots():
-    joined = inspect.getsource(comment_outcome.find_comments_in_list_batch)
-
-    assert "const primaryRootSelector = [" in joined
-    assert "const primaryRoots = [...scope.querySelectorAll(primaryRootSelector)].filter(visible);" in joined
-    assert ").slice(0, 250);" in joined
 
 
 @pytest.mark.unit
@@ -186,6 +248,7 @@ async def test_batch_search_partial_return_keeps_found_anchor_without_extra_scan
 
     monkeypatch.setattr(comment_outcome, "detect_captcha", fake_detect_captcha)
 
+    progress = {}
     found, info = await comment_outcome.find_comments_in_list_batch(
         _Page(),
         ["main one", "main two"],
@@ -194,6 +257,7 @@ async def test_batch_search_partial_return_keeps_found_anchor_without_extra_scan
         ensure_open=False,
         strict_scope=True,
         return_partial_on_found=True,
+        progress_sink=progress,
     )
 
     assert set(found) == {0}
@@ -206,6 +270,9 @@ async def test_batch_search_partial_return_keeps_found_anchor_without_extra_scan
     assert info["missing_previews"][0]["text_preview"] == "main two"
     assert info["partial_returned"] is True
     assert info["scrolls"] == 1
+    assert progress == info
+    assert progress["unique_rows_seen"] == 1
+    assert progress["resume_scroll_top"] == 0
 
 
 @pytest.mark.unit
@@ -288,7 +355,7 @@ async def test_batch_search_scroll_cap_is_not_reported_as_end_of_list(monkeypatc
 
 @pytest.mark.unit
 @pytest.mark.asyncio
-async def test_batch_search_accepts_expected_author_from_author_candidates(monkeypatch):
+async def test_batch_search_does_not_treat_mentions_or_display_names_as_row_author(monkeypatch):
     async def fake_detect_captcha(_page, wait_ms=0):
         return False, None
 
@@ -350,9 +417,76 @@ async def test_batch_search_accepts_expected_author_from_author_candidates(monke
         top_level_only=True,
     )
 
+    assert found == {}
+    assert info["found_count"] == 0
+
+
+@pytest.mark.asyncio
+async def test_batch_search_matches_expected_primary_author(monkeypatch):
+    async def fake_detect_captcha(_page, wait_ms=0):
+        return False, None
+
+    class _Scope:
+        async def evaluate(self, script, *_args):
+            if "=> ({top:" in script:
+                return {"top": 0, "height": 1000, "client": 500}
+            return None
+
+    class _Page:
+        url = "https://www.tiktok.com/@u/video/123"
+
+        async def evaluate(self, script, *_args, **_kwargs):
+            if "({selectors, strictScope})" in script:
+                return {
+                    "selector": '[data-smart-comment-surface-opened="1"]',
+                    "scroll_container_tag": "DIV",
+                    "scroll_container_scrollable": True,
+                    "items": 3,
+                    "strong_items": 3,
+                    "score": 3000,
+                }
+            return {
+                "rows": [
+                    {
+                        "position": 0,
+                        "text": "main parent text",
+                        "selector": '[data-e2e="comment-level-1"]',
+                        "cid": None,
+                        "author": "real_parent_author",
+                        "authorCandidates": ["real_parent_author", "Display Name"],
+                        "scrollTop": 0,
+                        "anchorToken": "anchor-real-author",
+                    }
+                ],
+                "scrollTop": 0,
+                "scopeMissing": False,
+            }
+
+        async def query_selector(self, selector):
+            if selector in {
+                '[data-smart-comment-list-batch-scope="1"]',
+                '[data-smart-comment-list-batch-scroll="1"]',
+            }:
+                return _Scope()
+            return None
+
+    monkeypatch.setattr(comment_outcome, "detect_captcha", fake_detect_captcha)
+
+    found, info = await comment_outcome.find_comments_in_list_batch(
+        _Page(),
+        ["main parent text"],
+        expected_authors=["real_parent_author"],
+        require_author_match=True,
+        max_scrolls=1,
+        scroll_delay_ms=0,
+        ensure_open=False,
+        strict_scope=True,
+        top_level_only=True,
+    )
+
     assert set(found) == {0}
     assert found[0]["matched_by"] == "text_author"
-    assert found[0]["author_candidates"] == ["display_name", "real_parent_author"]
+    assert found[0]["author"] == "real_parent_author"
     assert info["found_count"] == 1
 
 

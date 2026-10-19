@@ -2,16 +2,18 @@
 Engagement Engine - единый движок для HYBRID и ENGAGEMENT_ONLY комментирования.
 
 Реализует:
-- HYBRID FULL: главный комментарий через HTTP (DOM только fallback), ответы через HTTP, лайки — через API лайков (настроенное количество)
+- HYBRID FULL: главный комментарий и ответы через HTTP; DOM-публикация выбирается отдельной стратегией, лайки — через API лайков (настроенное количество)
 - ENGAGEMENT ONLY: ответы через HTTP, лайки — через API лайков (настроенное количество)
 
 КРИТИЧЕСКИЕ ПРАВИЛА:
 - НИ ОДНО действие не считается успешным, если HTTP ответ не подтвердил успех
-- НИ ОДНО действие не считается успешным, если DOM verify (если включен) не подтвердил видимость
+- HTTP-confirmed main принимается без DOM verify в main-only или после успешного HTTP-ответа
 - Запрещено логировать "успешно", если success=False
 - Запрещено увеличивать счетчики, если действие реально не выполнено
 """
 import logging
+from services.execution_attempts import pre_publish_outcomes, track_publication_requests
+from executor.http.execution_policy import http_first_enabled, valid_comment_id
 import asyncio
 import re
 import random
@@ -64,6 +66,9 @@ from services.likes_config import (
     provider_available as likes_provider_available,
 )
 from services.metrics import increment_counter, record_timing
+from services.comment_search import normalize_search_phrase
+from services.cookie_validator import normalize_cookie_records
+from services.cookie_persistence_service import synchronize_browser_cookies
 
 logger = logging.getLogger("executor.engagement_engine")
 settings = get_settings()
@@ -168,8 +173,6 @@ def _reply_variants_from_task(task: Task) -> List[str]:
 HTTP_SKIP_AFTER_FATAL_FAILS = 3
 HTTP_SKIP_AFTER_WARMUP_FAILS = 5
 HTTP_SKIP_AFTER_HTTP_FAILS = 5
-HTTP_SIGNER_COOLDOWN_AFTER_WARMUP_FAILS = 3
-HTTP_SIGNER_COOLDOWN_SECONDS = 180.0
 UI_NO_PROGRESS_COOLDOWN_AFTER = 3
 UI_NO_PROGRESS_UNKNOWN_COOLDOWN_AFTER = 1
 AMBIGUOUS_POST_SUBMIT_ERRORS = {
@@ -195,10 +198,7 @@ def _new_http_health_stats() -> Dict[str, int]:
     }
 
 _HTTP_ACCOUNT_HEALTH: Dict[int, Dict[str, int]] = _defaultdict(_new_http_health_stats)
-_HTTP_RUNTIME_SIGNER_HEALTH: Dict[str, float] = {
-    "warmup_fail": 0.0,
-    "cooldown_until": 0.0,
-}
+
 
 
 def _is_ambiguous_post_submit_result(result: Any) -> bool:
@@ -366,7 +366,7 @@ def extract_video_id(video_url: str) -> Optional[str]:
     """
     # Паттерны для различных форматов TikTok URL
     patterns = [
-        r'/video/(\d+)',  # Стандартный формат: /video/1234567890
+        r'/(?:video|photo)/(\d+)',  # Видео и фотокарусели используют общий aweme_id
         r'video_id=(\d+)',  # Query параметр: ?video_id=1234567890
         r'aweme_id=(\d+)',  # API формат: ?aweme_id=1234567890
         r'@[\w.]+/video/(\d+)',  # Формат с username: @user/video/1234567890
@@ -392,11 +392,12 @@ def extract_video_id(video_url: str) -> Optional[str]:
 def _is_tiktok_shortlink(url: Optional[str]) -> bool:
     if not url:
         return False
-    normalized = str(url).lower()
-    return any(marker in normalized for marker in _SHORTLINK_HOST_MARKERS)
+    return (urlparse(str(url)).hostname or "").lower() in _SHORTLINK_HOST_MARKERS
 
 
 async def _ensure_comment_panel_open(page: Page) -> None:
+    if http_first_enabled(settings):
+        return
     selectors_to_try = (
         'button[data-e2e="comments"]',
         '[data-e2e="comments"]',
@@ -430,9 +431,8 @@ async def resolve_video_url(
     IP-anonymity:
       - Если передан `proxy` — запрос идёт через него (тогда TikTok видит IP
         прокси, а не сервера-воркера).
-      - Если прокси нет, мы НЕ резолвим shortlink через httpx, потому что это
-        утечёт реальный IP сервера. Возвращаем (url, None) — далее
-        page.goto(shortlink) сам разрешит редирект через прокси аккаунта.
+      - При USE_PROXY=True без заданного proxy резолв оставляем браузеру.
+      - При USE_PROXY=False разрешён прямой резолв через интернет исполнителя.
     """
     existing_id = extract_video_id(url)
     if existing_id:
@@ -441,7 +441,9 @@ async def resolve_video_url(
     if not _is_tiktok_shortlink(url):
         return url, None
 
-    if not proxy:
+    if not settings.USE_PROXY:
+        proxy = None
+    if not proxy and settings.USE_PROXY:
         # Нет прокси — НЕ резолвим shortlink сами, чтобы не отдать TikTok IP
         # сервера. page.goto в аккаунт-контексте разрешит шортлинк через
         # прокси этого аккаунта.
@@ -463,7 +465,7 @@ async def resolve_video_url(
     # httpx понимает proxy как dict {"http://": "...", "https://": "..."} или
     # как одну строку. Принимаем привычный формат "scheme://host:port" /
     # "host:port" + auth — преобразуем в полный URL.
-    proxy_url = proxy.strip()
+    proxy_url = (proxy or "").strip() or None
     if proxy_url and "://" not in proxy_url:
         proxy_url = f"http://{proxy_url}"
 
@@ -473,6 +475,7 @@ async def resolve_video_url(
             timeout=timeout,
             headers=headers,
             proxy=proxy_url,
+            trust_env=False,
         ) as client:
             try:
                 response = await client.head(url)
@@ -499,6 +502,83 @@ async def resolve_video_url(
     except Exception as exc:
         logger.warning(f"[URL_RESOLVE] Failed to resolve {url[:80]} via proxy: {exc}")
         return url, None
+
+
+_RESOLVED_SHORTLINK_CACHE: Dict[Tuple[str, Any, int], Tuple[str, str, float]] = {}
+_RESOLVED_SHORTLINK_TTL_SECONDS = 600.0
+
+
+def cache_resolved_video_url(
+    url: str,
+    resolved_url: Optional[str],
+    media_id: Optional[str],
+    pool_owner_user_id: Any = None,
+) -> None:
+    """Store a resolved shortlink in the short-lived in-memory TTL cache."""
+    raw_url = str(url or "").strip()
+    canon_url = str(resolved_url or "").strip()
+    canon_id = str(media_id or "").strip() or (extract_video_id(canon_url) if canon_url else "")
+    if not raw_url or not canon_url or not canon_id:
+        return
+    now_mono = time.monotonic()
+    resolver_id = id(resolve_video_url)
+    for owner_key in (pool_owner_user_id, None):
+        _RESOLVED_SHORTLINK_CACHE[(raw_url, owner_key, resolver_id)] = (canon_url, canon_id, now_mono)
+
+
+async def resolve_order_video_url(db, url: str, pool_owner_user_id=None):
+    """Resolve once before workers, using the order's configured proxy pool and short-lived TTL cache."""
+    direct_id = extract_video_id(url)
+    if direct_id or not _is_tiktok_shortlink(url):
+        return url, direct_id
+
+    raw_url = str(url or "").strip()
+    now_mono = time.monotonic()
+    resolver_id = id(resolve_video_url)
+    for owner_key in (pool_owner_user_id, None):
+        cached = _RESOLVED_SHORTLINK_CACHE.get((raw_url, owner_key, resolver_id))
+        if cached is not None:
+            cached_url, cached_id, cached_at = cached
+            if now_mono - cached_at <= _RESOLVED_SHORTLINK_TTL_SECONDS and cached_url and cached_id:
+                return cached_url, cached_id
+            _RESOLVED_SHORTLINK_CACHE.pop((raw_url, owner_key, resolver_id), None)
+
+    if not settings.USE_PROXY:
+        resolved, media_id = await resolve_video_url(url)
+        if media_id:
+            cache_resolved_video_url(raw_url, resolved, media_id, pool_owner_user_id)
+        return resolved, media_id
+    from services.dedicated_proxy_service import get_current_dedicated_proxy
+    route = get_current_dedicated_proxy()
+    if route is not None:
+        resolved, media_id = await resolve_video_url(url, proxy=route.proxy)
+        if media_id:
+            cache_resolved_video_url(raw_url, resolved, media_id, pool_owner_user_id)
+        return resolved, media_id
+    if db is None:
+        return url, None
+    from sqlalchemy import case, func, select
+    from services.proxy_health_service import is_proxy_bad
+    pool_filter = Account.owner_user_id.is_(None) if pool_owner_user_id is None else Account.owner_user_id == int(pool_owner_user_id)
+    rows = db.query(Account.proxy).filter(
+        pool_filter, Account.status.in_(["active", "error"]),
+        Account.proxy.isnot(None), Account.proxy != "",
+        ~Account.proxy.in_(select(Proxy.proxy).where(Proxy.dedicated_user_id.isnot(None))),
+    ).group_by(Account.proxy).order_by(
+        func.min(case((Account.status == "active", 0), else_=1)), Account.proxy,
+    ).all()
+    attempts = 0
+    for row in rows:
+        if is_proxy_bad(row[0]):
+            continue
+        attempts += 1
+        resolved, media_id = await resolve_video_url(url, proxy=row[0])
+        if media_id:
+            cache_resolved_video_url(raw_url, resolved, media_id, pool_owner_user_id)
+            return resolved, media_id
+        if attempts >= 3:
+            break
+    return url, None
 
 
 def log_tokens_safely(cookies_dict: Dict[str, str], correlation_id: Optional[str] = None) -> Dict[str, str]:
@@ -636,7 +716,7 @@ def _build_warmup_video_url(video_url: str, aweme_id: Optional[str] = None) -> s
         try:
             parsed = urlparse(str(video_url))
             host = parsed.netloc.lower()
-            if (host == "tiktok.com" or host.endswith(".tiktok.com")) and "/video/" in parsed.path:
+            if (host == "tiktok.com" or host.endswith(".tiktok.com")) and re.search(r"/(?:video|photo)/\d+", parsed.path):
                 return video_url
         except Exception:
             pass
@@ -684,16 +764,6 @@ def _log_pipeline_event(
 
 
 def _record_http_account_result(account_id: Optional[int], outcome: str) -> None:
-    if outcome == "success":
-        _HTTP_RUNTIME_SIGNER_HEALTH["warmup_fail"] = 0.0
-        _HTTP_RUNTIME_SIGNER_HEALTH["cooldown_until"] = 0.0
-    elif outcome == "warmup_fail":
-        failures = float(_HTTP_RUNTIME_SIGNER_HEALTH.get("warmup_fail") or 0.0) + 1.0
-        _HTTP_RUNTIME_SIGNER_HEALTH["warmup_fail"] = failures
-        if failures >= HTTP_SIGNER_COOLDOWN_AFTER_WARMUP_FAILS:
-            _HTTP_RUNTIME_SIGNER_HEALTH["cooldown_until"] = (
-                time.monotonic() + HTTP_SIGNER_COOLDOWN_SECONDS
-            )
     if account_id is None:
         return
     stats = _HTTP_ACCOUNT_HEALTH[account_id]
@@ -743,8 +813,7 @@ def _record_http_account_failure_result(
 
 def _should_skip_http_for_account(account_id: Optional[int]) -> Optional[str]:
     if account_id is None:
-        cooldown_until = float(_HTTP_RUNTIME_SIGNER_HEALTH.get("cooldown_until") or 0.0)
-        return "runtime_signer_cooldown" if cooldown_until > time.monotonic() else None
+        return None
     stats = _HTTP_ACCOUNT_HEALTH.get(account_id)
     if stats:
         if stats["fatal"] >= HTTP_SKIP_AFTER_FATAL_FAILS:
@@ -753,17 +822,12 @@ def _should_skip_http_for_account(account_id: Optional[int]) -> Optional[str]:
             return "recent_warmup_failures"
         if stats["http_fail"] >= HTTP_SKIP_AFTER_HTTP_FAILS and stats["success"] == 0:
             return "repeated_http_failures_without_success"
-    cooldown_until = float(_HTTP_RUNTIME_SIGNER_HEALTH.get("cooldown_until") or 0.0)
-    if cooldown_until > time.monotonic():
-        return "runtime_signer_cooldown"
     return None
 
 
 def _is_degraded_http_profile(warmup_info: Optional[Dict[str, Any]]) -> bool:
     if not warmup_info:
         return False
-    if warmup_info.get("signer_ready") is False:
-        return True
     if warmup_info.get("status") == "degraded":
         return True
     missing_optional = warmup_info.get("missing_optional") or []
@@ -862,12 +926,12 @@ async def warmup_page_for_http(
     page: Page,
     video_url: str,
     correlation_id: Optional[str] = None,
-    max_retries: int = 2
+    max_retries: int = 2,
+    *,
+    account: Optional[Account] = None,
+    db: Optional[Session] = None,
 ) -> Tuple[Dict[str, str], bool, Dict[str, Any]]:
-    """
-    ?????????? ???????? ????? HTTP-????????? ? ?????????? ????????? ???????,
-    ???? ??????? ??? ? ?? ???? ????????? ??? HTTP.
-    """
+    """Warm the video page and session cookies for its native fetch interceptor."""
     cookies_dict: Dict[str, str] = {}
     warmup_started = time.monotonic()
     warmup_info: Dict[str, Any] = {
@@ -907,21 +971,68 @@ async def warmup_page_for_http(
         canonical_url = _build_warmup_video_url(video_url, aweme_id)
         warmup_info["target_url"] = canonical_url
 
+        def _refresh_target_url() -> bool:
+            current_url = str(getattr(page, "url", "") or "")
+            warmup_info["current_url"] = current_url
+            resolved_id = extract_video_id(current_url)
+            if resolved_id:
+                warmup_info["resolved_video_id"] = resolved_id
+            current = urlparse(current_url)
+            path = current.path.lower()
+            return (
+                current.scheme in {"http", "https"}
+                and (current.hostname == "tiktok.com" or (current.hostname or "").endswith(".tiktok.com"))
+                and re.search(r"/(?:video|photo)/\d+", path) is not None
+                and (not aweme_id or resolved_id == aweme_id)
+                and not any(marker in path for marker in ("/login", "/signup", "/verify", "/auth"))
+            )
+
+        def _redirect_failure():
+            warmup_info.update(
+                status="redirect", reason_code="redirect_not_video",
+                missing_critical=[], missing_optional=[],
+            )
+            logger.warning(
+                "[WARMUP] Target page changed during preparation for %s: %s",
+                correlation_id or "unknown", warmup_info["current_url"],
+            )
+            return _finish(False, dict(warmup_info))
+
+        async def _navigate_to_target() -> None:
+            try:
+                await page.goto(canonical_url, wait_until="domcontentloaded", timeout=30000)
+            except Exception as exc:
+                if "ERR_ABORTED" not in str(exc):
+                    raise
+                logger.info("[WARMUP] Navigation interrupted by in-flight redirect; reopening target page")
+                await asyncio.sleep(1.0)
+                await page.goto(canonical_url, wait_until="domcontentloaded", timeout=30000)
+
         logger.debug(
             f"[WARMUP] Starting warmup for {correlation_id or 'unknown'} | "
             f"original_url={video_url[:50]}, canonical_url={canonical_url}"
         )
 
+        retry_navigation_ready = False
         for attempt in range(max_retries):
             warmup_info["attempts"] = attempt + 1
-            await page.goto(canonical_url, wait_until="domcontentloaded", timeout=30000)
+            current = urlparse(str(getattr(page, "url", "") or ""))
+            already_on_target = (
+                attempt == 0 and bool(aweme_id)
+                and (current.hostname == "tiktok.com" or (current.hostname or "").endswith(".tiktok.com"))
+                and re.search(r"/(?:video|photo)/\d+", current.path.lower()) is not None
+                and not any(marker in current.path.lower() for marker in ("/login", "/signup", "/verify", "/auth"))
+                and extract_video_id(page.url) == aweme_id
+            )
+            if not already_on_target and not retry_navigation_ready:
+                await _navigate_to_target()
+            retry_navigation_ready = False
+            warmup_info["reused_page"] = already_on_target
 
-            current_url = page.url
-            warmup_info["current_url"] = current_url
+            on_target = _refresh_target_url()
+            current_url = warmup_info["current_url"]
             resolved_video_id = extract_video_id(current_url)
-            if resolved_video_id:
-                warmup_info["resolved_video_id"] = resolved_video_id
-            if "/video/" not in current_url:
+            if not on_target:
                 warmup_info.update(
                     {
                         "status": "redirect",
@@ -931,63 +1042,217 @@ async def warmup_page_for_http(
                     }
                 )
                 logger.warning(
-                    f"[WARMUP] Redirect detected after goto: {current_url} (expected /video/). "
+                    f"[WARMUP] Redirect detected after goto: {current_url} (expected target /video/ or /photo/). "
                     f"Attempt {attempt + 1}/{max_retries}"
                 )
                 if attempt < max_retries - 1:
-                    await page.reload(wait_until="domcontentloaded")
                     await asyncio.sleep(random.uniform(0.5, 1.0))
                 continue
 
-            await page.wait_for_load_state("domcontentloaded")
-            signer_ready = await wait_for_runtime_signer_ready(
-                page,
-                timeout_ms=1500,
-            )
+            # A shortlink may only reveal its media ID in this browser. Keep
+            # that first resolved ID as the target through subsequent waits.
+            aweme_id = aweme_id or resolved_video_id
+
+            try:
+                await page.wait_for_load_state("domcontentloaded", timeout=5000)
+                warmup_info["load_state"] = "domcontentloaded"
+            except Exception:
+                warmup_info["load_state"] = "loading"
+            target_observed_at = time.monotonic()
+
+            # A reused page can already be mature even if this warmup takes 140ms.
+            # Only credit document age when its original navigation is this video;
+            # SPA transitions from another video fall back to our own observation.
+            target_started_at = target_observed_at
+            target_dom_ready_at = target_observed_at
+            try:
+                timing = await asyncio.wait_for(page.evaluate("""() => {
+                    let ssrRegion = null;
+                    let deviceId = null;
+                    let odinId = null;
+                    let widTime = null;
+                    let widTimeExplicit = false;
+                    try {
+                        window.dispatchEvent(new MouseEvent('mousemove', {bubbles: true, clientX: 120, clientY: 160}));
+                        if (typeof PointerEvent === 'function') {
+                            window.dispatchEvent(new PointerEvent('pointermove', {bubbles: true, clientX: 124, clientY: 164}));
+                        }
+                        window.dispatchEvent(new Event('scroll', {bubbles: true}));
+                        document.dispatchEvent(new Event('visibilitychange'));
+                        const u = window.__UNIVERSAL_DATA_FOR_REHYDRATION__?.__DEFAULT_SCOPE__;
+                        const appCtx = u?.['webapp.app-context'] || u?.['webapp.a-context'];
+                        const pageProps = window.__NEXT_DATA__?.props?.pageProps;
+                        const nextCtx = pageProps?.appContext || pageProps?.webappContext;
+                        ssrRegion = appCtx?.region || nextCtx?.region || pageProps?.region || null;
+                        const rawWid = appCtx?.wid || appCtx?.webId || nextCtx?.wid || nextCtx?.webId || null;
+                        const rawOdin = appCtx?.odinId || nextCtx?.odinId || null;
+                        const rawWidTime = appCtx?.wid_ct || appCtx?.webIdCreatedTime || nextCtx?.wid_ct || nextCtx?.webIdCreatedTime || null;
+                        if (rawWid) deviceId = String(rawWid).trim();
+                        if (rawOdin) odinId = String(rawOdin).trim();
+                        if (rawWidTime) {
+                            widTime = String(rawWidTime).trim();
+                            widTimeExplicit = !!widTime;
+                        } else if (deviceId || odinId || appCtx || nextCtx) {
+                            if (!window.__tt_web_id_last_time) {
+                                window.__tt_web_id_last_time = String(Math.floor(Date.now() / 1000));
+                            }
+                            widTime = String(window.__tt_web_id_last_time);
+                        }
+                    } catch (e) {}
+                    return {
+                        current_url: location.href,
+                        navigation_url: performance.getEntriesByType('navigation')[0]?.name || '',
+                        age_ms: performance.now(),
+                        dom_ready_ms: performance.getEntriesByType('navigation')[0]?.domContentLoadedEventEnd || 0,
+                        early_activity_triggered: true,
+                        ssr_region: ssrRegion ? String(ssrRegion).trim().toUpperCase() : null,
+                        device_id: deviceId,
+                        odin_id: odinId,
+                        web_id_last_time: widTime,
+                        _web_id_last_time_explicit: widTimeExplicit
+                    };
+                }""", isolated_context=False), timeout=1.0)
+                warmup_info["early_activity_triggered"] = True
+                if isinstance(timing, dict):
+                    try:
+                        from executor.http.playwright_http_client import cache_web_identity
+                        cache_web_identity(
+                            getattr(account, "id", None) or getattr(page, "_pool_account_id", None),
+                            timing,
+                            context=getattr(page, "context", None),
+                            account=account,
+                        )
+                    except Exception:
+                        pass
+                    ssr_cc = str(timing.get("ssr_region") or getattr(getattr(page, "context", None), "_account_ssr_region", "") or "").strip().upper()
+                    if re.fullmatch(r"[A-Z]{2}", ssr_cc):
+                        if getattr(page, "context", None) is not None:
+                            try:
+                                setattr(page.context, "_account_ssr_region", ssr_cc)
+                            except Exception:
+                                pass
+                        if account is not None and not getattr(account, "country_code", None):
+                            try:
+                                account.country_code = ssr_cc
+                                if isinstance(db, Session):
+                                    db.add(account)
+                                    db.commit()
+                            except Exception:
+                                try:
+                                    if isinstance(db, Session):
+                                        db.rollback()
+                                except Exception:
+                                    pass
+                age = timing.get("age_ms") if isinstance(timing, dict) else None
+                navigation_url = str((timing.get("navigation_url") if isinstance(timing, dict) else "") or "")
+                if (type(age) in (int, float) and 0 <= age < 1e12
+                        and timing.get("current_url") == str(getattr(page, "url", ""))
+                        and urlparse(navigation_url).hostname == urlparse(page.url).hostname
+                        and extract_video_id(navigation_url) == aweme_id
+                        and re.search(r"/(?:video|photo)/\d+", urlparse(navigation_url).path)):
+                    navigation_started_at = time.monotonic() - age / 1000
+                    target_started_at = min(target_observed_at, navigation_started_at)
+                    dom_ready_ms = timing.get("dom_ready_ms")
+                    if (warmup_info["load_state"] == "domcontentloaded"
+                            and type(dom_ready_ms) in (int, float) and 0 < dom_ready_ms <= age):
+                        target_dom_ready_at = min(target_observed_at, navigation_started_at + dom_ready_ms / 1000)
+            except Exception:
+                pass
+            if not _refresh_target_url():
+                return _redirect_failure()
+            if aweme_id and current_url and current_url != video_url:
+                cache_resolved_video_url(video_url, current_url, aweme_id)
+
+            from executor.http.comment_discovery import fetch_comment_page
+
+            # Poll ttwid and runtime signer readiness in a single parallel loop
+            # (0.2s step, bounded to 6.0s total).
+            signer_ready = False
+            live_cookies = normalize_cookie_records(await page.context.cookies())
+            warmup_info["comment_api_ready"] = False
+            cookie_deadline = time.monotonic() + 6.0
+            for _ in range(30):
+                if not _refresh_target_url():
+                    return _redirect_failure()
+                remaining = round(cookie_deadline - time.monotonic(), 6)
+                if remaining <= 0:
+                    break
+                if not signer_ready:
+                    signer_ready = bool(await wait_for_runtime_signer_ready(
+                        page, timeout_ms=min(200, max(1, int(remaining * 1000))),
+                    ))
+                    if not _refresh_target_url():
+                        return _redirect_failure()
+                if live_cookies.get("ttwid") and signer_ready:
+                    break
+                remaining = round(cookie_deadline - time.monotonic(), 6)
+                if remaining <= 0:
+                    break
+                await asyncio.sleep(min(0.2, remaining))
+                live_cookies = normalize_cookie_records(await page.context.cookies())
             warmup_info["signer_ready"] = signer_ready
+            if not _refresh_target_url():
+                return _redirect_failure()
+            now = time.monotonic()
+            minimum_age_wait = max(
+                0.0, 3.2 - (now - target_started_at), 1.8 - (now - target_dom_ready_at),
+            )
+            warmup_info["minimum_age_wait_ms"] = round(minimum_age_wait * 1000)
+            if minimum_age_wait:
+                await asyncio.sleep(minimum_age_wait)
+                if not _refresh_target_url():
+                    return _redirect_failure()
+            warmup_info["target_page_age_ms"] = round((time.monotonic() - target_started_at) * 1000)
+            warmup_info["target_dom_age_ms"] = round((time.monotonic() - target_dom_ready_at) * 1000)
+            logger.info(
+                "[WARMUP] %s target_page_age_ms=%s target_dom_age_ms=%s minimum_age_wait_ms=%s load_state=%s signer_ready=%s",
+                correlation_id or "unknown", warmup_info["target_page_age_ms"],
+                warmup_info["target_dom_age_ms"], warmup_info["minimum_age_wait_ms"], warmup_info["load_state"], signer_ready,
+            )
             if not signer_ready:
                 logger.debug(
-                    f"[WARMUP] Signer not available (stable condition, not retrying) "
+                    f"[WARMUP] Readiness signals not observed after bounded wait; native fetch may still be usable "
                     f"for {correlation_id or 'unknown'}"
                 )
-            await asyncio.sleep(
-                random.uniform(0.15, 0.35) if signer_ready else random.uniform(0.45, 0.75)
-            )
+            if live_cookies.get("ttwid") and live_cookies.get("tt_csrf_token"):
+                warmup_info["comment_api_ready"] = True
+                warmup_info["comment_api_skipped"] = True
+            elif live_cookies.get("ttwid"):
+                target_video_id = resolved_video_id or aweme_id
+                warmup_comments = await fetch_comment_page(page, target_video_id, count=20)
+                warmup_info["comment_api_ready"] = warmup_comments is not None
+                if warmup_comments is not None and target_video_id:
+                    page._cached_first_comment_page = warmup_comments
+                    page._cached_first_comment_aweme_id = str(target_video_id)
 
-            context = page.context
-            cookies_dict = {}
-            for cookie in await context.cookies():
-                cookies_dict[cookie["name"]] = cookie["value"]
+            cookies_dict, warmup_info["cookies_saved"] = await synchronize_browser_cookies(page.context, account, db)
+            if not _refresh_target_url():
+                return _redirect_failure()
+
+            auth_verified_at = getattr(page, "_http_auth_verified_at", None)
+            recently_verified = (
+                isinstance(auth_verified_at, (int, float))
+                and 0.0 <= (time.monotonic() - auth_verified_at) <= 15.0
+            )
+            if not recently_verified:
+                from executor.user_schema import _visible_logged_out_reason, _fast_visible_captcha_reason
+                blocked_reason = await _fast_visible_captcha_reason(page, phase="http_warmup")
+                logged_out_reason = await _visible_logged_out_reason(page, phase="http_warmup")
+                if blocked_reason or logged_out_reason:
+                    warmup_info.update(status="blocked", reason_code=blocked_reason or f"dead_session:{logged_out_reason}")
+                    return _finish(False, dict(warmup_info))
 
             is_valid, missing_critical, missing_optional = validate_request_profile(cookies_dict)
+            # Unlike sid_guard, these cookies are actually sent as browser auth.
+            missing_critical = []
+            if not any(cookies_dict.get(name) for name in ("sessionid", "sid_tt", "sessionid_ss")):
+                missing_critical.append("sessionid")
+            if not cookies_dict.get("ttwid"):
+                missing_critical.append("ttwid")
+            is_valid = not missing_critical
             log_tokens_safely(cookies_dict, f"{correlation_id}_attempt{attempt + 1}" if correlation_id else None)
 
-            if not signer_ready:
-                warmup_info.update(
-                    {
-                        "status": "signer_not_ready",
-                        "reason_code": "signer_not_ready",
-                        "missing_critical": missing_critical,
-                        "missing_optional": missing_optional,
-                        "degraded_http": True,
-                        "signer_ready": False,
-                    }
-                )
-                if attempt < max_retries - 1:
-                    logger.debug(
-                        f"[WARMUP] Signer not ready (attempt {attempt + 1}/{max_retries}), will retry"
-                    )
-                    await page.reload(wait_until="domcontentloaded")
-                    await asyncio.sleep(random.uniform(0.5, 1.0))
-                    continue
-
-                logger.info(
-                    f"[WARMUP] Signer not ready after {max_retries} attempts for "
-                    f"{correlation_id or 'unknown'}"
-                )
-                return _finish(False, dict(warmup_info))
-
-            if is_valid and signer_ready:
+            if is_valid:
                 degraded = "msToken" in missing_optional
                 warmup_info.update(
                     {
@@ -1028,15 +1293,10 @@ async def warmup_page_for_http(
             )
 
             if attempt < max_retries - 1:
-                await page.reload(wait_until="domcontentloaded")
                 await asyncio.sleep(random.uniform(0.5, 1.0))
+                retry_navigation_ready = _refresh_target_url()
 
         final_reason = warmup_info.get("reason_code") or "unknown"
-        if final_reason == "signer_not_ready":
-            logger.info(
-                f"[WARMUP] Proceeding without signer for {correlation_id or 'unknown'} "
-                f"(this is normal for modern TikTok - HTTP will likely stealth-reject)"
-            )
         logger.warning(
             f"[WARMUP] Profile not fully valid after {max_retries} attempts for {correlation_id or 'unknown'}. "
             f"Reason={final_reason}, missing={warmup_info.get('missing_critical')}"
@@ -1054,8 +1314,7 @@ async def warmup_page_for_http(
         context = page.context
         cookies_dict = {}
         try:
-            for cookie in await context.cookies():
-                cookies_dict[cookie["name"]] = cookie["value"]
+            cookies_dict = normalize_cookie_records(await context.cookies())
         except Exception:
             pass
         warmup_info.update(
@@ -1126,6 +1385,7 @@ class EngagementResult:
             "confirmation_source": None,
         }
         self.replies: List[Dict[str, Any]] = []
+        self.expected_reply_variants: int = 0
         self.comment_found: bool = False
         self.comment_id: Optional[str] = None
         self.comment_author: Optional[str] = None
@@ -1140,7 +1400,34 @@ class EngagementResult:
         )
         self.boost_target_mode: str = BOOST_LIKES_TARGET_SINGLE_TOP
         self.warnings: List[Dict[str, str]] = []
+        self.resolved_video_url: Optional[str] = None
+        self.aweme_id: Optional[str] = None
     
+    def accept_http_main_confirmation(self) -> None:
+        """Apply the same HTTP main confirmation rule as the user-schema flow."""
+        main = self.main_comment
+        if not (settings.TIKTOK_NETWORK_FIRST and settings.TIKTOK_NETWORK_IMPL_READY):
+            return
+        if not (
+            main.get("success") and main.get("posted") and main.get("network_confirmed")
+            and str(main.get("method") or "").startswith("http")
+            and re.fullmatch(r"[0-9]{10,30}", str(main.get("comment_id") or ""))
+        ):
+            return
+        replies_required = bool(self.expected_reply_variants or self.replies)
+        if replies_required and not any(
+            reply.get("success") and str(reply.get("method") or "").startswith("http")
+            and valid_comment_id(reply.get("reply_id")) and reply.get("network_confirmed")
+            for reply in self.replies
+        ):
+            return
+        if not main.get("verified"):
+            main["verify_mode"] = "http_reply_confirmation" if replies_required else "network_confirmed_no_replies"
+        main["verified"] = True
+        main["submitted_unconfirmed"] = False
+        if main.get("error") in {"main_submitted_unconfirmed_manual_check", "main_public_confirmation_unconfirmed"}:
+            main["error"] = None
+
     def to_dict(
         self,
         source: str = "manual",
@@ -1154,14 +1441,29 @@ class EngagementResult:
         """
         from datetime import datetime, timezone
         
-        successful_replies = sum(1 for r in self.replies if r.get("success", False))
+        self.accept_http_main_confirmation()
+        def confirmed_reply(row):
+            return bool(row.get("success") and (not http_first_enabled(settings) or (
+                str(row.get("method") or "").startswith("http") and valid_comment_id(row.get("reply_id"))
+                and row.get("network_confirmed") and not row.get("submitted_unconfirmed")
+            )))
+        successful_replies = sum(1 for r in self.replies if confirmed_reply(r))
+        if http_first_enabled(settings):
+            successful_replies = min(successful_replies, len({str(r.get("reply_id")) for r in self.replies if confirmed_reply(r)}))
         submitted_unconfirmed_replies = sum(
             1
             for r in self.replies
             if r.get("submitted_unconfirmed", False)
             or r.get("visibility_status") == "submitted_unconfirmed"
         )
-        replies_ok = len(self.replies) == 0 or successful_replies == len(self.replies)
+        # Every planned reply must succeed, including variants with no result yet.
+        replies_ok = (
+            successful_replies == len(self.replies)
+            and successful_replies >= self.expected_reply_variants
+        )
+        if http_first_enabled(settings) and self.expected_reply_variants:
+            confirmed_variants = {int(r.get("variant_index") or index) for index, r in enumerate(self.replies, 1) if confirmed_reply(r)}
+            replies_ok = bool(replies_ok and set(range(1, self.expected_reply_variants + 1)) <= confirmed_variants)
         replies_terminal_ok = len(self.replies) == 0 or all(
             r.get("success", False)
             or r.get("submitted_unconfirmed", False)
@@ -1185,9 +1487,10 @@ class EngagementResult:
                 or bool(self.main_comment.get("local_confirmation_without_id"))
             )
         )
-        # Строгое правило: если ответы запланированы, успешными должны быть все.
-        replies_ok = len(self.replies) == 0 or successful_replies == len(self.replies)
-        
+        if http_first_enabled(settings):
+            main_success = bool(main_success and self.main_comment.get("network_confirmed")
+                                and str(self.main_comment.get("method") or "").startswith("http")
+                                and valid_comment_id(self.main_comment.get("comment_id")))
         # Лайки через Boost считаются отдельным вторичным шагом.
         # Основной заказ успешен по факту комментария/ответов, а не по факту Boost-заказа.
         from services.boost_project_client import is_boost_enabled as is_provider_enabled
@@ -1276,6 +1579,16 @@ class EngagementResult:
         if not started_at:
             started_at = ended_at
         
+        main_payload = dict(self.main_comment)
+        reply_payload = list(self.replies)
+        if http_first_enabled(settings):
+            receipt = bool(main_payload.get("network_confirmed") and valid_comment_id(main_payload.get("comment_id"))
+                           and str(main_payload.get("method") or "").startswith("http"))
+            for flag in ("success", "posted", "verified", "network_confirmed"):
+                main_payload[flag] = bool(main_payload.get(flag) and receipt)
+            main_payload["local_confirmed"] = False
+            reply_payload = [{**row, "success": confirmed_reply(row), "local_confirmed": False} for row in self.replies]
+
         result = {
             "status": "success" if core_success else ("submitted_unconfirmed" if submitted_unconfirmed else "fail"),
             "core_status": "success" if core_success else ("submitted_unconfirmed" if submitted_unconfirmed else "fail"),
@@ -1286,13 +1599,13 @@ class EngagementResult:
             "source": source,
             "mode": mode,
             "engagement": {
-                "main": self.main_comment,
+                "main": main_payload,
                 "replies": {
                     "ok": successful_replies,
                     "total": len(self.replies),
                     "submitted": successful_replies + submitted_unconfirmed_replies,
                     "submitted_unconfirmed": submitted_unconfirmed_replies,
-                    "items": self.replies
+                    "items": reply_payload
                 },
                 "likes": {
                     "provider": "boost_project",
@@ -1313,6 +1626,10 @@ class EngagementResult:
                 "duration_ms": duration_ms
             }
         }
+        if self.resolved_video_url:
+            result["resolved_video_url"] = self.resolved_video_url
+        if self.aweme_id:
+            result["aweme_id"] = self.aweme_id
         try:
             from services.task_execution_ledger import attach_url_execution_ledger
 
@@ -1348,7 +1665,12 @@ async def find_comment_for_engagement(
     Returns:
         tuple: (found, comment_id, author)
     """
-    video_url, _ = await resolve_video_url(video_url)
+    if http_first_enabled(settings):
+        # Text discovery belongs to the publishing account's comment-list API
+        # flow; this legacy viewer helper must never allocate observers.
+        return (True, str(comment_id), username) if valid_comment_id(comment_id) else (False, None, None)
+    if not extract_video_id(video_url):
+        video_url, _ = await resolve_video_url(video_url)
 
     # Если есть comment_id - используем его сразу
     if comment_id:
@@ -1488,6 +1810,8 @@ async def verify_comment_dom(
     Returns:
         tuple: (found, comment_id, author)
     """
+    if http_first_enabled(settings):
+        return False, None, None, "http_only_dom_observer_disabled"
     if retry_schedule is None:
         retry_schedule = [0.0] * max(1, settings.MAX_RETRY_ACCOUNTS)
 
@@ -1646,19 +1970,23 @@ async def _attempt_publish_on_account(
     'warmup', 'http', 'enrichment', 'bootstrap', 'publish', 'error'.
 
     The function chooses between three publish backends in this order:
-      1. BAS HTTP server (when settings.USE_BAS is enabled) — externalised
+      1. BAS HTTP server (when enabled and HTTP-only is disabled) — externalised
          publishing service.
       2. HTTP via the warmed Playwright page (for accounts whose strategy is
          http_first / http_cautious). For replies this branch only runs if a
          parent_comment_id is supplied — TikTok's reply endpoint requires it.
-      3. DOM publish via Playwright (fallback / dom_first strategy).
+      3. DOM publish via Playwright only when HTTP-only is disabled.
+
+    An HTTP strategy never changes to DOM after a preparation or request error.
     """
+    if outcome_dict is not None:
+        outcome_dict["publication_attempted"] = False
     is_reply = mode == _REPLY_PUBLISH_MODE
     scope_label = mode  # used as 'main' / 'reply' for runtime stats
     http_strategy_scope = REPLY_SCOPE if is_reply else MAIN_SCOPE
     publish_kind_label = "Reply" if is_reply else "Main comment"
 
-    if settings.USE_BAS:
+    if settings.USE_BAS and not http_first_enabled(settings):
         try:
             if is_reply:
                 from executor.bas_client import post_reply_via_bas
@@ -1718,32 +2046,42 @@ async def _attempt_publish_on_account(
     context = None
     page = None
     try:
-        context, page = await create_page_for_account(account)
-
         strategy_info = get_http_execution_strategy(account, http_strategy_scope)
         strategy = (strategy_info or {}).get("strategy")
         if strategy == "skip":
             reason = str((strategy_info or {}).get("reason") or "strategy_skip")
             return None, reason, "strategy"
 
-        eligible_for_http = strategy in {"http_first", "http_cautious"}
-        if is_reply:
-            eligible_for_http = eligible_for_http and bool(parent_comment_id)
+        from executor.user_schema import _http_first_for_correlation
+
+        http_mode = _http_first_for_correlation(http_strategy_scope, correlation_id)
+        eligible_for_http = http_mode and strategy in {"http_first", "http_cautious"}
+        if http_mode and not eligible_for_http:
+            return None, "cookies_not_http_ready", "strategy"
+        if eligible_for_http and is_reply and not parent_comment_id:
+            return None, "parent_comment_id_required_for_http", "http"
+
+        context, page = await create_page_for_account(account)
+        page._publication_attempted = False
+        detach_publication_tracker = track_publication_requests(page, outcome_dict if outcome_dict is not None else {})
 
         if eligible_for_http:
             skip_reason = _should_skip_http_for_account(account.id)
             if skip_reason:
                 logger.info(
-                    "Task %s: Skipping HTTP for account %s (%s), trying DOM fallback",
+                    "Task %s: Stopping HTTP for account %s (%s)",
                     task_id,
                     account.id,
                     skip_reason,
                 )
+                return None, skip_reason, "http_health_gate"
             else:
                 cookies_dict, profile_valid, warmup_info = await warmup_page_for_http(
                     page,
                     video_url,
                     correlation_id=correlation_id,
+                    account=account,
+                    db=db,
                 )
                 warmup_current_url = str(warmup_info.get("current_url") or "").strip()
                 warmup_video_id = extract_video_id(warmup_current_url) if warmup_current_url else None
@@ -1752,19 +2090,12 @@ async def _attempt_publish_on_account(
 
                 if not profile_valid:
                     reason = str(warmup_info.get("reason_code") or "warmup_failed")
-                    missing_critical = warmup_info.get("missing_critical") or []
-                    if reason == "signer_not_ready" and not missing_critical:
-                        _record_http_account_result(account.id, "warmup_fail")
-                        logger.info(
-                            "Task %s: HTTP warmup signer not ready for account %s; "
-                            "trying DOM fallback on the same account",
-                            task_id,
-                            account.id,
-                        )
-                    else:
-                        _record_http_account_result(account.id, "soft_fail")
-                        _register_runtime_failure(db, account, reason)
-                        return None, reason, "warmup"
+                    _record_http_account_result(account.id, "soft_fail")
+                    logger.info(
+                        "Task %s: HTTP warmup unavailable for account %s (%s); stopping account attempt",
+                        task_id, account.id, reason,
+                    )
+                    return None, reason, "warmup"
                 else:
                     aweme_id = extract_video_id(video_url)
                     if not aweme_id:
@@ -1812,6 +2143,7 @@ async def _attempt_publish_on_account(
                                 outcome_dict["posted"] = True
                                 outcome_dict["network_confirmed"] = True
                                 outcome_dict["method"] = "http"
+                                outcome_dict["publication_attempted"] = True
                                 outcome_dict["parent_confirmed"] = parent_confirmed
                                 outcome_dict["parent_confirmation_level"] = parent_confirmation_level
                                 outcome_dict["response_parent_id"] = (meta or {}).get("response_parent_id")
@@ -1837,6 +2169,10 @@ async def _attempt_publish_on_account(
                                 outcome_dict["posted"] = True
                                 outcome_dict["network_confirmed"] = True
                                 outcome_dict["method"] = "http"
+                                outcome_dict["publication_attempted"] = True
+                                request_meta = getattr(http_client, "last_request_meta", {})
+                                if isinstance(request_meta, dict):
+                                    outcome_dict["comment_author"] = request_meta.get("comment_author")
                             return comment_id, None, "http"
 
                     reason = error_msg or ("http_reply_failed" if is_reply else "http_failed")
@@ -1845,15 +2181,18 @@ async def _attempt_publish_on_account(
                     if isinstance(request_meta, dict) and "request_attempted" in request_meta:
                         request_attempted = bool(request_meta.get("request_attempted"))
 
+                    if outcome_dict is not None:
+                        outcome_dict["publication_attempted"] = request_attempted
                     if not request_attempted:
                         logger.info(
                             "Task %s: %s HTTP stopped before TikTok request on account %s "
-                            "(%s); trying DOM fallback on the same account",
+                            "(%s); stopping account attempt",
                             task_id,
                             publish_kind_label,
                             account.id,
                             str(reason)[:120],
                         )
+                        return None, reason, "http"
                     else:
                         _record_http_account_failure_result(account.id, error_type)
                         _register_runtime_failure(db, account, reason, error_type=error_type)
@@ -2305,6 +2644,10 @@ async def _attempt_publish_on_account(
         _register_runtime_failure(db, account, f"exception: {str(e)[:100]}")
         return None, f"exception: {str(e)[:100]}", "error"
     finally:
+        if outcome_dict is not None and page is not None:
+            outcome_dict["publication_attempted"] = bool(outcome_dict.get("publication_attempted") or getattr(page, "_publication_attempted", False))
+        if "detach_publication_tracker" in locals():
+            detach_publication_tracker()
         await _close_attempt_resources(page, context, reason="engagement_publish_done")
 
 
@@ -2423,11 +2766,12 @@ async def execute_replies_http(
     pool_owner_user_id: Optional[int] = None,
 ) -> List[Dict[str, Any]]:
     results: List[Dict[str, Any]] = []
-    video_url, _ = await resolve_video_url(video_url)
+    if not extract_video_id(video_url):
+        video_url, _ = await resolve_video_url(video_url)
 
     norm_parent_id = str(parent_comment_id).strip() if parent_comment_id else ""
     parent_author = (parent_author or "").strip() or None
-    allow_dom_text_parent = bool(not norm_parent_id and main_comment_text)
+    allow_dom_text_parent = bool(not http_first_enabled(settings) and not norm_parent_id and main_comment_text)
     if not norm_parent_id and not allow_dom_text_parent:
         for reply_text in replies:
             if not reply_text:
@@ -2525,7 +2869,10 @@ async def execute_replies_http(
                 continue
 
             force_dom_text_parent = not norm_parent_id
-            if force_dom_text_parent or strategy == "dom_first":
+            if http_first_enabled(settings) and strategy not in {"http_first", "http_cautious"}:
+                last_error = "cookies_not_http_ready"
+                continue
+            if not http_first_enabled(settings) and (force_dom_text_parent or strategy == "dom_first"):
                 try:
                     post_reply_func = globals().get("post_reply")
                     if post_reply_func is None:
@@ -2671,6 +3018,7 @@ async def execute_replies_http(
                     "fallback_used": False,
                     "warmup_reason": None,
                     "submitted_unconfirmed": reply_submitted_unconfirmed,
+                    "network_confirmed": bool(reply_outcome.get("network_confirmed")),
                     "local_confirmed": bool(reply_outcome.get("local_confirmed")),
                     "local_confirmation_without_id": bool(
                         reply_outcome.get("local_confirmation_without_id")
@@ -2757,13 +3105,13 @@ async def execute_engagement_only_replies_via_full_flow(
 
     anchor_text = (comment_text or "").strip()
     anchor_id = str(comment_id or "").strip() or None
-    if not anchor_text and not anchor_id:
+    if not normalize_search_phrase(anchor_text) and not anchor_id:
         return [
             {
                 "text": reply_text,
                 "success": False,
                 "method": None,
-                "error": "engagement_reply_anchor_missing",
+                "error": "engagement_reply_anchor_missing" if not anchor_text else "empty_search_phrase",
                 "reply_id": None,
                 "http_error_type": None,
                 "parent_confirmed": False,
@@ -2784,6 +3132,7 @@ async def execute_engagement_only_replies_via_full_flow(
     # reply phase.
     from executor.user_schema import (
         PublishedMain,
+        _SharedParentSearchCache,
         _infer_found_mains_from_reply_outcomes,
         _main_parent_keys,
         _reply_outcome_parent_key,
@@ -2797,10 +3146,19 @@ async def execute_engagement_only_replies_via_full_flow(
 
     results: List[Dict[str, Any]] = []
     used_reply_accounts: List[int] = []
+    shared_parent_cache = _SharedParentSearchCache()
+    reply_account_tries: Dict[int, int] = {}
+
+    def _adopt_resolved_video_url(resolved_url: str) -> None:
+        nonlocal video_url
+        parsed = urlparse(str(resolved_url))
+        if (parsed.hostname == "tiktok.com" or (parsed.hostname or "").endswith(".tiktok.com")) and extract_video_id(resolved_url):
+            video_url = resolved_url
     used_reply_proxy_values: set[str] = set()
     used_reply_proxy_counts: Dict[str, int] = {}
     resolved_parent_id = anchor_id
     resolved_author = (comment_author or "").strip() or None
+    requested_author = resolved_author
     max_attempts = max(1, min(int(settings.MAX_RETRY_ACCOUNTS), ENGAGEMENT_ONLY_REPLY_MAX_ATTEMPTS))
     dynamic_worker_pool_enabled = bool(getattr(settings, "PARALLEL_DYNAMIC_WORKER_POOL_ENABLED", True))
     def _positive_int_setting(name: str, default: int) -> int:
@@ -2815,9 +3173,17 @@ async def execute_engagement_only_replies_via_full_flow(
         max(3, requested_parallel_worker_target),
     )
     parallel_worker_target = min(requested_parallel_worker_target, parallel_browser_capacity)
+    reply_variant_worker_target = min(
+        parallel_worker_target,
+        _positive_int_setting(
+            "PARALLEL_REPLY_VARIANT_WORKERS",
+            min(2, parallel_worker_target),
+        ),
+    )
     max_active_browsers_per_proxy = min(
-        2,
-        _positive_int_setting("PARALLEL_MAX_ACTIVE_BROWSERS_PER_PROXY", 2),
+        parallel_browser_capacity,
+        _positive_int_setting("PARALLEL_MAX_ACTIVE_BROWSERS_PER_PROXY", 3),
+        _positive_int_setting("PARALLEL_REPLY_MAX_ACTIVE_BROWSERS_PER_PROXY", 2),
     )
     parallel_capacity_request = (
         parallel_browser_capacity
@@ -2825,11 +3191,13 @@ async def execute_engagement_only_replies_via_full_flow(
         else 3
     )
     reply_selection_lock = asyncio.Lock()
+    reply_proxy_slot_released = asyncio.Event()
     submitted_parent_keys_by_variant: Dict[int, set[str]] = {}
     soft_submitted_reply_keys_by_variant: Dict[int, set[str]] = {}
     last_outcomes_by_variant: Dict[int, List[Any]] = {}
     last_reply_account_by_variant: Dict[int, Optional[int]] = {}
-    confident_empty_reply_account_ids: set[int] = set()
+    missed_search_account_ids: set[int] = set()
+    confident_empty_rotation_account_ids: set[int] = set()
     reply_visibility_rotation_attempted = False
     reply_visibility_rotation_success = False
     reply_visibility_rotation_proxy: Optional[str] = None
@@ -2876,14 +3244,17 @@ async def execute_engagement_only_replies_via_full_flow(
         reply_selection_capacity_backoff_seconds = 1.5
 
     def _current_main_candidate() -> PublishedMain:
+        # Keep the user's phrase/optional author as the search criteria. A
+        # previous account's observed full text, CID or author is reporting
+        # evidence, not permission to narrow the next account's phrase search.
         return PublishedMain(
-            text=anchor_text or resolved_parent_id or "",
-            comment_id=resolved_parent_id,
-            network_confirmed=bool(resolved_parent_id),
+            text=anchor_text or anchor_id or "",
+            comment_id=anchor_id,
+            network_confirmed=bool(anchor_id),
             local_confirmed=True,
             method="engagement_only_anchor",
             account_id=0,
-            tiktok_username=(resolved_author or None),
+            tiktok_username=requested_author,
         )
 
     def _account_proxy_value(account: Optional[Account]) -> Optional[str]:
@@ -3218,7 +3589,8 @@ async def execute_engagement_only_replies_via_full_flow(
         nonlocal reply_visibility_rotation_attempted
         nonlocal reply_visibility_rotation_success
         nonlocal reply_visibility_rotation_proxy
-        confident_empty_reply_account_ids.clear()
+        missed_search_account_ids.clear()
+        confident_empty_rotation_account_ids.clear()
         reply_visibility_rotation_attempted = False
         reply_visibility_rotation_success = False
         reply_visibility_rotation_proxy = None
@@ -3295,19 +3667,21 @@ async def execute_engagement_only_replies_via_full_flow(
             )
             return False
 
-    async def _record_confident_empty_reply(raw_result: Dict[str, Any]) -> int:
+    async def _record_parent_search_miss(raw_result: Dict[str, Any]) -> int:
         empty_account_id = int(raw_result.get("account_id") or 0)
         if empty_account_id <= 0:
             return 0
-        is_new_account = empty_account_id not in confident_empty_reply_account_ids
-        confident_empty_reply_account_ids.add(empty_account_id)
+        is_new_account = empty_account_id not in missed_search_account_ids
+        missed_search_account_ids.add(empty_account_id)
+        if raw_result.get("confident_visibility_empty"):
+            confident_empty_rotation_account_ids.add(empty_account_id)
         logger.info(
-            "Task %s: engagement_only confident empty parent search account=%s "
+            "Task %s: engagement_only unsuccessful parent search account=%s "
             "proxy=%s total=%s/%s rows=%s unique=%s rotation=%s/%s",
             task_id,
             empty_account_id,
             str(raw_result.get("proxy_value") or "").rsplit("@", 1)[-1],
-            len(confident_empty_reply_account_ids),
+            len(missed_search_account_ids),
             _REPLY_VISIBILITY_EMPTY_STOP_QUORUM,
             raw_result.get("parent_search_max_seen_rows", 0),
             raw_result.get("parent_search_unique_rows_seen", 0),
@@ -3316,7 +3690,8 @@ async def execute_engagement_only_replies_via_full_flow(
         )
         if (
             is_new_account
-            and len(confident_empty_reply_account_ids) >= _REPLY_VISIBILITY_EMPTY_QUORUM
+            and raw_result.get("confident_visibility_empty")
+            and len(confident_empty_rotation_account_ids) >= _REPLY_VISIBILITY_EMPTY_QUORUM
             and not reply_visibility_rotation_attempted
         ):
             await _force_reply_visibility_rotation(raw_result.get("proxy_value"))
@@ -3371,6 +3746,9 @@ async def execute_engagement_only_replies_via_full_flow(
         from db.database import get_sync_db_context
 
         with get_sync_db_context() as attempt_db:
+            if reply_account_tries.get(variant_idx, 0) >= max(1, settings.MAX_RETRY_ACCOUNTS):
+                attempt_info["error"] = "no_free_reply_accounts"
+                return attempt_info
             reply_account, selection_error = await _select_reply_account(attempt_db)
             if not reply_account:
                 if selection_error == temporary_reply_selection_error:
@@ -3389,6 +3767,7 @@ async def execute_engagement_only_replies_via_full_flow(
                 return attempt_info
 
             attempt_info["account_id"] = reply_account.id
+            reply_account_tries[variant_idx] = reply_account_tries.get(variant_idx, 0) + 1
             attempt_info["proxy_value"] = _account_proxy_value(reply_account)
             last_reply_account_by_variant[variant_idx] = reply_account.id
             correlation_id = (
@@ -3406,10 +3785,11 @@ async def execute_engagement_only_replies_via_full_flow(
             author_hints_present = bool((main_candidate.tiktok_username or "").strip())
             if author_hints_present:
                 logger.info(
-                    "Task %s: engagement_only reply parent search has author hints, but will use text-first matching",
+                    "Task %s: engagement_only reply parent search will require author+text",
                     task_id,
                 )
 
+            parent_search_progress: Dict[str, Any] = {}
             try:
                 attempt_result = await asyncio.wait_for(
                     _reply_with_variant_on_all_mains(
@@ -3423,8 +3803,12 @@ async def execute_engagement_only_replies_via_full_flow(
                         fallback_main_texts=None,
                         already_replied_parent_keys=submitted_parent_keys,
                         soft_submitted_reply_keys=soft_submitted_reply_keys,
-                        require_parent_author_match=False,
+                        require_parent_author_match=author_hints_present,
                         allow_parent_author_fallback=False,
+                        parent_phrase_match=True,
+                        parent_search_progress_sink=parent_search_progress,
+                        shared_parent_cache=shared_parent_cache,
+                        on_resolved_video_url=_adopt_resolved_video_url,
                     ),
                     timeout=reply_worker_attempt_timeout_seconds,
                 )
@@ -3436,7 +3820,28 @@ async def execute_engagement_only_replies_via_full_flow(
                     reply_account.id,
                     reply_worker_attempt_timeout_seconds,
                 )
+                attempt_info["pre_publish_failure"] = not bool(parent_search_progress.get("publication_attempted"))
                 attempt_info["error"] = f"parallel_reply_attempt_timeout:{reply_worker_attempt_timeout_seconds:.1f}s"
+                attempt_info["parent_search_max_seen_rows"] = int(
+                    parent_search_progress.get("parent_search_max_seen_rows") or 0
+                )
+                attempt_info["parent_search_unique_rows_seen"] = int(
+                    parent_search_progress.get("parent_search_unique_rows_seen") or 0
+                )
+                attempt_info["parent_search_total_comment_count"] = parent_search_progress.get(
+                    "parent_search_total_comment_count"
+                )
+                attempt_info["parent_search_scroll_budget"] = int(
+                    parent_search_progress.get("parent_search_scroll_budget") or 0
+                )
+                attempt_info["parent_search_missed"] = bool(
+                    parent_search_progress.get("searched")
+                    and int(parent_search_progress.get("parent_search_found_count") or 0) <= 0
+                    and (
+                        parent_search_progress.get("saw_comment_rows")
+                        or parent_search_progress.get("parent_search_total_comment_count") == 0
+                    )
+                )
                 return attempt_info
             except Exception as exc:
                 logger.warning(
@@ -3446,6 +3851,7 @@ async def execute_engagement_only_replies_via_full_flow(
                     reply_account.id,
                     str(exc)[:120],
                 )
+                attempt_info["pre_publish_failure"] = not bool(parent_search_progress.get("publication_attempted"))
                 attempt_info["error"] = f"reply_attempt_exception:{str(exc)[:80]}"
                 return attempt_info
             finally:
@@ -3456,8 +3862,11 @@ async def execute_engagement_only_replies_via_full_flow(
                         # next selection tick runs a real scan and can claim it
                         # immediately instead of waiting out the backoff window.
                         reply_selection_state["capacity_cooldown_until"] = 0.0
+                    if attempt_info.get("proxy_value"):
+                        reply_proxy_slot_released.set()
 
         outcomes = list(attempt_result.replies or [])
+        attempt_info["pre_publish_failure"] = pre_publish_outcomes(outcomes)
         found_mains = list(getattr(attempt_result, "found_mains", None) or [])
         if not found_mains and outcomes:
             found_mains = _infer_found_mains_from_reply_outcomes(outcomes, [main_candidate])
@@ -3509,6 +3918,27 @@ async def execute_engagement_only_replies_via_full_flow(
         )
 
         attempt_info["outcomes"] = outcomes
+        # A bounded search that saw actual comments can miss the phrase even
+        # before reaching the end of TikTok's list. Count it toward the user's
+        # four-search limit, without declaring the parent definitely absent.
+        # Login/proxy/CAPTCHA failures and failures AFTER finding a parent are
+        # not unsuccessful searches.
+        attempt_info["parent_search_missed"] = bool(
+            attempt_info["confident_visibility_empty"]
+            or (
+                getattr(attempt_result, "searched", False)
+                and not found_mains
+                and (
+                    getattr(attempt_result, "saw_comment_rows", False)
+                    or getattr(attempt_result, "parent_search_total_comment_count", None) == 0
+                )
+                and not any(
+                    outcome.attempted
+                    or str(outcome.error or "").startswith(("captcha", "login", "proxy", "goto_failed"))
+                    for outcome in outcomes
+                )
+            )
+        )
         if outcomes:
             last_outcomes_by_variant[variant_idx] = outcomes
 
@@ -3587,9 +4017,10 @@ async def execute_engagement_only_replies_via_full_flow(
             next_reply_selection_retry_at = 0.0
             consecutive_surface_unavailable_attempts = 0
             max_surface_unavailable_attempts = (
-                max_surface_unavailable_batches * max(1, parallel_worker_target)
+                max_surface_unavailable_batches * max(1, reply_variant_worker_target)
             )
             recent_surface_failures: List[Tuple[int, str, Dict[str, Any]]] = []
+            capacity_waiting_for_slot_release = False
 
             async def _cancel_active_dynamic_reply_tasks() -> None:
                 if not active_reply_tasks:
@@ -3629,7 +4060,8 @@ async def execute_engagement_only_replies_via_full_flow(
                     while (
                         pending_reply_variants
                         and not stop_after_dynamic
-                        and len(active_reply_tasks) < parallel_worker_target
+                        and len(active_reply_tasks) < reply_variant_worker_target
+                        and not capacity_waiting_for_slot_release
                         and not _is_stop_requested()
                     ):
                         if next_reply_selection_retry_at > time.monotonic():
@@ -3675,6 +4107,17 @@ async def execute_engagement_only_replies_via_full_flow(
                     )
                     if not done:
                         continue
+
+                    # A real reply worker sets this event only after it has
+                    # decremented the active-proxy counter. Capacity-deferred
+                    # workers do not set it. This lets the scheduler wait for an
+                    # actual slot release instead of waking every backoff tick and
+                    # repeating the same synchronous account/proxy scan.
+                    slot_release_observed = reply_proxy_slot_released.is_set()
+                    if slot_release_observed:
+                        reply_proxy_slot_released.clear()
+                        capacity_waiting_for_slot_release = False
+                        next_reply_selection_retry_at = 0.0
 
                     completed_reply_results: List[Tuple[int, str, Dict[str, Any]]] = []
                     for task_obj in done:
@@ -3739,22 +4182,34 @@ async def execute_engagement_only_replies_via_full_flow(
                         else 1
                     )
                     for variant_idx, reply_text, raw_result in completed_reply_results:
+                        if raw_result.get("pre_publish_failure"):
+                            reply_rounds[variant_idx] = max(0, reply_rounds.get(variant_idx, 0) - 1)
                         if raw_result.get("error") == temporary_reply_selection_error:
                             reply_rounds[variant_idx] = max(0, reply_rounds.get(variant_idx, 0) - 1)
                             pending_reply_variants.append((variant_idx, reply_text))
-                            next_reply_selection_retry_at = max(
-                                next_reply_selection_retry_at,
-                                time.monotonic() + reply_selection_capacity_backoff_seconds,
+                            capacity_waiting_for_slot_release = bool(
+                                active_reply_tasks and not slot_release_observed
                             )
+                            if capacity_waiting_for_slot_release:
+                                next_reply_selection_retry_at = 0.0
+                            else:
+                                next_reply_selection_retry_at = max(
+                                    next_reply_selection_retry_at,
+                                    time.monotonic() + reply_selection_capacity_backoff_seconds,
+                                )
                             logger.info(
                                 "Task %s: engagement_only dynamic reply variant %s deferred until a proxy/browser slot frees up "
-                                "(backoff=%.1fs active=%s)",
+                                "(event_wait=%s backoff=%.1fs active=%s)",
                                 task_id,
                                 variant_idx,
+                                capacity_waiting_for_slot_release,
                                 reply_selection_capacity_backoff_seconds,
                                 dict(active_reply_proxy_counts),
                             )
-                            if not active_reply_tasks and await _sleep_or_stop(reply_selection_capacity_backoff_seconds):
+                            if (
+                                not active_reply_tasks
+                                and await _sleep_or_stop(reply_selection_capacity_backoff_seconds)
+                            ):
                                 results.append(
                                     _stopped_reply_row(
                                         reply_text,
@@ -3784,9 +4239,6 @@ async def execute_engagement_only_replies_via_full_flow(
                             resolved_parent_id = str(raw_result["resolved_parent_id"])
                         if raw_result.get("resolved_author"):
                             resolved_author = str(raw_result["resolved_author"])
-                        if raw_result.get("matched_text"):
-                            anchor_text = str(raw_result["matched_text"])
-
                         if raw_result.get("found_any_main"):
                             _reset_reply_visibility_sequence("main_found_by_reply_account")
 
@@ -3794,10 +4246,10 @@ async def execute_engagement_only_replies_via_full_flow(
                             results.extend(raw_result.get("replies") or [])
                             continue
 
-                        if raw_result.get("confident_visibility_empty"):
-                            empty_account_id = await _record_confident_empty_reply(raw_result)
+                        if raw_result.get("parent_search_missed"):
+                            empty_account_id = await _record_parent_search_miss(raw_result)
                             if (
-                                len(confident_empty_reply_account_ids)
+                                len(missed_search_account_ids)
                                 >= _REPLY_VISIBILITY_EMPTY_STOP_QUORUM
                             ):
                                 fatal_visibility_error = (
@@ -3815,9 +4267,9 @@ async def execute_engagement_only_replies_via_full_flow(
                                 _append_unresolved_dynamic_reply_rows(fatal_visibility_error)
                                 logger.warning(
                                     "Task %s: stopping engagement_only replies after %s distinct "
-                                    "accounts confidently failed to find the parent comment",
+                                    "accounts failed to find the parent comment",
                                     task_id,
-                                    len(confident_empty_reply_account_ids),
+                                    len(missed_search_account_ids),
                                 )
                                 pending_reply_variants = []
                                 stop_after_dynamic = True
@@ -4044,9 +4496,6 @@ async def execute_engagement_only_replies_via_full_flow(
                 resolved_parent_id = str(raw_result["resolved_parent_id"])
             if raw_result.get("resolved_author"):
                 resolved_author = str(raw_result["resolved_author"])
-            if raw_result.get("matched_text"):
-                anchor_text = str(raw_result["matched_text"])
-
             if raw_result.get("found_any_main"):
                 _reset_reply_visibility_sequence("main_found_by_reply_account")
 
@@ -4054,10 +4503,10 @@ async def execute_engagement_only_replies_via_full_flow(
                 results.extend(raw_result.get("replies") or [])
                 continue
 
-            if raw_result.get("confident_visibility_empty"):
-                empty_account_id = await _record_confident_empty_reply(raw_result)
+            if raw_result.get("parent_search_missed"):
+                empty_account_id = await _record_parent_search_miss(raw_result)
                 if (
-                    len(confident_empty_reply_account_ids)
+                    len(missed_search_account_ids)
                     >= _REPLY_VISIBILITY_EMPTY_STOP_QUORUM
                 ):
                     raw_result["error"] = (
@@ -4067,6 +4516,8 @@ async def execute_engagement_only_replies_via_full_flow(
                     visibility_exhausted_batch = True
                     stop_after_batch = True
 
+            if raw_result.get("pre_publish_failure"):
+                reply_rounds[variant_idx] = max(0, reply_rounds.get(variant_idx, 0) - 1)
             if raw_result.get("error") == temporary_reply_selection_error:
                 reply_rounds[variant_idx] = max(0, reply_rounds.get(variant_idx, 0) - 1)
                 retry_variants.append((variant_idx, reply_text))
@@ -4147,9 +4598,9 @@ async def execute_engagement_only_replies_via_full_flow(
                 reported_variants.add(pending_variant_idx)
             logger.warning(
                 "Task %s: stopping engagement_only batch replies after %s distinct accounts "
-                "confidently failed to find the parent comment",
+                "failed to find the parent comment",
                 task_id,
-                len(confident_empty_reply_account_ids),
+                len(missed_search_account_ids),
             )
             pending_reply_variants = []
             break
@@ -4216,22 +4667,35 @@ async def execute_engagement_only_replies_via_full_flow(
 def _engagement_reply_outcome_to_dict(outcome: Any, *, attempts: int) -> Dict[str, Any]:
     parent_confirmed = bool(outcome.matched_main_text or outcome.parent_comment_id)
     submitted_unconfirmed = bool(getattr(outcome, "submitted_unconfirmed", False))
+    http_transport = str(outcome.method or "").startswith("http") or outcome.method == "parent_http"
     return {
         "text": outcome.text,
-        "success": bool(outcome.success),
+        "success": bool(outcome.success and (not http_first_enabled(settings) or (
+            http_transport and valid_comment_id(getattr(outcome, "reply_comment_id", None))
+            and getattr(outcome, "reply_confirmation", None) == "network_comment_id"))),
+        "network_confirmed": bool(http_transport and valid_comment_id(getattr(outcome, "reply_comment_id", None))
+                                  and getattr(outcome, "reply_confirmation", None) == "network_comment_id"),
         "method": outcome.method,
         "error": outcome.error,
-        "reply_id": None,
+        "reply_id": getattr(outcome, "reply_comment_id", None),
+        "author_username": getattr(outcome, "author_username", None),
+        "author_uid": getattr(outcome, "author_uid", None),
         "http_error_type": None,
         "parent_confirmed": parent_confirmed,
-        "parent_confirmation_level": "ui_text_exact" if parent_confirmed else "unconfirmed",
+        "parent_confirmation_level": (
+            "network_exact" if http_transport and parent_confirmed and outcome.success
+            else "ui_text_exact" if parent_confirmed and not http_transport else "unconfirmed"
+        ),
         "visibility_status": (
             "network_confirmed"
             if outcome.success
             else ("submitted_unconfirmed" if submitted_unconfirmed else "not_checked")
         ),
-        "local_visible": True if outcome.success else None,
-        "verify_mode": "full_flow_dom_parent",
+        "local_visible": True if outcome.success and not http_transport else None,
+        "verify_mode": (
+            "http_comment_list" if outcome.method == "parent_http"
+            else "http_parent_id" if http_transport else "full_flow_dom_parent"
+        ),
         "attempts": attempts,
         "fallback_used": False,
         "warmup_reason": None,
@@ -4342,7 +4806,7 @@ async def execute_hybrid_full(
     result.boost_quantity = boost_quantity
     
     logger.info(f"Task {task_id}: Starting HYBRID FULL for {video_url[:50]}")
-    resolved_video_url, resolved_video_id = await resolve_video_url(video_url)
+    resolved_video_url, resolved_video_id = await resolve_order_video_url(db, video_url, pool_owner_user_id)
     if resolved_video_url != video_url:
         logger.info(
             "Task %s: resolved video URL for HYBRID FULL: %s -> %s",
@@ -4353,7 +4817,12 @@ async def execute_hybrid_full(
         video_url = resolved_video_url
     elif resolved_video_id:
         video_url = resolved_video_url
-    
+    if _is_tiktok_shortlink(video_url) and not resolved_video_id:
+        result.main_comment["error"] = "video_url_unresolved"
+        return result
+    result.resolved_video_url = video_url
+    result.aweme_id = resolved_video_id or extract_video_id(video_url)
+
     max_attempts = max(1, settings.MAX_RETRY_ACCOUNTS)
     tried_account_ids: List[int] = []
     reserved_main_account_ids: set[int] = set()
@@ -4362,6 +4831,7 @@ async def execute_hybrid_full(
     last_error = None
 
     replies_to_post: List[str] = _reply_variants_from_task(task)
+    result.expected_reply_variants = len(replies_to_post)
 
     def _release_reserved_main_accounts() -> None:
         for account_id in list(reserved_main_account_ids):
@@ -4412,21 +4882,35 @@ async def execute_hybrid_full(
         )
 
         if comment_id:
+            if http_first_enabled(settings):
+                if not (valid_comment_id(comment_id) and result.main_comment.get("network_confirmed") and str(result.main_comment.get("method") or "").startswith("http")):
+                    last_error = "main_http_confirmation_missing"
+                    release_main_account_reservation(candidate.id)
+                    reserved_main_account_ids.discard(candidate.id)
+                    continue
+                main_comment_id = str(comment_id)
+                result.main_comment.update(comment_id=main_comment_id, success=True, posted=True,
+                                           verified=True, verify_mode="http_api_receipt", submitted_unconfirmed=False)
+                result.comment_id = main_comment_id
+                result.comment_author = result.main_comment.get("comment_author") or candidate.label
+                result.comment_found = True
+                break
             if not replies_to_post:
                 main_comment_id = comment_id
                 result.main_comment["comment_id"] = main_comment_id
                 result.main_comment["verify_mode"] = "skipped_no_replies"
                 result.comment_id = main_comment_id
-                result.comment_author = candidate.label
+                result.comment_author = result.main_comment.get("comment_author") or candidate.label
                 result.comment_found = True
                 result.main_comment["success"] = True
                 result.main_comment["verified"] = False
                 result.main_comment["submitted_unconfirmed"] = True
                 result.main_comment["error"] = "main_submitted_unconfirmed_manual_check"
+                result.accept_http_main_confirmation()
                 logger.info(
                     "Task %s: Main comment accepted without public DOM verification "
-                    "(no replies planned). Marking as submitted_unconfirmed for manual check.",
-                    task_id,
+                    "(no replies planned); confirmation=%s",
+                    task_id, "http_network" if result.main_comment["verified"] else "submitted_unconfirmed",
                 )
                 break
 
@@ -4441,7 +4925,7 @@ async def execute_hybrid_full(
                 video_url=video_url,
                 comment_text=text_choice,
                 expected_comment_id=comment_id,
-                expected_author=candidate.label,
+                expected_author=result.main_comment.get("comment_author") or candidate.label,
                 task_id=task_id,
                 prefer_fast_path=True,
                 exclude_account_ids=[candidate.id],
@@ -4454,7 +4938,7 @@ async def execute_hybrid_full(
             result.main_comment["comment_id"] = main_comment_id
             result.main_comment["verify_mode"] = final_verify_mode
             result.comment_id = main_comment_id
-            result.comment_author = verified_author or candidate.label
+            result.comment_author = verified_author or result.main_comment.get("comment_author") or candidate.label
             result.comment_found = True
             result.main_comment["success"] = True
 
@@ -4564,7 +5048,9 @@ async def execute_hybrid_full(
         release_main_account_reservation(candidate.id)
         reserved_main_account_ids.discard(candidate.id)
 
-        if str(last_error).startswith("captcha_challenge:") or "after_captcha_clear" in str(last_error):
+        if (str(last_error).startswith("captcha_challenge:") or "after_captcha_clear" in str(last_error)) and (
+            not http_first_enabled(settings) or result.main_comment.get("publication_attempted")
+        ):
             logger.warning(
                 "Task %s: Stopping main-comment retries after captcha-related result "
                 "(%s) to avoid burning more accounts.",
@@ -4682,6 +5168,7 @@ async def execute_hybrid_full(
             _release_reserved_main_accounts()
             return result
 
+    result.accept_http_main_confirmation()
     if boost_enabled and not replies_to_post:
         result.boost_enabled = False
         result.boost_error = None
@@ -4761,6 +5248,12 @@ async def execute_engagement_only(
     result.boost_quantity = boost_quantity
     
     logger.info(f"Task {task_id}: Starting ENGAGEMENT ONLY for {video_url[:50]}")
+    video_url, resolved_media_id = await resolve_order_video_url(db, video_url, pool_owner_user_id)
+    if _is_tiktok_shortlink(video_url) and not resolved_media_id:
+        result.main_comment["error"] = "video_url_unresolved"
+        return result
+    result.resolved_video_url = video_url
+    result.aweme_id = resolved_media_id or extract_video_id(video_url)
 
     # Safety: comment_text is the anchor for finding the Reply button in the DOM.
     # Missing text → browser falls back to comment ID attribute only (less reliable).
@@ -4774,6 +5267,7 @@ async def execute_engagement_only(
 
     # ========== REPLIES (HTTP) ==========
     replies_to_post = _reply_variants_from_task(task)
+    result.expected_reply_variants = len(replies_to_post)
     likes_ordered_upfront = False
 
     initial_comment_id = str(comment_id or "").strip()

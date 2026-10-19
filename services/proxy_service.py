@@ -5,6 +5,7 @@ import time
 from typing import Tuple, Optional
 from urllib.parse import urlparse
 import httpx
+from services.log_sanitizer import sanitize_url
 
 logger = logging.getLogger("services.proxy_service")
 
@@ -78,6 +79,7 @@ async def check_proxy_health_async(
     
     proxy_str = proxy_str.strip()
     
+    safe_proxy = sanitize_url(str(proxy_str or ""), max_length=80)
     try:
         # Нормализуем URL (добавляем протокол если нет, НО НЕ ИЗМЕНЯЕМ саму строку)
         proxy_url = normalize_proxy_url(proxy_str)
@@ -120,9 +122,9 @@ async def check_proxy_health_async(
                         status = "active"
                         if response_time_ms and response_time_ms > 60000:  # Увеличено с 30 до 60 секунд
                             status = "slow"
-                            logger.info(f"Proxy {proxy_str[:30]} is slow but working: {response_time_ms}ms")
+                            logger.info(f"Proxy {safe_proxy} is slow but working: {response_time_ms}ms")
                         
-                        logger.debug(f"Proxy {proxy_str[:30]} is {status}, IP: {ip}, time: {response_time_ms}ms")
+                        logger.debug(f"Proxy {safe_proxy} is {status}, IP: {ip}, time: {response_time_ms}ms")
                         return True, status, None, response_time_ms
                     except Exception:
                         # Если не JSON, просто проверяем статус
@@ -130,7 +132,7 @@ async def check_proxy_health_async(
                             status = "active"
                             if response_time_ms and response_time_ms > 60000:  # Увеличено с 30 до 60 секунд
                                 status = "slow"
-                            logger.debug(f"Proxy {proxy_str[:30]} is {status} (status 200), time: {response_time_ms}ms")
+                            logger.debug(f"Proxy {safe_proxy} is {status} (status 200), time: {response_time_ms}ms")
                             return True, status, None, response_time_ms
                         else:
                             return False, "bad", f"HTTP {response.status_code}", response_time_ms
@@ -139,7 +141,7 @@ async def check_proxy_health_async(
                     
         except httpx.TimeoutException:
             # Timeout - прокси не работает (медленный или не отвечает)
-            logger.warning(f"Proxy {proxy_str[:30]} timeout")
+            logger.warning(f"Proxy {safe_proxy} timeout")
             # Таймаут обычно >30 секунд, помечаем как медленный
             return False, "slow", "Timeout connecting to proxy (>30s)", None
             
@@ -149,15 +151,15 @@ async def check_proxy_health_async(
             
             if "authentication" in error_msg.lower() or "auth" in error_msg.lower():
                 # Ошибка авторизации - прокси bad
-                logger.warning(f"Proxy {proxy_str[:30]} auth failed: {error_msg[:100]}")
+                logger.warning(f"Proxy {safe_proxy} auth failed: {error_msg[:100]}")
                 return False, "bad", f"Authentication failed: {error_msg[:100]}", None
             elif "connection refused" in error_msg.lower() or "refused" in error_msg.lower():
                 # Connection refused - прокси bad
-                logger.warning(f"Proxy {proxy_str[:30]} connection refused: {error_msg[:100]}")
+                logger.warning(f"Proxy {safe_proxy} connection refused: {error_msg[:100]}")
                 return False, "bad", f"Connection refused: {error_msg[:100]}", None
             else:
                 # Другие ошибки прокси - обычно это bad proxy
-                logger.warning(f"Proxy {proxy_str[:30]} proxy error: {error_msg[:100]}")
+                logger.warning(f"Proxy {safe_proxy} proxy error: {error_msg[:100]}")
                 return False, "bad", f"Proxy error: {error_msg[:100]}", None
                 
         except httpx.ConnectError as e:
@@ -166,28 +168,28 @@ async def check_proxy_health_async(
             
             if "getaddrinfo" in error_msg.lower() or "11001" in error_msg or "name resolution" in error_msg.lower():
                 # DNS ошибка - это ошибка клиента (неправильный домен), не прокси
-                logger.debug(f"Proxy {proxy_str[:30]} DNS error (client error): {error_msg[:100]}")
+                logger.debug(f"Proxy {safe_proxy} DNS error (client error): {error_msg[:100]}")
                 return False, "unknown", f"DNS resolution failed (client error): {error_msg[:100]}", None
             else:
                 # Другие ошибки подключения - обычно это bad proxy
-                logger.warning(f"Proxy {proxy_str[:30]} connection error: {error_msg[:100]}")
+                logger.warning(f"Proxy {safe_proxy} connection error: {error_msg[:100]}")
                 return False, "bad", f"Connection error: {error_msg[:100]}", None
                 
         except httpx.HTTPError as e:
             # Другие ошибки HTTP
             error_msg = str(e)[:200]
-            logger.warning(f"Proxy {proxy_str[:30]} HTTP error: {error_msg}")
+            logger.warning(f"Proxy {safe_proxy} HTTP error: {error_msg}")
             return False, "bad", f"HTTP error: {error_msg}", None
                 
     except ValueError as e:
         # Ошибка валидации/парсинга - это ошибка клиента
-        logger.debug(f"Proxy {proxy_str[:30]} validation error: {e}")
+        logger.debug(f"Proxy {safe_proxy} validation error: {e}")
         return False, "unknown", f"Invalid proxy format: {str(e)[:100]}", None
         
     except Exception as e:
         # Неожиданная ошибка - логируем и помечаем как unknown (ошибка клиента)
         error_msg = str(e)[:200]
-        logger.error(f"Proxy {proxy_str[:30]} unexpected error: {error_msg}")
+        logger.error(f"Proxy {safe_proxy} unexpected error: {error_msg}")
         return False, "unknown", f"Unexpected error: {error_msg}", None
 
 
@@ -229,7 +231,11 @@ async def quick_check_proxy(proxy_str: str, timeout: float = 30.0, max_response_
         # Прокси работает (может быть медленным, но работает)
         return True, response_time_ms
     except Exception as e:
-        logger.warning(f"Quick proxy check failed for {proxy_str[:30]}: {e}")
+        logger.warning(
+            "Quick proxy check failed for %s: %s",
+            sanitize_url(str(proxy_str or ""), max_length=80),
+            e,
+        )
         return False, None
 
 

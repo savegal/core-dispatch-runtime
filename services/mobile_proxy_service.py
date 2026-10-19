@@ -327,7 +327,11 @@ async def get_current_ip(proxy_string: str) -> Optional[str]:
                 return data.get("ip") or data.get("origin")  # Поддержка разных форматов ответа
             
     except Exception as e:
-        logger.warning(f"Failed to get current IP via proxy {proxy_string[:30]}: {e}")
+        logger.warning(
+            "Failed to get current IP via proxy %s: %s",
+            sanitize_url(str(proxy_string or ""), max_length=80),
+            e,
+        )
         return None
 
 

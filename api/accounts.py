@@ -2,7 +2,7 @@ from fastapi import APIRouter, Depends, HTTPException, Header, Request, Request 
 from pydantic import BaseModel
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select, func, and_, or_
-from db.database import get_db
+from db.database import get_db, get_sync_db_context
 from db.models import Account, Proxy
 from services.account_service import get_account_runtime_health
 from api.auth import verify_admin_header
@@ -27,6 +27,12 @@ router = APIRouter(prefix="/api/accounts", tags=["accounts"], dependencies=[Depe
 logger = logging.getLogger(__name__)
 
 # ИСПРАВЛЕНО: Импортируем limiter из отдельного модуля
+
+
+def _load_account_runtime_health() -> dict[str, Any]:
+    """Run the CPU-heavy account scan outside FastAPI's event loop."""
+    with get_sync_db_context() as db:
+        return get_account_runtime_health(db)
 
 
 class AccountRecord(BaseModel):
@@ -396,10 +402,10 @@ async def stats(db: AsyncSession = Depends(get_db)):
 
 
 @router.get("/runtime_health")
-async def runtime_health(db: AsyncSession = Depends(get_db)):
+async def runtime_health():
     """Returns runtime health of account pools used by monitor/main/reply flows."""
     try:
-        return await db.run_sync(get_account_runtime_health)
+        return await asyncio.to_thread(_load_account_runtime_health)
     except Exception as e:
         logger.error(f"Error getting account runtime health: {e}", exc_info=True)
         raise HTTPException(status_code=500, detail=f"Error getting runtime health: {str(e)}")
@@ -657,6 +663,8 @@ async def replace_proxy_endpoint(
         new_proxy_obj = result.scalar_one_or_none()
         if not new_proxy_obj:
             raise HTTPException(status_code=400, detail="Proxy not found")
+        if new_proxy_obj.dedicated_user_id is not None:
+            raise HTTPException(status_code=400, detail="Dedicated user proxy cannot be assigned to an account")
     else:
         # Автоматически выбираем лучший прокси (быстрый и свободный)
         # Получаем использованные прокси
@@ -668,7 +676,7 @@ async def replace_proxy_endpoint(
         used_proxy_strings = {acc for acc in accounts_result.scalars().all() if acc}
         
         # ИСПРАВЛЕНО: Убраны фильтры по status и response_time_ms (поля удалены)
-        query = select(Proxy)
+        query = select(Proxy).filter(Proxy.dedicated_user_id.is_(None))
         if used_proxy_strings:
             query = query.filter(~Proxy.proxy.in_(used_proxy_strings))
         query = query.order_by(Proxy.id)

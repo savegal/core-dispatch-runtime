@@ -48,6 +48,14 @@ settings = get_settings()
 router = APIRouter(prefix="/api/video-parsing", tags=["video_parsing"])
 
 
+def _load_monitor_account_snapshot() -> tuple[dict[str, Any], int]:
+    """Load expensive synchronous account diagnostics without blocking the API loop."""
+    from services.account_service import get_monitor_pool_stats
+
+    with get_sync_db_context() as db:
+        return get_monitor_pool_stats(db), int(get_monitor_max_parallel_browsers(db))
+
+
 def _video_time_payload(video: CreatorVideo) -> dict:
     create_time = create_time_from_meta(video.meta)
     return {
@@ -607,7 +615,6 @@ async def get_monitoring_summary(
     """Admin summary for monitoring state, backlog and monitor accounts."""
     from datetime import datetime, timezone, timedelta
     from db.models import MonitoredBlogger
-    from services.account_service import get_monitor_pool_stats
     from services.metrics import get_metrics_summary
     from services.monitor_incident_service import (
         build_recommended_actions,
@@ -686,7 +693,9 @@ async def get_monitoring_summary(
         )
     ).all()
     video_statuses = {status: count for status, count in video_status_rows}
-    account_pool = await db.run_sync(lambda sync_db: get_monitor_pool_stats(sync_db))
+    account_pool, monitor_max_parallel_browsers = await asyncio.to_thread(
+        _load_monitor_account_snapshot
+    )
     runtime = {
         "due_backlog": int(gauges.get("monitor.queue_len", 0) or 0),
         "oldest_overdue_minutes": int(gauges.get("monitor.oldest_overdue_minutes", 0) or 0),
@@ -724,9 +733,6 @@ async def get_monitoring_summary(
             incident_type = str(incident.get("type") or "monitor_incident")
             if incident_type not in attention:
                 attention.append(incident_type)
-
-    with get_sync_db_context() as sync_db:
-        monitor_max_parallel_browsers = get_monitor_max_parallel_browsers(sync_db)
 
     return {
         "system": {
