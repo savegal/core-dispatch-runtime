@@ -4,6 +4,7 @@ from __future__ import annotations
 import asyncio
 import copy
 import logging
+import os
 import time
 from collections import defaultdict
 from dataclasses import dataclass
@@ -299,6 +300,53 @@ async def verify_order_reply_visibility(db, task, video_url, result, *, pool_own
                     absent.extend(evidence["absent_ids"])
                     if evidence["complete"]:
                         complete_ids.extend(ids)
+
+            if str(os.getenv("AUTO_BOOST_LIKES", "1")).strip().lower() not in {"0", "false", "no", "off"} and (found or groups):
+                try:
+                    from executor.http.playwright_http_client import PlaywrightHttpClient
+                    obs_client = await PlaywrightHttpClient.from_page(page)
+                    boosted_cids = set()
+                    # 1. Like the parent comments (the main comments under video)
+                    for parent_cid in groups.keys():
+                        clean_parent = str(parent_cid).strip()
+                        if valid_comment_id(clean_parent) and clean_parent not in boosted_cids:
+                            boosted_cids.add(clean_parent)
+                            try:
+                                await obs_client.like_comment(
+                                    aweme_id=media_id,
+                                    cid=clean_parent,
+                                    correlation_id=f"{corr}_boost_parent_{clean_parent[:15]}",
+                                    video_url=url,
+                                )
+                                logger.info(
+                                    "[HTTP_AUTO_BOOST] Reply observer %s liked parent comment %s",
+                                    account.id, clean_parent[:20]
+                                )
+                                await asyncio.sleep(0.3)
+                            except Exception:
+                                pass
+                    # 2. Like the verified replies found by observer (up to 5)
+                    for reply_cid in found[:5]:
+                        clean_reply = str(reply_cid).strip()
+                        if valid_comment_id(clean_reply) and clean_reply not in boosted_cids:
+                            boosted_cids.add(clean_reply)
+                            try:
+                                await obs_client.like_comment(
+                                    aweme_id=media_id,
+                                    cid=clean_reply,
+                                    correlation_id=f"{corr}_boost_reply_{clean_reply[:15]}",
+                                    video_url=url,
+                                )
+                                logger.info(
+                                    "[HTTP_AUTO_BOOST] Reply observer %s liked verified reply %s",
+                                    account.id, clean_reply[:20]
+                                )
+                                await asyncio.sleep(0.3)
+                            except Exception:
+                                pass
+                except Exception as boost_err:
+                    logger.debug("[HTTP_AUTO_BOOST] Reply observer boost failed (non-blocking): %s", boost_err)
+
             return {"observer_id": account.id, "found_ids": found, "absent_ids": absent,
                     "complete_ids": complete_ids, "complete": all(b["complete"] for b in branches),
                     "branches": branches, "reason": "branches_checked", "api_check_attempted": api_check_attempted}

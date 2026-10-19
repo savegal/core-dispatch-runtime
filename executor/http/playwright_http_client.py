@@ -1150,7 +1150,9 @@ class PlaywrightHttpClient:
         cookies: Optional[Dict[str, str]] = None,
         user_agent: Optional[str] = None,
         correlation_id: Optional[str] = None,
-        digg_type: int = 1
+        digg_type: int = 1,
+        video_url: Optional[str] = None,
+        proxy_country_code: Optional[str] = None,
     ) -> Tuple[bool, Optional[str], Optional[HttpErrorType]]:
         """
         Лайкает комментарий через HTTP.
@@ -1162,33 +1164,35 @@ class PlaywrightHttpClient:
             user_agent: User-Agent
             correlation_id: ID для логирования
             digg_type: Тип лайка (1 = like, 0 = unlike)
+            video_url: URL видео для установки referer
+            proxy_country_code: Код страны прокси
         
         Returns:
             tuple: (success, error_message, error_type)
         """
         profile = RequestProfile.like_profile()
         dynamic_params = {
-            "aweme_id": aweme_id,
-            "cid": cid,
+            "aweme_id": str(aweme_id).strip(),
+            "cid": str(cid).strip(),
             "digg_type": str(digg_type)
         }
         
+        if video_url:
+            referer_url = self._canonical_referer_url(video_url, self.runtime_profile)
+            dynamic_params["referer"] = referer_url
+            dynamic_params["root_referer"] = referer_url
+
+        request_runtime_profile = self._runtime_profile_for_request(proxy_country_code)
         success, response_data, error_msg, error_type = await self._execute_request(
             profile=profile,
             dynamic_params=dynamic_params,
             cookies=cookies,
             user_agent=user_agent,
-            correlation_id=correlation_id
+            correlation_id=correlation_id,
+            runtime_profile_override=request_runtime_profile,
         )
         
         if success:
-            # Извлекаем comment_id из ответа если есть
-            comment_id = None
-            if isinstance(response_data, dict):
-                comment_data = response_data.get("comment") or response_data.get("data", {}).get("comment", {})
-                if isinstance(comment_data, dict):
-                    comment_id = comment_data.get("cid") or comment_data.get("comment_id")
-            
             return True, None, None
         else:
             return False, error_msg, error_type
@@ -1241,6 +1245,38 @@ class PlaywrightHttpClient:
             referer_url = self._canonical_referer_url(video_url, self.runtime_profile)
             dynamic_params["referer"] = referer_url
             dynamic_params["root_referer"] = referer_url
+
+        if "text_extra" not in dynamic_params and "@" in text:
+            from executor.http.mentions import find_mentions
+            if find_mentions(text):
+                try:
+                    from executor.http.mentions import prepare_mentions
+                    normalized_text, text_extra_json, mention_meta = await prepare_mentions(
+                        self.page, text, runtime_params=self.runtime_profile
+                    )
+                    if mention_meta.get("unresolved"):
+                        error_msg = f"Mentions unresolved: {mention_meta.get('unresolved')}. Aborting to avoid publishing unclickable plain text."
+                        logger.warning("[MENTION] %s | correlation_id=%s", error_msg, correlation_id)
+                        self.last_request_meta["mentions"] = mention_meta
+                        self.last_request_meta["request_attempted"] = False
+                        return False, None, error_msg, HttpErrorType.API_ERROR, {
+                            "parent_confirmed": False,
+                            "request_attempted": False,
+                            "mentions_unresolved": mention_meta.get("unresolved"),
+                            "request_meta": dict(self.last_request_meta),
+                        }
+                    if text_extra_json and text_extra_json != "[]":
+                        dynamic_params["text"] = normalized_text
+                        dynamic_params["text_extra"] = text_extra_json
+                        self.last_request_meta["mentions"] = mention_meta
+                except Exception as exc:
+                    logger.warning("[MENTION] Error preparing mentions for reply: %s", exc)
+                    self.last_request_meta["request_attempted"] = False
+                    return False, None, f"Mention preparation failed: {exc}", HttpErrorType.API_ERROR, {
+                        "parent_confirmed": False,
+                        "request_attempted": False,
+                        "request_meta": dict(self.last_request_meta),
+                    }
 
         request_runtime_profile = self._runtime_profile_for_request(proxy_country_code)
         success, response_data, error_msg, error_type = await self._execute_request(
@@ -1337,6 +1373,28 @@ class PlaywrightHttpClient:
                         f"Publication returned an ID; parent confirmation remains unconfirmed."
                     )
 
+            if "mentions" in self.last_request_meta:
+                try:
+                    from executor.http.mentions import extract_response_mentions
+                    retained_uids = extract_response_mentions(response_data)
+                    self.last_request_meta["mentions"]["retained_uids"] = retained_uids
+                    if not retained_uids and self.last_request_meta["mentions"].get("resolved"):
+                        self.last_request_meta["mentions"]["stripped_by_server"] = True
+                        logger.warning(
+                            "[MENTION] Server accepted reply %s but stripped text_extra! Target user might have restricted mentions.",
+                            comment_id[:20] if comment_id else "",
+                        )
+                    else:
+                        logger.info(
+                            "[MENTION] Reply comment %s: requested=%s, resolved=%s, retained_uids=%s",
+                            comment_id[:20] if comment_id else "",
+                            self.last_request_meta["mentions"].get("requested"),
+                            self.last_request_meta["mentions"].get("resolved"),
+                            retained_uids,
+                        )
+                except Exception:
+                    pass
+
             return True, comment_id, None, None, {
                 "parent_confirmed": parent_confirmed,
                 "response_parent_id": response_parent_id,
@@ -1401,6 +1459,29 @@ class PlaywrightHttpClient:
             dynamic_params["referer"] = referer_url
             dynamic_params["root_referer"] = referer_url
 
+        if "text_extra" not in dynamic_params and "@" in text:
+            from executor.http.mentions import find_mentions
+            if find_mentions(text):
+                try:
+                    from executor.http.mentions import prepare_mentions
+                    normalized_text, text_extra_json, mention_meta = await prepare_mentions(
+                        self.page, text, runtime_params=self.runtime_profile
+                    )
+                    if mention_meta.get("unresolved"):
+                        error_msg = f"Mentions unresolved: {mention_meta.get('unresolved')}. Aborting to avoid publishing unclickable plain text."
+                        logger.warning("[MENTION] %s | correlation_id=%s", error_msg, correlation_id)
+                        self.last_request_meta["mentions"] = mention_meta
+                        self.last_request_meta["request_attempted"] = False
+                        return False, None, error_msg, HttpErrorType.API_ERROR
+                    if text_extra_json and text_extra_json != "[]":
+                        dynamic_params["text"] = normalized_text
+                        dynamic_params["text_extra"] = text_extra_json
+                        self.last_request_meta["mentions"] = mention_meta
+                except Exception as exc:
+                    logger.warning("[MENTION] Error preparing mentions for main comment: %s", exc)
+                    self.last_request_meta["request_attempted"] = False
+                    return False, None, f"Mention preparation failed: {exc}", HttpErrorType.API_ERROR
+
         request_runtime_profile = self._runtime_profile_for_request(proxy_country_code)
         success, response_data, error_msg, error_type = await self._execute_request(
             profile=profile,
@@ -1417,6 +1498,27 @@ class PlaywrightHttpClient:
                 return False, None, "Response OK but missing comment_id", HttpErrorType.API_ERROR
             self.last_request_meta["comment_author"] = _extract_comment_author(response_data)
             self.last_request_meta["comment_author_uid"] = _extract_comment_user_id(response_data)
+            if "mentions" in self.last_request_meta:
+                try:
+                    from executor.http.mentions import extract_response_mentions
+                    retained_uids = extract_response_mentions(response_data)
+                    self.last_request_meta["mentions"]["retained_uids"] = retained_uids
+                    if not retained_uids and self.last_request_meta["mentions"].get("resolved"):
+                        self.last_request_meta["mentions"]["stripped_by_server"] = True
+                        logger.warning(
+                            "[MENTION] Server accepted main comment %s but stripped text_extra! Target user might have restricted mentions.",
+                            comment_id[:20] if comment_id else "",
+                        )
+                    else:
+                        logger.info(
+                            "[MENTION] Main comment %s: requested=%s, resolved=%s, retained_uids=%s",
+                            comment_id[:20] if comment_id else "",
+                            self.last_request_meta["mentions"].get("requested"),
+                            self.last_request_meta["mentions"].get("resolved"),
+                            retained_uids,
+                        )
+                except Exception:
+                    pass
             return True, comment_id, None, None
         else:
             return False, None, error_msg, error_type

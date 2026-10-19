@@ -1318,6 +1318,25 @@ async def _publish_reply_http_first_if_eligible(
         return None
 
     started = time.monotonic()
+    # Free HTTP auto-boost: like parent comment before replying
+    if _like_parent_before_reply_enabled() and parent_id:
+        try:
+            like_ok, _, _ = await session.client.like_comment(
+                aweme_id=session.aweme_id,
+                cid=parent_id,
+                cookies=session.cookies,
+                correlation_id=f"{correlation_id}_parent_like",
+                video_url=session.video_url,
+            )
+            if like_ok:
+                logger.info(
+                    "[HTTP_AUTO_BOOST] Liked parent comment %s before reply | account=%s, correlation_id=%s",
+                    parent_id[:20], session.account_id, correlation_id
+                )
+                await asyncio.sleep(0.3)
+        except Exception as exc:
+            logger.debug("[HTTP_AUTO_BOOST] Like parent comment %s failed (non-blocking): %s", parent_id[:20], exc)
+
     try:
         success, comment_id, error_msg, error_type, meta = await session.client.reply_comment(
             aweme_id=session.aweme_id,
@@ -5674,6 +5693,31 @@ async def _verify_order_main_visibility(
                 page, aweme_id, [m.comment_id for m in mains],
                 max_pages=_settings.MAIN_VISIBILITY_MAX_PAGES,
             )
+            found_ids = evidence.get("found_ids") or []
+            if found_ids and str(os.getenv("AUTO_BOOST_LIKES", "1")).strip().lower() not in _FALSE_ENV_VALUES:
+                try:
+                    from executor.http.playwright_http_client import PlaywrightHttpClient
+                    obs_client = await PlaywrightHttpClient.from_page(page)
+                    for cid in found_ids[:5]:
+                        clean_cid = str(cid).strip()
+                        if _looks_like_tiktok_comment_id(clean_cid):
+                            try:
+                                await obs_client.like_comment(
+                                    aweme_id=aweme_id,
+                                    cid=clean_cid,
+                                    correlation_id=f"{corr}_boost_{clean_cid[:15]}",
+                                    video_url=video_url,
+                                )
+                                logger.info(
+                                    "[HTTP_AUTO_BOOST] Main observer %s liked confirmed main comment %s",
+                                    observer.id, clean_cid[:20]
+                                )
+                                await asyncio.sleep(0.3)
+                            except Exception:
+                                pass
+                except Exception as boost_err:
+                    logger.debug("[HTTP_AUTO_BOOST] Main observer boost failed (non-blocking): %s", boost_err)
+
             return {**evidence, "observer_id": observer.id, "api_check_attempted": True}
         except asyncio.CancelledError:
             raise

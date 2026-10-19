@@ -102,6 +102,7 @@ Thumbs.db
 *.damaged.bak
 /services/*_block.txt
 /executor/worker_functions.txt
+/data/
 
 
 
