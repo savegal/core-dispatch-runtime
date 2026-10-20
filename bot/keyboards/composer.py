@@ -34,6 +34,11 @@ def format_composer_summary(draft: Draft, *, likes_label: str = "выключе�
     variants_count = len(draft.text_variants) if draft.text_variants else (1 if draft.comment else 0)
     pool_label = "👤 Мои аккаунты" if draft.account_pool_mode == "personal" else "🌐 Общий пул"
 
+    reply_likes_str = "выключены"
+    if draft.reply_like_count > 0 and str(draft.reply_like_target).lower() not in {"none", "0", "off"}:
+        target_display = "все" if draft.reply_like_target == "all" else f"ответ {draft.reply_like_target}"
+        reply_likes_str = f"{target_display} ({draft.reply_like_count} шт)"
+
     text = (
         "*Новый заказ*\n\n"
         f"🔗 Видео: *{links_count}*\n"
@@ -41,6 +46,8 @@ def format_composer_summary(draft: Draft, *, likes_label: str = "выключе�
         f"❤️ Лайки: *{likes_label}*\n"
         f"Пул: *{pool_label}*"
     )
+    if reply_likes_str != "выключены":
+        text += f"\n❤️ Лайки на ответ: *{reply_likes_str}*"
 
     if draft.comment:
         raw_preview = draft.comment.replace("\n", " ")

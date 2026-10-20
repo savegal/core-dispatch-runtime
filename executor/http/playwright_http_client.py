@@ -22,6 +22,8 @@ from executor.http.retry_policy import (
     STANDARD_POLICY
 )
 
+LIKE_FAST_POLICY = RetryPolicy(max_retries=0, base_delay=0.5, max_delay=1.0)
+
 logger = logging.getLogger("executor.http.playwright_client")
 _SHORTLINK_HOST_MARKERS = ("vt.tiktok.com", "vm.tiktok.com")
 _PAGE_FETCH_JS = """
@@ -742,7 +744,8 @@ class PlaywrightHttpClient:
         cookies: Optional[Dict[str, str]] = None,
         user_agent: Optional[str] = None,
         correlation_id: Optional[str] = None,
-        runtime_profile_override: Optional[Dict[str, Any]] = None
+        runtime_profile_override: Optional[Dict[str, Any]] = None,
+        retry_policy_override: Optional[RetryPolicy] = None,
     ) -> Tuple[bool, Optional[Dict[str, Any]], Optional[str], Optional[HttpErrorType]]:
         """
         Выполняет запрос через window.fetch страницы, либо APIRequestContext без page.
@@ -753,6 +756,7 @@ class PlaywrightHttpClient:
             cookies: Дополнительные cookies (если не указаны, используются из context)
             user_agent: User-Agent (если не указан, используется из context)
             correlation_id: ID для логирования (task_id, account_id и т.д.)
+            retry_policy_override: Опциональное переопределение политики повторов
         
         Returns:
             tuple: (success, response_data, error_message, error_type)
@@ -765,6 +769,7 @@ class PlaywrightHttpClient:
             "transport": "window.fetch" if self.page is not None else "request_context.fetch",
         }
         effective_runtime_profile = runtime_profile_override or self.runtime_profile
+        effective_retry_policy = retry_policy_override or self.retry_policy
         base_dynamic_params = dict(dynamic_params)
         request_signature_meta = {}
 
@@ -776,7 +781,7 @@ class PlaywrightHttpClient:
             enriched["__request_meta"] = dict(self.last_request_meta)
             return enriched
         
-        for attempt in range(self.retry_policy.max_retries + 1):
+        for attempt in range(effective_retry_policy.max_retries + 1):
             try:
                 attempt_cookies = dict(cookies or {})
                 if self.page is not None:
@@ -818,10 +823,11 @@ class PlaywrightHttpClient:
                 self.last_request_meta["attempt_count"] = int(
                     self.last_request_meta.get("attempt_count") or 0
                 ) + 1
-                # ИСПРАВЛЕНО: Разные timeout для разных попыток
-                # 15 сек для первого запроса (быстрее при ошибках), 30 сек для retry (может быть медленный прокси)
-                base_timeout = 15000  # 15 секунд для обычных запросов
-                retry_timeout = 30000  # 30 секунд для retry
+                # ИСПРАВЛЕНО: Разные timeout для разных попыток и эндпоинтов
+                # 5 сек для лайков (быстрый non-blocking вызов), 15 сек для обычных, 30 сек для retry
+                is_like = profile.endpoint == "/api/comment/digg/"
+                base_timeout = 5000 if is_like else 15000
+                retry_timeout = 8000 if is_like else 30000
                 timeout_to_use = base_timeout if attempt == 0 else retry_timeout
                 
                 self.last_request_meta["timeout_ms"] = timeout_to_use
@@ -891,7 +897,7 @@ class PlaywrightHttpClient:
                         error_type = HttpErrorType.FORBIDDEN
                         error_msg = "TikTok stealth-reject: empty JSON response (body_len=0). Publication was not confirmed."
                         redirected = any(marker in str(self._page_url_hint(self.page) or "").lower() for marker in ("/login", "/signup", "/verify", "/auth", "/messages", "/inbox"))
-                        if self.page is not None and attempt == 0 and self.retry_policy.max_retries > 0 and not redirected:
+                        if self.page is not None and attempt == 0 and effective_retry_policy.max_retries > 0 and not redirected:
                             self.last_request_meta["empty_body_retry_count"] = 1
                             await asyncio.sleep(2.0)
                             continue
@@ -911,7 +917,7 @@ class PlaywrightHttpClient:
                             )
                             if self._should_abort_local_retries(error_type, error_msg):
                                 return False, None, error_msg, error_type
-                            if not self.retry_policy.should_retry(error_type, attempt):
+                            if not effective_retry_policy.should_retry(error_type, attempt):
                                 return False, None, error_msg, error_type
                             continue
                     
@@ -935,7 +941,7 @@ class PlaywrightHttpClient:
                         )
                         if self._should_abort_local_retries(error_type, error_msg):
                             return False, None, error_msg, error_type
-                        if not self.retry_policy.should_retry(error_type, attempt):
+                        if not effective_retry_policy.should_retry(error_type, attempt):
                             return False, None, error_msg, error_type
                         continue
                     else:
@@ -950,7 +956,7 @@ class PlaywrightHttpClient:
                         )
                         if self._should_abort_local_retries(error_type, error_msg):
                             return False, None, error_msg, error_type
-                        if not self.retry_policy.should_retry(error_type, attempt):
+                        if not effective_retry_policy.should_retry(error_type, attempt):
                             return False, None, error_msg, error_type
                         continue
                 
@@ -996,7 +1002,7 @@ class PlaywrightHttpClient:
                                 f"redirected_page_state={redirected_page_state}"
                             )
                             if (
-                                self.page is not None and attempt == 0 and self.retry_policy.max_retries > 0
+                                self.page is not None and attempt == 0 and effective_retry_policy.max_retries > 0
                                 and not response_body.strip() and not redirected_page_state
                                 and profile.method.upper() == "POST" and "/api/comment/publish/" in profile.endpoint
                             ):
@@ -1013,7 +1019,7 @@ class PlaywrightHttpClient:
                             error_msg = "Response missing status_code field"
                         if self._should_abort_local_retries(error_type, error_msg):
                             return False, None, error_msg, error_type
-                        if not self.retry_policy.should_retry(error_type, attempt):
+                        if not effective_retry_policy.should_retry(error_type, attempt):
                             return False, None, error_msg, error_type
                         continue
                     elif type(status_code_in_body) is not int or status_code_in_body != 0:
@@ -1029,7 +1035,7 @@ class PlaywrightHttpClient:
                         # Check whether retry is allowed for this classified API error.
                         if self._should_abort_local_retries(error_type, error_msg):
                             return False, None, error_msg, error_type
-                        if not self.retry_policy.should_retry(error_type, attempt):
+                        if not effective_retry_policy.should_retry(error_type, attempt):
                             return False, None, error_msg, error_type
                         continue
                     
@@ -1070,7 +1076,7 @@ class PlaywrightHttpClient:
                         )
                         if self._should_abort_local_retries(error_type, error_msg):
                             return False, None, error_msg, error_type
-                        if not self.retry_policy.should_retry(error_type, attempt):
+                        if not effective_retry_policy.should_retry(error_type, attempt):
                             return False, None, error_msg, error_type
                         continue
                 elif error_type == HttpErrorType.SUCCESS and status_code == 200:
@@ -1084,7 +1090,7 @@ class PlaywrightHttpClient:
                     )
                     if self._should_abort_local_retries(error_type, error_msg):
                         return False, None, error_msg, error_type
-                    if not self.retry_policy.should_retry(error_type, attempt):
+                    if not effective_retry_policy.should_retry(error_type, attempt):
                         return False, None, error_msg, error_type
                     continue
                 else:
@@ -1093,22 +1099,22 @@ class PlaywrightHttpClient:
                         f"correlation_id={correlation_id}, "
                         f"status={status_code}, "
                         f"error_type={error_type.value}, "
-                        f"attempt={attempt+1}/{self.retry_policy.max_retries+1}"
+                        f"attempt={attempt+1}/{effective_retry_policy.max_retries+1}"
                     )
                     
                     # Проверяем, нужно ли повторять
                     if self._should_abort_local_retries(error_type, error_msg):
                         return False, None, error_msg, error_type
-                    if not self.retry_policy.should_retry(error_type, attempt):
+                    if not effective_retry_policy.should_retry(error_type, attempt):
                         return False, None, error_msg, error_type
                     
                     # ИСПРАВЛЕНО: Задержка перед повтором с экспоненциальным backoff+jitter
-                    if attempt < self.retry_policy.max_retries:
-                        delay = self.retry_policy.get_delay(attempt, error_type)
+                    if attempt < effective_retry_policy.max_retries:
+                        delay = effective_retry_policy.get_delay(attempt, error_type)
                         logger.debug(
                             f"[HTTP] Retry after {delay:.2f}s | "
                             f"correlation_id={correlation_id}, "
-                            f"attempt={attempt+1}/{self.retry_policy.max_retries+1}, "
+                            f"attempt={attempt+1}/{effective_retry_policy.max_retries+1}, "
                             f"error_type={error_type.value}"
                         )
                         await asyncio.sleep(delay)
@@ -1121,23 +1127,23 @@ class PlaywrightHttpClient:
                     f"[HTTP] Exception | "
                     f"correlation_id={correlation_id}, "
                     f"error={error_msg}, "
-                    f"attempt={attempt+1}/{self.retry_policy.max_retries+1}",
+                    f"attempt={attempt+1}/{effective_retry_policy.max_retries+1}",
                     exc_info=True
                 )
                 
                 # Проверяем, нужно ли повторять
                 if self._should_abort_local_retries(error_type, error_msg):
                     return False, None, error_msg, error_type
-                if not self.retry_policy.should_retry(error_type, attempt):
+                if not effective_retry_policy.should_retry(error_type, attempt):
                     return False, None, error_msg, error_type
                 
                 # ИСПРАВЛЕНО: Задержка перед повтором с error_type для корректного backoff
-                if attempt < self.retry_policy.max_retries:
-                    delay = self.retry_policy.get_delay(attempt, error_type)
+                if attempt < effective_retry_policy.max_retries:
+                    delay = effective_retry_policy.get_delay(attempt, error_type)
                     logger.debug(
                         f"[HTTP] Retry after exception {delay:.2f}s | "
                         f"correlation_id={correlation_id}, "
-                        f"attempt={attempt+1}/{self.retry_policy.max_retries+1}"
+                        f"attempt={attempt+1}/{effective_retry_policy.max_retries+1}"
                     )
                     await asyncio.sleep(delay)
         
@@ -1153,6 +1159,7 @@ class PlaywrightHttpClient:
         digg_type: int = 1,
         video_url: Optional[str] = None,
         proxy_country_code: Optional[str] = None,
+        retry_policy: Optional[RetryPolicy] = None,
     ) -> Tuple[bool, Optional[str], Optional[HttpErrorType]]:
         """
         Лайкает комментарий через HTTP.
@@ -1163,9 +1170,10 @@ class PlaywrightHttpClient:
             cookies: Дополнительные cookies
             user_agent: User-Agent
             correlation_id: ID для логирования
-            digg_type: Тип лайка (1 = like, 0 = unlike)
+            digg_type: Тип действия (1 = like, 2 = unlike в веб-API TikTok)
             video_url: URL видео для установки referer
             proxy_country_code: Код страны прокси
+            retry_policy: Политика повторов (по умолчанию LIKE_FAST_POLICY с 0 повторов)
         
         Returns:
             tuple: (success, error_message, error_type)
@@ -1182,6 +1190,7 @@ class PlaywrightHttpClient:
             dynamic_params["referer"] = referer_url
             dynamic_params["root_referer"] = referer_url
 
+        effective_policy = retry_policy or LIKE_FAST_POLICY
         request_runtime_profile = self._runtime_profile_for_request(proxy_country_code)
         success, response_data, error_msg, error_type = await self._execute_request(
             profile=profile,
@@ -1190,6 +1199,7 @@ class PlaywrightHttpClient:
             user_agent=user_agent,
             correlation_id=correlation_id,
             runtime_profile_override=request_runtime_profile,
+            retry_policy_override=effective_policy,
         )
         
         if success:

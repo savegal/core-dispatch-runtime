@@ -116,6 +116,7 @@ def build_preview_text(
     text_variants: list[str],
     replies: dict[int, str],
     likes_label: str = "выключены",
+    reply_likes_label: Optional[str] = None,
     template_name: Optional[str] = None,
     include_template_prompt: bool = False,
     estimated_cost_label: Optional[str] = None,
@@ -139,6 +140,7 @@ def build_preview_text(
         f"{Emoji.COMMENT} Комментарий: *{len(text_variants)} вариант(а)*\n"
         f"{Emoji.REPLY} Ответов: *{len(replies)}*\n"
         f"{Emoji.LIKES} Лайки: *{escape_markdown_simple(likes_label)}*"
+        + (f"\n❤️ Лайки на ответ: *{escape_markdown_simple(reply_likes_label)}*" if (replies and reply_likes_label) else "")
     )
 
     if estimated_cost_label:
@@ -201,6 +203,7 @@ def build_success_text(
     variants_count: int,
     likes: int = 0,
     likes_label: Optional[str] = None,
+    reply_likes_label: Optional[str] = None,
     template_name: Optional[str] = None,
     pool_label: Optional[str] = None,
 ) -> str:
@@ -213,6 +216,7 @@ def build_success_text(
         f"{Emoji.COMMENT} Комментарий: *{variants_count} вариант(а)*\n"
         f"{Emoji.REPLY} Ответов: *{reply_count}*\n"
         f"{Emoji.LIKES} Лайки: *{escape_markdown_simple(str(visible_likes))}*"
+        + (f"\n❤️ Лайки на ответ: *{escape_markdown_simple(reply_likes_label)}*" if (reply_count > 0 and reply_likes_label) else "")
     )
     if pool_label:
         text += f"\nПул: *{escape_markdown_simple(pool_label)}*"

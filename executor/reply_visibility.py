@@ -5,6 +5,8 @@ import asyncio
 import copy
 import logging
 import os
+import random
+import re
 import time
 from collections import defaultdict
 from dataclasses import dataclass
@@ -306,44 +308,100 @@ async def verify_order_reply_visibility(db, task, video_url, result, *, pool_own
                     from executor.http.playwright_http_client import PlaywrightHttpClient
                     obs_client = await PlaywrightHttpClient.from_page(page)
                     boosted_cids = set()
-                    # 1. Like the parent comments (the main comments under video)
-                    for parent_cid in groups.keys():
-                        clean_parent = str(parent_cid).strip()
-                        if valid_comment_id(clean_parent) and clean_parent not in boosted_cids:
-                            boosted_cids.add(clean_parent)
+                    task_settings = getattr(task, "settings", None) or {}
+                    reply_like_target = str(task_settings.get("reply_like_target") or "1").strip().lower()
+                    reply_like_count = int(task_settings.get("reply_like_count") or 0)
+
+                    # 1. Boost per branch: parent comment and specified reply targets
+                    branches_to_boost = [b for b in branches if b.get("parent_comment_id")]
+                    if not branches_to_boost and groups:
+                        branches_to_boost = [{"parent_comment_id": p, "found_ids": [cid for cid in found if cid in ids]} for p, ids in groups.items()]
+
+                    for branch_info in branches_to_boost:
+                        parent_cid = str(branch_info.get("parent_comment_id") or "").strip()
+                        branch_found = [str(x).strip() for x in (branch_info.get("found_ids") or []) if valid_comment_id(str(x).strip())]
+
+                        # 1a. Like parent comment
+                        if (
+                            valid_comment_id(parent_cid)
+                            and parent_cid not in boosted_cids
+                            and schema.can_boost_parent(parent_cid, account.id)
+                        ):
+                            boosted_cids.add(parent_cid)
                             try:
-                                await obs_client.like_comment(
+                                like_ok, like_err, _ = await obs_client.like_comment(
                                     aweme_id=media_id,
-                                    cid=clean_parent,
-                                    correlation_id=f"{corr}_boost_parent_{clean_parent[:15]}",
+                                    cid=parent_cid,
+                                    correlation_id=f"{corr}_boost_parent_{parent_cid[:15]}",
                                     video_url=url,
                                 )
-                                logger.info(
-                                    "[HTTP_AUTO_BOOST] Reply observer %s liked parent comment %s",
-                                    account.id, clean_parent[:20]
-                                )
-                                await asyncio.sleep(0.3)
+                                if like_ok:
+                                    schema.record_parent_boost(parent_cid, account.id)
+                                    logger.info(
+                                        "[HTTP_AUTO_BOOST] Reply observer %s liked parent comment %s",
+                                        account.id, parent_cid[:20]
+                                    )
+                                else:
+                                    logger.debug("[HTTP_AUTO_BOOST] Reply observer %s like parent non-ok: %s", account.id, like_err)
+                                await asyncio.sleep(random.uniform(0.6, 1.3))
                             except Exception:
                                 pass
-                    # 2. Like the verified replies found by observer (up to 5)
-                    for reply_cid in found[:5]:
-                        clean_reply = str(reply_cid).strip()
-                        if valid_comment_id(clean_reply) and clean_reply not in boosted_cids:
-                            boosted_cids.add(clean_reply)
-                            try:
-                                await obs_client.like_comment(
-                                    aweme_id=media_id,
-                                    cid=clean_reply,
-                                    correlation_id=f"{corr}_boost_reply_{clean_reply[:15]}",
-                                    video_url=url,
-                                )
-                                logger.info(
-                                    "[HTTP_AUTO_BOOST] Reply observer %s liked verified reply %s",
-                                    account.id, clean_reply[:20]
-                                )
-                                await asyncio.sleep(0.3)
-                            except Exception:
-                                pass
+
+                        # 1b. Like target replies in this branch
+                        if reply_like_count > 0 and reply_like_target not in {"0", "none", "off", "false"}:
+                            target_reply_cids = []
+                            digits = re.findall(r"\d+", reply_like_target)
+                            if digits:
+                                target_variant_idx = int(digits[0])
+                                # 1. Поиск по известным веткам публикации (точный variant_index)
+                                known_in_branch = schema._get_branch_published_replies(parent_cid)
+                                for item in known_in_branch:
+                                    if item.get("index") == target_variant_idx and item.get("cid") in branch_found:
+                                        target_reply_cids.append(item.get("cid"))
+
+                                # 2. Если в in-memory реестре ветки нет (напр. другой процесс/рестарт), ищем по слотам
+                                if not target_reply_cids:
+                                    for slot in pending:
+                                        if str(slot.item.get("parent_comment_id") or "").strip() == parent_cid:
+                                            slot_idx = int(slot.item.get("variant_index") or (slot.index + 1) or 0)
+                                            if slot_idx == target_variant_idx and slot.comment_id in branch_found:
+                                                target_reply_cids.append(slot.comment_id)
+
+                                # 3. Резервный фолбэк по позиции в branch_found
+                                if not target_reply_cids and 0 <= (target_variant_idx - 1) < len(branch_found):
+                                    target_reply_cids.append(branch_found[target_variant_idx - 1])
+
+                            elif reply_like_target == "all":
+                                # При выборе 'все' таргетируются ВСЕ найденные ответы этой ветки
+                                target_reply_cids.extend(branch_found)
+
+                            for reply_cid in target_reply_cids:
+                                clean_reply = str(reply_cid).strip()
+                                if (
+                                    valid_comment_id(clean_reply)
+                                    and clean_reply not in boosted_cids
+                                    and schema.can_boost_reply(clean_reply, account.id, max_likes=reply_like_count)
+                                ):
+                                    boosted_cids.add(clean_reply)
+                                    try:
+                                        like_ok, like_err, _ = await obs_client.like_comment(
+                                            aweme_id=media_id,
+                                            cid=clean_reply,
+                                            correlation_id=f"{corr}_boost_reply_{clean_reply[:15]}",
+                                            video_url=url,
+                                        )
+                                        if like_ok:
+                                            # Передаем parent_cid для надежной регистрации в реестре
+                                            schema.record_reply_boost(clean_reply, account.id, parent_id=parent_cid)
+                                            logger.info(
+                                                "[HTTP_AUTO_BOOST] Reply observer %s liked verified reply %s (parent=%s)",
+                                                account.id, clean_reply[:20], parent_cid[:20]
+                                            )
+                                        else:
+                                            logger.debug("[HTTP_AUTO_BOOST] Reply observer %s like reply non-ok: %s", account.id, like_err)
+                                        await asyncio.sleep(random.uniform(0.6, 1.3))
+                                    except Exception:
+                                        pass
                 except Exception as boost_err:
                     logger.debug("[HTTP_AUTO_BOOST] Reply observer boost failed (non-blocking): %s", boost_err)
 

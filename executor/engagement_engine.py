@@ -2116,21 +2116,28 @@ async def _attempt_publish_on_account(
                     http_client = await PlaywrightHttpClient.from_page(page)
                     if is_reply:
                         if str(os.getenv("LIKE_PARENT_BEFORE_REPLY", "1")).strip().lower() not in {"0", "false", "no", "off"} and parent_comment_id:
-                            try:
-                                await http_client.like_comment(
-                                    aweme_id=aweme_id,
-                                    cid=str(parent_comment_id).strip(),
-                                    cookies=cookies_dict,
-                                    correlation_id=f"{correlation_id}_parent_like",
-                                    video_url=video_url,
-                                )
-                                logger.info(
-                                    "Task %s: Liked parent comment %s before reply | account=%s",
-                                    task_id, str(parent_comment_id)[:20], account.id
-                                )
-                                await asyncio.sleep(0.3)
-                            except Exception as exc:
-                                logger.debug("Task %s: Non-blocking parent like error: %s", task_id, exc)
+                            clean_parent_id = str(parent_comment_id).strip()
+                            from executor.user_schema import can_boost_parent, record_parent_boost
+                            if can_boost_parent(clean_parent_id, account.id):
+                                try:
+                                    like_ok, like_err, _ = await http_client.like_comment(
+                                        aweme_id=aweme_id,
+                                        cid=clean_parent_id,
+                                        cookies=cookies_dict,
+                                        correlation_id=f"{correlation_id}_parent_like",
+                                        video_url=video_url,
+                                    )
+                                    if like_ok:
+                                        record_parent_boost(clean_parent_id, account.id)
+                                        logger.info(
+                                            "Task %s: Liked parent comment %s before reply | account=%s",
+                                            task_id, clean_parent_id[:20], account.id
+                                        )
+                                    else:
+                                        logger.debug("Task %s: Parent like non-ok: %s", task_id, like_err)
+                                    await asyncio.sleep(random.uniform(1.0, 2.0))
+                                except Exception as exc:
+                                    logger.debug("Task %s: Non-blocking parent like error: %s", task_id, exc)
 
                         success, comment_id, error_msg, error_type, meta = await http_client.reply_comment(
                             aweme_id=aweme_id,

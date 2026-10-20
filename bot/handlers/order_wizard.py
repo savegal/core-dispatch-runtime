@@ -23,7 +23,7 @@ from bot.services.template_utils import (
     template_text_variants,
 )
 from bot.services.formatting import Emoji
-from bot.services.likes_ui import get_likes_display_label_for_replies
+from bot.services.likes_ui import get_likes_display_label_for_replies, format_reply_likes_label
 from bot.state.order_states import OrderStates
 from bot.config import load_config
 from config.settings import get_settings
@@ -166,6 +166,8 @@ async def wizard_select_template(callback: CallbackQuery, state: FSMContext):
         draft.shuffle = template_settings.get("shuffle", False)
         draft.rotate_accounts = template_settings.get("rotate_accounts", True)
         draft.reply_mode = template_settings.get("reply_mode", "A")
+        draft.reply_like_target = str(template_settings.get("reply_like_target", "1") or "1")
+        draft.reply_like_count = int(template_settings.get("reply_like_count", 0) or 0)
         
         # Сохраняем весь draft в Redis (важно для сохранения links)
         save_draft(user_id, draft)
@@ -185,7 +187,9 @@ async def wizard_select_template(callback: CallbackQuery, state: FSMContext):
             main_comment=text_variants[0],
             template_id=template_id,
             using_template=True,
-            template_data=template
+            template_data=template,
+            reply_like_target=draft.reply_like_target,
+            reply_like_count=draft.reply_like_count,
         )
         
         # ИСПРАВЛЕНО: Переходим сразу к превью/подтверждению заказа
@@ -568,6 +572,10 @@ async def wizard_show_preview_from_message(message: Message, state: FSMContext):
         replies = state_data.get("replies", {})
         reply_count = state_data.get("reply_count", 0)
         
+        reply_like_target = str(state_data.get("reply_like_target") or draft.reply_like_target or "1")
+        reply_like_count = int(state_data.get("reply_like_count") if state_data.get("reply_like_count") is not None else draft.reply_like_count)
+        reply_likes_badge = format_reply_likes_label(reply_like_target, reply_like_count)
+
         text_variants = normalize_text_variants_list(state_data.get("text_variants") or [])
         if not text_variants and main_comment:
             text_variants = [main_comment]
@@ -576,17 +584,22 @@ async def wizard_show_preview_from_message(message: Message, state: FSMContext):
             text_variants=text_variants,
             replies=replies,
             likes_label=await _likes_display_label_for_replies(replies),
+            reply_likes_label=reply_likes_badge,
         )
         
+        keyboard_buttons = [
+            [
+                InlineKeyboardButton(text="🚀 Запустить", callback_data="wizard:confirm"),
+                InlineKeyboardButton(text="✏️ Изменить", callback_data="wizard:edit"),
+            ],
+        ]
+        if replies or reply_count > 0:
+            keyboard_buttons.append([InlineKeyboardButton(text=f"❤️ Лайки на ответ: {reply_likes_badge}", callback_data="wizard:edit_reply_likes")])
+        keyboard_buttons.append([InlineKeyboardButton(text=f"{Emoji.CANCEL} Отмена", callback_data="menu:main")])
+
         await message.answer(
             preview_text,
-            reply_markup=visibility_keyboard(InlineKeyboardMarkup(inline_keyboard=[
-                [
-                    InlineKeyboardButton(text="🚀 Запустить", callback_data="wizard:confirm"),
-                    InlineKeyboardButton(text="✏️ Изменить", callback_data="wizard:edit"),
-                ],
-                [InlineKeyboardButton(text=f"{Emoji.CANCEL} Отмена", callback_data="menu:main")],
-            ]), bool(state_data.get("verify_main_visibility", False)), bool(state_data.get("verify_reply_visibility", False))),
+            reply_markup=visibility_keyboard(InlineKeyboardMarkup(inline_keyboard=keyboard_buttons), bool(state_data.get("verify_main_visibility", False)), bool(state_data.get("verify_reply_visibility", False))),
             parse_mode="Markdown"
         )
         await state.set_state(OrderStates.CONFIRM_ORDER)
@@ -616,6 +629,10 @@ async def wizard_show_preview(callback: CallbackQuery, state: FSMContext):
         main_comment = draft.comment or main_comment_fsm or ""
         replies = state_data.get("replies", {})
         reply_count = state_data.get("reply_count", 0)
+
+        reply_like_target = str(state_data.get("reply_like_target") or draft.reply_like_target or "1")
+        reply_like_count = int(state_data.get("reply_like_count") if state_data.get("reply_like_count") is not None else draft.reply_like_count)
+        reply_likes_badge = format_reply_likes_label(reply_like_target, reply_like_count)
         
         text_variants = normalize_text_variants_list(state_data.get("text_variants") or [])
         if not text_variants and main_comment:
@@ -625,17 +642,22 @@ async def wizard_show_preview(callback: CallbackQuery, state: FSMContext):
             text_variants=text_variants,
             replies=replies,
             likes_label=await _likes_display_label_for_replies(replies),
+            reply_likes_label=reply_likes_badge,
         )
         
+        keyboard_buttons = [
+            [
+                InlineKeyboardButton(text="🚀 Запустить", callback_data="wizard:confirm"),
+                InlineKeyboardButton(text="✏️ Изменить", callback_data="wizard:edit")
+            ],
+        ]
+        if replies or reply_count > 0:
+            keyboard_buttons.append([InlineKeyboardButton(text=f"❤️ Лайки на ответ: {reply_likes_badge}", callback_data="wizard:edit_reply_likes")])
+        keyboard_buttons.append([InlineKeyboardButton(text=f"{Emoji.CANCEL} Отмена", callback_data="menu:main")])
+
         await callback.message.edit_text(
             preview_text,
-            reply_markup=visibility_keyboard(InlineKeyboardMarkup(inline_keyboard=[
-                [
-                    InlineKeyboardButton(text="🚀 Запустить", callback_data="wizard:confirm"),
-                    InlineKeyboardButton(text="✏️ Изменить", callback_data="wizard:edit")
-                ],
-                [InlineKeyboardButton(text=f"{Emoji.CANCEL} Отмена", callback_data="menu:main")]
-            ]), bool(state_data.get("verify_main_visibility", False)), bool(state_data.get("verify_reply_visibility", False))),
+            reply_markup=visibility_keyboard(InlineKeyboardMarkup(inline_keyboard=keyboard_buttons), bool(state_data.get("verify_main_visibility", False)), bool(state_data.get("verify_reply_visibility", False))),
             parse_mode="Markdown"
         )
         await state.set_state(OrderStates.CONFIRM_ORDER)
@@ -785,6 +807,141 @@ async def wizard_process_reply6(message: Message, state: FSMContext):
     await process_reply_input(message, state, 6, step_num=step_num)
 
 
+def _build_wizard_likes_keyboard(current_target: str, current_count: int) -> InlineKeyboardMarkup:
+    target_str = str(current_target or "1").strip().lower()
+    is_active = current_count > 0 and target_str not in {"none", "0", "off", "disabled"}
+
+    # Row 1: Target reply
+    r1 = []
+    for val, lbl in [("1", "1-й"), ("2", "2-й"), ("3", "3-й"), ("all", "Все")]:
+        checked = "✅ " if (is_active and target_str == val) else ""
+        r1.append(InlineKeyboardButton(text=f"{checked}{lbl}", callback_data=f"wizard:set_like_target:{val}"))
+
+    # Row 2: Count of likes
+    r2 = []
+    for c in [1, 2, 3, 5]:
+        checked = "✅ " if (is_active and current_count == c) else ""
+        r2.append(InlineKeyboardButton(text=f"{checked}{c} шт", callback_data=f"wizard:set_like_count:{c}"))
+
+    # Row 3: Off
+    off_checked = "✅ " if not is_active else ""
+    r3 = [InlineKeyboardButton(text=f"{off_checked}❌ Выключить", callback_data="wizard:set_like_count:0")]
+
+    # Row 4: Return
+    r4 = [InlineKeyboardButton(text="◀️ Сохранить и вернуться", callback_data="wizard:return_from_likes")]
+
+    return InlineKeyboardMarkup(inline_keyboard=[r1, r2, r3, r4])
+
+
+def _build_wizard_likes_prompt_text(target: str, count: int) -> str:
+    status = format_reply_likes_label(target, count)
+    return (
+        "❤️ *Настройка лайков на ответ*\n\n"
+        f"Текущая настройка: *{status}*\n\n"
+        "Выберите, на какой ответ ставить бесплатные HTTP-лайки со свободных аккаунтов задачи:\n\n"
+        "• *1-й / 2-й / 3-й* — точечный буст конкретного ответа ветки.\n"
+        "• *Все* — буст каждого опубликованного ответа ветки.\n"
+        "• *Выключить* — без лайков на ответы.\n\n"
+        "_Лайки ставятся участвующими аккаунтами без дополнительных затрат._"
+    )
+
+
+@router.callback_query(F.data == "wizard:return_from_likes")
+async def wizard_return_from_likes(callback: CallbackQuery, state: FSMContext):
+    await callback.answer()
+    state_data = await state.get_data()
+    template_id = state_data.get("template_id")
+    reply_count = state_data.get("reply_count", 0)
+    current_state = await state.get_state()
+    
+    if state_data.get("using_template") and template_id:
+        await show_template_preview_and_confirm(callback, state, template_id, reply_count)
+    elif current_state == OrderStates.INPUT_TEMPLATE_NAME or state_data.get("after_replies"):
+        await ask_save_template_with_preview(callback, state)
+    else:
+        await wizard_show_preview(callback, state)
+
+
+@router.callback_query(F.data == "wizard:edit_reply_likes")
+async def wizard_edit_reply_likes(callback: CallbackQuery, state: FSMContext):
+    try:
+        await callback.answer()
+        if not callback.message:
+            return
+        state_data = await state.get_data()
+        draft = get_draft(callback.from_user.id)
+        target = str(state_data.get("reply_like_target") or draft.reply_like_target or "1")
+        count = int(state_data.get("reply_like_count") if state_data.get("reply_like_count") is not None else draft.reply_like_count)
+
+        await callback.message.edit_text(
+            _build_wizard_likes_prompt_text(target, count),
+            reply_markup=_build_wizard_likes_keyboard(target, count),
+            parse_mode="Markdown"
+        )
+    except Exception as e:
+        logger.error(f"Error opening wizard reply likes edit: {e}", exc_info=True)
+        await callback.answer("Ошибка настройки лайков", show_alert=True)
+
+
+@router.callback_query(F.data.startswith("wizard:set_like_target:"))
+async def wizard_set_like_target(callback: CallbackQuery, state: FSMContext):
+    try:
+        new_target = callback.data.split(":")[-1]
+        state_data = await state.get_data()
+        draft = get_draft(callback.from_user.id)
+        count = int(state_data.get("reply_like_count") if state_data.get("reply_like_count") is not None else draft.reply_like_count)
+        if count <= 0:
+            count = 1
+        await state.update_data(reply_like_target=new_target, reply_like_count=count)
+        draft.reply_like_target = new_target
+        draft.reply_like_count = count
+        save_draft(callback.from_user.id, draft)
+
+        await callback.message.edit_text(
+            _build_wizard_likes_prompt_text(new_target, count),
+            reply_markup=_build_wizard_likes_keyboard(new_target, count),
+            parse_mode="Markdown"
+        )
+        await callback.answer(f"Выбран ответ: {new_target}")
+    except Exception as e:
+        if "message is not modified" in str(e).lower():
+            await callback.answer()
+            return
+        logger.error(f"Error setting wizard like target: {e}", exc_info=True)
+        await callback.answer("Ошибка", show_alert=True)
+
+
+@router.callback_query(F.data.startswith("wizard:set_like_count:"))
+async def wizard_set_like_count(callback: CallbackQuery, state: FSMContext):
+    try:
+        new_count = int(callback.data.split(":")[-1])
+        state_data = await state.get_data()
+        draft = get_draft(callback.from_user.id)
+        target = str(state_data.get("reply_like_target") or draft.reply_like_target or "1")
+        if new_count <= 0:
+            target = "none"
+        elif target in {"none", "0", "off", "disabled"}:
+            target = "1"
+
+        await state.update_data(reply_like_target=target, reply_like_count=new_count)
+        draft.reply_like_target = target
+        draft.reply_like_count = new_count
+        save_draft(callback.from_user.id, draft)
+
+        await callback.message.edit_text(
+            _build_wizard_likes_prompt_text(target, new_count),
+            reply_markup=_build_wizard_likes_keyboard(target, new_count),
+            parse_mode="Markdown"
+        )
+        await callback.answer(f"Лайков: {new_count}")
+    except Exception as e:
+        if "message is not modified" in str(e).lower():
+            await callback.answer()
+            return
+        logger.error(f"Error setting wizard like count: {e}", exc_info=True)
+        await callback.answer("Ошибка", show_alert=True)
+
+
 # ========== ШАГ 5: ПРЕВЬЮ И СОХРАНЕНИЕ ШАБЛОНА ==========
 
 async def show_template_preview_and_confirm(callback: CallbackQuery, state: FSMContext, template_id: int, reply_count: int):
@@ -796,19 +953,30 @@ async def show_template_preview_and_confirm(callback: CallbackQuery, state: FSMC
     
     replies = state_data.get("replies", {})
     text_variants = normalize_text_variants_list(state_data.get("text_variants") or draft.text_variants or [])
+
+    reply_like_target = str(state_data.get("reply_like_target") or draft.reply_like_target or "1")
+    reply_like_count = int(state_data.get("reply_like_count") if state_data.get("reply_like_count") is not None else draft.reply_like_count)
+    reply_likes_badge = format_reply_likes_label(reply_like_target, reply_like_count)
+
     text = build_preview_text(
         links=draft.links or [],
         text_variants=text_variants,
         replies=replies,
         likes_label=await _likes_display_label_for_replies(replies),
+        reply_likes_label=reply_likes_badge,
         template_name=template.get("name") or "Без названия",
     )
     
-    keyboard = InlineKeyboardMarkup(inline_keyboard=[
+    keyboard_buttons = [
         [InlineKeyboardButton(text=f"{Emoji.SUCCESS} Создать заказ", callback_data="wizard:confirm_with_template")],
+    ]
+    if replies or reply_count > 0:
+        keyboard_buttons.append([InlineKeyboardButton(text=f"❤️ Лайки на ответ: {reply_likes_badge}", callback_data="wizard:edit_reply_likes")])
+    keyboard_buttons.extend([
         [InlineKeyboardButton(text="📑 Другой шаблон", callback_data="wizard:change_template")],
         [InlineKeyboardButton(text=f"{Emoji.CANCEL} Отмена", callback_data="menu:main")],
     ])
+    keyboard = InlineKeyboardMarkup(inline_keyboard=keyboard_buttons)
 
     keyboard = visibility_keyboard(keyboard, bool(state_data.get("verify_main_visibility", False)), bool(state_data.get("verify_reply_visibility", False)))
     await callback.message.edit_text(text, reply_markup=keyboard, parse_mode="Markdown")
@@ -881,6 +1049,8 @@ async def wizard_confirm_with_template(callback: CallbackQuery, state: FSMContex
             "origin": "wizard_template",
             "verify_main_visibility": bool(state_data.get("verify_main_visibility", False)),
             "verify_reply_visibility": bool(state_data.get("verify_reply_visibility", False)),
+            "reply_like_target": str(state_data.get("reply_like_target") or template_settings.get("reply_like_target", "1") or "1"),
+            "reply_like_count": int(state_data.get("reply_like_count") if state_data.get("reply_like_count") is not None else template_settings.get("reply_like_count", 0)),
         }
         text_variants = normalize_text_variants_list(state_data.get("text_variants") or [])
         if len(text_variants) < 3:
@@ -917,6 +1087,7 @@ async def wizard_confirm_with_template(callback: CallbackQuery, state: FSMContex
                 reply_count=reply_count,
                 variants_count=len(text_variants),
                 likes_label=await _likes_display_label_for_replies(reply_count),
+                reply_likes_label=format_reply_likes_label(task_settings["reply_like_target"], task_settings["reply_like_count"]),
                 template_name=template.get("name") or "Без названия",
             ),
             reply_markup=InlineKeyboardMarkup(inline_keyboard=[
@@ -963,12 +1134,17 @@ async def ask_save_template_with_preview(message_or_callback: Message | Callback
     replies = state_data.get("replies", {})
     reply_count = state_data.get("reply_count", 0)
     
+    reply_like_target = str(state_data.get("reply_like_target") or draft.reply_like_target or "1")
+    reply_like_count = int(state_data.get("reply_like_count") if state_data.get("reply_like_count") is not None else draft.reply_like_count)
+    reply_likes_badge = format_reply_likes_label(reply_like_target, reply_like_count)
+
     text_variants = normalize_text_variants_list(state_data.get("text_variants") or [main_comment])
     text = build_preview_text(
         links=draft.links or [],
         text_variants=text_variants,
         replies=replies,
         likes_label=await _likes_display_label_for_replies(replies),
+        reply_likes_label=reply_likes_badge,
         include_template_prompt=True,
     )
     
@@ -1001,13 +1177,16 @@ async def ask_save_template_with_preview(message_or_callback: Message | Callback
     text += "\n*💾 Сохранить как шаблон?*"
     
     # ИСПРАВЛЕНО: Стандартизированные кнопки
-    keyboard = InlineKeyboardMarkup(inline_keyboard=[
+    keyboard_buttons = [
         [
             InlineKeyboardButton(text="💾 Сохранить шаблон", callback_data="wizard:save_template"),
             InlineKeyboardButton(text="🚀 Создать заказ", callback_data="wizard:create_order")
         ],
-        [InlineKeyboardButton(text="❌ Отмена", callback_data="menu:main")]
-    ])
+    ]
+    if replies or reply_count > 0:
+        keyboard_buttons.append([InlineKeyboardButton(text=f"❤️ Лайки на ответ: {reply_likes_badge}", callback_data="wizard:edit_reply_likes")])
+    keyboard_buttons.append([InlineKeyboardButton(text="❌ Отмена", callback_data="menu:main")])
+    keyboard = InlineKeyboardMarkup(inline_keyboard=keyboard_buttons)
     keyboard = visibility_keyboard(
         keyboard,
         bool(state_data.get("verify_main_visibility", False)),
@@ -1092,7 +1271,9 @@ async def wizard_save_template(message: Message, state: FSMContext):
             settings={
                 "reply_count": reply_count,
                 "replies": replies_dict_to_list(replies),
-                "text_variants": text_variants
+                "text_variants": text_variants,
+                "reply_like_target": str(state_data.get("reply_like_target") or draft.reply_like_target or "1"),
+                "reply_like_count": int(state_data.get("reply_like_count") if state_data.get("reply_like_count") is not None else draft.reply_like_count),
             }
         )
         
@@ -1375,6 +1556,9 @@ async def _wizard_create_order_impl(
         if account_pool_mode not in {"shared", "personal"}:
             account_pool_mode = "shared"
 
+        reply_like_target = str(state_data.get("reply_like_target") or draft.reply_like_target or "1")
+        reply_like_count = int(state_data.get("reply_like_count") if state_data.get("reply_like_count") is not None else draft.reply_like_count)
+
         settings_dict = {
             "delays": True,
             "shuffle": False,
@@ -1386,6 +1570,8 @@ async def _wizard_create_order_impl(
             "verify_main_visibility": bool(state_data.get("verify_main_visibility", False)),
             "verify_reply_visibility": bool(state_data.get("verify_reply_visibility", False)),
             "account_pool_mode": account_pool_mode,
+            "reply_like_target": reply_like_target,
+            "reply_like_count": reply_like_count,
         }
         
         await loading_msg.edit_text(f"{Emoji.PENDING} Создание заказа...")
@@ -1424,6 +1610,7 @@ async def _wizard_create_order_impl(
                 reply_count=reply_count,
                 variants_count=len(text_variants),
                 likes_label=await _likes_display_label_for_replies(reply_count),
+                reply_likes_label=format_reply_likes_label(reply_like_target, reply_like_count),
                 pool_label=pool_label,
             )
             

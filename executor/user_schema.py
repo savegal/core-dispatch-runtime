@@ -1301,12 +1301,98 @@ async def _publish_main_http_first_if_eligible(
     )
 
 
+_BRANCH_PUBLISHED_REPLIES: Dict[str, List[Dict[str, Any]]] = {}
+_BRANCH_PARENT_LIKED_ACCOUNTS: Dict[str, Set[str]] = {}
+_MAX_BRANCH_TRACKED = 500
+
+
+def can_boost_parent(parent_id: Optional[str], account_id: Optional[str]) -> bool:
+    clean_p = str(parent_id or "").strip()
+    clean_acc = str(account_id or "").strip()
+    if not clean_p:
+        return False
+    if not clean_acc:
+        return True
+    return clean_acc not in _BRANCH_PARENT_LIKED_ACCOUNTS.get(clean_p, set())
+
+
+def record_parent_boost(parent_id: Optional[str], account_id: Optional[str]) -> None:
+    clean_p = str(parent_id or "").strip()
+    clean_acc = str(account_id or "").strip()
+    if not clean_p or not clean_acc:
+        return
+    if len(_BRANCH_PARENT_LIKED_ACCOUNTS) > _MAX_BRANCH_TRACKED:
+        keys_to_del = list(_BRANCH_PARENT_LIKED_ACCOUNTS.keys())[:len(_BRANCH_PARENT_LIKED_ACCOUNTS) // 2]
+        for k in keys_to_del:
+            _BRANCH_PARENT_LIKED_ACCOUNTS.pop(k, None)
+    _BRANCH_PARENT_LIKED_ACCOUNTS.setdefault(clean_p, set()).add(clean_acc)
+
+
+def _record_branch_published_reply(parent_id: Optional[str], variant_index: int, comment_id: Optional[str]) -> None:
+    clean_p = str(parent_id or "").strip()
+    clean_c = str(comment_id or "").strip()
+    if not clean_p or not clean_c or not _looks_like_tiktok_comment_id(clean_c):
+        return
+    if len(_BRANCH_PUBLISHED_REPLIES) > _MAX_BRANCH_TRACKED:
+        keys_to_del = list(_BRANCH_PUBLISHED_REPLIES.keys())[:len(_BRANCH_PUBLISHED_REPLIES) // 2]
+        for k in keys_to_del:
+            _BRANCH_PUBLISHED_REPLIES.pop(k, None)
+    branch = _BRANCH_PUBLISHED_REPLIES.setdefault(clean_p, [])
+    if not any(item.get("cid") == clean_c for item in branch):
+        branch.append({"index": int(variant_index or 1), "cid": clean_c, "likes_given": 0, "liked_by": set()})
+
+
+def _get_branch_published_replies(parent_id: Optional[str]) -> List[Dict[str, Any]]:
+    return _BRANCH_PUBLISHED_REPLIES.get(str(parent_id or "").strip(), [])
+
+
+def can_boost_reply(cid: Optional[str], account_id: Optional[str], max_likes: int = 1) -> bool:
+    clean_c = str(cid or "").strip()
+    clean_acc = str(account_id or "").strip()
+    if not clean_c or max_likes <= 0:
+        return False
+    for branch in _BRANCH_PUBLISHED_REPLIES.values():
+        for item in branch:
+            if item.get("cid") == clean_c:
+                liked_by = item.setdefault("liked_by", set())
+                if clean_acc and clean_acc in liked_by:
+                    return False
+                return int(item.get("likes_given", 0)) < max_likes
+    return True
+
+
+def record_reply_boost(cid: Optional[str], account_id: Optional[str], parent_id: Optional[str] = None) -> None:
+    clean_c = str(cid or "").strip()
+    clean_acc = str(account_id or "").strip()
+    if not clean_c:
+        return
+    found = False
+    for branch in _BRANCH_PUBLISHED_REPLIES.values():
+        for item in branch:
+            if item.get("cid") == clean_c:
+                if clean_acc:
+                    item.setdefault("liked_by", set()).add(clean_acc)
+                item["likes_given"] = len(item.setdefault("liked_by", set()))
+                found = True
+    if not found and parent_id:
+        branch = _BRANCH_PUBLISHED_REPLIES.setdefault(str(parent_id).strip(), [])
+        liked_set = {clean_acc} if clean_acc else set()
+        branch.append({
+            "index": 1,
+            "cid": clean_c,
+            "likes_given": len(liked_set),
+            "liked_by": liked_set,
+        })
+
+
 async def _publish_reply_http_first_if_eligible(
     session: Optional[_UserSchemaHttpSession],
     reply_text: str,
     *,
     parent_comment_id: Optional[str],
     correlation_id: str,
+    variant_index: int = 1,
+    task_settings: Optional[Dict[str, Any]] = None,
 ) -> Optional[PublishResult]:
     parent_id = str(parent_comment_id or "").strip()
     if (
@@ -1319,9 +1405,9 @@ async def _publish_reply_http_first_if_eligible(
 
     started = time.monotonic()
     # Free HTTP auto-boost: like parent comment before replying
-    if _like_parent_before_reply_enabled() and parent_id:
+    if _like_parent_before_reply_enabled() and parent_id and can_boost_parent(parent_id, session.account_id):
         try:
-            like_ok, _, _ = await session.client.like_comment(
+            like_ok, like_err, _ = await session.client.like_comment(
                 aweme_id=session.aweme_id,
                 cid=parent_id,
                 cookies=session.cookies,
@@ -1329,13 +1415,61 @@ async def _publish_reply_http_first_if_eligible(
                 video_url=session.video_url,
             )
             if like_ok:
+                record_parent_boost(parent_id, session.account_id)
                 logger.info(
                     "[HTTP_AUTO_BOOST] Liked parent comment %s before reply | account=%s, correlation_id=%s",
                     parent_id[:20], session.account_id, correlation_id
                 )
-                await asyncio.sleep(0.3)
+            else:
+                logger.debug("[HTTP_AUTO_BOOST] Like parent comment %s non-ok: %s", parent_id[:20], like_err)
+            await asyncio.sleep(random.uniform(0.6, 1.2))
         except Exception as exc:
             logger.debug("[HTTP_AUTO_BOOST] Like parent comment %s failed (non-blocking): %s", parent_id[:20], exc)
+
+    # Targeted reply like boost (configured in order or template)
+    settings_dict = task_settings or {}
+    raw_target = str(settings_dict.get("reply_like_target") or "").strip().lower()
+    raw_count = int(settings_dict.get("reply_like_count") or 0)
+    if raw_count > 0 and raw_target not in {"0", "none", "off", "false", ""}:
+        known_replies = _get_branch_published_replies(parent_id)
+        target_items = []
+        digits = re.findall(r"\d+", raw_target)
+        if digits:
+            target_idx = int(digits[0])
+            target_items = [
+                item for item in known_replies
+                if item.get("index") == target_idx
+                and can_boost_reply(item.get("cid"), session.account_id, max_likes=raw_count)
+            ]
+        elif raw_target == "all":
+            target_items = [
+                item for item in known_replies
+                if can_boost_reply(item.get("cid"), session.account_id, max_likes=raw_count)
+            ]
+
+        for item in target_items:
+            try:
+                reply_like_ok, reply_like_err, _ = await session.client.like_comment(
+                    aweme_id=session.aweme_id,
+                    cid=item["cid"],
+                    cookies=session.cookies,
+                    correlation_id=f"{correlation_id}_target_reply_like_{item['cid'][:12]}",
+                    video_url=session.video_url,
+                )
+                if reply_like_ok:
+                    record_reply_boost(item["cid"], session.account_id, parent_id=parent_id)
+                    logger.info(
+                        "[HTTP_AUTO_BOOST] Reply bot %s liked target reply #%s (%s) [%s/%s likes] in branch %s",
+                        session.account_id, item.get("index"), item["cid"][:20], item.get("likes_given", 1), raw_count, parent_id[:20]
+                    )
+                else:
+                    logger.debug("[HTTP_AUTO_BOOST] Reply bot %s like target reply non-ok: %s", session.account_id, reply_like_err)
+                await asyncio.sleep(random.uniform(0.6, 1.3))
+            except Exception as exc:
+                logger.debug("[HTTP_AUTO_BOOST] Target reply like error (non-blocking): %s", exc)
+
+    # Organic pause before sending reply
+    await asyncio.sleep(random.uniform(1.0, 2.0))
 
     try:
         success, comment_id, error_msg, error_type, meta = await session.client.reply_comment(
@@ -1346,6 +1480,8 @@ async def _publish_reply_http_first_if_eligible(
             correlation_id=correlation_id,
             video_url=session.video_url,
         )
+        if success and comment_id:
+            _record_branch_published_reply(parent_id, variant_index, comment_id)
     except Exception as exc:
         session.disabled_reason = f"http_exception:{str(exc)[:80]}"
         request_attempted = _http_session_request_attempted(session, error_msg=str(exc))
@@ -5700,19 +5836,23 @@ async def _verify_order_main_visibility(
                     obs_client = await PlaywrightHttpClient.from_page(page)
                     for cid in found_ids[:5]:
                         clean_cid = str(cid).strip()
-                        if _looks_like_tiktok_comment_id(clean_cid):
+                        if _looks_like_tiktok_comment_id(clean_cid) and can_boost_parent(clean_cid, observer.id):
                             try:
-                                await obs_client.like_comment(
+                                like_ok, like_err, _ = await obs_client.like_comment(
                                     aweme_id=aweme_id,
                                     cid=clean_cid,
                                     correlation_id=f"{corr}_boost_{clean_cid[:15]}",
                                     video_url=video_url,
                                 )
-                                logger.info(
-                                    "[HTTP_AUTO_BOOST] Main observer %s liked confirmed main comment %s",
-                                    observer.id, clean_cid[:20]
-                                )
-                                await asyncio.sleep(0.3)
+                                if like_ok:
+                                    record_parent_boost(clean_cid, observer.id)
+                                    logger.info(
+                                        "[HTTP_AUTO_BOOST] Main observer %s liked confirmed main comment %s",
+                                        observer.id, clean_cid[:20]
+                                    )
+                                else:
+                                    logger.debug("[HTTP_AUTO_BOOST] Main observer %s like main comment non-ok: %s", observer.id, like_err)
+                                await asyncio.sleep(random.uniform(0.6, 1.3))
                             except Exception:
                                 pass
                 except Exception as boost_err:
@@ -9281,6 +9421,7 @@ async def _reply_with_variant_on_all_mains(
     parent_search_progress_sink: Optional[Dict[str, Any]] = None,
     on_resolved_video_url: Optional[Callable[[str], None]] = None,
     visibility_http_only: bool = False,
+    task_settings: Optional[Dict[str, Any]] = None,
 ) -> ReplyAttemptResult:
     """Один reply-аккаунт пишет один вариант ответа на каждый найденный main."""
     if visibility_http_only:
@@ -10040,6 +10181,8 @@ async def _reply_with_variant_on_all_mains(
                         publish_result = await _publish_reply_http_first_if_eligible(
                             reply_http_session, reply_text, parent_comment_id=parent_id,
                             correlation_id=sub_corr,
+                            variant_index=variant_index,
+                            task_settings=task_settings,
                         )
                     except Exception as exc:
                         if not _http_session_request_attempted(reply_http_session, error_msg=str(exc)):
@@ -10060,6 +10203,7 @@ async def _reply_with_variant_on_all_mains(
                         already_replied_parent_keys.add(parent_id)
                         submitted_parent_keys.add(parent_id)
                         found_mains_by_key[parent_id] = main
+                        _record_branch_published_reply(parent_id, variant_index, publish_result.comment_id)
                     elif unconfirmed and reply_attempt_key:
                         soft_submitted_reply_keys.add(reply_attempt_key)
                         soft_submitted_keys_this_attempt.add(reply_attempt_key)
@@ -11259,6 +11403,8 @@ async def _reply_with_variant_on_all_mains(
                             reply_text,
                             parent_comment_id=open_parent_id,
                             correlation_id=sub_corr,
+                            variant_index=variant_index,
+                            task_settings=task_settings,
                         )
                     elif open_parent_id and not reply_dom_first and not reply_http_enabled and not reply_http_disabled_logged:
                         reply_http_disabled_logged = True
@@ -11337,6 +11483,8 @@ async def _reply_with_variant_on_all_mains(
                         inflight_key_added = False
 
                 network_confirmed = publish_result.status == "success" and bool(publish_result.comment_id)
+                if network_confirmed:
+                    _record_branch_published_reply(open_parent_id or parent_id, variant_index, publish_result.comment_id)
                 submitted_unconfirmed = _reply_publish_submitted_unconfirmed(publish_result)
                 local_reply_probe: Any = early_local_reply_probe_holder.get("probe")
                 empty_reply_response = publish_result.error_reason == "stealth_reject_empty_body"
@@ -15306,6 +15454,7 @@ async def execute_user_schema_parallel(
                         inflight_reply_keys=reply_task_inflight_locks,
                         on_soft_submitted_outcome=_record_incremental_soft_submitted_reply,
                         parent_search_progress_sink=parent_search_progress,
+                        task_settings=task_settings,
                     ),
                     timeout=reply_worker_attempt_timeout_seconds,
                 )
@@ -16646,6 +16795,7 @@ async def execute_user_schema_full(
         resolved_video_url=video_url,
         aweme_id=resolved_media_id or extract_tiktok_media_id(video_url),
     )
+    task_settings = task.settings if isinstance(task.settings, dict) else {}
 
     def _is_stop_requested() -> bool:
         if stop_requested is None:
@@ -17298,6 +17448,7 @@ async def execute_user_schema_full(
                             soft_submitted_reply_keys=full_reply_task_attempt_locks,
                             inflight_reply_keys=full_reply_task_inflight_locks,
                             on_soft_submitted_outcome=_record_full_soft_submitted_reply,
+                            task_settings=task_settings,
                         )
                     finally:
                         try:

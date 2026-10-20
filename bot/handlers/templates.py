@@ -8,7 +8,7 @@ from bot.services.api_client import api_client
 from bot.services.bot_ui import block, kv_rows, screen
 from bot.services.drafts import get_draft, save_draft
 from bot.services.formatting import markdown_inline_code
-from bot.services.likes_ui import LIKES_DISABLED_LABEL
+from bot.services.likes_ui import LIKES_DISABLED_LABEL, format_reply_likes_label
 from bot.services.template_utils import (
     has_meaningful_text,
     is_replies_only_template,
@@ -96,6 +96,7 @@ def _template_edit_keyboard(template_id: int, *, replies_only: bool = False) -> 
     if not replies_only:
         rows.append([InlineKeyboardButton(text="💬 Комментарии", callback_data=f"template:edit_comment:{template_id}")])
     rows.append([InlineKeyboardButton(text="↩️ Ответы", callback_data=f"template:edit_replies:{template_id}")])
+    rows.append([InlineKeyboardButton(text="❤️ Лайки на ответ", callback_data=f"template:edit_likes:{template_id}")])
     rows.append([InlineKeyboardButton(text="◀️ Назад", callback_data=f"template:detail:{template_id}")])
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
@@ -106,6 +107,10 @@ def _build_template_detail_text(template: dict) -> str:
     replies = _template_reply_list(template)
     replies_only = is_replies_only_template(template)
     type_label = "только ответы" if replies_only else "полный"
+    t_settings = _template_settings(template)
+    target = t_settings.get("reply_like_target", "1")
+    count = int(t_settings.get("reply_like_count", 0) or 0)
+    reply_likes_str = format_reply_likes_label(target, count)
 
     parts = []
     if not replies_only:
@@ -118,6 +123,7 @@ def _build_template_detail_text(template: dict) -> str:
                 [
                     ("Тип", f"*{type_label}*"),
                     ("↩️ Ответов", f"*{len(replies)}*"),
+                    ("❤️ Лайки на ответ", f"*{reply_likes_str}*"),
                 ]
             ),
         ),
@@ -130,6 +136,10 @@ def _build_template_edit_text(template: dict) -> str:
     variants = template_text_variants(template)
     replies = _template_reply_list(template)
     replies_only = is_replies_only_template(template)
+    t_settings = _template_settings(template)
+    target = t_settings.get("reply_like_target", "1")
+    count = int(t_settings.get("reply_like_count", 0) or 0)
+    reply_likes_str = format_reply_likes_label(target, count)
 
     return screen(
         f"Редактирование · {name}",
@@ -140,6 +150,7 @@ def _build_template_edit_text(template: dict) -> str:
                 f"Тип: *{'только ответы' if replies_only else 'полный'}*",
                 f"Комментариев: *{len(variants)}*" if not replies_only else "Комментариев: *не используется*",
                 f"Ответов: *{len(replies)}*",
+                f"Лайки на ответ: *{reply_likes_str}*",
             ],
         ),
         "Выберите, что хотите изменить.",
@@ -282,6 +293,8 @@ async def apply_task_template(callback: CallbackQuery):
         draft.shuffle = template_settings.get("shuffle", False)
         draft.rotate_accounts = template_settings.get("rotate_accounts", True)
         draft.reply_mode = template_settings.get("reply_mode", "A")
+        draft.reply_like_target = str(template_settings.get("reply_like_target", "1") or "1")
+        draft.reply_like_count = int(template_settings.get("reply_like_count", 0) or 0)
         save_draft(callback.from_user.id, draft)
 
         await callback.message.edit_text(
@@ -723,42 +736,163 @@ async def _finish_template_replies_edit(message: Message, state: FSMContext, rep
         await message.answer(f"Не удалось обновить ответы: {str(e)[:200]}")
 
 
+def _build_template_likes_keyboard(template_id: int, current_target: str, current_count: int) -> InlineKeyboardMarkup:
+    target_str = str(current_target or "1").strip().lower()
+    is_active = current_count > 0 and target_str not in {"none", "0", "off", "disabled"}
+    
+    # Row 1: Target reply
+    r1 = []
+    targets = [("1", "1-й"), ("2", "2-й"), ("3", "3-й"), ("all", "Все")]
+    for val, lbl in targets:
+        checked = "✅ " if (is_active and target_str == val) else ""
+        r1.append(InlineKeyboardButton(text=f"{checked}{lbl}", callback_data=f"template:set_like_target:{template_id}:{val}"))
+
+    # Row 2: Count of likes
+    r2 = []
+    for c in [1, 2, 3, 5]:
+        checked = "✅ " if (is_active and current_count == c) else ""
+        r2.append(InlineKeyboardButton(text=f"{checked}{c} шт", callback_data=f"template:set_like_count:{template_id}:{c}"))
+
+    # Row 3: Off
+    off_checked = "✅ " if not is_active else ""
+    r3 = [InlineKeyboardButton(text=f"{off_checked}❌ Выключить", callback_data=f"template:set_like_count:{template_id}:0")]
+
+    # Row 4: Back
+    r4 = [InlineKeyboardButton(text="◀️ Сохранить и вернуться", callback_data=f"template:edit:{template_id}")]
+
+    return InlineKeyboardMarkup(inline_keyboard=[r1, r2, r3, r4])
+
+
+def _build_template_likes_prompt_text(template_name: str, target: str, count: int) -> str:
+    status = format_reply_likes_label(target, count)
+    return screen(
+        f"Лайки на ответ · {_md(template_name)}",
+        f"Текущая настройка: *{status}*\n",
+        "Выберите, на какой ответ ставить бесплатные HTTP-лайки со свободных аккаунтов задачи:\n\n"
+        "• *1-й / 2-й / 3-й* — точечный буст конкретного ответа ветки.\n"
+        "• *Все* — буст каждого опубликованного ответа ветки.\n"
+        "• *Выключить* — без лайков на ответы.\n",
+    )
+
+
 @router.callback_query(F.data.startswith("template:edit_likes:"))
 async def edit_template_likes_start(callback: CallbackQuery, state: FSMContext):
     try:
+        if not callback.message:
+            await callback.answer("Сообщение не найдено", show_alert=True)
+            return
+
         template_id = int(callback.data.split(":")[-1])
-        await callback.answer(
-            "Лайки задаются в общих настройках и больше не редактируются в шаблоне.",
-            show_alert=True,
+        user_backend_id, template = await _load_template_for_user(callback.from_user.id, template_id)
+        if not user_backend_id or not template:
+            await callback.answer("Шаблон не найден", show_alert=True)
+            return
+
+        t_settings = _template_settings(template)
+        target = t_settings.get("reply_like_target", "1")
+        count = int(t_settings.get("reply_like_count", 0) or 0)
+
+        await callback.message.edit_text(
+            _build_template_likes_prompt_text(template.get("name") or "шаблон", target, count),
+            reply_markup=_build_template_likes_keyboard(template_id, target, count),
+            parse_mode="Markdown",
         )
-        if callback.message:
-            await callback.message.edit_text(
-                _build_likes_prompt_text(0),
-                reply_markup=InlineKeyboardMarkup(
-                    inline_keyboard=[[InlineKeyboardButton(text="◀️ К шаблону", callback_data=f"template:edit:{template_id}")]]
-                ),
-                parse_mode="Markdown",
-            )
+        await callback.answer()
     except Exception as e:
         logger.error(f"Error starting template likes edit: {e}", exc_info=True)
-        await callback.answer("Не удалось изменить лайки", show_alert=True)
+        await callback.answer("Не удалось открыть настройку лайков", show_alert=True)
 
 
-@router.message(StateFilter(OrderStates.EDIT_TEMPLATE_LIKES))
-async def edit_template_likes_handler(message: Message, state: FSMContext):
-    data = await state.get_data()
-    template_id = data.get("editing_template_id")
-    await state.clear()
-    keyboard = None
-    if template_id:
-        keyboard = InlineKeyboardMarkup(
-            inline_keyboard=[[InlineKeyboardButton(text="◀️ К шаблону", callback_data=f"template:detail:{template_id}")]]
+@router.callback_query(F.data.startswith("template:set_like_target:"))
+async def edit_template_set_like_target(callback: CallbackQuery, state: FSMContext):
+    try:
+        if not callback.message:
+            await callback.answer("Сообщение не найдено", show_alert=True)
+            return
+
+        parts = callback.data.split(":")
+        template_id = int(parts[2])
+        new_target = parts[3]
+
+        user_backend_id, template = await _load_template_for_user(callback.from_user.id, template_id)
+        if not user_backend_id or not template:
+            await callback.answer("Шаблон не найден", show_alert=True)
+            return
+
+        t_settings = _template_settings(template)
+        count = int(t_settings.get("reply_like_count", 0) or 0)
+        if count <= 0:
+            count = 1  # При выборе цели автоматически включаем 1 лайк
+        t_settings["reply_like_target"] = new_target
+        t_settings["reply_like_count"] = count
+
+        await api_client.update_task_template(
+            template_id,
+            user_backend_id,
+            settings=t_settings,
         )
-    await message.answer(
-        screen(
-            "Лайки не изменены",
-            "Лайки задаются в общих настройках сервиса и не хранятся в шаблоне.",
-        ),
-        reply_markup=keyboard,
-        parse_mode="Markdown",
-    )
+        template["settings"] = t_settings
+        await state.update_data(editing_template=template)
+
+        await callback.message.edit_text(
+            _build_template_likes_prompt_text(template.get("name") or "шаблон", new_target, count),
+            reply_markup=_build_template_likes_keyboard(template_id, new_target, count),
+            parse_mode="Markdown",
+        )
+        await callback.answer(f"Выбран ответ: {new_target}")
+    except Exception as e:
+        if "message is not modified" in str(e).lower():
+            await callback.answer()
+            return
+        logger.error(f"Error updating template like target: {e}", exc_info=True)
+        await callback.answer("Не удалось обновить выбор", show_alert=True)
+
+
+@router.callback_query(F.data.startswith("template:set_like_count:"))
+async def edit_template_set_like_count(callback: CallbackQuery, state: FSMContext):
+    try:
+        if not callback.message:
+            await callback.answer("Сообщение не найдено", show_alert=True)
+            return
+
+        parts = callback.data.split(":")
+        template_id = int(parts[2])
+        new_count = int(parts[3])
+
+        user_backend_id, template = await _load_template_for_user(callback.from_user.id, template_id)
+        if not user_backend_id or not template:
+            await callback.answer("Шаблон не найден", show_alert=True)
+            return
+
+        t_settings = _template_settings(template)
+        target = t_settings.get("reply_like_target", "1")
+        t_settings["reply_like_count"] = new_count
+        if new_count <= 0:
+            target = "none"
+            t_settings["reply_like_target"] = "none"
+        elif target in {"none", "0", "off", "disabled"}:
+            target = "1"
+            t_settings["reply_like_target"] = target
+        else:
+            t_settings["reply_like_target"] = target
+
+        await api_client.update_task_template(
+            template_id,
+            user_backend_id,
+            settings=t_settings,
+        )
+        template["settings"] = t_settings
+        await state.update_data(editing_template=template)
+
+        await callback.message.edit_text(
+            _build_template_likes_prompt_text(template.get("name") or "шаблон", target, new_count),
+            reply_markup=_build_template_likes_keyboard(template_id, target, new_count),
+            parse_mode="Markdown",
+        )
+        await callback.answer(f"Количество лайков: {new_count}")
+    except Exception as e:
+        if "message is not modified" in str(e).lower():
+            await callback.answer()
+            return
+        logger.error(f"Error updating template like count: {e}", exc_info=True)
+        await callback.answer("Не удалось обновить количество", show_alert=True)

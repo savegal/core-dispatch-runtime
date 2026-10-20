@@ -489,6 +489,8 @@ async def process_template_name(message: Message, state: FSMContext):
                 "rotate_accounts": draft.rotate_accounts,
                 "reply_mode": draft.reply_mode,
                 "account_pool_mode": draft.account_pool_mode,
+                "reply_like_target": draft.reply_like_target,
+                "reply_like_count": draft.reply_like_count,
             }
         )
 
@@ -584,6 +586,8 @@ async def submit_order(callback: CallbackQuery, state: FSMContext):
             "rotate_accounts": draft.rotate_accounts,
             "reply_mode": draft.reply_mode,
             "account_pool_mode": draft.account_pool_mode,
+            "reply_like_target": draft.reply_like_target,
+            "reply_like_count": draft.reply_like_count,
             "origin": "composer"  # REFACTOR: Указываем источник заказа
         }
 

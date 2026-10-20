@@ -30,6 +30,8 @@ class Draft:
     rotate_accounts: bool = True
     account_pool_mode: str = "shared"
     text_variants: list[str] = field(default_factory=list)
+    reply_like_target: str = "1"
+    reply_like_count: int = 0
     
     def to_dict(self) -> dict:
         """Конвертирует Draft в словарь для Redis."""
@@ -42,7 +44,9 @@ class Draft:
             "shuffle": "1" if self.shuffle else "0",
             "rotate_accounts": "1" if self.rotate_accounts else "0",
             "account_pool_mode": self.account_pool_mode if self.account_pool_mode == "personal" else "shared",
-            "text_variants": json.dumps(self.text_variants)
+            "text_variants": json.dumps(self.text_variants),
+            "reply_like_target": str(self.reply_like_target),
+            "reply_like_count": str(self.reply_like_count)
         }
     
     @classmethod
@@ -69,7 +73,9 @@ class Draft:
             shuffle=data.get("shuffle") in ("1", "true", "True"),
             rotate_accounts=data.get("rotate_accounts") in ("1", "true", "True"),
             account_pool_mode="personal" if data.get("account_pool_mode") == "personal" else "shared",
-            text_variants=text_variants
+            text_variants=text_variants,
+            reply_like_target=str(data.get("reply_like_target", "1") or "1"),
+            reply_like_count=int(data.get("reply_like_count", 0) or 0)
         )
 
 

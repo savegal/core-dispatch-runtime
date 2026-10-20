@@ -54,3 +54,18 @@ async def get_likes_display_label_for_replies(replies_or_count: object) -> str:
     if not has_reply_texts(replies_or_count):
         return LIKES_DISABLED_LABEL
     return await get_likes_display_label()
+
+
+def format_reply_likes_label(target: object = "1", count: object = 0) -> str:
+    """Форматирует статус точечных лайков на ответ для UI."""
+    target_str = str(target or "1").strip().lower()
+    try:
+        cnt = int(count or 0)
+    except (ValueError, TypeError):
+        cnt = 0
+    if cnt <= 0 or target_str in {"none", "0", "off", "disabled"}:
+        return "выключены"
+    if target_str == "all":
+        return f"все ответы ({cnt} шт)"
+    return f"ответ {target_str} ({cnt} шт)"
+
