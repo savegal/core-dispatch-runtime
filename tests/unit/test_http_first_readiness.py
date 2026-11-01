@@ -182,14 +182,15 @@ async def test_photo_warmup_preserves_media_type(monkeypatch, reuse):
     cookies = [{"name": name, "value": name, "domain": ".tiktok.com"}
                for name in ("sessionid", "ttwid", "tt_csrf_token", "msToken")]
     page = SimpleNamespace(url=PHOTO_URL if reuse else "about:blank",
-                           context=SimpleNamespace(cookies=AsyncMock(return_value=cookies)),
+                           context=SimpleNamespace(cookies=AsyncMock(return_value=cookies), add_cookies=AsyncMock()),
                            wait_for_load_state=AsyncMock(), reload=AsyncMock())
 
     async def goto(url, **kwargs):
         page.url = url
 
     page.goto = AsyncMock(side_effect=goto)
-    monkeypatch.setattr(engagement_engine, "wait_for_runtime_signer_ready", AsyncMock(return_value=False))
+    monkeypatch.setattr(engagement_engine, "wait_for_runtime_signer_ready", AsyncMock(return_value=True))
+    monkeypatch.setattr("executor.http.comment_discovery.fetch_comment_page", AsyncMock(return_value={"comments": []}))
     monkeypatch.setattr(engagement_engine.asyncio, "sleep", AsyncMock())
     _, valid, info = await engagement_engine.warmup_page_for_http(page, PHOTO_URL)
     assert valid

@@ -296,7 +296,7 @@ async def test_enabled_adapter_uses_independent_accounts_and_releases_reservatio
     publish = AsyncMock(return_value=([new], None))
     if interrupted_cleanup:
         async def interrupted(*args, **kwargs):
-            kwargs["on_published"](new)
+            await kwargs["on_published"](new)
             raise TimeoutError("cleanup after receipt timed out")
         publish.side_effect = interrupted
     monkeypatch.setattr(schema, "_try_main_account", publish)
@@ -469,7 +469,7 @@ async def test_receipts_are_committed_before_verification_starts(monkeypatch, db
     monkeypatch.setattr(schema, "release_main_account_reservation", Mock())
 
     async def receipt_before_cleanup(*args, **kwargs):
-        kwargs["on_published"](replacement)
+        await kwargs["on_published"](replacement)
         with Session(db_session.bind) as reader:
             row = reader.get(Task, sample_task.id).settings["url_results"][short]
             assert row["main_visibility"]["pending_receipts"][0]["comment_id"] == NEW

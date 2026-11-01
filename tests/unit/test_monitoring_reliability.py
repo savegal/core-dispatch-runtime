@@ -2098,6 +2098,7 @@ async def test_process_blogger_rate_limited_exception_does_not_mark_proxy_bad(mo
         return None, None
 
     async def fake_fetch_latest_videos_from_profile(*args, **kwargs):
+        from services.video_parser import RateLimited
         raise RateLimited("HTTP 429")
 
     async def fake_send_admin_alert_once(*args, **kwargs):

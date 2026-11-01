@@ -111,14 +111,14 @@ def test_build_task_execution_summary_aggregates_execution_details():
     assert summary["main"]["comment_id"] == "1234567890"
     assert summary["main"]["expected"] == 4
     assert summary["main"]["submitted"] == 3
-    assert summary["main"]["verified_count"] == 2
+    assert summary["main"]["verified_count"] == 0
     assert summary["replies"]["ok"] == 2
     assert summary["replies"]["total"] == 3
     assert summary["replies"]["requested"] == 4
     assert summary["replies"]["submitted"] == 3
     assert summary["replies"]["parent_confirmed"] == 2
     assert summary["replies"]["parent_ui_confirmed"] == 1
-    assert summary["replies"]["visibility_confirmed"] == 2
+    assert summary["replies"]["visibility_confirmed"] == 0
     assert summary["replies"]["submitted_unconfirmed"] == 1
     assert summary["replies"]["method"] == "mixed"
     assert summary["likes"]["enabled"] is True
@@ -138,7 +138,7 @@ def test_build_task_execution_summary_aggregates_execution_details():
 
 
 @pytest.mark.unit
-def test_build_task_execution_summary_counts_legacy_verified_main_without_variants():
+def test_legacy_verified_flag_without_observer_evidence_is_not_public_visibility():
     task = {
         "status": "done",
         "video_urls": ["https://tiktok.test/1"],
@@ -162,7 +162,7 @@ def test_build_task_execution_summary_counts_legacy_verified_main_without_varian
     assert summary["main"]["verified"] is True
     assert summary["main"]["expected"] == 1
     assert summary["main"]["submitted"] == 1
-    assert summary["main"]["verified_count"] == 1
+    assert summary["main"]["verified_count"] == 0
 
 
 @pytest.mark.unit
@@ -373,7 +373,7 @@ def test_build_task_execution_summary_counts_legacy_unconfirmed_replies_as_submi
 
     assert summary["replies"]["submitted"] == 3
     assert summary["replies"]["submitted_unconfirmed"] == 2
-    assert summary["replies"]["visibility_confirmed"] == 1
+    assert summary["replies"]["visibility_confirmed"] == 0
 
 
 @pytest.mark.unit

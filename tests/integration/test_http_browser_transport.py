@@ -16,6 +16,90 @@ from executor.tiktok_client import parse_cookies
 
 
 pytestmark = [pytest.mark.integration, pytest.mark.asyncio]
+CLOCK_TOLERANCE_MS = int(time.get_clock_info("monotonic").resolution * 1000) + 1
+
+
+@pytest.mark.parametrize("mode,expected_calls,success", [
+    ("signed_empty", 2, True), ("unsigned_first", 2, True), ("invalid_json", 1, False),
+])
+async def test_publish_empty_body_has_one_bounded_retry_without_replaying_invalid_json(browser_page, mode, expected_calls, success):
+    requests = []
+    async def serve(route):
+        if urlparse(route.request.url).path != "/api/comment/publish/":
+            await route.fulfill(content_type="text/html", body="<html>Fixture</html>")
+            return
+        requests.append(route.request.url)
+        body = "invalid" if mode == "invalid_json" else ""
+        if len(requests) > 1:
+            body = '{"status_code":0,"comment":{"cid":"7641761192486194454"}}'
+        await route.fulfill(content_type="application/json", body=body)
+    await browser_page.route("**/*", serve)
+    await browser_page.goto("https://www.tiktok.com/@fixture/video/7635267329407913230")
+    await browser_page.evaluate("""mode => {
+        const original = window.fetch; let count = 0;
+        window.fetch = function(input, options) {
+            const url = new URL(input, location.href);
+            if (++count > 1 || mode !== 'unsigned_first') {
+                url.searchParams.set('X-Bogus', 'fixture');
+                url.searchParams.set('X-Gnarly', 'fixture');
+            }
+            return original.call(this, url.href, options);
+        };
+    }""", mode, isolated_context=False)
+    client = PlaywrightHttpClient(browser_page.context.request, page=browser_page,
+                                  retry_policy=RetryPolicy(max_retries=3))
+    result = await client._execute_request(RequestProfile.publish_main_profile(),
+                                           {"aweme_id": "7635267329407913230", "text": "fixture"})
+    assert result[0] is success
+    assert len(requests) == expected_calls
+    assert client.last_request_meta["security_params_source"] == "request_event"
+    if not success:
+        assert client.last_request_meta["publication_status"] == "submitted_unconfirmed"
+
+
+async def test_mention_resolution_aborts_a_stalled_response_body(browser_page, monkeypatch):
+    from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+    import threading
+    from executor.http import mentions
+    disconnected = threading.Event()
+    class Handler(BaseHTTPRequestHandler):
+        def log_message(self, *_):
+            pass
+        def do_GET(self):
+            if not self.path.startswith("/api/user/detail/"):
+                body = b"<html>Fixture</html>"
+                self.send_response(200)
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+                return
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", "999")
+            self.end_headers()
+            self.wfile.write(b'{"status_code":')
+            self.wfile.flush()
+            self.connection.settimeout(3)
+            try:
+                if not self.connection.recv(1):
+                    disconnected.set()
+            except OSError:
+                pass
+    server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+    server.daemon_threads = True
+    thread = threading.Thread(target=server.serve_forever, kwargs={"poll_interval": 0.05}, daemon=True)
+    thread.start()
+    monkeypatch.setattr(mentions, "_MENTION_CACHE", {})
+    try:
+        await browser_page.goto(f"http://127.0.0.1:{server.server_port}/")
+        started = time.monotonic()
+        assert await mentions.resolve_mention_user(browser_page, "fixture_abort", timeout_ms=200) is None
+        assert time.monotonic() - started < 2
+        assert await asyncio.to_thread(disconnected.wait, 2)
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=2)
 
 
 _COMMENT_INTERCEPTOR_JS = """() => {
@@ -107,6 +191,7 @@ async def test_warmup_waits_for_subresource_set_cookie_after_commit(browser_page
             body = '{"status_code":0,"comments":[],"has_more":0}' if "ttwid=" in headers.get("cookie", "") else ""
             await route.fulfill(status=200, content_type="application/json", body=body, headers={
                 "Set-Cookie": "tt_csrf_token=fresh-csrf; Domain=.tiktok.com; Path=/; Secure; SameSite=Lax",
+                "x-ms-token": "fresh-ms-token",
             })
         else:
             await route.fulfill(status=200, content_type="text/html", body="""<html><body><script>
@@ -118,6 +203,7 @@ async def test_warmup_waits_for_subresource_set_cookie_after_commit(browser_page
         "name": "sessionid", "value": "local-session", "domain": ".tiktok.com", "path": "/", "secure": True,
     }])
     await browser_page.context.add_init_script(f"({_COMMENT_INTERCEPTOR_JS})();")
+    await browser_page.context.add_init_script("window.byted_acrawler = {sign: () => ({})};")
     await browser_page.goto(target, wait_until="commit")
     # A reload here would interrupt the delayed response we're testing.
     monkeypatch.setattr(browser_page, "reload", AsyncMock(side_effect=AssertionError("Unexpected reload")))
@@ -346,7 +432,7 @@ async def test_browser_pool_init_scripts_preserve_plugins_chrome_and_account_ren
         # The browser belongs to browser_page's fixture; close our context only.
         await pool.close_context_for_account(account.id)
         pool._browsers.clear()
-        await pool.close_all()
+        await pool.close_all(stop_playwright=True)
 
 
 @pytest.mark.parametrize("signal", ["sdk", "delayed_sdk", "fetch_wrapper", "delayed_fetch_wrapper", "ms_token_resource", "signature_resource", "x_bogus_resource", "x_gnarly_resource", "both_signatures_resource", "empty_signatures_resource", "native", "foreign_resource"])
@@ -379,7 +465,7 @@ async def test_runtime_readiness_observes_main_world_signals(browser_page, signa
         await browser_page.evaluate("performance.getEntriesByType = () => [{name: 'https://example.com/api/?X-Bogus=local&X-Gnarly=local'}]", isolated_context=False)
 
     ready = await wait_for_runtime_signer_ready(browser_page, timeout_ms=600)
-    assert ready is (signal == "both_signatures_resource")
+    assert ready is (signal in {"sdk", "delayed_sdk", "delayed_fetch_wrapper", "signature_resource", "x_bogus_resource", "both_signatures_resource"})
 
 
 @pytest.mark.parametrize("signed", [False, True])
@@ -410,11 +496,11 @@ async def test_signer_wait_activity_wakes_background_traffic_once_without_false_
     assert await wait_for_runtime_signer_ready(browser_page, timeout_ms=600) is signed
     assert len(requests) == 1
     stats = await browser_page.evaluate("window.wakeStats", isolated_context=False)
-    assert stats == {"moves": 1, "scrolls": [[0, 80]]}
+    assert stats == {"moves": 1, "scrolls": []}
 
 
 @pytest.mark.parametrize("masked", [False, True])
-async def test_warmup_requires_signed_resource_despite_early_ttwid_sdk_and_fetch_wrapper(browser_page, masked):
+async def test_warmup_uses_callable_sdk_and_read_retry_without_claiming_signed_dispatch(browser_page, masked):
     from executor import engagement_engine
     from executor.http.signature_runtime import wait_for_runtime_signer_ready
     if masked:
@@ -435,6 +521,7 @@ async def test_warmup_requires_signed_resource_despite_early_ttwid_sdk_and_fetch
             requests.append(signed)
             await route.fulfill(content_type='application/json',body='{"comments":[]}' if signed else '',headers={
                 'Set-Cookie':'tt_csrf_token=local; Path=/; Secure; SameSite=Lax',
+                'x-ms-token':'local-token',
             })
         else:
             await route.fulfill(content_type='text/html',body='<html>Local</html>',headers={
@@ -447,17 +534,20 @@ async def test_warmup_requires_signed_resource_despite_early_ttwid_sdk_and_fetch
     }])
     url='https://www.tiktok.com/@demo/video/7635267329407913230'
     await browser_page.goto(url,wait_until='commit')
+    assert await wait_for_runtime_signer_ready(browser_page, timeout_ms=600)
+    assert browser_page._http_signer_state == {"sdk_present": True, "signed_dispatch_seen": False}
     browser_page._http_auth_verified_at=time.monotonic()
     cookies,valid,info=await engagement_engine.warmup_page_for_http(browser_page,url,max_retries=1)
-    assert valid and info['signer_ready'] is False and info['attempts']==1
+    assert valid and info['signer_ready'] is True and info['attempts']==1
+    assert info["sdk_present"] is True and info["signed_dispatch_seen"] is True
     assert cookies['ttwid']=='early-wid'
-    assert requests==[True]
-    assert browser_page._comment_list_http_meta['attempts']==1
+    assert requests[-1] is True and len(requests) <= 2
+    assert browser_page._comment_list_http_meta['attempts']==len(requests)
     assert await wait_for_runtime_signer_ready(browser_page, timeout_ms=600)
 
 
 @pytest.mark.parametrize("navigation_delay", [0.0, 1.8])
-async def test_warmup_respects_dom_age_after_slow_document_navigation(browser_page, navigation_delay):
+async def test_warmup_keeps_only_remaining_navigation_and_dom_maturity(browser_page, navigation_delay):
     from executor import engagement_engine
     url = "https://www.tiktok.com/@demo/video/7635267329407913230"
 
@@ -479,18 +569,18 @@ async def test_warmup_respects_dom_age_after_slow_document_navigation(browser_pa
     browser_page._http_auth_verified_at = time.monotonic()
     _, valid, info = await engagement_engine.warmup_page_for_http(browser_page, url, max_retries=1)
     assert valid and info["signer_ready"] and info["load_state"] == "domcontentloaded"
-    assert info["target_page_age_ms"] >= 3190 and info["target_dom_age_ms"] >= 1790
+    assert info["target_page_age_ms"] >= 800 - CLOCK_TOLERANCE_MS
+    assert info["target_dom_age_ms"] >= 500 - CLOCK_TOLERANCE_MS
     timing = await browser_page.evaluate("""() => {
         const domReady = performance.getEntriesByType('navigation')[0].domContentLoadedEventEnd;
         return {domReady, elapsedSinceDom: performance.now() - domReady};
     }""", isolated_context=False)
-    assert timing["elapsedSinceDom"] >= 1790
+    assert timing["elapsedSinceDom"] >= 450
     assert timing["domReady"] >= navigation_delay * 1000 - 100
 
 
 async def test_comment_list_retry_recovers_when_interceptor_arrives_after_empty_response(browser_page):
     from executor.http.comment_discovery import fetch_comment_page
-    await browser_page.context.add_init_script('setTimeout(' + _COMMENT_INTERCEPTOR_JS + ',400);')
     requests=[]
 
     async def serve(route):
@@ -500,6 +590,8 @@ async def test_comment_list_retry_recovers_when_interceptor_arrives_after_empty_
             signed=all(query.get(key) for key in ('X-Bogus','X-Gnarly'))
             requests.append((signed,time.monotonic()))
             await route.fulfill(content_type='application/json',body='{"comments":[]}' if signed else '')
+            if len(requests) == 1:
+                await browser_page.evaluate(_COMMENT_INTERCEPTOR_JS, isolated_context=False)
         else:
             await route.fulfill(content_type='text/html',body='<html>Local</html>')
 
@@ -563,7 +655,7 @@ async def test_comment_retries_refresh_cookies_and_never_presign_native_fetch(br
             assert payload == {"status_code": 0, "comments": [], "has_more": 0}
             if cursor == 0:
                 assert browser_page._comment_list_http_meta["attempts"] == 3
-    assert len(requests) == 4 and cookies.await_count == 3
+    assert len(requests) == 4 and cookies.await_count == 4
     for index, (query, version, cursor) in enumerate(zip(requests, (1, 2, 3, 3), (0, 0, 0, 20)), start=1):
         assert query["msToken"] == [f"token-{version}"] and query["cursor"] == [str(cursor)]
         assert query["count"] == ["20"]
@@ -598,7 +690,7 @@ async def test_comment_api_discovers_numeric_parent_without_dom(browser_page):
     assert info["available"]
 
 
-async def test_warmup_comment_get_refreshes_live_ms_token(browser_page, monkeypatch):
+async def test_warmup_comment_get_obtains_missing_ms_token(browser_page, monkeypatch):
     from executor import engagement_engine
     seen = []
 
@@ -615,7 +707,7 @@ async def test_warmup_comment_get_refreshes_live_ms_token(browser_page, monkeypa
     await browser_page.goto(url)
     await browser_page.evaluate(_COMMENT_INTERCEPTOR_JS, isolated_context=False)
     await browser_page.context.add_cookies([{"name": name, "value": value, "domain": ".tiktok.com", "path": "/", "secure": True}
-                                           for name, value in (("sessionid", "session"), ("ttwid", "wid"), ("msToken", "old"))])
+                                           for name, value in (("sessionid", "session"), ("ttwid", "wid"), ("tt_csrf_token", "csrf"))])
     monkeypatch.setattr(engagement_engine, "wait_for_runtime_signer_ready", AsyncMock(return_value=True))
     cookies, valid, info = await engagement_engine.warmup_page_for_http(browser_page, url)
     assert valid and info["comment_api_ready"]
@@ -706,7 +798,7 @@ async def test_replies_only_uses_comment_api_then_native_post_without_dom(browse
     dom.assert_not_awaited()
 
 
-async def test_browser_pool_explicitly_cleans_startup_antifraud_cookies(browser_page, monkeypatch):
+async def test_browser_pool_preserves_imported_ms_token_but_requires_live_refresh(browser_page, monkeypatch):
     from db.models import Account
     from executor import browser_pool, tiktok_client_async
     browser = browser_page.context.browser
@@ -726,9 +818,12 @@ async def test_browser_pool_explicitly_cleans_startup_antifraud_cookies(browser_
     try:
         context, _ = await pool.get_page_for_account(account)
         saved = {row["name"]: row["value"] for row in await context.cookies()}
-        assert not {"msToken", "tt_csrf_token", "_waftokenid"} & saved.keys()
+        assert not {"tt_csrf_token", "_waftokenid"} & saved.keys()
+        assert saved["msToken"] == "old-db-token"
+        from services.cookie_validator import ms_token_needs_browser_refresh
+        assert ms_token_needs_browser_refresh(context, saved, account)
         assert all(saved[name] == "a" * 32 for name in ("sessionid", "sid_tt", "sessionid_ss"))
     finally:
         await pool.close_context_for_account(account.id)
         pool._browsers.clear()
-        await pool.close_all()
+        await pool.close_all(stop_playwright=True)

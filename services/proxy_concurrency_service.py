@@ -2,7 +2,12 @@
 Service for tracking and limiting concurrent tasks per proxy.
 Prevents proxy overloading by checking active task counts in Redis.
 """
+import hashlib
 import logging
+import asyncio
+import uuid
+from dataclasses import dataclass, field
+from contextlib import asynccontextmanager
 from typing import Optional
 from config.settings import get_settings
 from services.redis_service import get_redis_client
@@ -16,18 +21,152 @@ _PROXY_USAGE_TTL = 3600  # 1 hour TTL for usage counters (safety cleanup)
 _PROXY_FAIL_PREFIX = "proxy_fail:"
 _PROXY_FAIL_TTL = 7200  # 2 hours TTL for fail counters
 
+# Token-owned leases are separate from legacy task counters. Redis TIME makes
+# expiration independent of worker clocks; pending rotation blocks new users.
+_LEASE_TTL = 60
+_LEASE_ACQUIRE = """
+local now = redis.call('TIME')[1]
+redis.call('ZREMRANGEBYSCORE', KEYS[1], '-inf', now)
+if ARGV[2] == 'rotate' then
+  local owner = redis.call('GET', KEYS[2])
+  if owner and owner ~= ARGV[1] then return 0 end
+  redis.call('SET', KEYS[2], ARGV[1], 'EX', ARGV[3])
+  if redis.call('ZCARD', KEYS[1]) > 0 then return 0 end
+else
+  if redis.call('EXISTS', KEYS[2]) == 1 then return 0 end
+  if redis.call('ZCARD', KEYS[1]) >= tonumber(ARGV[4]) then return 0 end
+  redis.call('ZADD', KEYS[1], now + tonumber(ARGV[3]), ARGV[1])
+  redis.call('EXPIRE', KEYS[1], tonumber(ARGV[3]) * 2)
+end
+return 1
+"""
+_LEASE_RELEASE = """
+redis.call('ZREM', KEYS[1], ARGV[1])
+if redis.call('GET', KEYS[2]) == ARGV[1] then redis.call('DEL', KEYS[2]) end
+return 1
+"""
+_LEASE_RENEW = """
+if ARGV[2] == 'rotate' then
+  if redis.call('GET', KEYS[2]) ~= ARGV[1] then return 0 end
+  redis.call('EXPIRE', KEYS[2], ARGV[3])
+else
+  local now = redis.call('TIME')[1]
+  local expiry = redis.call('ZSCORE', KEYS[1], ARGV[1])
+  if not expiry or tonumber(expiry) <= tonumber(now) then return 0 end
+  redis.call('ZADD', KEYS[1], now + tonumber(ARGV[3]), ARGV[1])
+  redis.call('EXPIRE', KEYS[1], tonumber(ARGV[3]) * 2)
+end
+return 1
+"""
+
+
+def _lease_client():
+    from services.proxy_health_service import _get_proxy_health_client
+    return _get_proxy_health_client()
+
+
+@dataclass
+class ProxyUsageLease:
+    keys: tuple[str, str]
+    token: str = field(repr=False)
+    mode: str = "use"
+    renewal: asyncio.Task | None = field(default=None, repr=False)
+
+    async def release(self):
+        renewal, self.renewal = self.renewal, None
+        if renewal is not None and renewal is not asyncio.current_task():
+            renewal.cancel()
+            await asyncio.gather(renewal, return_exceptions=True)
+        try:
+            await asyncio.to_thread(_lease_client().eval, _LEASE_RELEASE, 2, *self.keys, self.token)
+        except Exception:
+            logger.warning("Proxy lease release failed; token will expire", exc_info=False)
+
+
+async def acquire_proxy_usage(proxy_str: str, *, rotation: bool = False, timeout: float = 30):
+    from services.proxy_normalizer import ProxyRoute, ProxyRouteError
+    route = ProxyRoute.parse(proxy_str)
+    key = hashlib.sha256(route.url.encode()).hexdigest()
+    lease = ProxyUsageLease((f"proxy:leases:{key}", f"proxy:rotation:{key}"), uuid.uuid4().hex,
+                            "rotate" if rotation else "use")
+    deadline = asyncio.get_running_loop().time() + timeout
+    try:
+        while True:
+            granted = await asyncio.to_thread(
+                _lease_client().eval, _LEASE_ACQUIRE, 2, *lease.keys,
+                lease.token, lease.mode, _LEASE_TTL, max(1, settings.MAX_TASKS_PER_PROXY),
+            )
+            if granted:
+                break
+            if asyncio.get_running_loop().time() >= deadline:
+                raise ProxyRouteError("proxy_capacity_timeout")
+            await asyncio.sleep(0.1)
+    except BaseException as exc:
+        await lease.release()
+        if isinstance(exc, (asyncio.CancelledError, ProxyRouteError)):
+            raise
+        raise ProxyRouteError("proxy_coordination_unavailable") from exc
+
+    owner = asyncio.current_task()
+    async def renew():
+        try:
+            while True:
+                await asyncio.sleep(_LEASE_TTL / 3)
+                ok = await asyncio.to_thread(_lease_client().eval, _LEASE_RENEW, 2, *lease.keys,
+                                             lease.token, lease.mode, _LEASE_TTL)
+                if not ok:
+                    raise ProxyRouteError("proxy_lease_lost")
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            logger.error("Active proxy lease lost; cancelling its operation")
+            owner.cancel()
+    lease.renewal = asyncio.create_task(renew())
+    return lease
+
+
+@asynccontextmanager
+async def proxy_operation(proxy_str: str | None, *, rotation=False):
+    lease = await acquire_proxy_usage(proxy_str, rotation=rotation) if proxy_str else None
+    try:
+        yield lease
+    finally:
+        if lease is not None:
+            await lease.release()
+
+_INCR_LIMIT_LUA = """
+local current = redis.call('GET', KEYS[1])
+if current and tonumber(current) >= tonumber(ARGV[1]) then
+    return 0
+end
+local val = redis.call('INCR', KEYS[1])
+redis.call('EXPIRE', KEYS[1], ARGV[2])
+return tonumber(val)
+"""
+
+
+def _normalize_key_input(proxy_str: str) -> str:
+    if not proxy_str or not proxy_str.strip():
+        return ""
+    try:
+        from services.proxy_service import normalize_proxy_url
+        return normalize_proxy_url(proxy_str.strip())
+    except Exception:
+        return proxy_str.strip()
+
+
 def _get_proxy_key(proxy_str: str) -> str:
     """Returns Redis key for proxy usage counter."""
-    # Normalize proxy string (remove protocol for consistent keys)
-    # Using hash might be safer if proxies are long/complex, but raw string is easier to debug
-    import hashlib
-    proxy_hash = hashlib.md5(proxy_str.strip().encode()).hexdigest()
+    norm = _normalize_key_input(proxy_str)
+    proxy_hash = hashlib.md5(norm.encode()).hexdigest()
     return f"{_PROXY_USAGE_PREFIX}{proxy_hash}"
 
+
 def _get_fail_key(proxy_str: str) -> str:
-    import hashlib
-    proxy_hash = hashlib.md5(proxy_str.strip().encode()).hexdigest()
+    norm = _normalize_key_input(proxy_str)
+    proxy_hash = hashlib.md5(norm.encode()).hexdigest()
     return f"{_PROXY_FAIL_PREFIX}{proxy_hash}"
+
 
 def can_use_proxy(proxy_str: str) -> bool:
     """
@@ -55,6 +194,7 @@ def can_use_proxy(proxy_str: str) -> bool:
         logger.error(f"Error checking proxy usage for {sanitize_url(proxy_str, max_length=80)}: {e}")
         return True # Fail open to avoid blocking everything on Redis error
 
+
 def increment_proxy_usage(proxy_str: str) -> bool:
     """
     Increments usage counter for a proxy.
@@ -71,21 +211,28 @@ def increment_proxy_usage(proxy_str: str) -> bool:
         redis_client = get_redis_client()
         key = _get_proxy_key(proxy_str)
         
-        # INCR is atomic
-        new_count = redis_client.incr(key)
-        redis_client.expire(key, _PROXY_USAGE_TTL) # Refresh TTL
-        
-        if new_count > settings.MAX_TASKS_PER_PROXY:
-            # Over limit, revert
-            redis_client.decr(key)
-            logger.debug(f"Proxy {sanitize_url(proxy_str, max_length=80)} usage limit reached ({new_count-1} -> {new_count}), reverted.")
-            return False
-            
-        logger.debug(f"Proxy {sanitize_url(proxy_str, max_length=80)} usage incremented to {new_count}")
-        return True
+        try:
+            res = redis_client.eval(_INCR_LIMIT_LUA, 1, key, settings.MAX_TASKS_PER_PROXY, _PROXY_USAGE_TTL)
+            if res and int(res) > 0:
+                logger.debug(f"Proxy {sanitize_url(proxy_str, max_length=80)} usage incremented to {res}")
+                return True
+            else:
+                logger.debug(f"Proxy {sanitize_url(proxy_str, max_length=80)} usage limit reached, rejected atomically.")
+                return False
+        except Exception:
+            # Fallback for environments / mocks where eval is not supported
+            new_count = redis_client.incr(key)
+            redis_client.expire(key, _PROXY_USAGE_TTL)
+            if new_count > settings.MAX_TASKS_PER_PROXY:
+                redis_client.decr(key)
+                logger.debug(f"Proxy {sanitize_url(proxy_str, max_length=80)} usage limit reached ({new_count-1} -> {new_count}), reverted.")
+                return False
+            logger.debug(f"Proxy {sanitize_url(proxy_str, max_length=80)} usage incremented to {new_count}")
+            return True
     except Exception as e:
         logger.error(f"Error incrementing proxy usage: {e}")
         return True # Fail open
+
 
 def decrement_proxy_usage(proxy_str: str):
     """Decrements usage counter for a proxy."""
@@ -96,11 +243,7 @@ def decrement_proxy_usage(proxy_str: str):
         redis_client = get_redis_client()
         key = _get_proxy_key(proxy_str)
         
-        # DECR is atomic
-        # Use lua script to prevent negative values? Redis DECR allows negative.
-        # Simple DECR is fine, maybe check if < 0 and reset.
         new_count = redis_client.decr(key)
-        
         if new_count < 0:
             redis_client.set(key, 0)
             
@@ -140,6 +283,7 @@ def should_block_proxy(proxy_str: str) -> bool:
     except Exception as e:
         logger.error(f"Error checking proxy fail counter: {e}")
         return False
+
 
 def get_active_proxy_count(proxy_str: str) -> int:
     """Returns current active task count for a proxy."""

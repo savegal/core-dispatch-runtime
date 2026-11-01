@@ -51,6 +51,10 @@ from db.database import get_sync_db_context
 from config.settings import get_settings
 import logging
 
+from services.order_transport import (
+    get_order_transport, set_order_transport, http_transport_available, ORDER_TRANSPORT_MODES,
+)
+
 logger = logging.getLogger("api.app_settings")
 router = APIRouter(prefix="/api/settings", tags=["settings"])
 app_cfg = get_settings()
@@ -108,6 +112,16 @@ class OrderExecutionStrategyResponse(BaseModel):
 
 class OrderExecutionStrategyUpdate(BaseModel):
     order_execution_strategy: str
+
+
+class OrderTransportSettings(BaseModel):
+    order_transport_mode: str
+    available_modes: list[str]
+    http_available: bool
+
+
+class OrderTransportUpdate(BaseModel):
+    order_transport_mode: str
 
 
 class MonitorParallelBrowsersResponse(BaseModel):
@@ -369,6 +383,31 @@ async def update_commenting_mode_settings(
     except Exception as e:
         logger.error(f"Error updating commenting mode settings: {e}", exc_info=True)
         raise HTTPException(status_code=500, detail=f"Error updating commenting mode settings: {str(e)[:200]}")
+
+
+@router.get("/order_transport", response_model=OrderTransportSettings)
+async def get_order_transport_settings(_: None = Depends(verify_admin_header)):
+    with get_sync_db_context() as db:
+        return OrderTransportSettings(order_transport_mode=get_order_transport(db),
+                                      available_modes=["dom", "http"] if http_transport_available() else ["dom"],
+                                      http_available=http_transport_available())
+
+
+@router.post("/order_transport", response_model=OrderTransportSettings)
+async def update_order_transport_settings(
+    settings: OrderTransportUpdate, _: None = Depends(verify_admin_header),
+):
+    mode = str(settings.order_transport_mode or "").strip().lower()
+    if mode not in ORDER_TRANSPORT_MODES:
+        raise HTTPException(status_code=400, detail="Выберите режим DOM или HTTP")
+    if mode == "http" and not http_transport_available():
+        raise HTTPException(status_code=409, detail="HTTP-транспорт недоступен в конфигурации сервера")
+    with get_sync_db_context() as db:
+        if not set_order_transport(db, mode):
+            raise HTTPException(status_code=500, detail="Не удалось сохранить режим заказов")
+        return OrderTransportSettings(order_transport_mode=get_order_transport(db),
+                                      available_modes=["dom", "http"] if http_transport_available() else ["dom"],
+                                      http_available=http_transport_available())
 
 
 @router.get("/order_execution_strategy", response_model=OrderExecutionStrategyResponse)

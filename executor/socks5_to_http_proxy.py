@@ -11,6 +11,7 @@ from typing import Iterable
 from urllib.parse import urlparse
 
 import socks
+from services.log_sanitizer import sanitize_url
 
 logger = logging.getLogger("executor.socks5_to_http_proxy")
 
@@ -19,11 +20,12 @@ class SOCKS5ToHTTPProxy:
     """Local HTTP proxy server that tunnels traffic through SOCKS5."""
 
     def __init__(self, socks5_proxy_str: str):
-        parsed = urlparse(socks5_proxy_str if "://" in socks5_proxy_str else f"socks5://{socks5_proxy_str}")
-        self.socks5_host = parsed.hostname
-        self.socks5_port = parsed.port or 1080
-        self.socks5_user = parsed.username
-        self.socks5_pass = parsed.password
+        from services.proxy_normalizer import ProxyRoute, ProxyRouteError
+        route = ProxyRoute.parse(socks5_proxy_str)
+        if route.scheme != "socks5":
+            raise ProxyRouteError("socks_bridge_requires_socks5")
+        self.socks5_host, self.socks5_port = route.host, route.port
+        self.socks5_user, self.socks5_pass = route.username, route.password
         self.local_port: int | None = None
         self.server_thread: threading.Thread | None = None
         self.server_socket: socket.socket | None = None
@@ -75,15 +77,22 @@ class SOCKS5ToHTTPProxy:
 
     def _handle_client(self, client_socket: socket.socket) -> None:
         try:
-            data = client_socket.recv(4096)
-            if not data:
-                return
+            client_socket.settimeout(10)
+            data = b""
+            while b"\r\n\r\n" not in data:
+                chunk = client_socket.recv(4096)
+                if not chunk:
+                    return
+                data += chunk
+                if len(data) > 65536:
+                    client_socket.sendall(b"HTTP/1.1 431 Request Header Fields Too Large\r\n\r\n")
+                    return
 
             request_line = data.split(b"\n", 1)[0].decode("utf-8", errors="ignore")
             method, path, _ = request_line.split(" ", 2)
 
             if method == "CONNECT":
-                self._handle_connect(client_socket, path)
+                self._handle_connect(client_socket, path, data.split(b"\r\n\r\n", 1)[1])
             else:
                 self._handle_http(client_socket, data, method, path)
         except Exception as exc:
@@ -106,11 +115,11 @@ class SOCKS5ToHTTPProxy:
         sock.settimeout(timeout_seconds)
         return sock
 
-    def _handle_connect(self, client_socket: socket.socket, path: str) -> None:
+    def _handle_connect(self, client_socket: socket.socket, path: str, initial_data: bytes = b"") -> None:
         upstream = None
         try:
-            host, port_str = path.split(":", 1)
-            port = int(port_str)
+            target = urlparse("//" + path)
+            host, port = target.hostname, target.port or 443
             logger.debug("CONNECT request to %s:%s", host, port)
 
             upstream = self._create_socks_socket(timeout_seconds=30)
@@ -130,6 +139,8 @@ class SOCKS5ToHTTPProxy:
                 logger.error("Failed to send 200 OK to client: %s", send_error)
                 return
 
+            if initial_data:
+                upstream.sendall(initial_data)
             self._relay_data(client_socket, upstream)
         except Exception as exc:
             logger.error("Error in CONNECT to %s: %s", path, exc, exc_info=True)
@@ -151,13 +162,14 @@ class SOCKS5ToHTTPProxy:
         host = ""
         try:
             headers: dict[str, str] = {}
-            lines = request_data.decode("utf-8", errors="ignore").split("\r\n")
+            header_bytes, body = request_data.split(b"\r\n\r\n", 1)
+            lines = header_bytes.decode("iso-8859-1").split("\r\n")
             for line in lines[1:]:
                 if ":" in line:
                     key, value = line.split(":", 1)
-                    headers[key.strip()] = value.strip()
+                    headers[key.strip().lower()] = value.strip()
 
-            host = headers.get("Host", "")
+            host = headers.get("host", "")
             if not host:
                 client_socket.sendall(b"HTTP/1.1 400 Bad Request\r\n\r\n")
                 return
@@ -183,12 +195,12 @@ class SOCKS5ToHTTPProxy:
 
             upstream = self._create_socks_socket(timeout_seconds=timeout_seconds)
             upstream.connect((host, port))
-            upstream.sendall(request_data)
-
-            response = upstream.recv(8192)
-            while response:
-                client_socket.sendall(response)
-                response = upstream.recv(8192)
+            target = urlparse(path)
+            origin_path = (target.path or "/") + (("?" + target.query) if target.query else "") if target.scheme else path
+            lines[0] = f"{method} {origin_path} HTTP/1.1"
+            lines = [line for line in lines if not line.lower().startswith(("proxy-authorization:", "proxy-connection:"))]
+            upstream.sendall("\r\n".join(lines).encode("iso-8859-1") + b"\r\n\r\n" + body)
+            self._relay_data(client_socket, upstream)
         except Exception as exc:
             if not is_non_critical:
                 logger.error("Error in HTTP %s to %s: %s", method, path, exc)
@@ -272,12 +284,9 @@ _proxy_ref_counts: dict[str, int] = {}
 _proxy_lock = threading.Lock()
 
 
-def _normalize_socks5_proxy(socks5_proxy_str: str) -> str:
-    normalized_proxy = socks5_proxy_str.strip()
-    if "://" not in normalized_proxy:
-        normalized_proxy = f"socks5://{normalized_proxy}"
-    return normalized_proxy
-
+def _normalize_socks5_proxy(socks5_proxy_str):
+    from services.proxy_normalizer import ProxyRoute
+    return ProxyRoute.parse(socks5_proxy_str).url
 
 def get_local_http_proxy_for_socks5(socks5_proxy_str: str) -> int | None:
     if not socks5_proxy_str or not socks5_proxy_str.strip():
@@ -290,18 +299,18 @@ def get_local_http_proxy_for_socks5(socks5_proxy_str: str) -> int | None:
                 proxy = SOCKS5ToHTTPProxy(normalized_proxy)
                 port = proxy.start()
                 if not port:
-                    logger.error("Failed to start local HTTP proxy for SOCKS5: %s", normalized_proxy)
+                    logger.error("Failed to start local HTTP proxy for SOCKS5: %s", sanitize_url(normalized_proxy))
                     return None
                 _active_proxies[normalized_proxy] = proxy
                 _proxy_ref_counts[normalized_proxy] = 0
-                logger.info("Created local HTTP proxy on port %s for SOCKS5: %s", port, normalized_proxy)
+                logger.info("Created local HTTP proxy on port %s for SOCKS5: %s", port, sanitize_url(normalized_proxy))
 
             proxy = _active_proxies[normalized_proxy]
             proxy.touch()
             _proxy_ref_counts[normalized_proxy] = _proxy_ref_counts.get(normalized_proxy, 0) + 1
             return proxy.local_port
     except Exception as exc:
-        logger.error("Error creating/getting local HTTP proxy for SOCKS5 %s: %s", socks5_proxy_str, exc)
+        logger.error("Error creating/getting local HTTP proxy for SOCKS5 %s: %s", sanitize_url(socks5_proxy_str), type(exc).__name__)
         return None
 
 
@@ -326,7 +335,7 @@ def release_local_http_proxy_for_socks5(socks5_proxy_str: str) -> None:
 
     if proxy_to_stop:
         proxy_to_stop.stop()
-        logger.info("Stopped local HTTP proxy for SOCKS5: %s", normalized_proxy)
+        logger.info("Stopped local HTTP proxy for SOCKS5: %s", sanitize_url(normalized_proxy))
 
 
 def cleanup_idle_local_http_proxies(active_proxy_strings: Iterable[str] | None = None, idle_seconds: int = 300) -> int:

@@ -15,6 +15,20 @@ pytestmark = [pytest.mark.unit, pytest.mark.asyncio]
 URL = "https://www.tiktok.com/@demo/video/7635267329407913230"
 
 
+def observe_mock_dispatch(page, responses):
+    listeners = []
+    page.on = lambda _event, callback: listeners.append(callback)
+    page.remove_listener = lambda _event, callback: listeners.remove(callback)
+    replies = iter(responses)
+    async def dispatch(_script, args, **kwargs):
+        # Simulate an actually observed unsigned dispatch, not a response URL
+        # that might have lost its query on a redirect.
+        for callback in list(listeners):
+            callback(SimpleNamespace(method="POST", url=args["url"]))
+        return next(replies)
+    page.evaluate.side_effect = dispatch
+
+
 @pytest.mark.parametrize("second_body,expected", [
     ('{"status_code":0,"comment":{"cid":"7641761192486194454"}}', True),
     ("", False),
@@ -25,6 +39,7 @@ async def test_empty_publish_response_has_one_bounded_http_retry(monkeypatch, se
                  for body in ("", second_body)]
     page = SimpleNamespace(url=URL, evaluate=AsyncMock(side_effect=responses),
                            context=SimpleNamespace(cookies=AsyncMock(return_value=[])))
+    observe_mock_dispatch(page, responses)
     sleep = AsyncMock()
     monkeypatch.setattr("executor.http.playwright_http_client.asyncio.sleep", sleep)
     request_context = SimpleNamespace(fetch=AsyncMock())
@@ -39,7 +54,7 @@ async def test_empty_publish_response_has_one_bounded_http_retry(monkeypatch, se
     assert client.last_request_meta["attempt_count"] == 2
     assert client.last_request_meta["empty_body_retry_count"] == 1
     assert client.last_request_meta["observed_security_params"] == {
-        "X-Bogus": False, "X-Gnarly": False, "a_bogus": True, "msToken": True,
+        "X-Bogus": False, "X-Gnarly": False, "a_bogus": False, "msToken": False,
     }
 
 
@@ -71,7 +86,7 @@ async def test_retry_disabled_policy_remains_disabled():
 @pytest.mark.parametrize("load_timeout", [False, True])
 async def test_warmup_waits_for_load_and_interceptor_before_success(monkeypatch, load_timeout):
     page = SimpleNamespace(url=URL, goto=AsyncMock(), reload=AsyncMock(),
-                           context=SimpleNamespace(cookies=AsyncMock(return_value=[
+                           context=SimpleNamespace(add_cookies=AsyncMock(), cookies=AsyncMock(return_value=[
                                {"name": name, "value": name, "domain": ".tiktok.com"}
                                for name in ("sessionid", "ttwid", "tt_csrf_token", "msToken")
                            ])))
@@ -88,7 +103,7 @@ async def test_warmup_waits_for_load_and_interceptor_before_success(monkeypatch,
         assert timeout_ms == 200
         return True
 
-    async def comments(_page, aweme_id, *, count):
+    async def comments(_page, aweme_id, *, count, runtime_profile=None):
         events.append("comment_get")
         return {"comments": []}
 
@@ -99,7 +114,7 @@ async def test_warmup_waits_for_load_and_interceptor_before_success(monkeypatch,
     _, valid, info = await engagement_engine.warmup_page_for_http(page, URL)
     assert valid
     assert events == ["domcontentloaded", "interceptor"]
-    assert info["comment_api_ready"] is True
+    assert info["comment_api_ready"] is False
     assert info["comment_api_skipped"] is True
     assert info["load_state"] == ("loading" if load_timeout else "domcontentloaded")
 
@@ -148,6 +163,7 @@ async def test_live_cookie_rotation_applies_to_retry_and_later_variants(monkeypa
     cookie_reader = AsyncMock(side_effect=[records(i) for i in range(1, 5)])
     page = SimpleNamespace(url=URL, context=SimpleNamespace(cookies=cookie_reader),
                            evaluate=AsyncMock(side_effect=responses))
+    observe_mock_dispatch(page, responses)
     request_context = SimpleNamespace(fetch=AsyncMock())
     client = PlaywrightHttpClient(request_context, page=page, retry_policy=RetryPolicy(max_retries=1))
     monkeypatch.setattr("executor.http.playwright_http_client.asyncio.sleep", AsyncMock())

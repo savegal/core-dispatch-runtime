@@ -15,6 +15,7 @@ from bot.services.bot_ui import block, empty_screen, screen
 from html import escape as html_escape, unescape as html_unescape
 import logging
 import re
+import uuid
 from bot.state.order_states import OrderStates
 from bot.services.template_utils import normalize_user_text, preserve_nonempty_lines
 from services.user_facing_errors import (
@@ -221,6 +222,7 @@ def _build_recreated_order_settings(orig_settings: dict | None, *, origin: str) 
     """Build clean settings for copy/retry without carrying execution artifacts."""
     source = orig_settings if isinstance(orig_settings, dict) else {}
     clean = {
+        "mention_mode": "attempt" if source.get("mention_mode") == "attempt" else "plain",
         "delays": source.get("delays", True),
         "shuffle": source.get("shuffle", False),
         "rotate_accounts": source.get("rotate_accounts", True),
@@ -242,10 +244,18 @@ def _build_recreated_order_settings(orig_settings: dict | None, *, origin: str) 
     for key in ("engagement_comment_id", "engagement_username", "engagement_comment_text"):
         if source.get(key):
             clean[key] = source[key]
+    if isinstance(source.get("keywords"), list):
+        clean["keywords"] = list(source["keywords"])
+    for key in ("verify_main_visibility", "verify_reply_visibility", "boost_likes_enabled",
+                "reply_like_target", "reply_like_count"):
+        if key in source:
+            clean[key] = source[key]
     return clean
 
 
 def _text_variants_for_recreated_order(task: dict) -> list[str]:
+    if _order_kind(task) == "keyword_replies":
+        return ["Ответы по ключевым словам"] * 3
     task_settings = task.get("settings", {}) if isinstance(task.get("settings"), dict) else {}
     text_variants = task_settings.get("text_variants") or []
     text_variants = [str(item) for item in text_variants if str(item or "").strip()]
@@ -255,33 +265,8 @@ def _text_variants_for_recreated_order(task: dict) -> list[str]:
 
 
 def _failed_urls_for_retry(task: dict) -> list[str]:
-    task_settings = task.get("settings", {}) if isinstance(task.get("settings"), dict) else {}
-    url_results = task_settings.get("url_results") or {}
-    if not isinstance(url_results, dict):
-        url_results = {}
-    non_retry_statuses = {"success", "submitted_unconfirmed"}
-
-    def _stored_url_is_retryable(url: str) -> bool:
-        row = url_results.get(str(url))
-        if not isinstance(row, dict):
-            return True
-        return str(row.get("status") or "").lower() not in non_retry_statuses
-
-    failed_urls = [
-        str(url)
-        for url in (task_settings.get("failed_urls") or [])
-        if str(url or "").strip()
-        and _stored_url_is_retryable(str(url))
-    ]
-    if failed_urls:
-        return failed_urls
-
-    failed_statuses = {"fail", "failed", "error"}
-    return [
-        str(url)
-        for url, row in url_results.items()
-        if isinstance(row, dict) and str(row.get("status") or "").lower() in failed_statuses
-    ]
+    from services.task_replay import retryable_video_urls
+    return retryable_video_urls(task)
 
 
 def _order_status(task: dict) -> str:
@@ -317,7 +302,7 @@ def _order_kind(task: dict) -> str:
 
 
 def _order_is_engagement_only(task: dict) -> bool:
-    return _order_kind(task) == "engagement_only" or _order_origin(task).lower() == "engagement_only"
+    return _order_kind(task) in {"engagement_only", "keyword_replies"} or _order_origin(task).lower() == "engagement_only"
 
 
 def _html(value: object) -> str:
@@ -496,6 +481,8 @@ def _order_url_ledgers(task: dict) -> list[tuple[str, dict]]:
 
 
 def _order_parent_target_detail_lines(task: dict, *, limit: int = 5) -> list[str]:
+    if _order_kind(task) == "keyword_replies":
+        return []
     summary = _get_execution_summary(task)
     replies = summary.get("replies") if isinstance(summary.get("replies"), dict) else {}
     if not (
@@ -833,7 +820,24 @@ def _build_publication_map_rows(task: dict) -> tuple[list[dict], list[dict], dic
         replies = engagement.get("replies") if isinstance(engagement.get("replies"), dict) else {}
         reply_items = replies.get("items") if isinstance(replies.get("items"), list) else []
 
-        if is_engagement_only:
+        if _order_kind(task) == "keyword_replies":
+            parents = {}
+            for item in reply_items:
+                cid = str(item.get("parent_comment_id") or "") if isinstance(item, dict) else ""
+                if not cid or cid in parents:
+                    continue
+                row = {"index": len(rows) + 1, "url_index": url_index, "url_total": url_total, "url": str(url),
+                    "username": _clean_public_username(item.get("matched_parent_author")),
+                    "text": str(item.get("matched_main_text") or cid), "status": "✅ найден",
+                    "target_kind": "engagement_parent", "requested_author": None, "fallback_used": False,
+                    "replies": [], "likes": [], "aliases": {cid}}
+                parents[cid] = row
+                rows.append(row)
+                url_rows.append(row)
+                alias_to_rows.setdefault(cid, []).append(row)
+            total_expected += len(parents)
+
+        if is_engagement_only and _order_kind(task) != "keyword_replies":
             target_text = (
                 _order_engagement_target_text(task)
                 or str(main.get("text_choice") or "").strip()
@@ -1030,7 +1034,22 @@ def _build_publication_map_rows(task: dict) -> tuple[list[dict], list[dict], dic
 
 def _publication_map_summary_lines(task: dict, *, content_page: int = 0, total_pages: int = 1) -> list[str]:
     rows, unassigned, summary = _build_publication_map_rows(task)
-    if _order_is_engagement_only(task):
+    if _order_kind(task) == "keyword_replies":
+        results = _settings_dict(task).get("url_results") or {}
+        progress = [item["keyword_replies"] for item in results.values()
+                    if isinstance(item, dict) and isinstance(item.get("keyword_replies"), dict)]
+        if progress:
+            matched = sum(_safe_int(item.get("matched")) for item in progress)
+            confirmed = sum(_safe_int(item.get("replied")) for item in progress)
+            uncertain = sum(_safe_int(item.get("unconfirmed")) for item in progress)
+            lines = [f"Найденных комментариев: {matched}", f"Ответов подтверждено: {confirmed}"]
+            if uncertain:
+                lines.append(f"Отправок без подтверждения: {uncertain}")
+            if len(rows) < matched:
+                lines.append(f"Подробностей в карте: {len(rows)} из {matched}. Полный список появится после завершения обработки.")
+        else:
+            lines = [f"Найденных комментариев: {len(rows)}", f"Ответов отправлено: {summary['reply_submitted']}"]
+    elif _order_is_engagement_only(task):
         lines = [
             f"Комментарий для ответа: {'найден/задан' if rows else 'нет данных'}",
             (
@@ -1213,6 +1232,7 @@ def _origin_label(origin: str) -> str:
         "monitor_manual_review": "Мониторинг → ручной выбор",
         "notification": "Из уведомления",
         "engagement_only": "Только ответы",
+        "keyword_replies": "Ответы по ключевым словам",
         "retry_failed": "Повтор ошибок",
     }.get(origin, origin or "—")
 
@@ -1332,6 +1352,9 @@ def format_order_line(task: dict) -> str:
     progress_text = format_progress(progress, total_urls) if total_urls > 0 else "—"
     first_line = f"{icon} <b>#{_html(task_id)}</b> · {_html(status_label)} · {_html_inline_code(progress_text)}"
     meta_parts: list[str] = []
+    transport = str(_settings_dict(task).get("order_transport_mode") or "").lower()
+    if transport in {"dom", "http"}:
+        meta_parts.append(transport.upper())
     creator_username = _order_creator_username(task)
     if creator_username:
         meta_parts.append(_html_inline_code(f"@{creator_username}"))
@@ -1477,6 +1500,8 @@ def _order_replies(task: dict) -> list[str]:
 
 def _order_engagement_target_text(task: dict) -> str | None:
     settings_dict = _settings_dict(task)
+    if _order_kind(task) == "keyword_replies":
+        return "\n".join(str(key) for key in settings_dict.get("keywords", [])) or None
     target = normalize_user_text(
         settings_dict.get("engagement_comment_text")
         or task.get("engagement_comment_text")
@@ -1556,7 +1581,20 @@ def _overview_order_plan_lines(task: dict) -> list[str]:
     is_engagement_only = _order_is_engagement_only(task)
     main = summary.get("main") if isinstance(summary.get("main"), dict) else {}
     replies_summary = summary.get("replies") if isinstance(summary.get("replies"), dict) else {}
-    lines: list[str] = []
+    from services.order_transport import order_transport_label
+    transport = _settings_dict(task).get("order_transport_mode")
+    lines: list[str] = [f"Режим: {_html(order_transport_label(transport))}"] if transport else []
+    if _order_kind(task) == "keyword_replies":
+        lines += ["Тип: ответы по ключевым словам", f"Ключей: {len(_settings_dict(task).get('keywords') or [])}",
+                  "Один ответ на каждый найденный комментарий", f"Вариантов ответа: {len(replies)}"]
+        stats = [row.get("keyword_replies") or {} for row in (_settings_dict(task).get("url_results") or {}).values()
+                 if isinstance(row, dict)]
+        if stats:
+            lines += [f"Найдено совпадений: {sum(_safe_int(row.get('matched')) for row in stats)}",
+                      f"Ответов подтверждено: {sum(_safe_int(row.get('replied')) for row in stats)}"]
+            if any(not row.get("complete") for row in stats):
+                lines.append("Список комментариев прочитан не полностью")
+        return lines
 
     if is_engagement_only:
         lines.append("Тип: только ответы")
@@ -1601,6 +1639,11 @@ def _overview_notice_lines(task: dict) -> list[str]:
         show_reason = False
 
     lines: list[str] = []
+    from services.task_execution_ledger import has_submission_evidence
+    if (display_status == "partial" and any(has_submission_evidence(row)
+            for row in (_settings_dict(task).get("url_results") or {}).values())):
+        lines.append("Часть публикаций уже отправлена. Повтор этих видео целиком отключён, чтобы не создать дубли. "
+                     "Для недостающих ответов создайте отдельный заказ.")
     if show_reason:
         lines.append(f"Причина: {_html(display_reason)}")
     if warning_line:
@@ -1657,7 +1700,7 @@ def _overview_content_items(task: dict) -> list[str]:
         comment_chunks = _split_text_for_code(first_comment)
         for chunk_idx, chunk in enumerate(comment_chunks, 1):
             suffix = f" · часть {chunk_idx}/{len(comment_chunks)}" if len(comment_chunks) > 1 else ""
-            title = "Комментарий для поиска" if is_engagement_only else "Первый комментарий"
+            title = "Ключевые слова" if _order_kind(task) == "keyword_replies" else "Комментарий для поиска" if is_engagement_only else "Первый комментарий"
             items.append(_content_item(f"{title}{suffix}", chunk))
     if replies:
         reply_chunks = _split_text_for_code(replies[0])
@@ -1803,7 +1846,8 @@ def _text_content_items(task: dict) -> list[str]:
             chunks = _split_text_for_code(target_text)
             for chunk_idx, chunk in enumerate(chunks, 1):
                 suffix = f" · часть {chunk_idx}/{len(chunks)}" if len(chunks) > 1 else ""
-                items.append(_content_item(f"Комментарий для поиска{suffix}", chunk))
+                title = "Ключевые слова" if _order_kind(task) == "keyword_replies" else "Комментарий для поиска"
+                items.append(_content_item(f"{title}{suffix}", chunk))
 
     for idx, text in enumerate(variants, 1):
         chunks = _split_text_for_code(text)
@@ -1829,7 +1873,8 @@ def _render_order_texts(task: dict, content_page: int = 0) -> str:
     content_page = max(0, min(int(content_page or 0), len(pages) - 1))
 
     if _order_is_engagement_only(task):
-        summary = ["Тип: только ответы", f"Ответы: {len(replies)}"]
+        title = "Тип: ответы по ключевым словам" if _order_kind(task) == "keyword_replies" else "Тип: только ответы"
+        summary = [title, f"Вариантов ответа: {len(replies)}" if _order_kind(task) == "keyword_replies" else f"Ответы: {len(replies)}"]
     else:
         summary = [f"Тексты главных: {len(variants)}", f"Ответы: {len(replies)}"]
     if len(pages) > 1:
@@ -1862,7 +1907,9 @@ def _render_order_settings(task: dict) -> str:
     origin = _order_origin(task)
     account_pool_mode = _normalize_account_pool_mode(settings_dict.get("account_pool_mode"))
 
+    from services.order_transport import order_transport_label
     lines = [
+        f"Режим: {_html(order_transport_label(settings_dict.get('order_transport_mode')))}",
         f"Источник: {_html(_origin_label(origin))}",
         f"Пул: {_html(_account_pool_label(account_pool_mode))}",
     ]
@@ -1873,7 +1920,9 @@ def _render_order_settings(task: dict) -> str:
             "low": "низкий",
         }.get(_order_queue_priority(task), "обычный")
         lines.append(f"Приоритет очереди: {_html(priority_label)}")
-    if _order_is_engagement_only(task):
+    if _order_kind(task) == "keyword_replies":
+        lines.append("Тип: ответы по ключевым словам")
+    elif _order_is_engagement_only(task):
         lines.append("Тип: только ответы")
 
     # Привязка к шаблону: показываем только если заказ реально создан из
@@ -1888,10 +1937,14 @@ def _render_order_settings(task: dict) -> str:
     if creator_username:
         lines.append(f"Блогер: {_html_inline_code('@' + creator_username)}")
 
+    reply_visibility_label = "выкл"
+    if settings_dict.get("verify_reply_visibility") is True:
+        reply_visibility_label = "вкл, без повторной отправки" if _order_kind(task) == "keyword_replies" else "вкл, с заменой"
     lines.extend([
+        f"Отметки: {'попробовать отметить' if settings_dict.get('mention_mode') == 'attempt' else 'обычный текст'}",
         f"Задержки: {'вкл' if settings_dict.get('delays', True) else 'выкл'}",
         f"Проверка видимости главных: {'вкл, с заменой' if settings_dict.get('verify_main_visibility') is True else 'выкл'}",
-        f"Проверка видимости ответов: {'вкл, с заменой' if settings_dict.get('verify_reply_visibility') is True else 'выкл'}",
+        f"Проверка видимости ответов: {reply_visibility_label}",
         f"Перемешивание: {'вкл' if settings_dict.get('shuffle', False) else 'выкл'}",
         f"Ротация аккаунтов: {'вкл' if settings_dict.get('rotate_accounts', True) else 'выкл'}",
         f"ID заказа: {_html_inline_code(task_id)}",
@@ -1997,8 +2050,10 @@ def _build_order_detail_keyboard(
                     callback_data=_priority_order_callback(task_id, tab, page, filter_name, content_page),
                 )
             )
-        pending_row.append(InlineKeyboardButton(text="📝 Заменить тексты", callback_data=f"order:texts:{task_id}"))
-        keyboard.append(pending_row)
+        if _order_kind(task) != "keyword_replies":
+            pending_row.append(InlineKeyboardButton(text="📝 Заменить тексты", callback_data=f"order:texts:{task_id}"))
+        if pending_row:
+            keyboard.append(pending_row)
     if is_stopped:
         keyboard.append([InlineKeyboardButton(text="📋 Сделать копию", callback_data=f"order:copy:{task_id}")])
     else:
@@ -2416,6 +2471,7 @@ async def retry_failed_order(callback: CallbackQuery):
             )
             return
         new_settings = _build_recreated_order_settings(orig_settings, origin="retry_failed")
+        new_settings["retry_of_task_id"] = task_id
         if new_settings.get("account_pool_mode") == ACCOUNT_POOL_MODE_PERSONAL:
             try:
                 pool_summary = await api_client.get_personal_pool_summary(user_backend_id)
@@ -2423,8 +2479,9 @@ async def retry_failed_order(callback: CallbackQuery):
                 logger.warning("Retry failed order: failed to validate personal pool: %s", exc)
                 await callback.answer("Не удалось проверить личные аккаунты", show_alert=True)
                 return
-            available_main = int((pool_summary or {}).get("available_main_now") or 0)
-            if available_main <= 0:
+            availability_key = "available_reply_now" if _order_is_engagement_only(task) else "available_main_now"
+            available_accounts = int((pool_summary or {}).get(availability_key) or 0)
+            if available_accounts <= 0:
                 await callback.answer("В личном пуле сейчас нет доступных аккаунтов", show_alert=True)
                 return
 
@@ -2446,7 +2503,9 @@ async def retry_failed_order(callback: CallbackQuery):
         )
         new_task_id = result.get("task_id")
 
-        await callback.answer(f"Создан заказ #{new_task_id} ({len(failed_urls)} видео)", show_alert=True)
+        message = (f"Повтор уже существует: #{new_task_id}" if result.get("idempotency_reuse")
+                   else f"Создан заказ #{new_task_id} ({len(failed_urls)} видео)")
+        await callback.answer(message, show_alert=True)
         await callback.message.edit_reply_markup(
             reply_markup=InlineKeyboardMarkup(inline_keyboard=[
                 [InlineKeyboardButton(text=f"📋 Открыть заказ #{new_task_id}", callback_data=_detail_callback(int(new_task_id or 0)))],
@@ -2459,7 +2518,7 @@ async def retry_failed_order(callback: CallbackQuery):
 
 
 @router.callback_query(F.data.startswith("order:copy:"))
-async def copy_order(callback: CallbackQuery):
+async def copy_order(callback: CallbackQuery, state: FSMContext):
     """Создаёт копию заказа в композере."""
     try:
         if not callback.message:
@@ -2476,6 +2535,33 @@ async def copy_order(callback: CallbackQuery):
             return
         
         task = await api_client.get_task(task_id, user_backend_id)
+
+        if _order_kind(task) == "keyword_replies":
+            from bot.handlers.engagement_wizard import show_engagement_preview
+            from services.keyword_replies import normalize_keywords
+
+            source_settings = _settings_dict(task)
+            keywords = normalize_keywords(source_settings.get("keywords"))
+            video_urls = [str(url).strip() for url in task.get("video_urls", []) if str(url or "").strip()]
+            if not video_urls:
+                await callback.answer("В исходном заказе нет ссылок на видео", show_alert=True)
+                return
+            await state.clear()
+            await state.update_data(
+                order_kind="keyword_replies", video_url=video_urls[0], video_urls=video_urls,
+                order_create_token=uuid.uuid4().hex,
+                keywords=keywords, comment_text="\n".join(keywords), replies=_order_replies(task),
+                account_pool_mode=_normalize_account_pool_mode(source_settings.get("account_pool_mode")),
+                verify_reply_visibility=source_settings.get("verify_reply_visibility") is True,
+                delays=source_settings.get("delays", True), shuffle=source_settings.get("shuffle", False),
+                rotate_accounts=source_settings.get("rotate_accounts", True),
+                template_id=source_settings.get("template_id"), template_name=source_settings.get("template_name"),
+                template_usage="replies_only" if source_settings.get("template_id") else None,
+                reply_source="template" if source_settings.get("template_id") else "manual",
+                boost_likes_enabled=False,
+            )
+            await show_engagement_preview(callback, state)
+            return
 
         # REFACTOR: Заполняем draft с text_variants (минимум 3 строки)
         # WHY: Нужно для создания нового заказа с теми же текстами
@@ -2533,6 +2619,12 @@ async def order_replace_texts(callback: CallbackQuery, state: FSMContext):
             await callback.answer("Пользователь не найден", show_alert=True)
             return
         task = await api_client.get_task(task_id, user_backend_id)
+        if _order_kind(task) == "keyword_replies":
+            await callback.answer(
+                "Для изменения ответов сделайте копию заказа и измените ответы в её предпросмотре.",
+                show_alert=True,
+            )
+            return
         if str(task.get("status") or "").lower() != "pending":
             await callback.answer("Тексты можно менять только у pending-заказа", show_alert=True)
             return

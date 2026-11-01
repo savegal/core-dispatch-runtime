@@ -120,13 +120,14 @@ async def test_unconfirmed_responses_never_become_success(client_factory, body, 
     assert client.last_request_meta["request_attempted"] is True
     if not body:
         assert "stealth-reject" in error
+        assert client.last_request_meta["publication_status"] == "rejected"
 
 
 @pytest.mark.asyncio
 async def test_window_fetch_header_allowlist_preserves_native_security_sdk(client_factory):
     page = EventPage("response", json.dumps({"status_code": 0, "comment": {"cid": CID}}))
     profile = RequestProfile.publish_main_profile()
-    profile.build_headers = Mock(return_value={"Cookie": "sessionid=stale", "x-secsdk-csrf-request": "1",
+    profile.build_browser_headers = Mock(return_value={"Cookie": "sessionid=stale", "x-secsdk-csrf-request": "1",
                                                "x-secsdk-csrf-token": "fake", "accept": "application/json",
                                                "tt-csrf-token": "fresh", "user-agent": "fake"})
     success, *_ = await client_factory(page)._execute_request(profile, {"text": "fixture"})

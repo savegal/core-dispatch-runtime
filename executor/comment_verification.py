@@ -121,7 +121,8 @@ async def verify_comment_visible(
         await page.wait_for_timeout(1500)
         
         # HYBRID: network-first verify (stub, needs endpoints)
-        if settings.TIKTOK_NETWORK_FIRST and settings.TIKTOK_NETWORK_IMPL_READY:
+        from executor.http.execution_policy import http_first_enabled
+        if http_first_enabled(settings):
             try:
                 artifacts = await collect_session_artifacts(page)
                 net_result = await fetch_comment_list(page, video_url, artifacts)

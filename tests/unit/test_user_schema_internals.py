@@ -4462,6 +4462,7 @@ async def test_reply_batch_captcha_preserves_found_batch_parent(monkeypatch):
 @pytest.mark.unit
 @pytest.mark.asyncio
 async def test_reply_uses_http_first_for_id_verified_parent(monkeypatch):
+    monkeypatch.setattr("executor.user_schema._preflight_cookie_http_gate", AsyncMock(return_value=None))
     from executor import user_schema
     from executor.publish_action import PublishResult
 
@@ -4517,12 +4518,12 @@ async def test_reply_uses_http_first_for_id_verified_parent(monkeypatch):
     async def fake_prepare(*_args, **_kwargs):
         return http_session
 
-    async def fake_http(session, reply_text, *, parent_comment_id, correlation_id):
+    async def fake_http(session, reply_text, *, parent_comment_id, correlation_id, **kwargs):
         assert session is http_session
         http_calls.append((reply_text, parent_comment_id, correlation_id))
         return PublishResult(
             status="success",
-            comment_id="reply-http-1",
+            comment_id="7641761192486194455",
             network_captured=True,
             network_request_attempted=True,
             dom_strategy="http_user_schema:network_exact",
@@ -4757,6 +4758,7 @@ async def test_reply_uses_dom_only_when_network_first_disabled(monkeypatch):
 @pytest.mark.unit
 @pytest.mark.asyncio
 async def test_reply_http_parent_unconfirmed_is_not_retried_via_dom(monkeypatch):
+    monkeypatch.setattr("executor.user_schema._preflight_cookie_http_gate", AsyncMock(return_value=None))
     from executor import user_schema
     from executor.publish_action import PublishResult
 
@@ -4810,7 +4812,7 @@ async def test_reply_http_parent_unconfirmed_is_not_retried_via_dom(monkeypatch)
     async def fake_prepare(*_args, **_kwargs):
         return http_session
 
-    async def fake_http(session, reply_text, *, parent_comment_id, correlation_id):
+    async def fake_http(session, reply_text, *, parent_comment_id, correlation_id, **kwargs):
         assert session is http_session
         http_calls.append((reply_text, parent_comment_id, correlation_id))
         return PublishResult(
@@ -9192,7 +9194,7 @@ async def test_parallel_mode_reply_variant_targets_each_main_comment(monkeypatch
 
 @pytest.mark.unit
 @pytest.mark.asyncio
-async def test_parallel_mode_keeps_retrying_main_phase_after_empty_dynamic_threshold(monkeypatch):
+async def test_parallel_mode_stops_new_main_retries_after_empty_dynamic_threshold(monkeypatch):
     from db import database as db_database
     from executor import browser_pool, user_schema
 
@@ -9200,7 +9202,7 @@ async def test_parallel_mode_keeps_retrying_main_phase_after_empty_dynamic_thres
     def fake_db_context():
         yield SimpleNamespace(no_autoflush=SimpleNamespace())
 
-    main_accounts = [SimpleNamespace(id=101 + i, proxy=None) for i in range(8)]
+    main_accounts = [SimpleNamespace(id=101 + i, proxy=None) for i in range(100)]
     main_attempts = []
     close_calls = []
 
@@ -9242,8 +9244,9 @@ async def test_parallel_mode_keeps_retrying_main_phase_after_empty_dynamic_thres
     )
 
     assert result.error == "parallel_main_no_publications_after_two_batches"
-    assert len(main_attempts) == len(main_accounts)
-    assert len(main_attempts) > 6
+    # Six completed failures trip the breaker; up to two active workers drain.
+    assert 6 <= len(main_attempts) <= 8
+    assert len(main_attempts) < len(main_accounts)
     assert close_calls == ["close"]
 
 

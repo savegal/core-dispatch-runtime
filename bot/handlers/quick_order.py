@@ -1,3 +1,4 @@
+from bot.services.order_creation_ui import current_order_transport_label
 """
 Упрощенный интерфейс для быстрого создания заказов.
 Когда пользователь скидывает ссылку, бот автоматически предлагает выбрать шаблон.
@@ -16,6 +17,7 @@ from bot.services.error_handlers import get_task_creation_error_message
 from bot.services.formatting import Emoji, markdown_inline_code
 from bot.services.likes_ui import get_likes_display_label_for_replies
 from bot.services.order_creation_ui import build_success_text
+from bot.services.mention_choice import ensure_mention_choice
 from bot.services.template_utils import (
     filter_full_templates,
     has_meaningful_text,
@@ -72,6 +74,7 @@ async def _template_preview_text(
 ) -> str:
     return format_template_preview(
         template,
+        transport_label=await current_order_transport_label(api_client),
         reply_count=reply_count,
         edited_comment=edited_comment,
         edited_text_variants=edited_text_variants,
@@ -958,10 +961,18 @@ async def confirm_new_template(callback: CallbackQuery, state: FSMContext):
                 'new_template:confirm',
             ):
                 return
+        replies_list = replies_dict_to_list(replies)
+        mention_choice = await ensure_mention_choice(
+            callback.message, state, [*text_variants, *replies_list], user_id=user_id,
+            resume="new_template:confirm", scope={"links": draft_links, "pool": state_data.get("account_pool_mode"),
+                "reply_count": reply_count, "verify_main_visibility": state_data.get("verify_main_visibility", False),
+                "verify_reply_visibility": state_data.get("verify_reply_visibility", False)},
+        )
+        if mention_choice is None:
+            return
         await callback.answer('Создаём заказ...')
         await callback.bot.send_chat_action(user_id, ChatAction.TYPING)
         logger.info(f'[ORDER_CREATE] User {user_id} creating NEW TEMPLATE order: videos={len(draft_links)}, comment_len={len(main_comment)}, replies={reply_count}')
-        replies_list = replies_dict_to_list(replies)
         reply1 = replies_list[0] if len(replies_list) >= 1 else None
         reply2 = replies_list[1] if len(replies_list) >= 2 else None
         reply3 = replies_list[2] if len(replies_list) >= 3 else None
@@ -974,6 +985,7 @@ async def confirm_new_template(callback: CallbackQuery, state: FSMContext):
                 (await state.get_data()).get('account_pool_mode')
             )
             task_settings = {
+                'mention_mode': mention_choice.mode,
                 'reply_mode': reply_mode,
                 'reply_count': reply_count,
                 'replies': replies_list,
@@ -1002,7 +1014,7 @@ async def confirm_new_template(callback: CallbackQuery, state: FSMContext):
                 )
                 task = {'task_id': task.get('id')}
             else:
-                task = await api_client.create_task(user_id=user_backend_id, main_comment=main_comment, video_urls=draft_links, text_variants=text_variants, reply1=reply1, reply2=reply2, reply3=reply3, replies=replies_list, likes=0, settings=task_settings)
+                task = await api_client.create_task(user_id=user_backend_id, main_comment=main_comment, video_urls=draft_links, text_variants=text_variants, reply1=reply1, reply2=reply2, reply3=reply3, replies=replies_list, likes=0, settings=task_settings, **mention_choice.request_kwargs)
         except Exception as e:
             logger.error(f'Error confirming new template: {e}', exc_info=True)
             error_text, error_keyboard = get_task_creation_error_message(e)
@@ -1031,6 +1043,7 @@ async def confirm_new_template(callback: CallbackQuery, state: FSMContext):
         else:
             await callback.message.edit_text(
                 build_success_text(
+                    transport_mode=task.get("order_transport_mode"),
                     task_id=task_id,
                     links_count=draft_links_count,
 
@@ -1040,8 +1053,8 @@ async def confirm_new_template(callback: CallbackQuery, state: FSMContext):
                     pool_label=_account_pool_label(account_pool_mode),
                 ),
                 reply_markup=InlineKeyboardMarkup(inline_keyboard=[
-                    [InlineKeyboardButton(text='👁 Смотреть заказ', callback_data=f'order:detail:{task_id}')],
-                    [InlineKeyboardButton(text='➕ Ещё заказ', callback_data='menu:new_order')],
+                    [InlineKeyboardButton(text='👁 Открыть заказ', callback_data=f'order:detail:{task_id}')],
+                    [InlineKeyboardButton(text='➕ Создать ещё', callback_data='menu:new_order')],
                     [InlineKeyboardButton(text='🏠 Меню', callback_data='menu:main')]
                 ]),
                 parse_mode='Markdown'
@@ -1385,8 +1398,15 @@ async def confirm_template(callback: CallbackQuery, state: FSMContext):
         text_variants = normalize_text_variants_list(base_text_variants)
         if len(text_variants) < 3:
             raise APIRequestError("Нужно минимум 3 варианта комментария в шаблоне.")
+        mention_choice = await ensure_mention_choice(
+            callback.message, state, [*text_variants, *selected_replies], user_id=user_id,
+            resume=callback.data, scope={"links": draft.links, "settings": task_settings},
+        )
+        if mention_choice is None:
+            return
+        task_settings['mention_mode'] = mention_choice.mode
         try:
-            task = await api_client.create_task(user_id=user_backend_id, main_comment=main_comment, video_urls=draft.links, text_variants=text_variants, reply1=reply1, reply2=reply2, reply3=reply3, replies=selected_replies, likes=0, settings=task_settings)
+            task = await api_client.create_task(user_id=user_backend_id, main_comment=main_comment, video_urls=draft.links, text_variants=text_variants, reply1=reply1, reply2=reply2, reply3=reply3, replies=selected_replies, likes=0, settings=task_settings, **mention_choice.request_kwargs)
         except Exception as e:
             logger.error(f'Error confirming template: {e}', exc_info=True)
             error_text, error_keyboard = get_task_creation_error_message(e)
@@ -1402,6 +1422,7 @@ async def confirm_template(callback: CallbackQuery, state: FSMContext):
         from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup
         await callback.message.edit_text(
             build_success_text(
+                    transport_mode=task.get("order_transport_mode"),
                 task_id=task_id,
                 links_count=len(draft.links),
                 reply_count=len(selected_replies),
@@ -1411,8 +1432,8 @@ async def confirm_template(callback: CallbackQuery, state: FSMContext):
                 pool_label=_account_pool_label(account_pool_mode),
             ),
             reply_markup=InlineKeyboardMarkup(inline_keyboard=[
-                [InlineKeyboardButton(text='👁 Смотреть заказ', callback_data=f'order:detail:{task_id}')],
-                [InlineKeyboardButton(text='➕ Ещё заказ', callback_data='menu:new_order')],
+                [InlineKeyboardButton(text='👁 Открыть заказ', callback_data=f'order:detail:{task_id}')],
+                [InlineKeyboardButton(text='➕ Создать ещё', callback_data='menu:new_order')],
                 [InlineKeyboardButton(text='🏠 Меню', callback_data='menu:main')]
             ]),
             parse_mode='Markdown'

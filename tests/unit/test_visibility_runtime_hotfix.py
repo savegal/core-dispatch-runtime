@@ -118,15 +118,17 @@ async def test_scan_retries_twice_without_multiplying_retries_in_scanner(monkeyp
         text = json.dumps(payload) if recover and len(scripts) == 3 else ""
         return {"status": 200, "text": text, "url": url + "&X-Bogus=fixture&X-Gnarly=fixture"}
 
-    page = SimpleNamespace(url=URL, evaluate=AsyncMock(side_effect=evaluate), context=SimpleNamespace(cookies=AsyncMock(return_value=[])))
+    page = SimpleNamespace(url=URL, evaluate=AsyncMock(side_effect=evaluate), mouse=SimpleNamespace(move=AsyncMock()),
+                           context=SimpleNamespace(cookies=AsyncMock(return_value=[])))
     if mode == "main":
         report = await main_visibility.scan_main_comment_ids(page, VIDEO, [CID])
     else:
         report = await reply_visibility.scan_reply_comment_ids(page, VIDEO, PARENT, [CID])
     assert len(scripts) == 3 and sleep.await_count == 2
     assert [call.args for call in sleep.await_args_list] == [(2.0,), (2.0,)]
-    assert "scrollBy" not in scripts[0]
-    assert all('window.scrollBy(0, 120)' in script and 'new Event("mousemove")' in script for script in scripts[1:])
+    assert "scrollBy" in scripts[0]
+    assert all('window.scrollBy(0, 120)' in script and 'new MouseEvent("mousemove"' not in script for script in scripts[1:])
+    page.mouse.move.assert_awaited_once_with(120, 160)
     assert all('cache: "no-store"' in script for script in scripts)
     assert report["found_ids"] == ([CID] if recover else [])
     assert report["absent_ids"] == []

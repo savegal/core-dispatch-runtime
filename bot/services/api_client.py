@@ -242,6 +242,8 @@ class APIClient:
             return ("/api/settings/commenting_mode",)
         if endpoint.startswith("/api/settings/order_execution_strategy"):
             return ("/api/settings/order_execution_strategy",)
+        if endpoint.startswith("/api/settings/order_transport"):
+            return ("/api/settings/order_transport",)
         if endpoint.startswith("/api/pricing"):
             return ("/api/pricing",)
         if endpoint.startswith("/api/users/") or endpoint.startswith("/api/users?"):
@@ -647,7 +649,7 @@ class APIClient:
         """Ð¡Ð¾Ð·Ð´Ð°Ñ‘Ñ‚ Ð·Ð°Ð´Ð°Ñ‡Ñƒ."""
         normalized_main_comment = self._meaningful_user_text(main_comment)
         if not normalized_main_comment:
-            if kind == "engagement_only":
+            if kind in {"engagement_only", "keyword_replies"}:
                 # engagement_only does not publish main_comment, but payload must stay valid.
                 normalized_main_comment = (
                     self._meaningful_user_text(engagement_comment_text)
@@ -662,7 +664,7 @@ class APIClient:
             raise APIRequestError("Не переданы валидные ссылки на видео.")
 
         text_variants_input = text_variants
-        if kind == "engagement_only" and not text_variants_input:
+        if kind in {"engagement_only", "keyword_replies"} and not text_variants_input:
             text_variants_input = [normalized_main_comment] * 3
         normalized_text_variants = self._normalize_text_variants(normalized_main_comment, text_variants_input)
         normalized_settings = dict(settings or {})
@@ -1531,6 +1533,14 @@ class APIClient:
             "/api/settings/commenting_mode",
             json={"commenting_mode": commenting_mode},
         )
+
+    async def get_order_transport_settings(self) -> dict:
+        """Fresh global order mode; never show a cached choice after a switch."""
+        return await self._request("GET", "/api/settings/order_transport", timeout=5.0)
+
+    async def update_order_transport(self, mode: str) -> dict:
+        return await self._request("POST", "/api/settings/order_transport",
+                                   json={"order_transport_mode": mode}, timeout=10.0)
 
     async def get_order_execution_strategy_settings(self) -> dict:
         """Returns the current order execution strategy."""

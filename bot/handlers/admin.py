@@ -1,3 +1,4 @@
+from services.order_transport import order_transport_label
 import asyncio
 import json
 
@@ -591,7 +592,7 @@ async def admin_menu(callback: CallbackQuery):
             api_client.get_boost_likes_settings(),
             api_client.get_software_mode_settings(),
             api_client.get_commenting_mode_settings(),
-            api_client.get_order_execution_strategy_settings(),
+            api_client.get_order_transport_settings(),
             return_exceptions=True,
         )
 
@@ -654,7 +655,7 @@ async def admin_menu(callback: CallbackQuery):
         current_software_mode = software_mode_data.get("software_mode", "full")
         software_mode_label = "🟢 Полный" if current_software_mode == "full" else "🟡 Парсинг"
         current_commenting_mode = commenting_mode_data.get("commenting_mode", "old")
-        order_strategy_label = str(order_strategy_data.get("order_execution_strategy") or "balanced")
+        order_strategy_label = order_transport_label(order_strategy_data.get("order_transport_mode"))
         commenting_mode_label = {
             "parallel": "🟢 Новая параллельная",
             "parallel_6x1": "🟣 Параллельная 6×1",
@@ -695,7 +696,7 @@ async def admin_menu(callback: CallbackQuery):
             "⚙️ *Текущий конфиг*\n"
             f"Режим: `{software_mode_label}`\n"
             f"Комментинг: `{commenting_mode_label}`\n"
-            f"Стратегия заказов: `{order_strategy_label}`\n"
+            f"Режим заказов: {order_strategy_label}\n"
             f"Прокси-режим: `{proxy_mode}`\n"
             f"Лайки: `{'вкл' if likes_enabled else 'выкл'}` | qty `{likes_quantity}` | API лайков `{'настроен' if provider_available else 'не настроен'}`\n"
             f"Цены: success `{price_success:.2f}` | failure `{price_failure:.2f}` | refund `{refund_delta:.2f}`\n"
@@ -3624,7 +3625,7 @@ async def search_worker_bloggers_input(message: Message, state: FSMContext):
 
     if not matches:
         await message.answer(
-            f"🔍 У {owner_label} ничего не найдено по запросу {safe_query}.\n"
+            f"🔍 У {owner_label} ничего не найдено по запросу {markdown_inline_code(query[:80])}.\n"
             f"Всего блогеров: `{len(creators or [])}`.",
             reply_markup=InlineKeyboardMarkup(inline_keyboard=[
                 [InlineKeyboardButton(text="🔍 Искать ещё", callback_data=f"admin:wbloggers:search:{user_backend_id}")],
@@ -4939,88 +4940,61 @@ async def set_commenting_mode_handler(callback: CallbackQuery):
 
 
 def _build_order_strategy_text(strategy: str, available: list[str] | None = None) -> tuple[str, InlineKeyboardMarkup]:
-    available_set = set(available or ["balanced", "fast", "careful", "verify"])
-    ordered = [item for item in ("balanced", "fast", "careful", "verify") if item in available_set]
-    labels = {
-        "balanced": "Balanced",
-        "fast": "Fast",
-        "careful": "Careful",
-        "verify": "Verify",
-    }
-    descriptions = {
-        "balanced": "Current production behavior. Safest default.",
-        "fast": "For future lower-latency policies.",
-        "careful": "For future deeper retries and slower confirmation.",
-        "verify": "For future stronger public-confirmation policies.",
-    }
-    active = strategy if strategy in available_set else "balanced"
-    lines = [
-        "*Order execution strategy*",
-        "",
-        f"Active: `{active}`",
-        "",
-    ]
-    for item in ordered:
-        marker = "✓" if item == active else "•"
-        lines.append(f"{marker} *{labels.get(item, item)}* — {descriptions.get(item, '')}")
-    lines.append("")
-    lines.append("_Balanced keeps current commenting behavior. Other modes are stored on new orders for controlled rollout._")
-    keyboard_rows = [
-        [InlineKeyboardButton(text=f"{'✓ ' if item == active else ''}{labels.get(item, item)}", callback_data=f"admin:order_strategy:set:{item}")]
-        for item in ordered
-    ]
-    keyboard_rows.append([InlineKeyboardButton(text="Back", callback_data="admin:main")])
-    return "\n".join(lines), InlineKeyboardMarkup(inline_keyboard=keyboard_rows)
+    active = strategy if strategy in {"dom", "http"} else None
+    available_set = set(available if available is not None else ["dom", "http"])
+    text = (
+        "*Режим заказов*\n\n"
+        f"Сейчас: *{order_transport_label(active)}*\n\n"
+        "*DOM — через браузер*\nПубликация через интерфейс TikTok.\n\n"
+        "*HTTP — быстрый*\nПубликация HTTP-запросами с браузерной сессией и подписью.\n\n"
+        "Общая настройка для полных заказов и «Только ответы», включая шаблоны и мониторинг. "
+        "«Ответы по ключевым словам» всегда выполняются через HTTP. "
+        "Уже созданные заказы сохраняют свой режим.\n\n"
+        "Проверки видимости, лайки и схема комментариев настраиваются отдельно."
+    )
+    rows = [[InlineKeyboardButton(
+        text=("✓ " if item == active else "") + order_transport_label(item),
+        callback_data=f"admin:order_strategy:set:{item}",
+    )] for item in ("dom", "http") if item in available_set]
+    if "http" not in available_set:
+        text += "\n\nHTTP недоступен в конфигурации сервера."
+    rows.append([InlineKeyboardButton(text="◀️ Админ-панель", callback_data="admin:main")])
+    return text, InlineKeyboardMarkup(inline_keyboard=rows)
 
 
 @router.callback_query(F.data == "admin:order_strategy")
 async def order_strategy_menu(callback: CallbackQuery):
     try:
         await callback.answer()
-        settings_data = await api_client.get_order_execution_strategy_settings()
-        strategy = str(settings_data.get("order_execution_strategy") or "balanced")
-        available = settings_data.get("available_strategies")
-        text, keyboard = _build_order_strategy_text(strategy, available if isinstance(available, list) else None)
+        data = await api_client.get_order_transport_settings()
+        text, keyboard = _build_order_strategy_text(data.get("order_transport_mode"), data.get("available_modes"))
         await _safe_edit_callback_text(callback, text, reply_markup=keyboard, parse_mode="Markdown")
-    except Exception as e:
-        logger.error(f"Error showing order strategy menu: {e}", exc_info=True)
-        try:
-            await callback.answer("Order strategy load error", show_alert=True)
-        except Exception:
-            pass
+    except Exception:
+        logger.exception("Error loading order transport")
+        await callback.answer("Не удалось загрузить режим заказов. Попробуйте ещё раз.", show_alert=True)
 
 
 @router.callback_query(F.data.startswith("admin:order_strategy:set:"))
 async def set_order_strategy_handler(callback: CallbackQuery):
-    strategy = callback.data.split(":")[-1]
-    if strategy not in {"balanced", "fast", "careful", "verify"}:
-        await callback.answer("Invalid strategy", show_alert=True)
+    mode = callback.data.split(":")[-1]
+    if mode not in {"dom", "http"}:
+        await callback.answer("Меню устарело. Откройте «Режим заказов» заново.", show_alert=True)
         return
-
     try:
-        await callback.answer(f"Strategy: {strategy}", show_alert=False)
-    except Exception:
-        pass
-
-    try:
-        old_data = await api_client.get_order_execution_strategy_settings()
-        old_strategy = str(old_data.get("order_execution_strategy") or "balanced")
-        if old_strategy != strategy:
-            await api_client.update_order_execution_strategy(strategy)
-            await log_admin_action(
-                admin_telegram_id=callback.from_user.id,
-                action_type="order_execution_strategy_update",
-                target_user_id=None,
-                details={"old_strategy": old_strategy, "new_strategy": strategy},
-            )
-        text, keyboard = _build_order_strategy_text(strategy, old_data.get("available_strategies"))
+        await callback.answer()
+        data = await api_client.update_order_transport(mode)
+        if data.get("order_transport_mode") != mode:
+            raise ValueError("Сервер не подтвердил выбранный режим")
+        await log_admin_action(
+            admin_telegram_id=callback.from_user.id,
+            action_type="order_transport_update", target_user_id=None,
+            details={"new_mode": mode},
+        )
+        text, keyboard = _build_order_strategy_text(data["order_transport_mode"], data.get("available_modes"))
         await _safe_edit_callback_text(callback, text, reply_markup=keyboard, parse_mode="Markdown")
-    except Exception as e:
-        logger.error(f"Error updating order strategy: {e}", exc_info=True)
-        try:
-            await callback.answer("Order strategy update error", show_alert=True)
-        except Exception:
-            pass
+    except Exception:
+        logger.exception("Error updating order transport")
+        await callback.answer("Не удалось сохранить режим. Обновите меню и попробуйте ещё раз.", show_alert=True)
 
 
 @router.callback_query(F.data == "admin:boost_likes")

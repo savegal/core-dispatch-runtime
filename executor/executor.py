@@ -32,10 +32,11 @@ import asyncio
 import copy
 from types import SimpleNamespace
 from typing import Any, Callable
+from sqlalchemy import func
 from sqlalchemy.orm import Session
 from sqlalchemy.orm.attributes import flag_modified
 from db.database import get_sync_db
-from db.models import Task, Proxy, User
+from db.models import Task, Proxy, User, Transaction
 from services.balance_service import (
     get_pricing,
     refund_balance,
@@ -169,6 +170,13 @@ def _reply_visibility_exhausted(result: dict | None) -> bool:
     if not isinstance(result, dict):
         return False
     return str(result.get("error") or "") in _REPLY_VISIBILITY_EXHAUSTED_ERRORS
+
+
+def _completion_status_with_errors(successful_urls: int, url_results: dict) -> str:
+    from services.task_execution_ledger import has_confirmed_publications
+    return "partial" if successful_urls or any(has_confirmed_publications(row)
+        or (isinstance(row, dict) and row.get("status") == "partial")
+        for row in url_results.values()) else "error"
 
 
 def _url_result_counts_as_success(result: dict | None) -> bool:
@@ -921,12 +929,12 @@ async def prepare_mobile_proxy_for_account(account, db: Session, proxy_obj: Prox
         logger.info(f"Mobile proxy {proxy_obj.id} prepared: IP {new_ip}")
         
         # Возвращаем True - блокировка захвачена и нужно освободить
-        return True, proxy_obj
+        return lock_acquired, proxy_obj
         
     except Exception as e:
         # При ошибке освобождаем блокировку и пробрасываем исключение
         try:
-            await release_proxy_lock(proxy_obj.id)
+            await release_proxy_lock(lock_acquired)
         except:
             pass
         raise
@@ -1148,6 +1156,8 @@ def process_task(task_id: int) -> None:
     # TODO: В будущем перейти на AsyncSession для полной асинхронности
     db: Session = next(get_sync_db())
     dedicated_proxy_token = None
+    mention_mode_token = None
+    order_transport_token = None
     task_start_time = time.time()
     task_start_monotonic = time.monotonic()
     task_timeout_seconds = max(1, int(getattr(settings, "TASK_PROCESSING_TIMEOUT", 1800) or 1800))
@@ -1302,6 +1312,11 @@ def process_task(task_id: int) -> None:
 
         # Разбираем настройки задачи
         task_settings = task.settings or {}
+        from services.mention_policy import set_task_mention_mode
+        mention_mode_token = set_task_mention_mode(task_settings)
+        from services.order_transport import ORDER_TRANSPORT_KEY, set_task_order_transport
+        transport_mode = "http" if getattr(task, "kind", None) == "keyword_replies" else task_settings.get(ORDER_TRANSPORT_KEY)
+        order_transport_token = set_task_order_transport(transport_mode, settings)
         delays_enabled = task_settings.get("delays", True)
         shuffle_enabled = task_settings.get("shuffle", False)
         rotate_accounts = task_settings.get("rotate_accounts", True)
@@ -1318,7 +1333,11 @@ def process_task(task_id: int) -> None:
             dedicated_proxy_token = activate_dedicated_proxy_for_user(db, int(task.user_id))
         text_variants = task_settings.get("text_variants") or [task.main_comment]
         text_variants = [t for t in text_variants if t]
-        if not text_variants:
+        reply_only_has_text = False
+        if not text_variants and getattr(task, "kind", None) in {"engagement_only", "keyword_replies"}:
+            from executor.engagement_engine import _reply_variants_from_task
+            reply_only_has_text = bool(_reply_variants_from_task(task))
+        if not text_variants and not reply_only_has_text:
             logger.error(f"Task {task_id}: no text variants available")
             task.status = "error"
             task.error_reason = "Нет доступных текстов для публикации"
@@ -1406,6 +1425,8 @@ def process_task(task_id: int) -> None:
 
         def task_stop_requested_now() -> bool:
             nonlocal task_stopped_by_user
+            if getattr(task, "_publication_checkpoint_failed", False):
+                return True
             if task_timeout_requested_now():
                 return True
             if shutdown_event and shutdown_event.is_set():
@@ -1501,6 +1522,7 @@ def process_task(task_id: int) -> None:
             return False
 
         # Обрабатываем каждую ссылку
+        from services.publication_progress import publication_scope, merge_url_result
         for idx, video_url in enumerate(video_urls):
             if task_timeout_requested_now():
                 logger.info(f"Task {task_id}: timeout detected before URL {idx+1}/{len(video_urls)}")
@@ -1520,9 +1542,15 @@ def process_task(task_id: int) -> None:
             # Это защищает от двойного коммента при повторном запуске задачи
             # (resume после crash, ручной replay через Telegram, retry воркера).
             existing_row = previous_url_results.get(video_url)
+            from services.task_execution_ledger import has_submission_evidence
+            keyword_resume = (getattr(task, "kind", None) == "keyword_replies"
+                              and isinstance(existing_row, dict) and not _url_result_counts_as_success(existing_row))
             if (
                 isinstance(existing_row, dict)
-                and (_url_result_counts_as_success(existing_row) or _visibility_result_has_receipts(existing_row))
+                and not keyword_resume
+                and video_url not in ((task.settings or {}).get("_reply_resume") or {})
+                and (_url_result_counts_as_success(existing_row) or _visibility_result_has_receipts(existing_row)
+                     or has_submission_evidence(existing_row))
             ):
                 logger.info(
                     f"Task {task_id}, URL {idx+1}: skipping — already processed "
@@ -1534,8 +1562,8 @@ def process_task(task_id: int) -> None:
                 if not _url_result_counts_as_success(existing_row):
                     resume_error = _visibility_resume_error(existing_row)
                     if resume_error in {"main_visibility_unconfirmed", "reply_visibility_unconfirmed"}:
-                        unconfirmed_urls.append(video_url)
-                    failed_urls.append(video_url)
+                        unconfirmed_urls.append(video_urls[idx])
+                    failed_urls.append(video_urls[idx])
                     has_errors = True
                     error_messages.append(f"{video_url}: {resume_error}")
                 db.commit()
@@ -1569,7 +1597,7 @@ def process_task(task_id: int) -> None:
             task_kind = getattr(task, "kind", "full") or "full"
             
             # Для engagement_only используем engagement_engine
-            if task_kind == "engagement_only":
+            if task_kind in {"engagement_only", "keyword_replies"} or video_url in ((task.settings or {}).get("_reply_resume") or {}):
                 try:
                     logger.info(f"Task {task_id}, URL {idx+1}: Processing ENGAGEMENT_ONLY order")
                     
@@ -1577,18 +1605,30 @@ def process_task(task_id: int) -> None:
                     task_settings = task.settings or {}
                     engagement_comment_id = task_settings.get("engagement_comment_id")
                     engagement_username = task_settings.get("engagement_username")
-                    engagement_comment_text = task_settings.get("engagement_comment_text") or task.main_comment
+                    engagement_comment_text = task_settings.get("engagement_comment_text") or (
+                        None if task_settings.get("engagement_target_mode") == "auto_top" else task.main_comment
+                    )
                     
                     # ИСПРАВЛЕНО: Записываем тайминги для единого формата
                     started_at = datetime.now(timezone.utc).isoformat()
                     
                     # Используем engagement_engine
                     from executor.engagement_engine import execute_engagement_only
+                    from executor.keyword_replies import execute_keyword_replies
                     from executor.browser_pool import browser_pool_task_scope
                     loop = get_event_loop()
-                    with browser_pool_task_scope(task_id):
-                        engagement_result = loop.run_until_complete(
-                            execute_engagement_only(
+                    with browser_pool_task_scope(task_id), publication_scope(db, task, video_urls[idx]):
+                        if video_url in ((task.settings or {}).get("_reply_resume") or {}):
+                            from services.publication_progress import execute_reply_resume, ResumedReplyResult
+                            engagement_result = ResumedReplyResult(loop.run_until_complete(execute_reply_resume(
+                                db, task, video_url, pool_owner_user_id=pool_owner_user_id,
+                                stop_requested=task_stop_requested_now)))
+                        elif task_kind == "keyword_replies":
+                            engagement_result = loop.run_until_complete(execute_keyword_replies(
+                                db, task, video_url, task_id=task_id, pool_owner_user_id=pool_owner_user_id,
+                                stop_requested=task_stop_requested_now))
+                        else:
+                            engagement_result = loop.run_until_complete(execute_engagement_only(
                                 db=db,
                                 task=task,
                                 video_url=video_url,
@@ -1598,8 +1638,7 @@ def process_task(task_id: int) -> None:
                                 task_id=task_id,
                                 pool_owner_user_id=pool_owner_user_id,
                                 stop_requested=task_stop_requested_now,
-                            )
-                        )
+                            ))
                     
                     # ИСПРАВЛЕНО: Передаем source, mode, timing в to_dict()
                     ended_at = datetime.now(timezone.utc).isoformat()
@@ -1612,19 +1651,22 @@ def process_task(task_id: int) -> None:
                         ended_at=ended_at
                     )
                     from executor.reply_visibility import verify_order_reply_visibility
-                    with browser_pool_task_scope(task_id):
+                    with browser_pool_task_scope(task_id), publication_scope(db, task, video_urls[idx]):
                         result_dict = loop.run_until_complete(verify_order_reply_visibility(
-                            db, task, video_url, result_dict, pool_owner_user_id=pool_owner_user_id,
+                            db, task, video_urls[idx], result_dict, pool_owner_user_id=pool_owner_user_id,
                             stop_requested=task_stop_requested_now,
                         ))
                     task_settings = task.settings or {}
                     result_dict = normalize_url_result_for_timeout(result_dict)
-                    url_results[video_url] = result_dict
+                    db.refresh(task, attribute_names=["settings"])
+                    result_dict = merge_url_result(((task.settings or {}).get("url_results") or {}).get(video_urls[idx]), result_dict)
+                    task_settings = dict(task.settings or {})
+                    url_results[video_urls[idx]] = result_dict
                     
                     # Сохраняем результат в task_settings
                     if not task_settings.get("url_results"):
                         task_settings["url_results"] = {}
-                    task_settings["url_results"][video_url] = result_dict
+                    task_settings["url_results"][video_urls[idx]] = result_dict
                     task_settings = _refresh_execution_ledger(task_settings)
                     task.settings = task_settings
                     _mark_task_settings_dirty(task)
@@ -1633,9 +1675,9 @@ def process_task(task_id: int) -> None:
                     result_status = result_dict.get("status")
                     if _url_result_counts_as_success(result_dict):
                         successful_urls += 1
-                        successful_urls_list.append(video_url)
+                        successful_urls_list.append(video_urls[idx])
                         if result_status in _URL_UNCONFIRMED_STATUSES:
-                            unconfirmed_urls.append(video_url)
+                            unconfirmed_urls.append(video_urls[idx])
                         engagement = result_dict.get("engagement", {})
                         replies_info = engagement.get("replies", {})
                         likes_info = engagement.get("likes", {})
@@ -1653,10 +1695,11 @@ def process_task(task_id: int) -> None:
                             f"{likes_str}"
                         )
                     else:
-                        if (result_dict.get("reply_publication_visibility") or {}).get("enabled"):
-                            unconfirmed_urls.append(video_url)
+                        reply_visibility = result_dict.get("reply_publication_visibility") or {}
+                        if reply_visibility.get("enabled") and reply_visibility.get("status") not in {"confirmed", "not_requested"}:
+                            unconfirmed_urls.append(video_urls[idx])
                             error_messages.append(f"{video_url}: {result_dict.get('error') or 'reply_visibility_unconfirmed'}")
-                        failed_urls.append(video_url)
+                        failed_urls.append(video_urls[idx])
                         has_errors = True
                         engagement = result_dict.get("engagement", {})
                         replies_info = engagement.get("replies", {})
@@ -1693,16 +1736,16 @@ def process_task(task_id: int) -> None:
 
                 except Exception as e:
                     logger.error(f"Task {task_id}, URL {idx+1}: ENGAGEMENT_ONLY error: {e}", exc_info=True)
-                    failed_urls.append(video_url)
+                    failed_urls.append(video_urls[idx])
                     # ИСПРАВЛЕНО: Используем унифицированный формат даже для ошибок с source, mode, timing
                     ended_at = datetime.now(timezone.utc).isoformat()
                     source = task_settings.get("origin", "manual")
-                    url_results[video_url] = {
+                    url_results[video_urls[idx]] = {
                         "status": "fail",
                         "error": str(e)[:200],
                         "comment_id": None,
                         "source": source,
-                        "mode": "engagement_only",
+                        "mode": task_kind,
                         "engagement": {
                             "main": {"success": False, "error": str(e)[:200]},
                             "replies": {"ok": 0, "total": 0, "items": []},
@@ -1714,6 +1757,11 @@ def process_task(task_id: int) -> None:
                             "duration_ms": None
                         }
                     }
+                    if task_kind == "keyword_replies":
+                        checkpoint_row = ((task.settings or {}).get("url_results") or {}).get(video_url)
+                        if isinstance(checkpoint_row, dict):
+                            url_results[video_urls[idx]] = {**checkpoint_row, "error": str(e)[:200],
+                                "status": "partial" if has_submission_evidence(checkpoint_row) else "fail"}
                     has_errors = True
                     continue
             
@@ -1851,9 +1899,11 @@ def process_task(task_id: int) -> None:
                             except Exception:
                                 logger.debug("user_schema: failed to read boost config", exc_info=True)
 
-                            with browser_pool_task_scope(task_id):
+                            with browser_pool_task_scope(task_id), publication_scope(db, task, video_urls[idx]):
                                 def user_schema_stop_requested() -> bool:
                                     nonlocal task_stopped_by_user
+                                    if getattr(task, "_publication_checkpoint_failed", False):
+                                        return True
                                     if task_timeout_requested_now():
                                         return True
                                     try:
@@ -1898,7 +1948,7 @@ def process_task(task_id: int) -> None:
                                     user_schema_runner(
                                         db=db,
                                         task=task,
-                                        video_url=video_url,
+                                        video_url=video_urls[idx],
                                         text_variants=prepared_variants,
                                         task_id=task_id,
                                         boost_enabled=boost_enabled_user,
@@ -1964,7 +2014,7 @@ def process_task(task_id: int) -> None:
                             variant_started_at = datetime.now(timezone.utc).isoformat()
                             variant_task = _task_for_variant(task, allow_likes=(variant_num == 1))
                             from executor.browser_pool import browser_pool_task_scope
-                            with browser_pool_task_scope(task_id):
+                            with browser_pool_task_scope(task_id), publication_scope(db, task, video_urls[idx]):
                                 hybrid_result = loop.run_until_complete(
                                     execute_hybrid_full(
                                         db=db,
@@ -2001,19 +2051,22 @@ def process_task(task_id: int) -> None:
                 result_dict["timing"]["started_at"] = started_at
                 result_dict["timing"]["ended_at"] = ended_at
                 from executor.reply_visibility import verify_order_reply_visibility
-                with browser_pool_task_scope(task_id):
+                with browser_pool_task_scope(task_id), publication_scope(db, task, video_urls[idx]):
                     result_dict = loop.run_until_complete(verify_order_reply_visibility(
-                        db, task, video_url, result_dict, pool_owner_user_id=pool_owner_user_id,
+                        db, task, video_urls[idx], result_dict, pool_owner_user_id=pool_owner_user_id,
                         stop_requested=task_stop_requested_now,
                     ))
                 task_settings = task.settings or {}
                 result_dict = normalize_url_result_for_timeout(result_dict)
-                url_results[video_url] = result_dict
+                db.refresh(task, attribute_names=["settings"])
+                result_dict = merge_url_result(((task.settings or {}).get("url_results") or {}).get(video_urls[idx]), result_dict)
+                task_settings = dict(task.settings or {})
+                url_results[video_urls[idx]] = result_dict
                 
                 # Сохраняем результат в task_settings
                 if not task_settings.get("url_results"):
                     task_settings["url_results"] = {}
-                task_settings["url_results"][video_url] = result_dict
+                task_settings["url_results"][video_urls[idx]] = result_dict
                 task_settings = _refresh_execution_ledger(task_settings)
                 task.settings = task_settings
                 _mark_task_settings_dirty(task)
@@ -2023,9 +2076,9 @@ def process_task(task_id: int) -> None:
                 result_status = result_dict.get("status")
                 if _url_result_counts_as_success(result_dict):
                     successful_urls += 1
-                    successful_urls_list.append(video_url)
+                    successful_urls_list.append(video_urls[idx])
                     if result_status in _URL_UNCONFIRMED_STATUSES:
-                        unconfirmed_urls.append(video_url)
+                        unconfirmed_urls.append(video_urls[idx])
                     engagement = result_dict.get("engagement", {})
                     replies_info = engagement.get("replies", {})
                     likes_info = engagement.get("likes", {})
@@ -2060,8 +2113,8 @@ def process_task(task_id: int) -> None:
                 else:
                     if ((result_dict.get("main_visibility") or {}).get("enabled")
                             or (result_dict.get("reply_publication_visibility") or {}).get("enabled")):
-                        unconfirmed_urls.append(video_url)
-                    failed_urls.append(video_url)
+                        unconfirmed_urls.append(video_urls[idx])
+                    failed_urls.append(video_urls[idx])
                     has_errors = True
                     error_messages.append(
                         f"{video_url}: {result_dict.get('status') or 'fail'} "
@@ -2104,12 +2157,12 @@ def process_task(task_id: int) -> None:
                 
             except Exception as e:
                 logger.error(f"Task {task_id}, URL {idx+1}: HYBRID FULL error: {e}", exc_info=True)
-                failed_urls.append(video_url)
+                failed_urls.append(video_urls[idx])
                 # ИСПРАВЛЕНО: Используем унифицированный формат даже для ошибок с source, mode, timing
                 ended_at = datetime.now(timezone.utc).isoformat()
                 task_settings = task.settings or {}
                 source = task_settings.get("origin", "manual")
-                url_results[video_url] = {
+                url_results[video_urls[idx]] = {
                     "status": "fail",
                     "error": str(e)[:200],
                     "comment_id": None,
@@ -2128,6 +2181,12 @@ def process_task(task_id: int) -> None:
                 }
                 has_errors = True
                 continue
+
+        # Merge durable receipts on exception/stop paths as well as normal returns.
+        db.refresh(task, attribute_names=["settings"])
+        durable_urls = (task.settings or {}).get("url_results") or {}
+        url_results = {key: merge_url_result(durable_urls.get(key), value)
+                       for key, value in {**durable_urls, **url_results}.items()}
 
         # Финализация задачи
         if task_timed_out:
@@ -2199,7 +2258,7 @@ def process_task(task_id: int) -> None:
             return
 
         if has_errors:
-            if successful_urls == 0:
+            if _completion_status_with_errors(successful_urls, url_results) == "error":
                 task.status = "error"
             else:
                 # ИСПРАВЛЕНО: Валидация перехода статуса
@@ -2242,30 +2301,51 @@ def process_task(task_id: int) -> None:
                         pricing = get_pricing(db)
                         # ИСПРАВЛЕНО: Используем централизованную функцию расчёта возврата
                         from services.balance_service import calculate_refund_amount
-                        total_refund = calculate_refund_amount(refund_units, pricing)
+                        # Recovery may finalize the same paid task again. Settle
+                        # only the unpaid difference, never more than its hold.
+                        db.refresh(task, attribute_names=["total_cost", "refunded_cost"], with_for_update=True)
+                        paid_cost = max(Decimal(str(task.total_cost or 0)), Decimal("0.00"))
+                        recorded_refunds = db.query(func.coalesce(func.sum(Transaction.amount), 0)).filter(
+                            Transaction.task_id == task_id, Transaction.type == "refund",
+                        ).scalar()
+                        already_refunded = max(Decimal(str(task.refunded_cost or 0)),
+                                               Decimal(str(recorded_refunds or 0)), Decimal("0.00"))
+                        task.refunded_cost = already_refunded
+                        target_refund = min(calculate_refund_amount(refund_units, pricing), paid_cost)
+                        total_refund = max(target_refund - already_refunded, Decimal("0.00"))
                         refund_reason_parts = []
                         if failed_urls:
                             refund_reason_parts.append(f"{len(failed_urls)} failed")
                         refund_reason = ", ".join(refund_reason_parts) or f"{refund_units} not completed"
                         
-                        refund_balance(
+                        refunded = total_refund > 0 and refund_balance(
                             db,
                             task.user_id,
                             total_refund,
                             task_id=task_id,
-                            description=f"Refund for {refund_reason} video(s) in task #{task_id}"
+                            description=f"Refund for {refund_reason} video(s) in task #{task_id}",
+                            commit=False,
                         )
-                        
-                        task.refunded_cost = total_refund
-                        logger.info(
-                            "Task %s: Refunded %s UAH for %s video(s): %s",
-                            task_id,
-                            total_refund,
-                            refund_units,
-                            refund_reason,
-                        )
+                        if total_refund > 0 and not refunded:
+                            raise RuntimeError("Refund settlement failed; no refund was recorded")
+                        if refunded:
+                            # Commit the balance transaction and settlement
+                            # marker together below, closing the crash window.
+                            task.refunded_cost = already_refunded + total_refund
+                            logger.info(
+                                "Task %s: Refunded %s UAH for %s video(s): %s",
+                                task_id,
+                                total_refund,
+                                refund_units,
+                                refund_reason,
+                            )
                     except Exception as refund_error:
                         logger.error(f"Task {task_id}: Error refunding balance: {refund_error}", exc_info=True)
+                        # A failed balance operation can roll the session back,
+                        # including the terminal task status. Let the outer
+                        # handler record an explicit error after that rollback.
+                        db.rollback()
+                        raise
             
             if unconfirmed_urls:
                 logger.warning(
@@ -2372,6 +2452,10 @@ def process_task(task_id: int) -> None:
     
     finally:
         stop_watcher_stop.set()
+        from services.mention_policy import reset_task_mention_mode
+        reset_task_mention_mode(mention_mode_token)
+        from services.order_transport import reset_task_order_transport
+        reset_task_order_transport(order_transport_token)
         reset_dedicated_proxy(dedicated_proxy_token)
         try:
             stop_watcher_thread.join(timeout=1.0)
@@ -2501,7 +2585,7 @@ def worker(worker_id: int) -> None:
             from executor.browser_pool import close_browser_pool
             loop = get_event_loop()
             if not loop.is_closed():
-                loop.run_until_complete(close_browser_pool())
+                loop.run_until_complete(close_browser_pool(stop_playwright=True))
                 logger.info(f"Worker {worker_id}: Browser pool closed")
         except Exception as e:
             logger.warning(f"Worker {worker_id}: Error closing browser pool: {e}")

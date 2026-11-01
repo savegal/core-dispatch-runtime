@@ -563,8 +563,9 @@ async def get_browser_login_state(page: Page) -> dict:
                 const inCookieContext = (el) => {
                     let cur = el;
                     for (let depth = 0; depth < 20 && cur && cur !== document.body && cur !== document.documentElement; depth++, cur = cur.parentElement) {
+                        const curRaw = rawTextOf(cur);
                         const label = [
-                            textOf(cur),
+                            curRaw.length <= 600 ? textOf(cur) : '',
                             cur.id || '',
                             String(cur.className || ''),
                             cur.getAttribute && (cur.getAttribute('aria-label') || ''),
@@ -630,6 +631,7 @@ async def get_browser_login_state(page: Page) -> dict:
                     const href = (el.getAttribute('href') || '').toLowerCase();
                     const metadataMatch = matches(aria) || dataE2e.includes('login-button')
                         || dataE2e === 'login' || href.includes('/login') || href.includes('/signup');
+                    if (visibleText.length > 250 && !metadataMatch) return false;
                     // Hidden descendants can precede the rendered label. Use
                     // a permissive text-only prefilter, then the visible label.
                     if (!loginLabels.some(needle => visibleText.includes(needle)) && !metadataMatch) return false;
@@ -638,11 +640,13 @@ async def get_browser_login_state(page: Page) -> dict:
                     return renderedText.length <= 90 && (matches(renderedText) || metadataMatch);
                 });
 
-                const stateText = [
+                const ssrStateText = [
                     document.getElementById('SIGI_STATE')?.textContent || '',
                     document.getElementById('__UNIVERSAL_DATA_FOR_REHYDRATION__')?.textContent || '',
-                    document.body?.innerHTML?.slice(0, 250000) || '',
                 ].join('\n').toLowerCase();
+                const stateText = (ssrStateText.includes('"islogin"') || ssrStateText.includes('"is_login"'))
+                    ? ssrStateText
+                    : [ssrStateText, document.body?.innerHTML?.slice(0, 250000) || ''].join('\n').toLowerCase();
                 const stateIsLoginTrue = stateText.includes('"islogin":true')
                     || stateText.includes('"is_login":true')
                     || stateText.includes('"isLogin":true'.toLowerCase());

@@ -104,6 +104,7 @@ def test_build_text_extra_skips_empty_sec_uid():
 @pytest.mark.asyncio
 async def test_resolve_mention_user_success():
     mock_page = AsyncMock()
+    mock_page.is_closed = lambda: False
     mock_page.evaluate.return_value = {
         "status": "ok",
         "user": {
@@ -131,6 +132,7 @@ async def test_resolve_mention_user_success():
 async def test_resolve_mention_user_transient_error_does_not_negative_cache():
     _MENTION_CACHE.pop("glitch_user", None)
     mock_page = AsyncMock()
+    mock_page.is_closed = lambda: False
     mock_page.evaluate.return_value = {
         "status": "transient_error",
         "reason": "api_empty_body",
@@ -149,6 +151,7 @@ async def test_resolve_mention_user_transient_error_does_not_negative_cache():
 async def test_resolve_mention_user_confirmed_not_found_negative_caches():
     _MENTION_CACHE.pop("banned_user", None)
     mock_page = AsyncMock()
+    mock_page.is_closed = lambda: False
     mock_page.evaluate.return_value = {
         "status": "not_found",
         "reason": "api_code_10202",
@@ -167,6 +170,7 @@ async def test_resolve_mention_user_confirmed_not_found_negative_caches():
 @pytest.mark.asyncio
 async def test_prepare_mentions_normalizes_casing():
     mock_page = AsyncMock()
+    mock_page.is_closed = lambda: False
     mock_page.evaluate.return_value = {
         "status": "ok",
         "user": {
@@ -226,10 +230,11 @@ def test_extract_response_mentions_nested_data_envelope():
 
 @pytest.mark.unit
 @pytest.mark.asyncio
-async def test_client_reply_comment_automatically_injects_text_extra():
+async def test_client_reply_comment_injects_text_extra_when_explicitly_enabled():
     from executor.http.playwright_http_client import PlaywrightHttpClient
 
     mock_page = AsyncMock()
+    mock_page.is_closed = lambda: False
     mock_page.evaluate.return_value = {
         "status": "ok",
         "user": {
@@ -258,6 +263,7 @@ async def test_client_reply_comment_automatically_injects_text_extra():
         aweme_id="71234567890",
         parent_comment_id="7123456789099999999",
         text="видел у него @myfriend супер",
+        mention_mode="attempt",
     )
 
     assert success is True
@@ -276,6 +282,7 @@ async def test_client_publish_aborts_when_mentions_unresolved():
     from executor.http.playwright_http_client import PlaywrightHttpClient
 
     mock_page = AsyncMock()
+    mock_page.is_closed = lambda: False
     # Simulate failed resolution
     mock_page.evaluate.return_value = {
         "status": "transient_error",
@@ -295,6 +302,7 @@ async def test_client_publish_aborts_when_mentions_unresolved():
     success, cid, err, err_type = await client.publish_main_comment(
         aweme_id="71234567890",
         text="видел у него @unknown_user супер",
+        mention_mode="attempt",
     )
 
     # Must abort BEFORE execute_request
@@ -306,10 +314,11 @@ async def test_client_publish_aborts_when_mentions_unresolved():
 
 @pytest.mark.unit
 @pytest.mark.asyncio
-async def test_client_publish_main_comment_automatically_injects_text_extra():
+async def test_client_publish_main_comment_injects_text_extra_when_explicitly_enabled():
     from executor.http.playwright_http_client import PlaywrightHttpClient
 
     mock_page = AsyncMock()
+    mock_page.is_closed = lambda: False
     mock_page.evaluate.return_value = {
         "status": "ok",
         "user": {
@@ -338,6 +347,7 @@ async def test_client_publish_main_comment_automatically_injects_text_extra():
     success, cid, err, err_type = await client.publish_main_comment(
         aweme_id="71234567890",
         text="подпишись на @creator!",
+        mention_mode="attempt",
     )
 
     assert success is True

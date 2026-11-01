@@ -19,6 +19,7 @@ from bot.services.template_utils import (
     template_text_variants,
 )
 from bot.services.user_utils import get_user_backend_id
+from bot.services.order_creation_ui import current_order_transport_label
 from bot.state.order_states import OrderStates
 from bot.utils.markdown_escape import escape_markdown_simple
 from config.settings import get_settings
@@ -31,7 +32,9 @@ settings = get_settings()
 
 
 async def _format_template_composer_summary(draft) -> str:
-    return format_composer_summary(draft, likes_label=LIKES_DISABLED_LABEL)
+    from bot.services.likes_ui import get_likes_display_label_for_replies
+    return format_composer_summary(draft, likes_label=await get_likes_display_label_for_replies(draft.replies),
+                                   transport_label=await current_order_transport_label(api_client))
 
 
 def _md(text: str | None) -> str:
@@ -64,18 +67,21 @@ def _template_reply_list(template: dict | None) -> list[str]:
 def _variants_lines(variants: list[str]) -> list[str]:
     if not variants:
         return ["Варианты пока не заданы."]
-    return [f"{idx}. {_preview(item, 220)}" for idx, item in enumerate(variants[:3], start=1)]
+    return [f"{idx}. {_preview(item, 150)}" for idx, item in enumerate(variants[:3], start=1)]
 
 
 def _replies_lines(replies: list[str]) -> list[str]:
     if not replies:
         return ["Ответы не добавлены."]
-    return [f"{idx}. {_preview(item, 140)}" for idx, item in enumerate(replies, start=1)]
+    lines = [f"{idx}. {_preview(item, 100)}" for idx, item in enumerate(replies[:6], start=1)]
+    if len(replies) > 6:
+        lines.append(f"… ещё {len(replies) - 6}. Все ответы сохранены в шаблоне.")
+    return lines
 
 
 def _template_detail_keyboard(template_id: int, *, replies_only: bool = False) -> InlineKeyboardMarkup:
     use_button = (
-        InlineKeyboardButton(text="⚡ Заказ только на ответы", callback_data="menu:engagement_only")
+        InlineKeyboardButton(text="🚀 Создать заказ с ответами", callback_data=f"engagement:from_template:{template_id}")
         if replies_only
         else InlineKeyboardButton(text="✅ Использовать", callback_data=f"template:apply:{template_id}")
     )
@@ -102,7 +108,7 @@ def _template_edit_keyboard(template_id: int, *, replies_only: bool = False) -> 
 
 
 def _build_template_detail_text(template: dict) -> str:
-    name = _md(template.get("name") or "Без названия")
+    name = _md(str(template.get("name") or "Без названия")[:100])
     variants = template_text_variants(template)
     replies = _template_reply_list(template)
     replies_only = is_replies_only_template(template)
@@ -128,6 +134,7 @@ def _build_template_detail_text(template: dict) -> str:
             ),
         ),
     ])
+    parts.append("Режим DOM / HTTP выбирает администратор. При создании заказа используется текущая настройка сервиса.")
     return screen(f"Шаблон · {name}", *parts)
 
 
@@ -295,6 +302,11 @@ async def apply_task_template(callback: CallbackQuery):
         draft.reply_mode = template_settings.get("reply_mode", "A")
         draft.reply_like_target = str(template_settings.get("reply_like_target", "1") or "1")
         draft.reply_like_count = int(template_settings.get("reply_like_count", 0) or 0)
+        draft.replies = _template_reply_list(template)
+        draft.template_id = template_id
+        draft.template_name = str(template.get("name") or "Без названия")
+        draft.verify_main_visibility = template_settings.get("verify_main_visibility") is True
+        draft.verify_reply_visibility = template_settings.get("verify_reply_visibility") is True
         save_draft(callback.from_user.id, draft)
 
         await callback.message.edit_text(

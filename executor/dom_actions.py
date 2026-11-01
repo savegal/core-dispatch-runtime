@@ -4229,19 +4229,22 @@ async def open_comment_section(
         return max(0.0, deadline - _time.monotonic())
 
     async def _hard_bounded(awaitable: Any, timeout: float) -> Any:
-        task = asyncio.ensure_future(awaitable)
-        done, _pending = await asyncio.wait({task}, timeout=max(0.0, timeout))
-        if task in done:
-            return task.result()
-        task.cancel()
-
         def _consume_result(done_task: asyncio.Task) -> None:
             try:
                 done_task.exception()
             except (asyncio.CancelledError, Exception):
                 pass
 
+        task = asyncio.ensure_future(awaitable)
         task.add_done_callback(_consume_result)
+        try:
+            done, _pending = await asyncio.wait({task}, timeout=max(0.0, timeout))
+        except BaseException:
+            task.cancel()
+            raise
+        if task in done:
+            return task.result()
+        task.cancel()
         raise asyncio.TimeoutError
 
     # Do NOT run global dismiss_overlays() here.

@@ -57,15 +57,16 @@ def parse_proxy_line(line: str) -> dict | None:
     
     # Базовая проверка формата прокси
     # login:pass@ip:port или ip:port
-    proxy_pattern = r'^([^@:]+(:[^@]+)?@)?([\d.]+|[\w.-]+):(\d+)$'
-    if re.match(proxy_pattern, proxy_part):
+    from services.proxy_normalizer import ProxyRoute, ProxyRouteError
+    try:
+        route = ProxyRoute.parse(proxy_part)
         return {
-            "proxy": proxy_part,
+            "proxy": route.url,
             "rotation_url": rotation_url,
             "is_mobile": "Y" if rotation_url else "N"
         }
-    
-    return None
+    except ProxyRouteError:
+        return None
 
 
 @router.callback_query(F.data == "admin:proxies")

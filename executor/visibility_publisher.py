@@ -49,6 +49,7 @@ async def publish_visibility_http(db, account, video_url, text, *, correlation_i
         else:
             published = await schema._publish_reply_http_first_if_eligible(
                 session, text, parent_comment_id=str(parent.comment_id).strip(), correlation_id=correlation_id,
+                variant_index=variant_index,
             )
         if published is None:
             return None, session.disabled_reason or "http_publish_not_eligible"
@@ -81,8 +82,9 @@ async def publish_visibility_http(db, account, video_url, text, *, correlation_i
                 parent_target_id=schema._main_logical_target_id(parent),
                 **schema._publication_author_identity(account, session),
             )
+        await schema.record_publication("main" if parent is None else "reply", receipt)
         if on_published is not None:
-            on_published(receipt)  # Save the ID before any DB/cleanup await can fail.
+            await schema._call_publication_callback(on_published, receipt)  # Save the ID before any DB/cleanup await can fail.
         schema._register_runtime_success(db, account, scope=scope)
         await schema._persist_cookies_after_success(db, page, account, scope=scope, correlation_id=correlation_id)
         return receipt, None

@@ -5,6 +5,46 @@ from urllib.parse import urlencode
 import re
 import locale as system_locale
 import sys
+import random
+import string
+import threading
+
+
+from functools import lru_cache
+
+_VERIFY_FP_LOCK = threading.RLock()
+
+
+def generate_fallback_device_id(device_seed: str) -> str:
+    """Stable account-local fallback; an observed native web ID supersedes it."""
+    import hashlib
+    digest = hashlib.sha256(f"web-device-id-v1:{device_seed}".encode("utf-8")).digest()
+    return str(10**18 + int.from_bytes(digest, "big") % (9 * 10**18))
+
+
+def _new_verify_fp(rng) -> str:
+    timestamp = int(time.time() * 1000)
+    chars = "0123456789abcdefghijklmnopqrstuvwxyz"
+    encoded = ""
+    while timestamp:
+        encoded = chars[timestamp % 36] + encoded
+        timestamp //= 36
+    suffix = "".join(rng.choices(string.ascii_letters + string.digits, k=32))
+    return f"verify_{encoded}_{suffix}"
+
+
+@lru_cache(maxsize=4096)
+def _seeded_verify_fp(seed: str) -> str:
+    # Creation time is captured once. Native cookie/SSR tokens take priority;
+    # persistence of the selected fallback belongs to the account identity.
+    return _new_verify_fp(random.Random(seed))
+
+
+def generate_tiktok_verify_fp(seed: Optional[str] = None) -> str:
+    """Create a fallback with a current timestamp; reuse it for a seeded identity."""
+    with _VERIFY_FP_LOCK:
+        return _seeded_verify_fp(str(seed)) if seed else _new_verify_fp(random.SystemRandom())
+
 
 from config.settings import get_settings
 from executor.browser_identity import desktop_user_agent, sec_ch_ua
@@ -102,15 +142,9 @@ def _cookie_country(cookies: Dict[str, str]) -> Optional[str]:
     country = _country_code(cookies.get("store-region"))
     if country:
         return country
-    # IDC identifies a data centre, so use only recognisable regional labels
-    # as a last-resort hint; opaque/European labels do not identify a country.
-    idc = str(cookies.get("tt-target-idc") or "").lower()
-    if idc.startswith(("useast", "uswest")):
-        return "US"
-    if idc.startswith(("alisg", "sgp")) or idc == "sg":
-        return "SG"
-    country = _country_code(idc)
-    return country if country in COUNTRY_TO_LOCALE else None
+    # A service data centre is not the account/proxy's country. Do not turn
+    # alisg/eu/useast routing labels into a fabricated context geography.
+    return None
 
 
 def resolve_request_geo(
@@ -132,10 +166,35 @@ def resolve_request_geo(
         # country and cookies can still describe a previously used foreign IP.
         from tzlocal import get_localzone_name
         timezone_name = runtime.get("timezone") or runtime.get("tz_name") or get_localzone_name()
-        # A timezone is not evidence of country or IP. Use the browser's actual
-        # navigator.language, falling back to the OS when it is unavailable.
         language = _normalize_locale(runtime.get("browser_language") or _executor_language())
-        region = _extract_region_from_locale(language)
+
+        # Determine region in strict priority order:
+        # 1. ssr_region from TikTok server-side rehydration
+        region = _country_code(runtime.get("ssr_region"))
+        # 2. by timezone_name (Ukrainian timezones -> "UA")
+        if not region and str(timezone_name) in (
+            "Europe/Kyiv", "Europe/Kiev", "Europe/Uzhgorod", "Europe/Zaporozhye"
+        ):
+            region = "UA"
+        # 3. from locale region only if not contradicting timezone (do not use RU on non-Russian timezone)
+        if not region:
+            candidate_region = _extract_region_from_locale(language)
+            if candidate_region == "RU":
+                tz_lower = str(timezone_name or "").lower()
+                is_russian_tz = any(
+                    r_tz in tz_lower for r_tz in (
+                        "moscow", "samara", "yekaterinburg", "omsk", "krasnoyarsk",
+                        "irkutsk", "yakutsk", "vladivostok", "magadan", "sakhalin",
+                        "kamchatka", "anadyr", "kaliningrad", "russia"
+                    )
+                )
+                if is_russian_tz:
+                    region = "RU"
+                elif str(timezone_name) == "Asia/Jerusalem":
+                    region = "RU"
+            else:
+                region = candidate_region
+
         result = {"tz_name": str(timezone_name)}
         if language:
             result.update(app_language=language, browser_language=language, webcast_language=language)
@@ -149,7 +208,9 @@ def resolve_request_geo(
         or dynamic.get("browser_language") or dynamic.get("app_language")
         or cookies.get("locale") or cookies.get("i18next") or cookies.get("lang")
     )
-    runtime_region = _country_code(runtime.get("region") or dynamic.get("region"))
+    runtime_region = _country_code(
+        runtime.get("ssr_region") or runtime.get("region") or dynamic.get("region")
+    )
     locale_region = _extract_region_from_locale(language)
     proxy_region = _country_code(dynamic.get("proxy_country_code") or runtime.get("proxy_country_code"))
     fallback_region = _country_code(
@@ -160,12 +221,22 @@ def resolve_request_geo(
     # When stronger geo contradicts the browser's old/default country, replace
     # the entire fallback tuple rather than mixing unrelated country defaults.
     geo_override = proxy_region or (fallback_region if not runtime_region else None)
-    if geo_override and geo_override != (runtime_region or locale_region):
-        language = COUNTRY_TO_LOCALE.get(geo_override)
-        timezone_name = COUNTRY_TO_TIMEZONE.get(geo_override)
+    if runtime.get("context_geo_bound"):
+        # Navigator and Intl describe the already-created context. Query values
+        # must not invent a different language/timezone after navigation.
+        language = _normalize_locale(runtime.get("browser_language") or runtime.get("locale")) or language
+    elif geo_override and geo_override != (runtime_region or locale_region):
+        language = COUNTRY_TO_LOCALE.get(geo_override) or language
+        timezone_name = COUNTRY_TO_TIMEZONE.get(geo_override) or timezone_name
     elif region:
-        language = language or COUNTRY_TO_LOCALE.get(region)
-        timezone_name = timezone_name or COUNTRY_TO_TIMEZONE.get(region)
+        # If proxy is in use and the determined region (e.g. from ssr_region / runtime)
+        # contradicts the browser's initial language or timezone, synchronize them.
+        if locale_region and region != locale_region:
+            language = COUNTRY_TO_LOCALE.get(region) or language
+            timezone_name = COUNTRY_TO_TIMEZONE.get(region) or timezone_name
+        else:
+            language = language or COUNTRY_TO_LOCALE.get(region)
+            timezone_name = timezone_name or COUNTRY_TO_TIMEZONE.get(region)
 
     result = {}
     if region:
@@ -344,8 +415,8 @@ def _apply_runtime_overrides(
     explicit_root_referer = (dynamic_params or {}).get("root_referer")
     if current_url and not explicit_referer and params.get("referer", "").startswith("https://www.google.com"):
         params["referer"] = str(current_url)
-    if current_url and not explicit_root_referer and params.get("root_referer", "").startswith("https://www.google.com"):
-        params["root_referer"] = str(current_url)
+    if explicit_root_referer is None:
+        params["root_referer"] = str(runtime_profile.get("root_referer") or "")
 
 
 @dataclass
@@ -384,7 +455,7 @@ class RequestProfile:
                 "is_page_visible": "true",
                 "os": "windows",
                 "referer": "https://www.google.com/",
-                "root_referer": "https://www.google.com/",
+                "root_referer": "",
                 "screen_height": "1080",
                 "screen_width": "1920",
                 "user_is_login": "true",
@@ -431,7 +502,7 @@ class RequestProfile:
                 "is_page_visible": "true",
                 "os": "windows",
                 "referer": "https://www.google.com/",
-                "root_referer": "https://www.google.com/",
+                "root_referer": "",
                 "screen_height": "1080",
                 "screen_width": "1920",
                 "text_extra": "[]",
@@ -497,7 +568,7 @@ class RequestProfile:
                 "os": "windows",
                 "referer": "https://www.google.com/",
                 "reply_to_reply_id": "0",
-                "root_referer": "https://www.google.com/",
+                "root_referer": "",
                 "screen_height": "1080",
                 "screen_width": "1920",
                 "text_extra": "[]",
@@ -550,7 +621,9 @@ class RequestProfile:
                 params["odinId"] = odin_id
             if verify_fp and ("verifyFp" not in params or not params.get("verifyFp")):
                 params["verifyFp"] = verify_fp
-            if web_id_last_time and "WebIdLastTime" not in params:
+            runtime_device_id = (runtime_profile or {}).get("device_id")
+            device_changed = bool(runtime_device_id and str(runtime_device_id) != str(device_id or ""))
+            if web_id_last_time and not device_changed and "WebIdLastTime" not in params:
                 params["WebIdLastTime"] = web_id_last_time
             if include_ms_token and ms_token and "msToken" not in params:
                 params["msToken"] = ms_token
@@ -563,17 +636,54 @@ class RequestProfile:
 
         if runtime_profile:
             runtime_device_id = runtime_profile.get("device_id")
-            if runtime_device_id and ("device_id" not in params or not params.get("device_id")):
+            if runtime_device_id:
                 params["device_id"] = str(runtime_device_id)
             runtime_odin_id = runtime_profile.get("odin_id") or runtime_profile.get("odinId")
-            if runtime_odin_id and ("odinId" not in params or not params.get("odinId")):
+            if runtime_odin_id:
                 params["odinId"] = str(runtime_odin_id)
             runtime_web_id_last_time = runtime_profile.get("web_id_last_time") or runtime_profile.get("WebIdLastTime")
-            if runtime_web_id_last_time and "WebIdLastTime" not in params:
+            if runtime_web_id_last_time:
                 params["WebIdLastTime"] = str(runtime_web_id_last_time)
+            runtime_verify_fp = (
+                runtime_profile.get("verify_fp")
+                or runtime_profile.get("verifyFp")
+                or runtime_profile.get("s_v_web_id")
+            )
+            if runtime_verify_fp and ("verifyFp" not in params or not params.get("verifyFp")):
+                params["verifyFp"] = str(runtime_verify_fp)
 
-        if "WebIdLastTime" not in params:
-            params["WebIdLastTime"] = str(int(time.time()))
+        # Unknown creation times are omitted instead of being moved forward on
+        # every request. An observed cookie/SSR value is restored above.
+
+        if "verifyFp" not in params or not params.get("verifyFp"):
+            account_id = (runtime_profile or {}).get("account_id") or dynamic_params.get("account_id")
+            cached_vfp = None
+            if account_id:
+                try:
+                    from executor.http.playwright_http_client import get_cached_web_identity
+                    cached = get_cached_web_identity(account_id)
+                    cached_vfp = cached.get("verify_fp") or cached.get("s_v_web_id") or cached.get("verifyFp")
+                except Exception:
+                    pass
+
+            vfp = cached_vfp
+            if not vfp:
+                seed = (runtime_profile or {}).get("device_seed")
+                if not seed and account_id:
+                    seed = f"desktop-hardware-v1:{account_id}"
+                elif not seed and cookies:
+                    for k in ("sessionid", "sid_tt", "sessionid_ss", "uid_tt", "sid_guard", "device_id", "odin_tt"):
+                        if cookies.get(k):
+                            seed = f"verify_fp:{k}:{cookies[k]}"
+                            break
+                vfp = generate_tiktok_verify_fp(seed)
+            params["verifyFp"] = vfp
+            if account_id:
+                try:
+                    from executor.http.playwright_http_client import cache_web_identity
+                    cache_web_identity(account_id, {"verify_fp": vfp, "s_v_web_id": vfp})
+                except Exception:
+                    pass
 
         if not include_ms_token:
             params = {key: value for key, value in params.items() if key.lower().replace("_", "") != "mstoken"}
@@ -638,6 +748,14 @@ class RequestProfile:
         )
         return self.build_url_from_params(params)
 
+    def build_browser_headers(self, cookies: Optional[Dict[str, str]] = None) -> Dict[str, str]:
+        """Only application-owned headers; the live browser owns UA/geo/cookies."""
+        headers = {key.lower(): value for key, value in self.static_headers.items()
+                   if key.lower() in {"accept", "tt-csrf-token", "content-type"}}
+        if cookies and cookies.get("tt_csrf_token"):
+            headers["tt-csrf-token"] = cookies["tt_csrf_token"]
+        return headers
+
     def build_headers(
         self,
         cookies: Optional[Dict[str, str]] = None,
@@ -659,6 +777,8 @@ class RequestProfile:
             or self.static_params.get("browser_version")
             or ""
         ).strip()
+        if runtime_user_agent:
+            headers["user-agent"] = str(runtime_user_agent)
 
         if runtime_profile:
             current_url = runtime_profile.get("current_url")

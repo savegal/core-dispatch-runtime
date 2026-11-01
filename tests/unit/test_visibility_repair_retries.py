@@ -82,11 +82,11 @@ def repair(request, monkeypatch):
         state.published = True
         if mode == "main":
             receipt = schema.PublishedMain("hello", NEW, True, False, "http", account.id, f"user{account.id}")
-            kwargs["on_published"](receipt)
+            await kwargs["on_published"](receipt)
             return [receipt], None
         receipt = schema.ReplyOutcome("hello", 1, "parent", PARENT, True, "http", None, account.id,
                                       reply_comment_id=NEW, publication_attempted=True)
-        kwargs["on_submitted_outcome"](receipt)
+        await kwargs["on_submitted_outcome"](receipt)
         return schema.ReplyAttemptResult(replies=[receipt])
 
     state.publish = AsyncMock(side_effect=publish)
@@ -151,6 +151,7 @@ async def test_browser_retry_budget_remains_six_after_preflight_skips(repair):
 
 async def test_dead_candidates_stop_at_separate_account_limit(repair, monkeypatch):
     monkeypatch.setattr(schema._settings, "MAX_RETRY_ACCOUNTS", 10)
+    monkeypatch.setattr(schema._settings, "MAX_ACCOUNT_CANDIDATES", 10)
     repair.dead.update(range(20, 60))
     report = await repair.run()
     assert report["status"] == "unconfirmed"

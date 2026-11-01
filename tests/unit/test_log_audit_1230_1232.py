@@ -32,7 +32,7 @@ async def test_uid_only_passport_is_cached_without_becoming_a_username(monkeypat
     assert await schema._preflight_cookie_http_gate(None, account, correlation_id="fixture", phase="reply_visibility_pre_browser") is None
     assert schema._get_cached_http_preflight_user_id(account) == "123456789"
     assert schema._get_cached_http_preflight_username(account) is None
-    other_instance = SimpleNamespace(id=1)
+    other_instance = SimpleNamespace(id=1, cookies=account.cookies, cookie_file=None)
     assert schema._get_cached_http_preflight_user_id(other_instance) == "123456789"
     schema._forget_http_preflight_valid(account)
     assert schema._get_cached_http_preflight_user_id(account) is None
@@ -152,7 +152,7 @@ async def test_get_retries_use_clean_urls_live_cookies_and_refresh_scan_batch(mo
         {"name": "msToken", "value": f"token-{version}", "domain": ".tiktok.com"},
         {"name": "WebIdLastTime", "value": f"time-{version}", "domain": ".tiktok.com"},
         {"name": "X-Bogus", "value": "stale-cookie-signature", "domain": ".tiktok.com"},
-    ] for version in (1, 2, 3)])
+    ] for version in (1, 2, 3, 4)])
     page = SimpleNamespace(url=URL, context=SimpleNamespace(cookies=cookies), evaluate=AsyncMock(side_effect=evaluate))
     report = (await main_visibility.scan_main_comment_ids(page, VIDEO, [CID]) if mode == "main"
               else await reply_visibility.scan_reply_comment_ids(page, VIDEO, PARENT, [CID]))
@@ -160,12 +160,12 @@ async def test_get_retries_use_clean_urls_live_cookies_and_refresh_scan_batch(mo
     from urllib.parse import parse_qs, urlparse
     queries = [parse_qs(urlparse(url).query) for url in urls]
     assert len(queries) == 4 and not manual_sign_calls
-    for query, version, cursor in zip(queries, (1, 2, 3, 3), (0, 0, 0, 20)):
+    for query, version, cursor in zip(queries, (1, 2, 3, 4), (0, 0, 0, 20)):
         assert query["msToken"] == [f"token-{version}"]
         assert query["WebIdLastTime"] == [f"time-{version}"]
         assert query["cursor"] == [str(cursor)]
         assert not {"X-Bogus", "X-Gnarly", "a_bogus"} & query.keys()
-    assert cookies.await_count == 3 and runtime.await_count == 1
+    assert cookies.await_count == 4 and runtime.await_count == 1
 
 
 async def test_wire_evidence_survives_stripped_response_url_and_ignores_other_requests():

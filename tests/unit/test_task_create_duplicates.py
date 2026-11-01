@@ -68,3 +68,35 @@ async def test_same_request_key_still_reuses_one_order(order_db, kind):
     assert repeat['task_id'] == first['task_id']
     assert repeat['idempotency_reuse'] is True
     assert len((await order_db.execute(select(Task))).scalars().all()) == 1
+
+
+@pytest.mark.asyncio
+async def test_partial_retry_api_transfers_owned_receipts_and_reuses_one_child(order_db):
+    first = await _create(order_db, 'engagement_only')
+    original = await order_db.get(Task, first['task_id'])
+    url = original.video_urls[0]
+    parent = '7641761192486194454'
+    original.status = 'error'
+    original.settings = {**original.settings, 'url_results': {url: {
+        'status': 'fail', 'comment_id': parent, 'engagement': {'replies': {'expected': 3, 'items': [
+            {'variant_index': 1, 'text': 'one', 'reply_id': '7641761192486194501',
+             'parent_comment_id': parent, 'success': True, 'network_confirmed': True},
+            {'variant_index': 2, 'text': 'two', 'parent_comment_id': parent,
+             'publication_attempted': False, 'error': 'http_preflight:inconclusive'},
+            {'variant_index': 3, 'text': 'three', 'reply_id': '7641761192486194503',
+             'parent_comment_id': parent, 'success': True, 'network_confirmed': True}]}}}}}
+    await order_db.commit()
+    payload = tasks.TaskCreate(user_id=1, main_comment='same comment',
+        text_variants=['same comment'] * 3, video_urls=[url], kind='engagement_only',
+        reply1='one', reply2='two', reply3='three', engagement_comment_text='anchor',
+        settings={'retry_of_task_id': original.id, '_reply_resume': {'forged': True}})
+    request = Request({'type': 'http', 'headers': []})
+    create = inspect.unwrap(tasks.create_task)
+    result = await create(request=request, task_data=payload, db=order_db, auth_user_id=1)
+    child = await order_db.get(Task, result['task_id'])
+    plan = child.settings['_reply_resume'][url]
+    assert [item['variant_index'] for item in plan['actions']] == [2]
+    assert plan['source_task_id'] == original.id
+    assert 'forged' not in child.settings['_reply_resume']
+    again = await create(request=request, task_data=payload, db=order_db, auth_user_id=1)
+    assert again['task_id'] == child.id

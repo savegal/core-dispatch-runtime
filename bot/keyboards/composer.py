@@ -1,6 +1,5 @@
 from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton
 from bot.services.drafts import Draft
-from bot.services.formatting import markdown_inline_code
 
 
 def get_composer_keyboard(draft: Draft) -> InlineKeyboardMarkup:
@@ -28,30 +27,15 @@ def get_composer_keyboard(draft: Draft) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=keyboard)
 
 
-def format_composer_summary(draft: Draft, *, likes_label: str = "выключены") -> str:
+def format_composer_summary(draft: Draft, *, likes_label: str = "выключены", transport_label: str | None = None) -> str:
     """Форматирует сводку композера."""
-    links_count = len(draft.links)
-    variants_count = len(draft.text_variants) if draft.text_variants else (1 if draft.comment else 0)
-    pool_label = "👤 Мои аккаунты" if draft.account_pool_mode == "personal" else "🌐 Общий пул"
-
-    reply_likes_str = "выключены"
-    if draft.reply_like_count > 0 and str(draft.reply_like_target).lower() not in {"none", "0", "off"}:
-        target_display = "все" if draft.reply_like_target == "all" else f"ответ {draft.reply_like_target}"
-        reply_likes_str = f"{target_display} ({draft.reply_like_count} шт)"
-
-    text = (
-        "*Новый заказ*\n\n"
-        f"🔗 Видео: *{links_count}*\n"
-        f"💬 Вариантов комментария: *{variants_count}*\n"
-        f"❤️ Лайки: *{likes_label}*\n"
-        f"Пул: *{pool_label}*"
+    from bot.services.order_creation_ui import build_preview_text
+    from bot.services.likes_ui import format_reply_likes_label
+    text = build_preview_text(
+        links=draft.links, text_variants=draft.text_variants or ([draft.comment] if draft.comment else []),
+        replies=dict(enumerate(draft.replies, 1)), likes_label=likes_label,
+        reply_likes_label=format_reply_likes_label(draft.reply_like_target, draft.reply_like_count),
+        template_name=draft.template_name, transport_label=transport_label,
     )
-    if reply_likes_str != "выключены":
-        text += f"\n❤️ Лайки на ответ: *{reply_likes_str}*"
-
-    if draft.comment:
-        raw_preview = draft.comment.replace("\n", " ")
-        preview = raw_preview[:80] + "..." if len(raw_preview) > 80 else raw_preview
-        text += f"\n\n*Текст*\n{markdown_inline_code(preview)}"
-
+    text += "\n\nПул: *" + ("Мои аккаунты" if draft.account_pool_mode == "personal" else "Общий пул") + "*"
     return text

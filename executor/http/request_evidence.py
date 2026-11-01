@@ -6,6 +6,11 @@ from urllib.parse import parse_qs, urlparse
 SECURITY_KEYS = ("X-Bogus", "X-Gnarly", "a_bogus", "msToken")
 
 
+def has_request_signature(presence):
+    """Read-path readiness signal; presence does not prove cryptographic validity."""
+    return isinstance(presence, dict) and any(presence.get(key) for key in ("X-Bogus", "a_bogus"))
+
+
 def signature_presence(url):
     query = parse_qs(urlparse(str(url or "")).query)
     return {key: bool(query.get(key)) for key in SECURITY_KEYS}

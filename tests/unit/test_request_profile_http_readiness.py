@@ -161,7 +161,7 @@ def test_runtime_profile_overrides_headers_and_query_shape():
         runtime_profile=runtime_profile,
     )
 
-    assert "user-agent" not in headers
+    assert headers["user-agent"] == runtime_profile["user_agent"]
     assert headers["accept-language"].startswith("en-US")
     assert headers["sec-ch-ua-mobile"] == "?0"
     assert headers["referer"] == runtime_profile["current_url"]
@@ -198,8 +198,8 @@ def test_request_profiles_do_not_invent_geo_without_runtime_or_cookie_evidence(f
 
 @pytest.mark.unit
 @pytest.mark.parametrize("cookies, region, language, timezone", [
-    ({"tt-target-idc": "useast5"}, "US", "en-US", "America/New_York"),
-    ({"tt-target-idc": "alisg"}, "SG", "en-SG", "Asia/Singapore"),
+    ({"store-region": "US", "tt-target-idc": "useast5"}, "US", "en-US", "America/New_York"),
+    ({"store-region": "SG", "tt-target-idc": "alisg"}, "SG", "en-SG", "Asia/Singapore"),
     ({"store-region": "pl", "tt-target-idc": "useast2a"}, "PL", "pl-PL", "Europe/Warsaw"),
     ({"locale": "uk_UA"}, "UA", "uk-UA", "Europe/Kyiv"),
 ])
@@ -271,7 +271,7 @@ def test_legacy_endpoints_use_the_same_runtime_geo_resolution(endpoint):
 @pytest.mark.unit
 @pytest.mark.parametrize("endpoint", ["publish", "digg"])
 def test_legacy_endpoints_use_cookie_fallback_without_geo_hardcodes(endpoint):
-    kwargs = {"cookies": {"tt-target-idc": "alisg"}}
+    kwargs = {"cookies": {"store-region": "SG", "tt-target-idc": "alisg"}}
     url = TikTokEndpoints.comment_publish("123", "hello", **kwargs) if endpoint == "publish" else TikTokEndpoints.comment_digg("123", "456", **kwargs)
     query = parse_qs(urlparse(url).query)
     assert query["region"] == ["SG"]
@@ -286,7 +286,7 @@ def test_build_headers_keeps_sec_ch_headers_consistent_with_explicit_user_agent(
 
     headers = profile.build_headers(cookies={}, user_agent=explicit_user_agent)
 
-    assert "user-agent" not in headers
+    assert headers["user-agent"] == explicit_user_agent
     assert 'v="146"' in headers["sec-ch-ua"]
     assert headers["sec-ch-ua-platform"] == '"Windows"'
 

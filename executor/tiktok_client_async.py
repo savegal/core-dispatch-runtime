@@ -663,72 +663,9 @@ def _get_cookies_for_account(account: Account) -> str:
     raise TikTokClientError(f"Account {account.id} has no cookies")
 
 
-def _normalize_proxy_for_playwright(proxy_str: Optional[str]) -> Optional[Dict[str, str]]:
-    """
-    Нормализует строку прокси в формат для Playwright.
-    
-    Поддерживает форматы:
-    - http://user:pass@host:port
-    - socks5://user:pass@host:port
-    - host:port (без протокола)
-    
-    Returns:
-        dict в формате Playwright или None
-    """
-    if not proxy_str or not proxy_str.strip():
-        return None
-    
-    proxy_str = proxy_str.strip()
-    
-    # Если есть протокол
-    if '://' in proxy_str:
-        if proxy_str.startswith('http://') or proxy_str.startswith('https://'):
-            # HTTP прокси
-            # Извлекаем user:pass@host:port
-            parts = proxy_str.split('://', 1)[1]
-            if '@' in parts:
-                auth, server = parts.rsplit('@', 1)
-                if ':' in auth:
-                    username, password = auth.split(':', 1)
-                    return {
-                        "server": f"http://{server}",
-                        "username": username,
-                        "password": password
-                    }
-            return {"server": proxy_str}
-        
-        elif proxy_str.startswith('socks5://'):
-            # SOCKS5 прокси
-            parts = proxy_str.split('://', 1)[1]
-            if '@' in parts:
-                auth, server = parts.rsplit('@', 1)
-                if ':' in auth:
-                    username, password = auth.split(':', 1)
-                    return {
-                        "server": f"socks5://{server}",
-                        "username": username,
-                        "password": password
-                    }
-            return {"server": proxy_str}
-    
-    # Auth without a scheme is treated as an HTTP proxy. SOCKS proxies must be
-    # explicit: socks5://user:pass@host:port.
-    if '@' in proxy_str:
-        auth, server = proxy_str.rsplit('@', 1)
-        if ':' in auth and ':' in server:
-            username, password = auth.split(':', 1)
-            return {
-                "server": f"http://{server}",
-                "username": username,
-                "password": password
-            }
-
-    # Простой формат host:port
-    if ':' in proxy_str:
-        return {"server": f"http://{proxy_str}"}
-    
-    return None
-
+def _normalize_proxy_for_playwright(proxy_str):
+    from services.proxy_normalizer import ProxyRoute
+    return ProxyRoute.parse(proxy_str).playwright() if str(proxy_str or '').strip() else None
 
 async def quick_validate_account(account: Account, timeout: int | None = None) -> bool:
     """
@@ -905,7 +842,8 @@ async def quick_validate_account(account: Account, timeout: int | None = None) -
             try:
                 if page:
                     await asyncio.sleep(0.1)
-                    await page.close()
+                    from executor.page_utils import safe_close_page
+                    await safe_close_page(page)
             except Exception as e:
                 logger.debug(f"[VALIDATE] Error closing page: {e}")
     
@@ -1169,7 +1107,7 @@ async def post_comment(account: Account, video_url: str, text: str, task_id: int
             )
         
         # Проверяем, что мы на странице видео (должен быть /video/ в URL)
-        if '/video/' not in current_url and '/@' not in current_url:
+        if not any(marker in current_url for marker in ('/video/', '/photo/', '/@')):
             logger.warning(f"[COMMENT] ⚠️ Not on video page: {page.url[:100]}")
             screenshot_path, html_path = await _save_diagnostic(page, account, task_id, "navigation_error")
             return CommentResult.error(
@@ -2992,7 +2930,6 @@ async def like_comment(account: Account, comment_id: str, task_id: int | None = 
                 el => {
                     // Проверяем различные индикаторы лайка
                     const ariaPressed = el.getAttribute('aria-pressed');
-                    const className = el.className || '';
                     const ariaLabel = el.getAttribute('aria-label') || '';
                     
                     // Если aria-pressed="true" - уже лайкнут
@@ -3001,7 +2938,7 @@ async def like_comment(account: Account, comment_id: str, task_id: int | None = 
                     }
                     
                     // Если в классе есть "liked" или "active" - уже лайкнут
-                    if (className.includes('liked') || className.includes('active')) {
+                    if (el.classList.contains('liked') || el.classList.contains('active')) {
                         return true;
                     }
                     
@@ -3081,12 +3018,10 @@ async def like_comment(account: Account, comment_id: str, task_id: int | None = 
                 is_liked_now = is_liked_now == 'true'
             except TargetClosedError:
                 log_step("LIKE_VERIFICATION_ERROR", {"error": "TargetClosedError during evaluation"})
-                # Если клик прошел, но проверка не удалась - считаем успехом (клик был выполнен)
-                return True
+                return False
             except Exception as eval_error:
                 logger.debug(f"[LIKE] Error evaluating button state: {eval_error}")
-                # Если клик прошел, но проверка не удалась - считаем успехом (клик был выполнен)
-                return True
+                return False
             
             if is_liked_now:
                 log_step("LIKE_SUCCESS")
@@ -3105,8 +3040,7 @@ async def like_comment(account: Account, comment_id: str, task_id: int | None = 
                     is_liked_now = await like_button.get_attribute('aria-pressed')
                     is_liked_now = is_liked_now == 'true'
                 except (TargetClosedError, Exception):
-                    # Если клик прошел, но проверка не удалась - считаем успехом
-                    return True
+                    return False
                 
                 if is_liked_now:
                     log_step("LIKE_SUCCESS_DELAYED")
@@ -3121,21 +3055,17 @@ async def like_comment(account: Account, comment_id: str, task_id: int | None = 
                         f"[LIKE] Verification failed: {task_info}account_id={account.id}, "
                         f"comment_id={comment_id[:20]} - button state did not change"
                     )
-                    # ИСПРАВЛЕНО: Если клик прошел, но состояние не изменилось - все равно считаем успехом
-                    # (возможно, TikTok еще не обновил UI, но лайк поставлен)
-                    return True
+                    return False
                     
         except TargetClosedError as e:
             log_step("LIKE_VERIFICATION_ERROR", {"error": "TargetClosedError", "details": str(e)[:100]})
-            # Если клик прошел, но проверка не удалась - считаем успехом (клик был выполнен)
-            return True
+            return False
         except Exception as verify_error:
             logger.warning(
                 f"[LIKE] Verification error: {task_info}account_id={account.id}, "
                 f"error={str(verify_error)[:200]}"
             )
-            # Если клик прошел, но проверка не удалась - считаем успехом (клик был выполнен)
-            return True
+            return False
         
     except Exception as e:
         error_msg = str(e)
@@ -3678,139 +3608,23 @@ async def get_video_comments(
 async def check_shadow_ban(
     account: Account,
     video_urls: List[str],
-    task_id: int | None = None
+    task_id: int | None = None,
 ) -> dict:
-    """
-    Проверяет наличие shadow ban на аккаунте.
-    
-    Shadow ban - это скрытая блокировка, при которой комментарии публикуются,
-    но не видны другим пользователям. Функция проверяет видимость комментариев
-    с других аккаунтов и определяет вероятность shadow ban.
-    
-    Args:
-        account: аккаунт для проверки
-        video_urls: Список URL видео, где были оставлены комментарии (для проверки)
-        task_id: опциональный ID задачи (для логирования)
-        
-    Returns:
-        dict: {
-            "is_shadow_banned": bool,  # Есть ли shadow ban
-            "confidence": float,  # Уверенность в результате (0.0 - 1.0)
-            "details": str,  # Детали проверки
-            "recommendations": List[str],  # Рекомендации по исправлению
-            "checked_comments": int,  # Количество проверенных комментариев
-            "visible_comments": int,  # Количество видимых комментариев
-            "hidden_comments": int  # Количество скрытых комментариев
-        }
+    """Return an inconclusive result until independent comment receipts exist.
+
+    Video availability is not comment visibility. A valid diagnosis requires
+    known comment IDs and an independent observer; this legacy API has neither.
+    ``is_shadow_banned`` is None when no such evidence was collected.
     """
     _validate_account(account)
-    
     if not video_urls:
         raise ValueError("video_urls list cannot be empty")
-    
-    task_info = f"task_id={task_id}, " if task_id else ""
-    
-    logger.info(
-        f"[SHADOW_BAN] Starting check: {task_info}account_id={account.id}, "
-        f"videos_count={len(video_urls)}"
-    )
-    
-    result = {
-        "is_shadow_banned": False,
-        "confidence": 0.0,
-        "details": "",
-        "recommendations": [],
-        "checked_comments": 0,
-        "visible_comments": 0,
-        "hidden_comments": 0
+    logger.info("[SHADOW_BAN] Inconclusive: account_id=%s task_id=%s independent comment evidence unavailable",
+                account.id, task_id)
+    return {
+        "status": "inconclusive", "reason": "independent_visibility_required",
+        "is_shadow_banned": None, "confidence": 0.0,
+        "details": "Нет независимой проверки конкретных комментариев; диагноз не установлен.",
+        "recommendations": ["Проверьте известные ID комментариев независимым аккаунтом"],
+        "checked_comments": 0, "visible_comments": 0, "hidden_comments": 0,
     }
-    
-    # Для проверки shadow ban нужен другой аккаунт (верификатор)
-    # В реальной реализации нужно получать верификатор из БД
-    # Здесь упрощенная версия - используем тот же аккаунт, что менее точно
-    
-    checked_count = 0
-    visible_count = 0
-    hidden_count = 0
-    
-    # Проверяем ограниченное количество видео для скорости
-    videos_to_check = min(len(video_urls), 5)  # Максимум 5 видео для проверки
-    
-    for video_url in video_urls[:videos_to_check]:
-        try:
-            # Попытка найти комментарии аккаунта на видео
-            # В реальной реализации здесь должна быть логика поиска комментариев аккаунта
-            # через другой верификатор-аккаунт
-            
-            checked_count += 1
-            
-            # Упрощенная проверка: если видео недоступно, пропускаем
-            availability = await check_video_availability(account, video_url, task_id)
-            if not availability.get("available"):
-                continue
-            
-            # В реальной реализации здесь должен быть поиск комментариев
-            # аккаунта через verify_account и проверка их видимости
-            # Для демонстрации используем упрощенную логику
-            
-        except Exception as e:
-            logger.debug(f"[SHADOW_BAN] Error checking video {video_url}: {e}")
-            continue
-    
-    result["checked_comments"] = checked_count
-    result["visible_comments"] = visible_count
-    result["hidden_comments"] = hidden_count
-    
-    # Определяем вероятность shadow ban
-    if checked_count == 0:
-        result["confidence"] = 0.0
-        result["details"] = "Не удалось проверить комментарии (видео недоступны или не найдены)"
-        result["recommendations"].append("Попробуйте проверить другие видео")
-    else:
-        visibility_rate = visible_count / checked_count if checked_count > 0 else 0
-        
-        if visibility_rate < 0.3:  # Меньше 30% видимых - вероятен shadow ban
-            result["is_shadow_banned"] = True
-            result["confidence"] = 1.0 - visibility_rate
-            result["details"] = (
-                f"Обнаружена низкая видимость комментариев: "
-                f"{visible_count}/{checked_count} видны ({visibility_rate * 100:.1f}%). "
-                f"Возможен shadow ban."
-            )
-            result["recommendations"].extend([
-                "Снизьте частоту комментирования",
-                "Используйте более разнообразные тексты комментариев",
-                "Увеличьте задержки между действиями",
-                "Проверьте качество прокси и геолокацию"
-            ])
-        elif visibility_rate < 0.7:  # 30-70% видимых - подозрительно
-            result["is_shadow_banned"] = False
-            result["confidence"] = 0.5
-            result["details"] = (
-                f"Частичная видимость комментариев: "
-                f"{visible_count}/{checked_count} видны ({visibility_rate * 100:.1f}%). "
-                f"Возможны проблемы с модерацией или временные ограничения."
-            )
-            result["recommendations"].extend([
-                "Мониторьте видимость комментариев",
-                "Используйте более естественные тексты",
-                "Избегайте спам-паттернов"
-            ])
-        else:  # Больше 70% видимых - все в порядке
-            result["is_shadow_banned"] = False
-            result["confidence"] = 0.9
-            result["details"] = (
-                f"Комментарии видимы: "
-                f"{visible_count}/{checked_count} видны ({visibility_rate * 100:.1f}%). "
-                f"Shadow ban не обнаружен."
-            )
-            result["recommendations"].append("Продолжайте работать в том же режиме")
-    
-    logger.info(
-        f"[SHADOW_BAN] Result: {task_info}account_id={account.id}, "
-        f"is_shadow_banned={result['is_shadow_banned']}, "
-        f"confidence={result['confidence']:.2f}"
-    )
-    
-    return result
-

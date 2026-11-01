@@ -31,16 +31,20 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
-import re
+import math
 import time
+import threading
+import uuid
+import weakref
+from executor.cache_lock import synchronized
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
+from services.mention_policy import find_mentions, MAX_MENTIONS_PER_COMMENT, order_mention_identities
 
 logger = logging.getLogger("executor.http.mentions")
 
 # TikTok unique_id: latin letters, digits, "_" and "."; 2..24 chars.
 # The negative lookbehind keeps e-mails ("a@b.c") and "@@x" out.
-_MENTION_RE = re.compile(r"(?<![\w@.])@([A-Za-z0-9_.]{2,24})")
 
 _POSITIVE_TTL_SECONDS = 24 * 3600
 _NEGATIVE_TTL_SECONDS = 10 * 60
@@ -48,10 +52,24 @@ _MAX_CACHE_SIZE = 5000
 _DISK_CACHE_PATH = Path("data/mention_cache.json")
 
 _MENTION_CACHE: Dict[str, Tuple[float, Optional[Dict[str, str]]]] = {}
-_MENTION_LOCKS: Dict[str, asyncio.Lock] = {}
-_LOCK_GLOBAL = asyncio.Lock()
+_MENTION_LOCKS = weakref.WeakKeyDictionary()
+_LOCK_GLOBAL = threading.RLock()
+_DISK_WRITE_LOCK = threading.Lock()
 
-MAX_MENTIONS_PER_COMMENT = 3
+
+
+def _validated_user_info(username, data):
+    if not isinstance(data, dict):
+        return None
+    raw_uid, raw_sec = data.get("user_id"), data.get("sec_uid")
+    if isinstance(raw_uid, bool) or not isinstance(raw_uid, (str, int)) or not isinstance(raw_sec, str):
+        return None
+    uid, sec = str(raw_uid).strip(), raw_sec.strip()
+    canonical = data.get("unique_id")
+    if (not uid.isascii() or not uid.isdigit() or not uid.strip("0") or not sec
+            or not isinstance(canonical, str) or canonical.lower() != username.lower()):
+        return None
+    return {"user_id": uid, "sec_uid": sec, "unique_id": canonical}
 
 
 def _load_disk_cache() -> None:
@@ -60,30 +78,45 @@ def _load_disk_cache() -> None:
         if _DISK_CACHE_PATH.exists():
             with open(_DISK_CACHE_PATH, "r", encoding="utf-8") as f:
                 loaded = json.load(f)
-            now = time.monotonic()
+            if not isinstance(loaded, dict):
+                return
+            now = time.time()
             count = 0
             for u, item in loaded.items():
-                if isinstance(item, dict) and item.get("user_id") and item.get("sec_uid"):
-                    _MENTION_CACHE[u.lower()] = (now + _POSITIVE_TTL_SECONDS, item)
+                if (isinstance(u, str) and isinstance(item, dict) and item.get("user_id") and item.get("sec_uid")
+                        and type(item.get("expires_at")) in (int, float)
+                        and math.isfinite(item["expires_at"]) and item["expires_at"] > now):
+                    with _LOCK_GLOBAL:
+                        _MENTION_CACHE[u.lower()] = (item["expires_at"], {k: v for k, v in item.items() if k != "expires_at"})
+                        while len(_MENTION_CACHE) > _MAX_CACHE_SIZE:
+                            _MENTION_CACHE.pop(next(iter(_MENTION_CACHE)))
                     count += 1
+                    if count >= _MAX_CACHE_SIZE:
+                        break
             if count > 0:
                 logger.info("[MENTION] Loaded %d cached mentions from %s", count, _DISK_CACHE_PATH)
     except Exception as exc:
         logger.warning("[MENTION] Failed to load disk cache: %s", exc)
 
 
-def _save_disk_cache() -> None:
+def _save_disk_cache(path: Optional[Path] = None) -> None:
     """Atomically write positive cached entries to data/mention_cache.json."""
+    with _DISK_WRITE_LOCK:
+        _write_disk_cache(path or _DISK_CACHE_PATH)
+
+
+def _write_disk_cache(path: Path) -> None:
     try:
-        _DISK_CACHE_PATH.parent.mkdir(parents=True, exist_ok=True)
-        serializable = {
-            k: v for k, (exp, v) in _MENTION_CACHE.items()
-            if v and v.get("user_id") and v.get("sec_uid")
-        }
-        temp_file = _DISK_CACHE_PATH.with_suffix(".tmp")
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with _LOCK_GLOBAL:
+            serializable = {
+                k: {**v, "expires_at": exp} for k, (exp, v) in _MENTION_CACHE.items()
+                if exp > time.time() and v and v.get("user_id") and v.get("sec_uid")
+            }
+        temp_file = path.with_suffix(f".{uuid.uuid4().hex}.tmp")
         with open(temp_file, "w", encoding="utf-8") as f:
             json.dump(serializable, f, ensure_ascii=False, indent=2)
-        temp_file.replace(_DISK_CACHE_PATH)
+        temp_file.replace(path)
     except Exception as exc:
         logger.warning("[MENTION] Failed to save disk cache: %s", exc)
 
@@ -94,26 +127,13 @@ _load_disk_cache()
 
 async def _get_username_lock(username: str) -> asyncio.Lock:
     key = username.lower()
-    async with _LOCK_GLOBAL:
-        if key not in _MENTION_LOCKS:
-            _MENTION_LOCKS[key] = asyncio.Lock()
-        return _MENTION_LOCKS[key]
-
-
-def find_mentions(text: str) -> List[Tuple[int, int, str]]:
-    """Return ``(py_start, py_end, username)`` for each ``@username`` in text."""
-    found: List[Tuple[int, int, str]] = []
-    for match in _MENTION_RE.finditer(text or ""):
-        username = match.group(1)
-        # A trailing period usually ends the sentence ("...у @user."), and
-        # TikTok usernames cannot end with ".".
-        stripped = username.rstrip(".")
-        if len(stripped) < 2:
-            continue
-        start = match.start()
-        end = start + 1 + len(stripped)
-        found.append((start, end, stripped))
-    return found
+    with _LOCK_GLOBAL:
+        locks = _MENTION_LOCKS.setdefault(asyncio.get_running_loop(), weakref.WeakValueDictionary())
+        lock = locks.get(key)
+        if lock is None:
+            lock = asyncio.Lock()
+            locks[key] = lock
+        return lock
 
 
 def utf16_offset(text: str, py_index: int) -> int:
@@ -141,21 +161,23 @@ def build_text_extra(text: str, resolved: Dict[str, Dict[str, str]]) -> List[Dic
     return entries
 
 
+@synchronized(_LOCK_GLOBAL)
 def _cache_get(username: str) -> Tuple[bool, Optional[Dict[str, str]]]:
     item = _MENTION_CACHE.get(username.lower())
     if not item:
         return False, None
     expires_at, value = item
-    if time.monotonic() > expires_at:
+    if time.time() > expires_at:
         _MENTION_CACHE.pop(username.lower(), None)
         return False, None
-    return True, value
+    return True, dict(value) if value is not None else None
 
 
+@synchronized(_LOCK_GLOBAL)
 def _cache_put(username: str, value: Optional[Dict[str, str]]) -> None:
     # Memory safeguard: evict expired or oldest items if cache grows large
     if len(_MENTION_CACHE) >= _MAX_CACHE_SIZE:
-        now = time.monotonic()
+        now = time.time()
         expired = [k for k, (exp, _) in _MENTION_CACHE.items() if exp < now]
         for k in expired:
             _MENTION_CACHE.pop(k, None)
@@ -163,7 +185,35 @@ def _cache_put(username: str, value: Optional[Dict[str, str]]) -> None:
             for k in list(_MENTION_CACHE.keys())[:1000]:
                 _MENTION_CACHE.pop(k, None)
     ttl = _POSITIVE_TTL_SECONDS if value else _NEGATIVE_TTL_SECONDS
-    _MENTION_CACHE[username.lower()] = (time.monotonic() + ttl, value)
+    _MENTION_CACHE[username.lower()] = (time.time() + ttl, dict(value) if value is not None else None)
+
+
+def validate_text_extra(text: str, text_extra: Any) -> list[dict]:
+    """Every mention occurrence must map to exactly one valid UTF-16 entity."""
+    mentions = find_mentions(text)
+    if len(mentions) > MAX_MENTIONS_PER_COMMENT:
+        raise ValueError(f"Too many mentions: maximum {MAX_MENTIONS_PER_COMMENT}")
+    try:
+        entries = json.loads(text_extra) if isinstance(text_extra, str) else text_extra
+    except (ValueError, TypeError) as exc:
+        raise ValueError("Invalid text_extra JSON") from exc
+    if not isinstance(entries, list):
+        raise ValueError("text_extra must be an array")
+    spans = {(utf16_offset(text, start), utf16_offset(text, end)) for start, end, _ in mentions}
+    actual = set()
+    for entry in entries:
+        if not isinstance(entry, dict) or type(entry.get("type")) is not int or entry["type"] != 0:
+            raise ValueError("Invalid mention entity type")
+        start, end = entry.get("start"), entry.get("end")
+        if type(start) is not int or type(end) is not int or (start, end) not in spans or (start, end) in actual:
+            raise ValueError("Invalid or duplicate mention offsets")
+        uid = str(entry.get("user_id") or "").strip()
+        if not uid.isascii() or not uid.isdigit() or int(uid) <= 0 or not str(entry.get("sec_uid") or "").strip():
+            raise ValueError("Mention requires user_id and sec_uid")
+        actual.add((start, end))
+    if actual != spans:
+        raise ValueError("text_extra must cover every mention")
+    return entries
 
 
 _RESOLVE_USER_JS = """async ({username, timeoutMs, runtimeParams}) => {
@@ -179,6 +229,14 @@ _RESOLVE_USER_JS = """async ({username, timeoutMs, runtimeParams}) => {
         };
     };
     const deadline = Date.now() + timeoutMs;
+    const sameEndpoint = (response, path) => {
+        try {
+            const url = new URL(response.url);
+            return url.origin === location.origin && url.pathname.toLowerCase() === path.toLowerCase();
+        } catch (error) { return false; }
+    };
+    const controller = new AbortController();
+    const abortTimer = setTimeout(() => controller.abort(), timeoutMs);
     const remainingTimeout = () => Math.max(600, deadline - Date.now());
 
     const withTimeout = (promise, ms) => Promise.race([
@@ -186,6 +244,7 @@ _RESOLVE_USER_JS = """async ({username, timeoutMs, runtimeParams}) => {
         new Promise((_, reject) => setTimeout(() => reject(new Error('timeout')), ms)),
     ]);
 
+    try {
     let lastError = null;
 
     // Phase 1: Native webmssdk-signed fetch to user detail API with full params
@@ -203,30 +262,32 @@ _RESOLVE_USER_JS = """async ({username, timeoutMs, runtimeParams}) => {
             secUid: '',
         });
         if (p.device_id) qs.set('device_id', String(p.device_id));
-        if (p.odin_id) qs.set('odinId', String(p.odin_id));
+        if (p.odin_id || p.odinId) qs.set('odinId', String(p.odin_id || p.odinId));
+        if (p.web_id_last_time || p.WebIdLastTime) qs.set('WebIdLastTime', String(p.web_id_last_time || p.WebIdLastTime));
         if (p.region) qs.set('region', String(p.region));
-        if (p.tz_name) qs.set('tz_name', String(p.tz_name));
+        qs.set('tz_name', String(p.timezone || p.tz_name || Intl.DateTimeFormat().resolvedOptions().timeZone));
         if (p.msToken) qs.set('msToken', String(p.msToken));
-        if (p.verifyFp) qs.set('verifyFp', String(p.verifyFp));
+        if (p.verifyFp || p.s_v_web_id) qs.set('verifyFp', String(p.verifyFp || p.s_v_web_id));
 
         const resp = await withTimeout(
             fetch('/api/user/detail/?' + qs.toString(), {
-                credentials: 'include', headers: {accept: 'application/json'},
+                credentials: 'include', headers: {accept: 'application/json'}, signal: controller.signal,
             }),
             remainingTimeout()
         );
 
-        if (resp.status === 404) {
-            return {status: 'not_found', reason: 'http_404', source: 'api_user_detail'};
-        }
+        if (!sameEndpoint(resp, '/api/user/detail/')) throw new Error('api_unexpected_response_url');
+        // A missing private API endpoint does not prove that the user is gone.
+        // Try the public profile before creating a negative cache entry.
+        if (resp.status !== 200) throw new Error('api_http_' + resp.status);
 
         const body = await resp.text();
         if (body) {
             try {
                 const data = JSON.parse(body);
-                const found = pick(data?.userInfo?.user);
-                if (found) return {status: 'ok', user: {...found, source: 'api_user_detail'}};
                 const code = data?.statusCode ?? data?.status_code;
+                const found = code == null || Number(code) === 0 ? pick(data?.userInfo?.user) : null;
+                if (found) return {status: 'ok', user: {...found, source: 'api_user_detail'}};
                 if ([10202, 10221, 10222].includes(Number(code))) {
                     return {status: 'not_found', reason: 'api_code_' + code, source: 'api_user_detail'};
                 }
@@ -246,14 +307,16 @@ _RESOLVE_USER_JS = """async ({username, timeoutMs, runtimeParams}) => {
         try {
             const resp = await withTimeout(
                 fetch('/@' + encodeURIComponent(username), {
-                    credentials: 'include', headers: {accept: 'text/html'},
+                    credentials: 'include', headers: {accept: 'text/html'}, signal: controller.signal,
                 }),
                 remainingTimeout()
             );
 
+            if (!sameEndpoint(resp, '/@' + encodeURIComponent(username))) throw new Error('ssr_unexpected_response_url');
             if (resp.status === 404) {
                 return {status: 'not_found', reason: 'ssr_http_404', source: 'profile_ssr'};
             }
+            if (resp.status !== 200) throw new Error('ssr_http_' + resp.status);
 
             const html = await resp.text();
             if (html) {
@@ -281,6 +344,7 @@ _RESOLVE_USER_JS = """async ({username, timeoutMs, runtimeParams}) => {
     }
 
     return {status: 'transient_error', reason: lastError || 'all_phases_failed'};
+    } finally { clearTimeout(abortTimer); controller.abort(); }
 }"""
 
 
@@ -296,17 +360,31 @@ async def resolve_mention_user(
     if not username:
         return None
 
+    # Resolve once freshly per order: a saved handle may have changed owners
+    # since yesterday's disk cache. All publishing accounts share this binding.
+    order_cache = order_mention_identities()
+    key = username.lower()
+    if order_cache is not None and key in order_cache:
+        value = order_cache[key]
+        return dict(value) if value is not None else None
+
     # Check cache outside lock
-    hit, cached = _cache_get(username)
+    hit, cached = _cache_get(username) if order_cache is None else (False, None)
+    if hit and (cached is None or _validated_user_info(username, cached)):
+        return _validated_user_info(username, cached) if cached is not None else None
     if hit:
-        return cached
+        with _LOCK_GLOBAL:
+            _MENTION_CACHE.pop(username.lower(), None)
 
     lock = await _get_username_lock(username)
     async with lock:
+        if order_cache is not None and key in order_cache:
+            value = order_cache[key]
+            return dict(value) if value is not None else None
         # Double check cache inside lock
-        hit, cached = _cache_get(username)
-        if hit:
-            return cached
+        hit, cached = _cache_get(username) if order_cache is None else (False, None)
+        if hit and (cached is None or _validated_user_info(username, cached)):
+            return _validated_user_info(username, cached) if cached is not None else None
 
         if page is None:
             return None
@@ -314,7 +392,7 @@ async def resolve_mention_user(
             return None
 
         try:
-            result = await page.evaluate(
+            result = await asyncio.wait_for(page.evaluate(
                 _RESOLVE_USER_JS,
                 {
                     "username": username,
@@ -322,7 +400,7 @@ async def resolve_mention_user(
                     "runtimeParams": runtime_params or {},
                 },
                 isolated_context=False,
-            )
+            ), timeout=max(0.1, timeout_ms / 1000) + 0.5)
         except Exception as exc:
             logger.warning("[MENTION] resolve failed for @%s: %s", username, str(exc)[:120])
             return None  # transient: do not negative-cache page errors
@@ -335,6 +413,9 @@ async def resolve_mention_user(
 
         if status == "ok":
             user_data = result.get("user") or {}
+            if _validated_user_info(username, user_data) is None:
+                logger.warning("[MENTION] Invalid or mismatched identity for @%s; not cached", username)
+                return None
             user_id = str(user_data.get("user_id") or "").strip()
             sec_uid = str(user_data.get("sec_uid") or "").strip()
             unique_id = str(user_data.get("unique_id") or "").strip() or username
@@ -357,7 +438,9 @@ async def resolve_mention_user(
                     username, info["user_id"], info["sec_uid"][:12], user_data.get("source")
                 )
                 _cache_put(username, info)
-                _save_disk_cache()
+                if order_cache is not None:
+                    order_cache[key] = dict(info)
+                await asyncio.to_thread(_save_disk_cache, _DISK_CACHE_PATH)
                 return info
 
         elif status == "not_found":
@@ -366,6 +449,8 @@ async def resolve_mention_user(
                 username, result.get("reason"), _NEGATIVE_TTL_SECONDS
             )
             _cache_put(username, None)
+            if order_cache is not None:
+                order_cache[key] = None
             return None
 
         else:
@@ -388,6 +473,8 @@ async def prepare_mentions(
     Without mentions this returns ``(text, "[]", meta)`` so callers can always pass it.
     """
     mentions = find_mentions(text)
+    if len(mentions) > MAX_MENTIONS_PER_COMMENT:
+        raise ValueError(f"Too many mentions: maximum {MAX_MENTIONS_PER_COMMENT}")
     meta: Dict[str, Any] = {"requested": [], "resolved": [], "unresolved": []}
     if not mentions:
         return text, "[]", meta
@@ -414,18 +501,16 @@ async def prepare_mentions(
 
     # Normalize casing in text according to canonical TikTok unique_id
     normalized_text = text
-    for _, _, u in mentions:
+    for py_start, py_end, u in reversed(mentions):
         info = resolved.get(u.lower())
         if info and info.get("unique_id"):
             canonical = info["unique_id"]
             if canonical != u:
-                normalized_text = re.sub(
-                    rf"(?<![\w@.])@{re.escape(u)}(?![\w.])",
-                    f"@{canonical}",
-                    normalized_text
-                )
+                normalized_text = normalized_text[:py_start] + "@" + canonical + normalized_text[py_end:]
 
     entries = build_text_extra(normalized_text, resolved)
+    if not meta["unresolved"]:
+        validate_text_extra(normalized_text, entries)
     meta["entries"] = len(entries)
     return normalized_text, json.dumps(entries, ensure_ascii=False, separators=(",", ":")), meta
 
@@ -434,12 +519,28 @@ def extract_response_mentions(response_data: Any) -> List[str]:
     """Return mentioned user ids that TikTok kept in the published comment."""
     if not isinstance(response_data, dict):
         return []
-    comment = response_data.get("comment") or (response_data.get("data") or {}).get("comment") or {}
+    nested = response_data.get("data")
+    comment = response_data.get("comment") or (nested.get("comment") if isinstance(nested, dict) else None) or {}
     extras = comment.get("text_extra") if isinstance(comment, dict) else None
     ids: List[str] = []
-    for item in extras or []:
+    for item in extras if isinstance(extras, list) else []:
         if isinstance(item, dict) and str(item.get("type", 0)) == "0":
             uid = item.get("user_id") or item.get("uid")
             if uid:
                 ids.append(str(uid))
     return ids
+
+
+def mention_receipt(response_data, expected_uids):
+    """Distinguish an omitted entity list from explicit loss of mention entities."""
+    if not isinstance(response_data, dict):
+        return {"confirmation": "unknown", "retained_uids": []}
+    nested = response_data.get("data")
+    comment = response_data.get("comment") or (nested.get("comment") if isinstance(nested, dict) else None)
+    if not isinstance(comment, dict) or not isinstance(comment.get("text_extra"), list):
+        return {"confirmation": "unknown", "retained_uids": []}
+    retained = extract_response_mentions(response_data)
+    missing = sorted(set(expected_uids) - set(retained))
+    return {"confirmation": "partial" if retained and missing else "not_retained" if missing else "retained",
+            "retained_uids": retained, "missing_uids": missing,
+            "stripped_by_server": bool(missing and not retained)}

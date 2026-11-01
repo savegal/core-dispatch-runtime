@@ -67,7 +67,7 @@ def test_invalid_engine_version_is_not_silently_replaced():
 async def test_page_preparation_is_shared_and_uses_native_cdp():
     import asyncio
     context = SimpleNamespace(add_init_script=AsyncMock(), on=Mock(), new_cdp_session=AsyncMock())
-    session = SimpleNamespace(send=AsyncMock())
+    session = SimpleNamespace(send=AsyncMock(return_value={"windowId": 7}))
     context.new_cdp_session.return_value = session
     profile = build_device_profile(SimpleNamespace(id=1, user_agent=None), {}, "145.0.7632.6")
     await install_device_profile(context, profile, False)
@@ -78,6 +78,10 @@ async def test_page_preparation_is_shared_and_uses_native_cdp():
     assert session.send.await_args_list == [
         call("Emulation.setUserAgentOverride", profile["override"]),
         call("Emulation.setHardwareConcurrencyOverride", {"hardwareConcurrency":profile["identity"]["hardware"]["hardwareConcurrency"]}),
+        call("Browser.getWindowForTarget"),
+        call("Browser.setWindowBounds", {"windowId": 7, "bounds": {
+            "width": profile["identity"]["geometry"]["outerWidth"],
+            "height": profile["identity"]["geometry"]["outerHeight"], "windowState": "normal"}}),
     ]
 
 

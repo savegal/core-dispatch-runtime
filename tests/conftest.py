@@ -26,6 +26,49 @@ from db.models import (
 )
 from decimal import Decimal
 
+
+@pytest.fixture(autouse=True)
+def isolated_runtime_caches(monkeypatch, tmp_path):
+    from executor.http import mentions
+    from executor.http import playwright_http_client as http_client
+    from services.autopilot.cache import clear_cache
+    clear_cache()
+    with http_client._ACCOUNT_WEB_IDENTITY_LOCK:
+        http_client._ACCOUNT_WEB_IDENTITY_CACHE.clear()
+        http_client._ACCOUNT_WEB_IDENTITY_SEEDS.clear()
+    engine = sys.modules.get("executor.engagement_engine")
+    schema = sys.modules.get("executor.user_schema")
+    if schema is not None:
+        monkeypatch.setattr(schema, "_HTTP_PREFLIGHT_BROWSER_TASK_STATES", {})
+    if engine is not None:
+        with engine._RESOLVED_SHORTLINK_LOCK:
+            engine._RESOLVED_SHORTLINK_CACHE.clear()
+    cache = mentions._MENTION_CACHE
+    saved = dict(cache)
+    cache.clear()
+    monkeypatch.setattr(mentions, "_DISK_CACHE_PATH", tmp_path / "mention_cache.json")
+    yield
+    cache.clear()
+    cache.update(saved)
+    clear_cache()
+    with http_client._ACCOUNT_WEB_IDENTITY_LOCK:
+        http_client._ACCOUNT_WEB_IDENTITY_CACHE.clear()
+        http_client._ACCOUNT_WEB_IDENTITY_SEEDS.clear()
+    if engine is not None:
+        with engine._RESOLVED_SHORTLINK_LOCK:
+            engine._RESOLVED_SHORTLINK_CACHE.clear()
+
+
+@pytest.fixture(autouse=True)
+def isolated_proxy_leases(monkeypatch):
+    """Run production lease Lua against an isolated Redis emulator, never a live server."""
+    import fakeredis
+    from services import proxy_concurrency_service
+    client = fakeredis.FakeRedis(decode_responses=True)
+    monkeypatch.setattr(proxy_concurrency_service, "_lease_client", lambda: client)
+    yield client
+    client.close()
+
 def _build_test_db_urls() -> tuple[str, str]:
     sync_override = os.getenv("TEST_DB_URL")
     async_override = os.getenv("TEST_DB_URL_ASYNC")
@@ -44,6 +87,13 @@ def db_session() -> Generator[Session, None, None]:
     """Создаёт тестовую БД сессию для каждого теста."""
     sync_url, _ = _build_test_db_urls()
     test_engine = create_engine(sync_url, connect_args={"check_same_thread": False})
+    from sqlalchemy import event
+    @event.listens_for(test_engine, "connect")
+    def fast_disposable_database(connection, _record):
+        # These files are recreated per test; disk durability is unnecessary.
+        if sync_url.startswith("sqlite:"):
+            connection.execute("PRAGMA synchronous=OFF")
+            connection.execute("PRAGMA journal_mode=MEMORY")
     TestSessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=test_engine)
 
     Base.metadata.create_all(bind=test_engine)
@@ -72,6 +122,12 @@ async def async_db_session() -> AsyncGenerator[AsyncSession, None]:
         echo=False,
         future=True,
     )
+    from sqlalchemy import event
+    @event.listens_for(test_async_engine.sync_engine, "connect")
+    def fast_disposable_async_database(connection, _record):
+        if async_url.startswith("sqlite+aiosqlite:"):
+            connection.execute("PRAGMA synchronous=OFF")
+            connection.execute("PRAGMA journal_mode=MEMORY")
     TestAsyncSessionLocal = async_sessionmaker(
         test_async_engine,
         class_=AsyncSession,

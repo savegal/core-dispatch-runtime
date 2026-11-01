@@ -114,7 +114,7 @@ async def test_duplicate_page_with_new_cursor_stops_early(monkeypatch, mode):
     assert fetch.await_count == 2 and not result["absent_ids"]
 
 
-async def test_three_pages_read_runtime_and_cookies_only_once(monkeypatch):
+async def test_three_pages_read_runtime_once_and_refresh_cookies_per_fetch(monkeypatch):
     page = page_with_body(monkeypatch, {})
     page.evaluate.side_effect = [
         {"status": 200, "text": json.dumps({"status_code": 0, "comments": [], "has_more": more, "cursor": cursor}),
@@ -123,7 +123,7 @@ async def test_three_pages_read_runtime_and_cookies_only_once(monkeypatch):
     ]
     result = await main_visibility.scan_main_comment_ids(page, VIDEO, [CID])
     assert result["absent_ids"] == [CID]
-    assert page.context.cookies.await_count == 1
+    assert page.context.cookies.await_count == 3
     assert api._extract_runtime_profile.await_count == 1
     assert page.evaluate.await_count == 3
 

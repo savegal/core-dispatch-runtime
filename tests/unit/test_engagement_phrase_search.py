@@ -147,6 +147,7 @@ def engagement_runtime(db_session, monkeypatch):
 
     monkeypatch.setattr(database, "get_sync_db_context", db_context)
     monkeypatch.setattr(engagement_engine, "get_free_account_for_reply", select)
+    monkeypatch.setattr(user_schema, "_preflight_cookie_http_gate", AsyncMock(return_value=None))
     monkeypatch.setattr(browser_pool, "ensure_thread_browser_pool_capacity", lambda _: None)
     monkeypatch.setattr(browser_pool, "close_browser_pool", AsyncMock())
     monkeypatch.setattr(engagement_engine.settings, "PARALLEL_COMMENTING_TARGET_BROWSERS", 1)
@@ -166,6 +167,7 @@ async def test_dead_accounts_do_not_spend_publish_attempt_but_replacement_is_bou
     engine, schema = engagement_runtime
     monkeypatch.setattr(engine.settings, "PARALLEL_DYNAMIC_WORKER_POOL_ENABLED", dynamic)
     monkeypatch.setattr(engine.settings, "MAX_RETRY_ACCOUNTS", 3)
+    monkeypatch.setattr(engine.settings, "MAX_ACCOUNT_CANDIDATES", 3)
     monkeypatch.setattr(engine, "ENGAGEMENT_ONLY_REPLY_MAX_ATTEMPTS", 1)
     seen = []
 
@@ -304,7 +306,7 @@ async def test_bot_rejects_emoji_only_query_but_preserves_real_phrase(monkeypatc
     from bot.handlers import engagement_wizard as wizard
 
     message = SimpleNamespace(text=query, answer=AsyncMock())
-    state = SimpleNamespace(update_data=AsyncMock())
+    state = SimpleNamespace(update_data=AsyncMock(), get_data=AsyncMock(return_value={}))
     ask = AsyncMock()
     monkeypatch.setattr(wizard, "ask_for_reply_source", ask)
     await wizard.process_comment_text(message, state)

@@ -1,11 +1,25 @@
 from __future__ import annotations
 
+import asyncio
 from typing import Optional
 
 from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup
 
 from bot.services.formatting import Emoji, markdown_inline_code
 from bot.utils.markdown_escape import escape_markdown_simple
+from bot.services.template_utils import replies_dict_to_list
+from services.order_transport import order_transport_label
+
+
+async def current_order_transport_label(client=None) -> str:
+    """Show fresh server policy; a failed read must not invent an active mode."""
+    from bot.services.api_client import api_client
+    try:
+        async with asyncio.timeout(2.0):
+            data = await (client or api_client).get_order_transport_settings()
+        return order_transport_label(data.get("order_transport_mode"))
+    except Exception:
+        return "Уточняется при создании"
 
 
 def _safe_preview(text: Optional[str], limit: int) -> str:
@@ -20,8 +34,8 @@ def _safe_preview(text: Optional[str], limit: int) -> str:
 
 def _reply_items(replies: dict[int, str], *, limit: int = 3) -> list[str]:
     items: list[str] = []
-    for idx in sorted(replies.keys())[:limit]:
-        preview = _safe_preview(replies.get(idx), 72)
+    for idx, reply in enumerate(replies_dict_to_list(replies)[:limit], start=1):
+        preview = _safe_preview(reply, 72)
         items.append(f"{idx}. {preview}")
     return items
 
@@ -29,7 +43,7 @@ def _reply_items(replies: dict[int, str], *, limit: int = 3) -> list[str]:
 def _link_items(links: list[str], *, limit: int = 6) -> list[str]:
     items: list[str] = []
     for idx, link in enumerate((links or [])[:limit], start=1):
-        items.append(f"{idx}. {escape_markdown_simple(link)}")
+        items.append(f"{idx}. {escape_markdown_simple(str(link)[:120])}")
     if len(links) > limit:
         items.append(f"... и ещё {len(links) - limit}")
     return items
@@ -72,16 +86,10 @@ def build_main_comment_variant_prompt_text(
     variant_index: int,
     total_variants: int = 3,
 ) -> str:
-    examples = {
-        1: "Пример: Отличное видео, спасибо за контент 👍",
-        2: "Пример: Очень круто получилось, лайк за подачу 🔥",
-        3: "Пример: Сильный ролик, досмотрел до конца 👏",
-    }
     return (
         f"*Вариант комментария {variant_index} из {total_variants}*\n\n"
         "Введите текст, который будет опубликован под видео.\n"
-        "Все варианты должны отличаться по смыслу.\n\n"
-        f"{escape_markdown_simple(examples.get(variant_index, 'Пример: Живой комментарий без копипаста.'))}"
+        "Сделайте варианты разными. Эмодзи и переносы строк сохранятся."
     )
 
 
@@ -121,6 +129,7 @@ def build_preview_text(
     include_template_prompt: bool = False,
     estimated_cost_label: Optional[str] = None,
     balance_label: Optional[str] = None,
+    transport_label: Optional[str] = None,
 ) -> str:
     variant_lines: list[str] = []
     for idx, variant in enumerate(text_variants[:4], start=1):
@@ -137,18 +146,21 @@ def build_preview_text(
     text = (
         "*Проверьте заказ*\n\n"
         f"{Emoji.LINK} Видео: *{len(links)}*\n"
-        f"{Emoji.COMMENT} Комментарий: *{len(text_variants)} вариант(а)*\n"
+        f"{Emoji.COMMENT} Вариантов комментария: *{len(text_variants)}*\n"
         f"{Emoji.REPLY} Ответов: *{len(replies)}*\n"
         f"{Emoji.LIKES} Лайки: *{escape_markdown_simple(likes_label)}*"
         + (f"\n❤️ Лайки на ответ: *{escape_markdown_simple(reply_likes_label)}*" if (replies and reply_likes_label) else "")
     )
+
+    if transport_label:
+        text += f"\nРежим: *{escape_markdown_simple(transport_label)}*"
 
     if estimated_cost_label:
         text += f"\n💸 Списание: *{escape_markdown_simple(estimated_cost_label)}*"
     if balance_label:
         text += f"\n👛 Баланс: *{escape_markdown_simple(balance_label)}*"
     if template_name:
-        text += f"\n📑 Шаблон: *{escape_markdown_simple(template_name)}*"
+        text += f"\n📑 Шаблон: *{escape_markdown_simple(template_name[:80])}*"
 
     text += "\n\n*Видео*\n" + ("\n".join(link_lines) if link_lines else "Не добавлены")
     text += "\n\n*Комментарий*\n" + "\n".join(variant_lines or [f"1. {markdown_inline_code('не указано')}"])
@@ -206,21 +218,24 @@ def build_success_text(
     reply_likes_label: Optional[str] = None,
     template_name: Optional[str] = None,
     pool_label: Optional[str] = None,
+    transport_mode: Optional[str] = None,
 ) -> str:
     visible_likes = likes_label
     if visible_likes is None:
         visible_likes = str(likes) if likes else "выключены"
     text = (
-        f"{Emoji.SUCCESS} Заказ #{task_id} принят\n\n"
+        f"{Emoji.SUCCESS} *Заказ #{task_id} принят*\n\n"
         f"{Emoji.LINK} Видео: *{links_count}*\n"
-        f"{Emoji.COMMENT} Комментарий: *{variants_count} вариант(а)*\n"
+        f"{Emoji.COMMENT} Вариантов комментария: *{variants_count}*\n"
         f"{Emoji.REPLY} Ответов: *{reply_count}*\n"
         f"{Emoji.LIKES} Лайки: *{escape_markdown_simple(str(visible_likes))}*"
         + (f"\n❤️ Лайки на ответ: *{escape_markdown_simple(reply_likes_label)}*" if (reply_count > 0 and reply_likes_label) else "")
     )
+    if transport_mode:
+        text += f"\nРежим: *{escape_markdown_simple(order_transport_label(transport_mode))}*"
     if pool_label:
         text += f"\nПул: *{escape_markdown_simple(pool_label)}*"
     if template_name:
-        text += f"\n📑 Шаблон: *{escape_markdown_simple(template_name)}*"
+        text += f"\n📑 Шаблон: *{escape_markdown_simple(template_name[:80])}*"
     text += "\n\nДобавлен в очередь."
     return text

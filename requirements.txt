@@ -15,6 +15,8 @@ aiogram[fast]>=3.0.0
 
 # HTTP client
 httpx[socks]>=0.25.0,<0.28.0  # Keep FastAPI/Starlette TestClient compatibility
+PySocks>=1.7.1,<2  # Authenticated SOCKS5 bridge for Chromium
+aiohttp-socks>=0.8.4,<1  # SOCKS5 routes in HTTP cookie preflight
 
 # Redis (async)
 redis[asyncio]>=5.0.0

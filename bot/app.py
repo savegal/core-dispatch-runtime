@@ -8,6 +8,7 @@ from aiogram.client.session.aiohttp import AiohttpSession
 from bot.config import load_config
 from bot.handlers import menu, composer, orders, admin, templates, quick_order, admin_resources, admin_geo, settings, video_parsing, video_inbox, engagement_wizard, personal_accounts
 from bot.handlers import autopilot
+from bot.handlers import mention_choice
 from config.logging_config import setup_logging
 from config.settings import get_settings
 from config.sentry_config import init_sentry
@@ -214,6 +215,7 @@ async def main():
     from bot.middleware.worker_access_middleware import WorkerAccessMiddleware
     worker_access_middleware = WorkerAccessMiddleware()
     for worker_router in (
+        mention_choice.router,
         autopilot.router,
         video_parsing.router,
         video_inbox.router,
@@ -229,6 +231,7 @@ async def main():
         worker_router.callback_query.middleware(worker_access_middleware)
 
     for commenting_router in (
+        mention_choice.router,
         orders.router,
         templates.router,
         order_wizard.router,
@@ -240,6 +243,7 @@ async def main():
         commenting_router.message.middleware(comment_mode_guard)
         commenting_router.callback_query.middleware(comment_mode_guard)
 
+    dp.include_router(mention_choice.router)
     dp.include_router(orders.router)    # Заказы
     dp.include_router(templates.router) # Шаблоны
     dp.include_router(order_wizard.router)  # Новый мастер создания заказа (menu:new_order здесь)

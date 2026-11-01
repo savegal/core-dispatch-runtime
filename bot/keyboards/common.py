@@ -53,6 +53,7 @@ def get_main_menu_keyboard(
             InlineKeyboardButton(text="➕ Полный заказ", callback_data=MENU_NEW_ORDER),
             InlineKeyboardButton(text="⚡ Только ответы", callback_data="menu:engagement_only")
         ],
+        [InlineKeyboardButton(text="🔎 Ответы по ключевым словам", callback_data="menu:keyword_replies")],
         [
             InlineKeyboardButton(text="📋 Заказы", callback_data=MENU_ORDERS),
             InlineKeyboardButton(text="📑 Шаблоны", callback_data=MENU_TEMPLATES)

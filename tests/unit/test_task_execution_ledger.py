@@ -78,7 +78,7 @@ def test_url_execution_ledger_counts_coverage_and_author_fallbacks():
 
     assert ledger["summary"]["main"]["expected"] == 9
     assert ledger["summary"]["main"]["submitted"] == 3
-    assert ledger["summary"]["main"]["verified"] == 2
+    assert ledger["summary"]["main"]["verified"] == 0  # Network/local is not independent visibility.
     assert ledger["summary"]["replies"]["requested"] == 5
     assert ledger["summary"]["replies"]["submitted"] == 2
     assert ledger["summary"]["replies"]["variants_not_started"] == 2
@@ -217,7 +217,7 @@ def test_attach_url_execution_ledger_mutates_result_compatibly():
 
     assert returned is result
     assert result["execution_ledger"]["version"] == LEDGER_VERSION
-    assert result["execution_ledger"]["summary"]["main"]["verified"] == 1
+    assert result["execution_ledger"]["summary"]["main"]["verified"] == 0
 
 
 @pytest.mark.unit
@@ -254,10 +254,10 @@ def test_reply_parent_confirmed_does_not_mean_reply_was_published():
     replies = ledger["summary"]["replies"]
 
     assert replies["submitted"] == 1
-    assert replies["confirmed"] == 1
+    assert replies["confirmed"] == 0
     assert replies["failed"] == 1
     assert ledger["coverage"]["reply_variants"][0]["status"] == "failed"
-    assert ledger["coverage"]["reply_variants"][1]["status"] == "confirmed"
+    assert ledger["coverage"]["reply_variants"][1]["status"] == "submitted_unconfirmed"
 
 
 @pytest.mark.unit

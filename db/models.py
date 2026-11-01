@@ -3,6 +3,7 @@ from sqlalchemy.sql import func
 from sqlalchemy.orm import relationship
 from db.database import Base
 from decimal import Decimal
+import secrets
 
 
 class User(Base):
@@ -57,6 +58,7 @@ class Subscription(Base):
 
 class Account(Base):
     __tablename__ = "accounts"
+    device_seed = Column(String(64), nullable=True, default=lambda: secrets.token_hex(32))
 
     id = Column(Integer, primary_key=True, index=True)
     label = Column(Text, nullable=False, unique=True, index=True)
@@ -161,6 +163,21 @@ class Task(Base):
         # WHERE status = 'pending' ORDER BY updated_at
         Index('idx_task_status_updated', 'status', 'updated_at'),
     )
+
+
+class KeywordReplyTarget(Base):
+    """One durable reply decision per task, video and parent comment."""
+    __tablename__ = "keyword_reply_targets"
+    task_id = Column(Integer, ForeignKey("tasks.id", ondelete="CASCADE"), primary_key=True)
+    video_key = Column(String(64), primary_key=True)
+    comment_id = Column(String(32), primary_key=True)
+    position = Column(Integer, nullable=False)
+    parent_text = Column(Text, nullable=False)
+    parent_author = Column(String(128), nullable=True)
+    reply_text = Column(Text, nullable=False)
+    status = Column(String(24), nullable=False, default="pending")
+    result = Column(JSON, nullable=True)
+    updated_at = Column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now())
 
 
 class Log(Base):

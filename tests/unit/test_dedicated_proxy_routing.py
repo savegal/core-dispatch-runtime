@@ -62,7 +62,8 @@ async def test_explicit_active_dedicated_route_survives_global_direct_mode(monke
         geo = resolve_request_geo(cookies={"tt-target-idc":"useast5"})
         assert geo["region"] == "PL" and geo["tz_name"] == "Europe/Warsaw"
         await pool.get_page_for_account(account)
-        assert launch.call_args.kwargs["proxy"]["server"] == route.proxy
+        assert launch.call_args.kwargs["proxy"]["server"] == "http://127.0.0.1:1"
+        assert browser.new_context_options[0]["proxy"]["server"] == route.proxy
         assert "--no-proxy-server" not in launch.call_args.kwargs["args"]
         assert browser.new_context_options[0]["timezone_id"] == "Europe/Warsaw"
     finally:

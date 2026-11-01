@@ -32,6 +32,11 @@ class Draft:
     text_variants: list[str] = field(default_factory=list)
     reply_like_target: str = "1"
     reply_like_count: int = 0
+    replies: list[str] = field(default_factory=list)
+    template_id: Optional[int] = None
+    template_name: Optional[str] = None
+    verify_main_visibility: bool = False
+    verify_reply_visibility: bool = False
     
     def to_dict(self) -> dict:
         """Конвертирует Draft в словарь для Redis."""
@@ -46,7 +51,12 @@ class Draft:
             "account_pool_mode": self.account_pool_mode if self.account_pool_mode == "personal" else "shared",
             "text_variants": json.dumps(self.text_variants),
             "reply_like_target": str(self.reply_like_target),
-            "reply_like_count": str(self.reply_like_count)
+            "reply_like_count": str(self.reply_like_count),
+            "replies": json.dumps(self.replies, ensure_ascii=False),
+            "template_id": str(self.template_id or ""),
+            "template_name": self.template_name or "",
+            "verify_main_visibility": "1" if self.verify_main_visibility else "0",
+            "verify_reply_visibility": "1" if self.verify_reply_visibility else "0",
         }
     
     @classmethod
@@ -64,7 +74,18 @@ class Draft:
         except Exception:
             text_variants = []
 
+        try:
+            replies = json.loads(data.get("replies") or "[]")
+            replies = [str(item) for item in replies if str(item or "").strip()] if isinstance(replies, list) else []
+        except (ValueError, TypeError):
+            replies = []
+        template_id = str(data.get("template_id") or "")
         return cls(
+            replies=replies,
+            template_id=int(template_id) if template_id.isdigit() else None,
+            template_name=data.get("template_name") or None,
+            verify_main_visibility=data.get("verify_main_visibility") in ("1", "true", "True"),
+            verify_reply_visibility=data.get("verify_reply_visibility") in ("1", "true", "True"),
             links=links,
             comment=data.get("comment") or None,
             reply_mode=data.get("reply_mode", "A"),

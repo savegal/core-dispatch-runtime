@@ -29,7 +29,7 @@ COOKIES = [{"name": name, "value": value, "domain": ".tiktok.com"} for name, val
 ])
 async def test_warmup_only_reuses_the_current_target_video(monkeypatch, current_url, reuse):
     page = SimpleNamespace(
-        url=current_url, context=SimpleNamespace(cookies=AsyncMock(return_value=COOKIES)),
+        url=current_url, context=SimpleNamespace(cookies=AsyncMock(return_value=COOKIES), add_cookies=AsyncMock()),
         wait_for_load_state=AsyncMock(), reload=AsyncMock(),
     )
 
@@ -37,7 +37,8 @@ async def test_warmup_only_reuses_the_current_target_video(monkeypatch, current_
         page.url = url
 
     page.goto = AsyncMock(side_effect=goto)
-    monkeypatch.setattr(engagement_engine, "wait_for_runtime_signer_ready", AsyncMock(return_value=False))
+    monkeypatch.setattr(engagement_engine, "wait_for_runtime_signer_ready", AsyncMock(return_value=True))
+    monkeypatch.setattr("executor.http.comment_discovery.fetch_comment_page", AsyncMock(return_value={"comments": []}))
     monkeypatch.setattr(engagement_engine.asyncio, "sleep", AsyncMock())
 
     _, valid, info = await engagement_engine.warmup_page_for_http(page, VIDEO_URL)
@@ -63,7 +64,8 @@ async def test_video_cookie_sync_saves_fresh_cookies_before_deciding_to_enrich(d
 
     assert needed is False
     assert user_schema.needs_enrichment(account) is False
-    context.add_cookies.assert_awaited_once()
+    added_names = {row["name"] for call in context.add_cookies.await_args_list for row in call.args[0]}
+    assert {"sessionid", "sid_tt", "sessionid_ss"} <= added_names
     saved = parse_cookies_to_dict(account.cookies)
     assert saved["ttwid"] == "wid" and saved["tt_csrf_token"] == "csrf"
     assert saved["sessionid"] == "b" * 32
@@ -71,7 +73,7 @@ async def test_video_cookie_sync_saves_fresh_cookies_before_deciding_to_enrich(d
 
 async def test_live_missing_cookie_requires_enrichment_even_when_database_is_rich():
     account = SimpleNamespace(id=1, cookies=json.dumps(COOKIES), cookie_file=None)
-    page = SimpleNamespace(context=SimpleNamespace(cookies=AsyncMock(return_value=[c for c in COOKIES if c["name"] != "tt_csrf_token"])))
+    page = SimpleNamespace(context=SimpleNamespace(cookies=AsyncMock(return_value=[c for c in COOKIES if c["name"] != "tt_csrf_token"]), add_cookies=AsyncMock()))
     assert user_schema.needs_enrichment(account) is False
     assert await user_schema._video_cookies_need_enrichment(page, account, None) is True
 

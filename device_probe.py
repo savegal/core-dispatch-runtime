@@ -86,6 +86,7 @@ READ_DEVICE = r"""async () => {
         }
         const off=new OffscreenCanvas(64,32), offctx=off.getContext('2d');
         offctx.fillStyle='#7f7f7f';offctx.fillRect(0,0,64,32);
+        offctx.fillStyle='#abc';offctx.font='12px Arial';offctx.fillText('device probe',2,20);
         result.offscreen=await hash(await (await off.convertToBlob()).arrayBuffer());
         result.offscreenRepeat=await hash(await (await off.convertToBlob()).arrayBuffer());
         result.offscreenPixels=await hash(offctx.getImageData(0,0,64,32).data);

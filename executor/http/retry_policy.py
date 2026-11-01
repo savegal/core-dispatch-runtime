@@ -22,6 +22,7 @@ class HttpErrorType(Enum):
     SERVER_ERROR = "server_error"  # 5xx
     CLIENT_ERROR = "client_error"  # 4xx (кроме 403, 429)
     API_ERROR = "api_error"  # ИСПРАВЛЕНО: TikTok вернул 200, но status_code != 0 или другие проблемы с ответом API
+    SUBMITTED_UNCONFIRMED = "submitted_unconfirmed"
 
 
 class RetryPolicy:
@@ -67,7 +68,7 @@ class RetryPolicy:
         
         # Фатальные ошибки - не ретраим (403, капча)
         # ИСПРАВЛЕНО: При 403/капче не повторяем HTTP, сразу fallback
-        if error_type in (HttpErrorType.FORBIDDEN, HttpErrorType.CAPTCHA):
+        if error_type in (HttpErrorType.FORBIDDEN, HttpErrorType.CAPTCHA, HttpErrorType.SUBMITTED_UNCONFIRMED):
             return False
         
         # 429 (rate limit) - можно ретраить, но с cooldown на аккаунт

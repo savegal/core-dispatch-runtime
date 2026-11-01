@@ -36,6 +36,11 @@ from services.app_settings_service import (
     normalize_order_execution_strategy,
 )
 
+from services.order_transport import (
+    ORDER_TRANSPORT_KEY, get_order_transport, get_order_transport_async,
+    normalize_order_transport, default_order_transport,
+)
+
 logger = logging.getLogger("services.task_creation")
 settings = get_settings()
 
@@ -125,6 +130,7 @@ def _build_monitor_task_settings(
     boost_likes_target_mode: str = BOOST_LIKES_TARGET_SINGLE_TOP,
     order_execution_strategy: str = ORDER_EXECUTION_STRATEGY_BALANCED,
     text_variant_offset: int = 0,
+    order_transport_mode: str | None = None,
 ) -> dict[str, Any]:
     task_settings = dict(template.settings or {})
     text_variants = _build_text_variants(template)
@@ -139,6 +145,7 @@ def _build_monitor_task_settings(
     task_settings["likes_count"] = boost_likes_quantity if boost_likes_enabled else 0
     task_settings["boost_likes_target_mode"] = _coerce_likes_target_mode(boost_likes_target_mode)
     task_settings["order_execution_strategy"] = normalize_order_execution_strategy(order_execution_strategy)
+    task_settings[ORDER_TRANSPORT_KEY] = normalize_order_transport(order_transport_mode, default_order_transport())
     # Связь с шаблоном: используется UI orders для отображения "Шаблон: X",
     # для повторов "Сделать копию" и для аналитики monitoring.
     task_settings["template_id"] = template.id
@@ -289,6 +296,7 @@ def create_monitored_task_sync(
     boost_likes_enabled, boost_likes_quantity = get_boost_likes_config_sync(db)
     boost_likes_target_mode = get_boost_likes_target_mode_sync(db)
     order_execution_strategy = get_order_execution_strategy_sync(db)
+    order_transport_mode = get_order_transport(db)
     task_boost_likes_enabled = boost_likes_enabled and bool(_template_reply_texts(template))
     likes_for_task = boost_likes_quantity if task_boost_likes_enabled else 0
     task_settings = _build_monitor_task_settings(
@@ -301,6 +309,7 @@ def create_monitored_task_sync(
         boost_likes_quantity,
         boost_likes_target_mode,
         order_execution_strategy,
+        order_transport_mode=order_transport_mode,
     )
     invalid_text_reason = _validate_monitor_text_variants(task_settings)
     if invalid_text_reason:
@@ -390,6 +399,7 @@ async def create_monitored_task_async(
     boost_likes_enabled, boost_likes_quantity = await get_boost_likes_config_async(db)
     boost_likes_target_mode = await get_boost_likes_target_mode_async(db)
     order_execution_strategy = await get_order_execution_strategy_async(db)
+    order_transport_mode = await get_order_transport_async(db)
     task_boost_likes_enabled = boost_likes_enabled and bool(_template_reply_texts(template))
     likes_for_task = boost_likes_quantity if task_boost_likes_enabled else 0
     task_settings = _build_monitor_task_settings(
@@ -402,6 +412,7 @@ async def create_monitored_task_async(
         boost_likes_quantity,
         boost_likes_target_mode,
         order_execution_strategy,
+        order_transport_mode=order_transport_mode,
     )
     invalid_text_reason = _validate_monitor_text_variants(task_settings)
     if invalid_text_reason:
@@ -523,6 +534,7 @@ def create_monitored_tasks_batch_sync(
     boost_likes_enabled, boost_likes_quantity = get_boost_likes_config_sync(db)
     boost_likes_target_mode = get_boost_likes_target_mode_sync(db)
     order_execution_strategy = get_order_execution_strategy_sync(db)
+    order_transport_mode = get_order_transport(db)
     task_boost_likes_enabled = boost_likes_enabled and bool(_template_reply_texts(template))
     likes_for_task = boost_likes_quantity if task_boost_likes_enabled else 0
 
@@ -540,6 +552,7 @@ def create_monitored_tasks_batch_sync(
             boost_likes_quantity,
             boost_likes_target_mode,
             order_execution_strategy,
+            order_transport_mode=order_transport_mode,
             text_variant_offset=video_index,
         )
         invalid_text_reason = _validate_monitor_text_variants(task_settings)

@@ -174,9 +174,16 @@ async def ask_retry(callback: CallbackQuery):
         await edit_or_answer(callback, text, reply_markup=_back_to_card_keyboard(task_id))
         await callback.answer()
         return
+    if details.get("reused"):
+        retry_id = int(details.get("retry_task_id") or 0)
+        text = f"*Повтор уже создан · #{retry_id}*\n\nНовый заказ и повторное списание не нужны."
+        await edit_or_answer(callback, text, reply_markup=_back_to_card_keyboard(retry_id or task_id))
+        await callback.answer()
+        return
     text = (
-        f"🔁 *Создать заказ #{task_id} заново?*\n\n"
-        "Будет создан новый заказ-копия на это же видео.\n"
+        f"🔁 *Повторить ошибки заказа #{task_id}?*\n\n"
+        f"Видео для безопасного повтора: *{int(details.get('video_count') or 0)}*.\n"
+        "Видео с сохранёнными отправками повторяться не будут.\n"
         f"Спишется *{money_fmt(cost)}*."
     )
     await edit_or_answer(callback, text, reply_markup=get_retry_confirm_keyboard(task_id))

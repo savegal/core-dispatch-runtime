@@ -82,7 +82,8 @@ def setup_orders(monkeypatch):
         get_pricing=AsyncMock(return_value={"price_success": 5}),
         link_videos_to_tasks=AsyncMock(),
     )
-    draft = SimpleNamespace(links=[URL], comment="one", text_variants=["one", "two", "three"])
+    draft = SimpleNamespace(links=[URL], comment="one", text_variants=["one", "two", "three"],
+                            reply_like_target="1", reply_like_count=0)
     for module in (quick_order, order_wizard, video_parsing_new_videos, engagement_wizard):
         monkeypatch.setattr(module, "api_client", api)
         monkeypatch.setattr(module, "get_user_backend_id", AsyncMock(return_value=55))

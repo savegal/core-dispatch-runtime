@@ -8,8 +8,8 @@
     чтобы старый код и user-schema не давили на статус по-разному;
   - двусторонний «дрожжевой» сценарий (бывает «dead» по proxy-таймауту,
     потом «ready» при следующем заходе) разрешается через persisted-
-    счётчик Account.validation_fail_count: только два подряд DEAD
-    помечают аккаунт reauth_needed.
+    счётчик Account.validation_fail_count для временного cooldown;
+    reauth_needed требует definitive-отказа Passport API.
 
 Не путать с:
   - executor/session_bootstrap.quick_video_login_check — это «дёшево
@@ -435,22 +435,27 @@ def register_dead_session(
     db: Session,
     account: Account,
     reason: Optional[str],
+    *,
+    force_retire: bool = False,
+    definitive: bool = False,
 ) -> bool:
-    """Аккаунт показал DEAD при визуальной проверке.
+    """Аккаунт показал DEAD при визуальной проверке или явном HTTP-отказе аутентификации.
 
     - Атомарно увеличивает Account.validation_fail_count.
-    - Если стало >= COOKIE_DEAD_RETIRE_THRESHOLD (default 1) → помечает
-      аккаунт reauth_needed: он больше НЕ попадёт в селекторы
-      get_free_account_for_main_comment / _for_reply пока не пройдёт
-      перевалидацию.
-    - При первом DEAD — soft_error с причиной (короткий cooldown).
+    - Только при definitive=True (окончательный отказ Passport API)
+      порог устанавливается в 1. Строка причины и legacy force_retire не являются доказательством.
+    - reauth_needed разрешён только при definitive=True.
+    - Повторные DOM/сетевые отказы остаются soft_error с cooldown.
 
     Возвращает True, если аккаунт окончательно выведен из работы
     (reauth_needed). False — если только soft.
     """
     if not account:
         return False
-    threshold = _threshold()
+    reason_str = str(reason or "")
+    # Text from an inconclusive response is not authentication evidence.
+    is_definitive = definitive is True
+    threshold = 1 if is_definitive else _threshold()
 
     new_count = _bump_validation_fail_count(db, account.id)
     if new_count is None:
@@ -468,7 +473,7 @@ def register_dead_session(
         threshold,
         (reason or "")[:120],
     )
-    if new_count >= threshold:
+    if is_definitive and new_count >= threshold:
         try:
             mark_needs_reauth(db, account.id, reason=f"dead_session_repeat:{reason}"[:200])
         except Exception:
@@ -548,7 +553,7 @@ def register_captcha_session(db: Session, account: Account, reason: Optional[str
 
 
 def register_blocked_session(db: Session, account: Account, reason: Optional[str]) -> bool:
-    """Usable video UI did not render after settle; quarantine and retire after repeats."""
+    """Usable video UI did not render; apply a temporary soft failure."""
     if not account:
         return False
     threshold = _blocked_threshold()
@@ -571,20 +576,7 @@ def register_blocked_session(db: Session, account: Account, reason: Optional[str
         threshold,
         safe_reason[:120],
     )
-    if new_count >= threshold:
-        try:
-            mark_needs_reauth(db, account.id, reason=f"blocked_ui_repeat:{safe_reason}"[:200])
-        except Exception:
-            logger.exception(
-                "[COOKIE_HEALTH] mark_needs_reauth failed for blocked account=%s",
-                account.id,
-            )
-            return False
-        logger.warning(
-            "[COOKIE_HEALTH] account=%s retired from rotation after repeated blocked UI probes",
-            account.id,
-        )
-        return True
+    # A blocked DOM is not definitive Passport authentication evidence.
 
     try:
         mark_soft_error(db, account.id, safe_reason)

@@ -27,22 +27,8 @@ def normalize_proxy_url(proxy_str: str) -> str:
     Returns:
         str: полный URL прокси
     """
-    if not proxy_str or not proxy_str.strip():
-        raise ValueError("Proxy string cannot be empty")
-    
-    proxy_str = proxy_str.strip()
-    
-    # Если уже полный URL - возвращаем как есть
-    if "://" in proxy_str:
-        return proxy_str
-    
-    # Auth without a scheme is most often an HTTP proxy. If the provider gives
-    # SOCKS, the import line must include socks5:// explicitly.
-    if "@" in proxy_str:
-        return f"http://{proxy_str}"
-    
-    # Просто ip:port - добавляем http://
-    return f"http://{proxy_str}"
+    from services.proxy_normalizer import ProxyRoute
+    return ProxyRoute.parse(proxy_str).url
 
 
 async def check_proxy_health_async(
@@ -96,14 +82,14 @@ async def check_proxy_health_async(
         start_time = time.time() if measure_speed else None
         
         try:
-            # ИСПРАВЛЕНО: В httpx прокси передаются в каждый запрос, а не в конструктор
-            # Создаём клиент без прокси
+            # ИСПРАВЛЕНО: httpx настраивает прокси в конструкторе AsyncClient
             async with httpx.AsyncClient(
                 timeout=timeout,
-                follow_redirects=True
+                follow_redirects=True,
+                proxy=proxy_url,
+                trust_env=False,
             ) as client:
-                # Прокси передаём в запрос
-                response = await client.get(test_url, proxies=proxy_url)
+                response = await client.get(test_url)
                 
                 response_time_ms = None
                 if measure_speed and start_time:

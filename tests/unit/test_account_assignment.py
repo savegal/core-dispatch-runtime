@@ -34,7 +34,9 @@ def isolated_scheduler(monkeypatch):
 def add_accounts(db, count):
     now = datetime.now(timezone.utc)
     accounts = [Account(label=f"fair-{i}", status="active", cookies=json.dumps(
-        {"sessionid": f"session-{i}", **({"sid_tt":f"sid-{i}","s_v_web_id":"fp","ttwid":"wid","msToken":"token"} if i % 2 else {})}),
+        # Exercise turn fairness within one readiness tier; readiness itself
+        # now takes precedence over turns and validation history.
+        {"sessionid": f"session-{i}", "ttwid": "wid", **({"sid_tt":f"sid-{i}","s_v_web_id":"fp","msToken":"token"} if i % 2 else {})}),
         last_validation_ok=now if i % 2 else None,
         created_at=now-timedelta(days=7)) for i in range(count)]
     db.add_all(accounts)

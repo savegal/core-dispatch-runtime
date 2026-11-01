@@ -11,16 +11,20 @@ Engagement Engine - единый движок для HYBRID и ENGAGEMENT_ONLY �
 - Запрещено логировать "успешно", если success=False
 - Запрещено увеличивать счетчики, если действие реально не выполнено
 """
+import threading
+from executor.cache_lock import synchronized
 import logging
-from services.execution_attempts import pre_publish_outcomes, track_publication_requests
+import json
+import os
+from services.publication_progress import record_publication, delivery_state, explicit_publication_flags
+from services.execution_attempts import pre_publish_outcomes, track_publication_requests, candidate_scan_limit, is_pre_publish_account_failure
 from executor.http.execution_policy import http_first_enabled, valid_comment_id
 import asyncio
 import re
 import random
 import time
 from typing import Optional, Dict, Any, List, Tuple, Callable
-from urllib.parse import urlparse
-import httpx
+from urllib.parse import urlparse, parse_qs
 from sqlalchemy.orm import Session
 from db.models import Task, Account, Proxy
 from executor.tiktok_client_async import create_page_for_account
@@ -47,6 +51,7 @@ from services.account_service import (
     get_http_execution_strategy,
     mark_needs_reauth,
     mark_soft_error,
+    mark_runtime_cooldown,
     record_main_comment_success,
     record_reply_success,
     release_main_account_reservation,
@@ -67,7 +72,7 @@ from services.likes_config import (
 )
 from services.metrics import increment_counter, record_timing
 from services.comment_search import normalize_search_phrase
-from services.cookie_validator import normalize_cookie_records
+from services.cookie_validator import normalize_cookie_records, classify_account_web_readiness, ms_token_needs_browser_refresh
 from services.cookie_persistence_service import synchronize_browser_cookies
 
 logger = logging.getLogger("executor.engagement_engine")
@@ -198,6 +203,7 @@ def _new_http_health_stats() -> Dict[str, int]:
     }
 
 _HTTP_ACCOUNT_HEALTH: Dict[int, Dict[str, int]] = _defaultdict(_new_http_health_stats)
+_HTTP_ACCOUNT_HEALTH_LOCK = threading.RLock()
 
 
 
@@ -425,6 +431,7 @@ async def resolve_video_url(
     timeout: float = 10.0,
     *,
     proxy: Optional[str] = None,
+    proxy_country_code: Optional[str] = None,
 ) -> tuple[str, Optional[str]]:
     """Resolves TikTok shortlinks into canonical URLs.
 
@@ -454,60 +461,41 @@ async def resolve_video_url(
         )
         return url, None
 
-    headers = {
-        "User-Agent": (
-            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-            "AppleWebKit/537.36 (KHTML, like Gecko) "
-            "Chrome/143.0.0.0 Safari/537.36"
-        )
-    }
-
-    # httpx понимает proxy как dict {"http://": "...", "https://": "..."} или
-    # как одну строку. Принимаем привычный формат "scheme://host:port" /
-    # "host:port" + auth — преобразуем в полный URL.
-    proxy_url = (proxy or "").strip() or None
-    if proxy_url and "://" not in proxy_url:
-        proxy_url = f"http://{proxy_url}"
+    try:
+        from services.proxy_normalizer import ProxyRoute
+        proxy = ProxyRoute.parse(proxy).url if proxy else None
+    except Exception:
+        return url, None
 
     try:
-        async with httpx.AsyncClient(
-            follow_redirects=True,
-            timeout=timeout,
-            headers=headers,
-            proxy=proxy_url,
-            trust_env=False,
-        ) as client:
-            try:
-                response = await client.head(url)
-            except Exception:
-                response = await client.get(url)
-
-            resolved_url = str(response.url)
-            resolved_id = extract_video_id(resolved_url)
-            if resolved_id:
-                logger.info(
-                    f"[URL_RESOLVE] {url[:80]} -> video_id={resolved_id} via {resolved_url[:120]}"
-                )
-                return resolved_url, resolved_id
-
+        import httpx
+        async with httpx.AsyncClient(proxy=proxy, timeout=timeout, follow_redirects=True, trust_env=False) as client:
             response = await client.get(url)
+            response.raise_for_status()
             resolved_url = str(response.url)
-            resolved_id = extract_video_id(resolved_url)
-            if resolved_id:
-                logger.info(
-                    f"[URL_RESOLVE] {url[:80]} -> video_id={resolved_id} via GET {resolved_url[:120]}"
-                )
-                return resolved_url, resolved_id
-            return resolved_url, None
+        from executor.http.page_runtime import target_url_matches
+        media_id = extract_video_id(resolved_url)
+        if media_id and media_id != "0" and target_url_matches(resolved_url, media_id):
+            return resolved_url, media_id
     except Exception as exc:
-        logger.warning(f"[URL_RESOLVE] Failed to resolve {url[:80]} via proxy: {exc}")
+        logger.info("[URL_RESOLVE] HTTP redirect unavailable; trying browser (%s)", type(exc).__name__)
+
+    from executor.browser_pool import get_browser_pool
+    try:
+        pool = await get_browser_pool()
+        resolved_url = await pool.resolve_shortlink(url, proxy=proxy, timeout=timeout, country_code=proxy_country_code)
+        return resolved_url, extract_video_id(resolved_url)
+    except Exception as exc:
+        logger.warning("[URL_RESOLVE] Browser redirect failed: %s", getattr(exc, "reason", type(exc).__name__))
         return url, None
 
 
 _RESOLVED_SHORTLINK_CACHE: Dict[Tuple[str, Any, int], Tuple[str, str, float]] = {}
 _RESOLVED_SHORTLINK_TTL_SECONDS = 600.0
+_RESOLVED_SHORTLINK_LOCK = threading.RLock()
 
 
+@synchronized(_RESOLVED_SHORTLINK_LOCK)
 def cache_resolved_video_url(
     url: str,
     resolved_url: Optional[str],
@@ -522,6 +510,9 @@ def cache_resolved_video_url(
         return
     now_mono = time.monotonic()
     resolver_id = id(resolve_video_url)
+    if len(_RESOLVED_SHORTLINK_CACHE) >= 1024:
+        for key in list(_RESOLVED_SHORTLINK_CACHE)[:512]:
+            _RESOLVED_SHORTLINK_CACHE.pop(key, None)
     for owner_key in (pool_owner_user_id, None):
         _RESOLVED_SHORTLINK_CACHE[(raw_url, owner_key, resolver_id)] = (canon_url, canon_id, now_mono)
 
@@ -535,13 +526,14 @@ async def resolve_order_video_url(db, url: str, pool_owner_user_id=None):
     raw_url = str(url or "").strip()
     now_mono = time.monotonic()
     resolver_id = id(resolve_video_url)
-    for owner_key in (pool_owner_user_id, None):
-        cached = _RESOLVED_SHORTLINK_CACHE.get((raw_url, owner_key, resolver_id))
-        if cached is not None:
-            cached_url, cached_id, cached_at = cached
-            if now_mono - cached_at <= _RESOLVED_SHORTLINK_TTL_SECONDS and cached_url and cached_id:
-                return cached_url, cached_id
-            _RESOLVED_SHORTLINK_CACHE.pop((raw_url, owner_key, resolver_id), None)
+    with _RESOLVED_SHORTLINK_LOCK:
+        for owner_key in (pool_owner_user_id, None):
+            cached = _RESOLVED_SHORTLINK_CACHE.get((raw_url, owner_key, resolver_id))
+            if cached is not None:
+                cached_url, cached_id, cached_at = cached
+                if now_mono - cached_at <= _RESOLVED_SHORTLINK_TTL_SECONDS and cached_url and cached_id:
+                    return cached_url, cached_id
+                _RESOLVED_SHORTLINK_CACHE.pop((raw_url, owner_key, resolver_id), None)
 
     if not settings.USE_PROXY:
         resolved, media_id = await resolve_video_url(url)
@@ -551,7 +543,8 @@ async def resolve_order_video_url(db, url: str, pool_owner_user_id=None):
     from services.dedicated_proxy_service import get_current_dedicated_proxy
     route = get_current_dedicated_proxy()
     if route is not None:
-        resolved, media_id = await resolve_video_url(url, proxy=route.proxy)
+        geo_args = {"proxy_country_code": route.country_code} if route.country_code else {}
+        resolved, media_id = await resolve_video_url(url, proxy=route.proxy, **geo_args)
         if media_id:
             cache_resolved_video_url(raw_url, resolved, media_id, pool_owner_user_id)
         return resolved, media_id
@@ -572,7 +565,9 @@ async def resolve_order_video_url(db, url: str, pool_owner_user_id=None):
         if is_proxy_bad(row[0]):
             continue
         attempts += 1
-        resolved, media_id = await resolve_video_url(url, proxy=row[0])
+        country = db.query(Proxy.country_code).filter(Proxy.proxy == row[0]).scalar()
+        geo_args = {"proxy_country_code": country} if country else {}
+        resolved, media_id = await resolve_video_url(url, proxy=row[0], **geo_args)
         if media_id:
             cache_resolved_video_url(raw_url, resolved, media_id, pool_owner_user_id)
             return resolved, media_id
@@ -763,6 +758,7 @@ def _log_pipeline_event(
     getattr(logger, level, logger.info)(" ".join(parts))
 
 
+@synchronized(_HTTP_ACCOUNT_HEALTH_LOCK)
 def _record_http_account_result(account_id: Optional[int], outcome: str) -> None:
     if account_id is None:
         return
@@ -776,6 +772,8 @@ def _record_http_account_result(account_id: Optional[int], outcome: str) -> None
         stats["ui_no_progress"] = 0
     elif outcome == "warmup_fail":
         stats["warmup_fail"] += 1
+    elif outcome == "warmup_success":
+        stats["warmup_fail"] = 0
     elif outcome == "soft_fail":
         stats["soft_fail"] += 1
         stats["http_fail"] += 1
@@ -786,6 +784,7 @@ def _record_http_account_result(account_id: Optional[int], outcome: str) -> None
         stats["http_fail"] += 1
 
 
+@synchronized(_HTTP_ACCOUNT_HEALTH_LOCK)
 def _record_ui_no_progress(account_id: Optional[int]) -> int:
     if account_id is None:
         return 0
@@ -794,6 +793,7 @@ def _record_ui_no_progress(account_id: Optional[int]) -> int:
     return stats["ui_no_progress"]
 
 
+@synchronized(_HTTP_ACCOUNT_HEALTH_LOCK)
 def _reset_ui_no_progress(account_id: Optional[int]) -> None:
     if account_id is None:
         return
@@ -811,6 +811,7 @@ def _record_http_account_failure_result(
         _record_http_account_result(account_id, "soft_fail")
 
 
+@synchronized(_HTTP_ACCOUNT_HEALTH_LOCK)
 def _should_skip_http_for_account(account_id: Optional[int]) -> Optional[str]:
     if account_id is None:
         return None
@@ -932,8 +933,12 @@ async def warmup_page_for_http(
     db: Optional[Session] = None,
 ) -> Tuple[Dict[str, str], bool, Dict[str, Any]]:
     """Warm the video page and session cookies for its native fetch interceptor."""
+    from executor.browser_reads import await_browser_read
     cookies_dict: Dict[str, str] = {}
     warmup_started = time.monotonic()
+    target_document_generation = None
+    response_tasks = set()
+    response_listener_active = True
     warmup_info: Dict[str, Any] = {
         "status": "unknown",
         "reason_code": "unknown",
@@ -944,8 +949,86 @@ async def warmup_page_for_http(
         "degraded_http": False,
     }
 
-    def _finish(valid: bool, info: Dict[str, Any]) -> Tuple[Dict[str, str], bool, Dict[str, Any]]:
+    async def _on_warmup_response(response):
+        try:
+            url = str(getattr(response, "url", "") or "")
+            parsed = urlparse(url)
+            query = parse_qs(parsed.query)
+            expected_id = aweme_id or extract_video_id(getattr(page, "url", ""))
+            if (parsed.hostname == "www.tiktok.com" and parsed.path == "/api/comment/list/"
+                    and expected_id and query.get("aweme_id") == [str(expected_id)]
+                    and query.get("cursor") == ["0"] and getattr(response, "status", None) == 200):
+                from executor.http.page_runtime import document_generation
+                generation = document_generation(page)
+                text = await await_browser_read(response.text)
+                if text and '"comments"' in text:
+                    data = json.loads(text)
+                    payload = data.get("data", data) if isinstance(data, dict) else None
+                    if (isinstance(payload, dict) and data.get("status_code") == 0
+                            and isinstance(payload.get("comments"), list)
+                            and response_listener_active
+                            and document_generation(page) == generation
+                            and extract_video_id(getattr(page, "url", "")) == expected_id):
+                        page._cached_first_comment_page = payload
+                        page._cached_first_comment_aweme_id = str(expected_id)
+        except Exception:
+            pass
+
+    def _schedule_warmup_response(response):
+        if not response_listener_active or "/api/comment/list/" not in str(getattr(response, "url", "")):
+            return
+        task = asyncio.create_task(_on_warmup_response(response))
+        response_tasks.add(task)
+
+        def completed(done):
+            response_tasks.discard(done)
+            if not done.cancelled():
+                done.exception()
+
+        task.add_done_callback(completed)
+
+    async def _finish(valid: bool, info: Dict[str, Any]) -> Tuple[Dict[str, str], bool, Dict[str, Any]]:
+        nonlocal target_document_generation
+        if valid and target_document_generation is not None:
+            from executor.http.page_runtime import document_generation, target_page_matches
+            generation = document_generation(page)
+            same_target = target_page_matches(page, aweme_id)
+            if generation != target_document_generation and same_target and info.get("signer_ready"):
+                refreshed = normalize_cookie_records(await page.context.cookies())
+                has_required_cookies = (
+                    any(refreshed.get(name) for name in ("sessionid", "sid_tt", "sessionid_ss"))
+                    and all(refreshed.get(name) for name in ("ttwid", "tt_csrf_token", "msToken"))
+                )
+                rebased_signer_ready = (has_required_cookies
+                                        and bool(await wait_for_runtime_signer_ready(page, timeout_ms=1000)))
+                info["signer_ready"] = rebased_signer_ready
+                if rebased_signer_ready:
+                    # The signer and cookies must belong to the stable new
+                    # document, including after the asynchronous readiness probe.
+                    refreshed = normalize_cookie_records(await page.context.cookies())
+                    if (document_generation(page) == generation and target_page_matches(page, aweme_id)
+                            and any(refreshed.get(name) for name in ("sessionid", "sid_tt", "sessionid_ss"))
+                            and all(refreshed.get(name) for name in ("ttwid", "tt_csrf_token", "msToken"))):
+                        target_document_generation = generation
+                        cookies_dict.update(refreshed)
+                        info["document_rebased"] = True
+            if (document_generation(page) != target_document_generation
+                    or not target_page_matches(page, aweme_id)):
+                valid = False
+                info.update(status="navigation_changed", reason_code="target_document_changed")
+            info["current_url"] = str(getattr(page, "url", ""))
+        _record_http_account_result(getattr(account, "id", None), "warmup_success" if valid else "warmup_fail")
+        if valid and account is not None:
+            account._http_preflight_requires_browser_warmup = False
+        state = getattr(page, "_http_signer_state", {})
+        info["sdk_present"] = bool(state.get("sdk_present")) if isinstance(state, dict) else False
+        info["signed_dispatch_seen"] = bool(state.get("signed_dispatch_seen")) if isinstance(state, dict) else False
         outcome = "ok" if valid else "fail"
+        if page is not None:
+            try:
+                setattr(page, "_warmup_signer_ready", bool(info.get("signer_ready", False)))
+            except Exception:
+                pass
         try:
             increment_counter(
                 "tiktok.http.warmup",
@@ -987,7 +1070,7 @@ async def warmup_page_for_http(
                 and not any(marker in path for marker in ("/login", "/signup", "/verify", "/auth"))
             )
 
-        def _redirect_failure():
+        async def _redirect_failure():
             warmup_info.update(
                 status="redirect", reason_code="redirect_not_video",
                 missing_critical=[], missing_optional=[],
@@ -996,33 +1079,42 @@ async def warmup_page_for_http(
                 "[WARMUP] Target page changed during preparation for %s: %s",
                 correlation_id or "unknown", warmup_info["current_url"],
             )
-            return _finish(False, dict(warmup_info))
+            return await _finish(False, dict(warmup_info))
 
         async def _navigate_to_target() -> None:
             try:
-                await page.goto(canonical_url, wait_until="domcontentloaded", timeout=30000)
+                await await_browser_read(lambda: page.goto(canonical_url, wait_until="domcontentloaded", timeout=30000))
             except Exception as exc:
                 if "ERR_ABORTED" not in str(exc):
                     raise
                 logger.info("[WARMUP] Navigation interrupted by in-flight redirect; reopening target page")
                 await asyncio.sleep(1.0)
-                await page.goto(canonical_url, wait_until="domcontentloaded", timeout=30000)
+                await await_browser_read(lambda: page.goto(canonical_url, wait_until="domcontentloaded", timeout=30000))
 
         logger.debug(
             f"[WARMUP] Starting warmup for {correlation_id or 'unknown'} | "
             f"original_url={video_url[:50]}, canonical_url={canonical_url}"
         )
 
+        from executor.http.page_runtime import document_generation
+        document_generation(page)
+        if page is not None and hasattr(page, "on"):
+            try:
+                page.on("response", _schedule_warmup_response)
+            except Exception:
+                pass
+
         retry_navigation_ready = False
         for attempt in range(max_retries):
+            timing = None
             warmup_info["attempts"] = attempt + 1
             current = urlparse(str(getattr(page, "url", "") or ""))
             already_on_target = (
-                attempt == 0 and bool(aweme_id)
+                attempt == 0 and bool(aweme_id or _is_tiktok_shortlink(video_url))
                 and (current.hostname == "tiktok.com" or (current.hostname or "").endswith(".tiktok.com"))
                 and re.search(r"/(?:video|photo)/\d+", current.path.lower()) is not None
                 and not any(marker in current.path.lower() for marker in ("/login", "/signup", "/verify", "/auth"))
-                and extract_video_id(page.url) == aweme_id
+                and (not aweme_id or extract_video_id(page.url) == aweme_id)
             )
             if not already_on_target and not retry_navigation_ready:
                 await _navigate_to_target()
@@ -1052,6 +1144,10 @@ async def warmup_page_for_http(
             # A shortlink may only reveal its media ID in this browser. Keep
             # that first resolved ID as the target through subsequent waits.
             aweme_id = aweme_id or resolved_video_id
+            cached_video = getattr(page, "_cached_first_comment_aweme_id", None)
+            if cached_video is not None and str(cached_video) != str(aweme_id):
+                page._cached_first_comment_page = None
+                page._cached_first_comment_aweme_id = None
 
             try:
                 await page.wait_for_load_state("domcontentloaded", timeout=5000)
@@ -1065,84 +1161,25 @@ async def warmup_page_for_http(
             # SPA transitions from another video fall back to our own observation.
             target_started_at = target_observed_at
             target_dom_ready_at = target_observed_at
+            from executor.http.page_runtime import activate_page_input, document_generation
+            warmup_info["early_activity_triggered"] = await activate_page_input(page)
+            generation = document_generation(page)
+            target_document_generation = generation
+            mature = getattr(page, "_http_target_maturity", None)
+            if (already_on_target and isinstance(mature, dict)
+                    and mature.get("key") == (current_url, generation)
+                    and mature.get("aweme_id") == aweme_id):
+                target_started_at = min(target_observed_at, mature["started_at"])
+                target_dom_ready_at = min(target_observed_at, mature["dom_ready_at"])
             try:
                 timing = await asyncio.wait_for(page.evaluate("""() => {
-                    let ssrRegion = null;
-                    let deviceId = null;
-                    let odinId = null;
-                    let widTime = null;
-                    let widTimeExplicit = false;
-                    try {
-                        window.dispatchEvent(new MouseEvent('mousemove', {bubbles: true, clientX: 120, clientY: 160}));
-                        if (typeof PointerEvent === 'function') {
-                            window.dispatchEvent(new PointerEvent('pointermove', {bubbles: true, clientX: 124, clientY: 164}));
-                        }
-                        window.dispatchEvent(new Event('scroll', {bubbles: true}));
-                        document.dispatchEvent(new Event('visibilitychange'));
-                        const u = window.__UNIVERSAL_DATA_FOR_REHYDRATION__?.__DEFAULT_SCOPE__;
-                        const appCtx = u?.['webapp.app-context'] || u?.['webapp.a-context'];
-                        const pageProps = window.__NEXT_DATA__?.props?.pageProps;
-                        const nextCtx = pageProps?.appContext || pageProps?.webappContext;
-                        ssrRegion = appCtx?.region || nextCtx?.region || pageProps?.region || null;
-                        const rawWid = appCtx?.wid || appCtx?.webId || nextCtx?.wid || nextCtx?.webId || null;
-                        const rawOdin = appCtx?.odinId || nextCtx?.odinId || null;
-                        const rawWidTime = appCtx?.wid_ct || appCtx?.webIdCreatedTime || nextCtx?.wid_ct || nextCtx?.webIdCreatedTime || null;
-                        if (rawWid) deviceId = String(rawWid).trim();
-                        if (rawOdin) odinId = String(rawOdin).trim();
-                        if (rawWidTime) {
-                            widTime = String(rawWidTime).trim();
-                            widTimeExplicit = !!widTime;
-                        } else if (deviceId || odinId || appCtx || nextCtx) {
-                            if (!window.__tt_web_id_last_time) {
-                                window.__tt_web_id_last_time = String(Math.floor(Date.now() / 1000));
-                            }
-                            widTime = String(window.__tt_web_id_last_time);
-                        }
-                    } catch (e) {}
                     return {
                         current_url: location.href,
                         navigation_url: performance.getEntriesByType('navigation')[0]?.name || '',
                         age_ms: performance.now(),
                         dom_ready_ms: performance.getEntriesByType('navigation')[0]?.domContentLoadedEventEnd || 0,
-                        early_activity_triggered: true,
-                        ssr_region: ssrRegion ? String(ssrRegion).trim().toUpperCase() : null,
-                        device_id: deviceId,
-                        odin_id: odinId,
-                        web_id_last_time: widTime,
-                        _web_id_last_time_explicit: widTimeExplicit
                     };
-                }""", isolated_context=False), timeout=1.0)
-                warmup_info["early_activity_triggered"] = True
-                if isinstance(timing, dict):
-                    try:
-                        from executor.http.playwright_http_client import cache_web_identity
-                        cache_web_identity(
-                            getattr(account, "id", None) or getattr(page, "_pool_account_id", None),
-                            timing,
-                            context=getattr(page, "context", None),
-                            account=account,
-                        )
-                    except Exception:
-                        pass
-                    ssr_cc = str(timing.get("ssr_region") or getattr(getattr(page, "context", None), "_account_ssr_region", "") or "").strip().upper()
-                    if re.fullmatch(r"[A-Z]{2}", ssr_cc):
-                        if getattr(page, "context", None) is not None:
-                            try:
-                                setattr(page.context, "_account_ssr_region", ssr_cc)
-                            except Exception:
-                                pass
-                        if account is not None and not getattr(account, "country_code", None):
-                            try:
-                                account.country_code = ssr_cc
-                                if isinstance(db, Session):
-                                    db.add(account)
-                                    db.commit()
-                            except Exception:
-                                try:
-                                    if isinstance(db, Session):
-                                        db.rollback()
-                                except Exception:
-                                    pass
+                }""", isolated_context=False), timeout=1.5)
                 age = timing.get("age_ms") if isinstance(timing, dict) else None
                 navigation_url = str((timing.get("navigation_url") if isinstance(timing, dict) else "") or "")
                 if (type(age) in (int, float) and 0 <= age < 1e12
@@ -1159,11 +1196,11 @@ async def warmup_page_for_http(
             except Exception:
                 pass
             if not _refresh_target_url():
-                return _redirect_failure()
+                return await _redirect_failure()
             if aweme_id and current_url and current_url != video_url:
                 cache_resolved_video_url(video_url, current_url, aweme_id)
 
-            from executor.http.comment_discovery import fetch_comment_page
+            from executor.http.comment_discovery import fetch_comment_page, activate_comment_list_via_page
 
             # Poll ttwid and runtime signer readiness in a single parallel loop
             # (0.2s step, bounded to 6.0s total).
@@ -1173,16 +1210,14 @@ async def warmup_page_for_http(
             cookie_deadline = time.monotonic() + 6.0
             for _ in range(30):
                 if not _refresh_target_url():
-                    return _redirect_failure()
+                    return await _redirect_failure()
                 remaining = round(cookie_deadline - time.monotonic(), 6)
                 if remaining <= 0:
                     break
                 if not signer_ready:
-                    signer_ready = bool(await wait_for_runtime_signer_ready(
-                        page, timeout_ms=min(200, max(1, int(remaining * 1000))),
-                    ))
+                    signer_ready = bool(await wait_for_runtime_signer_ready(page, timeout_ms=min(200, max(1, int(remaining * 1000)))))
                     if not _refresh_target_url():
-                        return _redirect_failure()
+                        return await _redirect_failure()
                 if live_cookies.get("ttwid") and signer_ready:
                     break
                 remaining = round(cookie_deadline - time.monotonic(), 6)
@@ -1191,19 +1226,78 @@ async def warmup_page_for_http(
                 await asyncio.sleep(min(0.2, remaining))
                 live_cookies = normalize_cookie_records(await page.context.cookies())
             warmup_info["signer_ready"] = signer_ready
+            if page is not None:
+                try:
+                    setattr(page, "_warmup_signer_ready", bool(signer_ready))
+                except Exception:
+                    pass
             if not _refresh_target_url():
-                return _redirect_failure()
-            now = time.monotonic()
-            minimum_age_wait = max(
-                0.0, 3.2 - (now - target_started_at), 1.8 - (now - target_dom_ready_at),
-            )
-            warmup_info["minimum_age_wait_ms"] = round(minimum_age_wait * 1000)
-            if minimum_age_wait:
+                return await _redirect_failure()
+            total_age_wait = 0.0
+            is_hot_account = (classify_account_web_readiness(live_cookies) == 2
+                              and not ms_token_needs_browser_refresh(page.context, live_cookies, account))
+            while True:
+                dom_ready = getattr(page, "_http_document_dom_ready", None)
+                if (isinstance(dom_ready, tuple) and len(dom_ready) == 2
+                        and dom_ready[0] == generation and dom_ready[1] >= target_observed_at):
+                    target_dom_ready_at = max(target_dom_ready_at, dom_ready[1])
+                    warmup_info["load_state"] = "domcontentloaded"
+                now = time.monotonic()
+                signer_state = getattr(page, "_http_signer_state", {}) or {}
+                has_real_signed_traffic = (bool(signer_state.get("signed_dispatch_seen"))
+                                           or getattr(page, "_cached_first_comment_page", None) is not None)
+                if is_hot_account and has_real_signed_traffic:
+                    req_nav_age, req_dom_age = 0.8, 0.5
+                elif is_hot_account and signer_ready:
+                    req_nav_age, req_dom_age = 2.0, 1.5
+                else:
+                    req_nav_age, req_dom_age = 3.2, 1.8
+                warmup_info["required_nav_age_ms"] = round(req_nav_age * 1000)
+                warmup_info["required_dom_age_ms"] = round(req_dom_age * 1000)
+                minimum_age_wait = max(
+                    0.0, req_nav_age - (now - target_started_at), req_dom_age - (now - target_dom_ready_at),
+                )
+                if minimum_age_wait <= 0.000001:
+                    break
+                total_age_wait += minimum_age_wait
                 await asyncio.sleep(minimum_age_wait)
                 if not _refresh_target_url():
-                    return _redirect_failure()
+                    return await _redirect_failure()
+            warmup_info["minimum_age_wait_ms"] = round(total_age_wait * 1000)
             warmup_info["target_page_age_ms"] = round((time.monotonic() - target_started_at) * 1000)
             warmup_info["target_dom_age_ms"] = round((time.monotonic() - target_dom_ready_at) * 1000)
+            if document_generation(page) != generation:
+                if not _refresh_target_url():
+                    return await _redirect_failure()
+                try:
+                    await page.wait_for_load_state("domcontentloaded", timeout=3000)
+                    warmup_info["load_state"] = "domcontentloaded"
+                except Exception:
+                    pass
+                if not _refresh_target_url():
+                    return await _redirect_failure()
+                await activate_page_input(page)
+                generation = document_generation(page)
+                target_document_generation = generation
+                # Keep the same-video rebase, but do not inherit the previous
+                # document's age or SDK readiness after a real reload.
+                target_started_at = target_dom_ready_at = time.monotonic()
+                await asyncio.sleep(3.2)
+                if not _refresh_target_url():
+                    return await _redirect_failure()
+                if document_generation(page) != generation:
+                    warmup_info.update(status="navigation_changed", reason_code="target_document_unstable")
+                    return await _finish(False, dict(warmup_info))
+                warmup_info["document_rebased"] = True
+                warmup_info["minimum_age_wait_ms"] += 3200
+                warmup_info["target_page_age_ms"] = round((time.monotonic() - target_started_at) * 1000)
+                warmup_info["target_dom_age_ms"] = round((time.monotonic() - target_dom_ready_at) * 1000)
+                signer_ready = bool(await wait_for_runtime_signer_ready(page, timeout_ms=1500))
+                warmup_info["signer_ready"] = signer_ready
+                page._warmup_signer_ready = signer_ready
+                live_cookies = normalize_cookie_records(await page.context.cookies())
+            page._http_target_maturity = {"key": (page.url, document_generation(page)), "aweme_id": aweme_id,
+                                         "started_at": target_started_at, "dom_ready_at": target_dom_ready_at}
             logger.info(
                 "[WARMUP] %s target_page_age_ms=%s target_dom_age_ms=%s minimum_age_wait_ms=%s load_state=%s signer_ready=%s",
                 correlation_id or "unknown", warmup_info["target_page_age_ms"],
@@ -1214,20 +1308,147 @@ async def warmup_page_for_http(
                     f"[WARMUP] Readiness signals not observed after bounded wait; native fetch may still be usable "
                     f"for {correlation_id or 'unknown'}"
                 )
-            if live_cookies.get("ttwid") and live_cookies.get("tt_csrf_token"):
+            from executor.http.playwright_http_client import (
+                cache_web_identity, extract_web_identity_from_cookies,
+            )
+            cache_web_identity(
+                getattr(account, "id", None) or getattr(page, "_pool_account_id", None),
+                extract_web_identity_from_cookies(live_cookies), context=getattr(page, "context", None), account=account,
+            )
+            cookies_dict = dict(live_cookies)
+            try:
+                from executor.http.page_runtime import read_warmup_runtime_profile
+                current_signer = getattr(page, "_http_signer_state", {}) or {}
+                runtime_profile, extended_read = await read_warmup_runtime_profile(page,
+                    allow_extension=bool(signer_ready or current_signer.get("sdk_present")
+                                         or current_signer.get("signed_dispatch_seen")))
+                warmup_info["runtime_profile_read_extended"] = extended_read
+            except asyncio.TimeoutError:
+                warmup_info.update(status="timeout", reason_code="warmup_runtime_profile_timeout",
+                                   missing_critical=["runtime_profile"])
+                logger.info("[WARMUP] Runtime profile read exceeded bounded wait for %s", correlation_id or "unknown")
+                return await _finish(False, dict(warmup_info))
+            warmup_info["_runtime_profile"] = runtime_profile
+            timing = {**(timing if isinstance(timing, dict) else {}), **runtime_profile}
+            if isinstance(timing, dict):
+                try:
+                    from executor.http.playwright_http_client import cache_web_identity
+                    cache_web_identity(
+                        getattr(account, "id", None) or getattr(page, "_pool_account_id", None),
+                        timing,
+                        context=getattr(page, "context", None),
+                        account=account,
+                    )
+                except Exception:
+                    pass
+                ssr_cc = str(timing.get("ssr_region") or getattr(getattr(page, "context", None), "_account_ssr_region", "") or "").strip().upper()
+                if re.fullmatch(r"[A-Z]{2}", ssr_cc):
+                    if getattr(page, "context", None) is not None:
+                        try:
+                            setattr(page.context, "_account_ssr_region", ssr_cc)
+                        except Exception:
+                            pass
+                    if account is not None and not getattr(account, "country_code", None):
+                        try:
+                            account.country_code = ssr_cc
+                            if isinstance(db, Session):
+                                db.add(account)
+                                db.commit()
+                        except Exception:
+                            try:
+                                if isinstance(db, Session):
+                                    db.rollback()
+                            except Exception:
+                                pass
+            target_video_id = resolved_video_id or aweme_id
+            cached_video = getattr(page, "_cached_first_comment_aweme_id", None)
+            cached_comments = getattr(page, "_cached_first_comment_page", None)
+            if cached_comments and str(cached_video or "") != str(target_video_id or ""):
+                page._cached_first_comment_page = None
+                cached_comments = None
+            signer_state = getattr(page, "_http_signer_state", {})
+            from services.cookie_validator import remember_observed_ms_token
+            imported_ms_token_only = ms_token_needs_browser_refresh(page.context, live_cookies, account)
+            warmup_info["ms_token_from_import_only"] = imported_ms_token_only
+            if not cached_comments:
+                if (any(live_cookies.get(key) for key in ("sessionid", "sid_tt", "sessionid_ss"))
+                        and all(live_cookies.get(key) for key in ("ttwid", "tt_csrf_token", "msToken"))
+                        and signer_ready and not imported_ms_token_only):
+                    warmup_info["comment_api_skipped"] = True
+                elif live_cookies.get("ttwid"):
+                    read_comments = fetch_comment_page if signer_ready else activate_comment_list_via_page
+                    warmup_comments = await read_comments(page, target_video_id, count=20, runtime_profile=runtime_profile)
+                    warmup_info["comment_api_probed"] = True
+                    warmup_info["comment_api_native_only"] = not signer_ready
+                    warmup_info["comment_api_ready"] = warmup_comments is not None
+                    if warmup_comments is not None and target_video_id:
+                        page._cached_first_comment_page = warmup_comments
+                        page._cached_first_comment_aweme_id = str(target_video_id)
+            else:
                 warmup_info["comment_api_ready"] = True
-                warmup_info["comment_api_skipped"] = True
-            elif live_cookies.get("ttwid"):
-                target_video_id = resolved_video_id or aweme_id
-                warmup_comments = await fetch_comment_page(page, target_video_id, count=20)
-                warmup_info["comment_api_ready"] = warmup_comments is not None
-                if warmup_comments is not None and target_video_id:
-                    page._cached_first_comment_page = warmup_comments
-                    page._cached_first_comment_aweme_id = str(target_video_id)
+                warmup_info["comment_api_intercepted"] = True
+
+            read_meta = getattr(page, "_comment_list_http_meta", {}) or {}
+            from executor.http.request_evidence import has_request_signature
+            wire = read_meta.get("security_params", {})
+            if has_request_signature(wire) and read_meta.get("security_params_source") == "request_event":
+                signer_ready = True
+                page._warmup_signer_ready = True
+                page._http_signer_state = {**(signer_state if isinstance(signer_state, dict) else {}),
+                                           "signed_dispatch_seen": True}
+                warmup_info["signer_ready"] = True
+            # A successful GET can rotate tokens. Give its bootstrap callbacks
+            # a short bounded window; do not navigate or POST while CSRF is absent.
+            token_deadline = time.monotonic() + 0.8
+            while warmup_info.get("comment_api_ready"):
+                refreshed = normalize_cookie_records(await page.context.cookies())
+                if refreshed.get("tt_csrf_token") and (refreshed.get("msToken") or wire.get("msToken")):
+                    break
+                if time.monotonic() >= token_deadline:
+                    break
+                await asyncio.sleep(0.05)
 
             cookies_dict, warmup_info["cookies_saved"] = await synchronize_browser_cookies(page.context, account, db)
+            if warmup_info.get("comment_api_ready"):
+                remember_observed_ms_token(page.context, cookies_dict)
+            ms_token_refresh_pending = ms_token_needs_browser_refresh(page.context, cookies_dict, account)
+            warmup_info["ms_token_refresh_pending"] = ms_token_refresh_pending
+            if not cookies_dict.get("verifyFp") and cookies_dict.get("s_v_web_id"):
+                cookies_dict["verifyFp"] = cookies_dict["s_v_web_id"]
+            if isinstance(timing, dict):
+                if timing.get("device_id") and not cookies_dict.get("device_id"):
+                    cookies_dict["device_id"] = str(timing["device_id"]).strip()
+                if timing.get("odin_id") and not cookies_dict.get("odin_id"):
+                    cookies_dict["odin_id"] = str(timing["odin_id"]).strip()
+                wid_time_val = timing.get("web_id_last_time")
+                if wid_time_val and not cookies_dict.get("WebIdLastTime"):
+                    cookies_dict["WebIdLastTime"] = str(wid_time_val).strip()
+                    cookies_dict["web_id_last_time"] = str(wid_time_val).strip()
+                if timing.get("verify_fp") and not cookies_dict.get("verifyFp"):
+                    cookies_dict["verifyFp"] = str(timing["verify_fp"]).strip()
+                    cookies_dict["s_v_web_id"] = str(timing["verify_fp"]).strip()
+
+            if not cookies_dict.get("verifyFp") and not cookies_dict.get("s_v_web_id"):
+                from executor.http.request_profile import generate_tiktok_verify_fp
+                from executor.http.playwright_http_client import get_cached_web_identity, cache_web_identity
+                from executor.device_profiles import _account_seed_key
+                account_id = getattr(account, "id", None)
+                identity = get_cached_web_identity(account_id, context=page.context, account=account)
+                vfp = identity.get("verify_fp") or identity.get("s_v_web_id") or identity.get("verifyFp")
+                if not vfp:
+                    vfp = generate_tiktok_verify_fp(_account_seed_key(account) if account is not None else None)
+                cache_web_identity(account_id, {"verify_fp": vfp}, context=page.context, account=account)
+                cookies_dict["verifyFp"] = vfp
+                cookies_dict["s_v_web_id"] = vfp
+                if page is not None and getattr(page, "context", None) is not None:
+                    try:
+                        await page.context.add_cookies([
+                            {"name": "s_v_web_id", "value": vfp, "domain": ".tiktok.com", "path": "/"}
+                        ])
+                    except Exception:
+                        pass
             if not _refresh_target_url():
-                return _redirect_failure()
+                return await _redirect_failure()
 
             auth_verified_at = getattr(page, "_http_auth_verified_at", None)
             recently_verified = (
@@ -1240,7 +1461,18 @@ async def warmup_page_for_http(
                 logged_out_reason = await _visible_logged_out_reason(page, phase="http_warmup")
                 if blocked_reason or logged_out_reason:
                     warmup_info.update(status="blocked", reason_code=blocked_reason or f"dead_session:{logged_out_reason}")
-                    return _finish(False, dict(warmup_info))
+                    return await _finish(False, dict(warmup_info))
+
+            # A bounded poll can finish while the driver is still evaluating
+            # the SDK. Consume its current-document result after the other
+            # warmup reads instead of rejecting a now-ready document.
+            current_signer = getattr(page, "_http_signer_state", {}) or {}
+            if not signer_ready and (current_signer.get("sdk_present")
+                                     or current_signer.get("signed_dispatch_seen")):
+                signer_ready = bool(await wait_for_runtime_signer_ready(page, timeout_ms=1000))
+                warmup_info["signer_ready"] = signer_ready
+                warmup_info["signer_recovered_after_reads"] = signer_ready
+                page._warmup_signer_ready = signer_ready
 
             is_valid, missing_critical, missing_optional = validate_request_profile(cookies_dict)
             # Unlike sid_guard, these cookies are actually sent as browser auth.
@@ -1249,32 +1481,36 @@ async def warmup_page_for_http(
                 missing_critical.append("sessionid")
             if not cookies_dict.get("ttwid"):
                 missing_critical.append("ttwid")
+            if not cookies_dict.get("tt_csrf_token"):
+                missing_critical.append("tt_csrf_token")
+            if not cookies_dict.get("msToken") and not wire.get("msToken"):
+                missing_critical.append("msToken")
+            elif ms_token_refresh_pending:
+                missing_critical.append("msToken_refresh_unconfirmed")
+            if not signer_ready:
+                missing_critical.append("signer_not_ready")
             is_valid = not missing_critical
+            missing_optional = [name for name in missing_optional
+                                if name not in {"tt_csrf_token", "msToken"}]
             log_tokens_safely(cookies_dict, f"{correlation_id}_attempt{attempt + 1}" if correlation_id else None)
 
             if is_valid:
-                degraded = "msToken" in missing_optional
                 warmup_info.update(
                     {
-                        "status": "degraded" if degraded else "ok",
-                        "reason_code": "missing_msToken" if degraded else "ready",
+                        "status": "ok",
+                        "reason_code": "ready",
                         "missing_critical": [],
                         "missing_optional": missing_optional,
-                        "degraded_http": degraded,
+                        "degraded_http": False,
                         "signer_ready": signer_ready,
                     }
                 )
-                if degraded:
-                    logger.warning(
-                        f"[WARMUP] Warmup validated in degraded mode for {correlation_id or 'unknown'}: "
-                        f"missing optional params {missing_optional}"
-                    )
-                else:
-                    logger.debug(f"[WARMUP] Warmup completed and validated for {correlation_id or 'unknown'}")
-                return _finish(True, dict(warmup_info))
+                logger.debug(f"[WARMUP] Warmup completed and validated for {correlation_id or 'unknown'}")
+                return await _finish(True, dict(warmup_info))
 
             reason_code = (
-                f"missing_{missing_critical[0]}"
+                (missing_critical[0] if missing_critical[0] == "signer_not_ready"
+                 else f"missing_{missing_critical[0]}")
                 if len(missing_critical) == 1
                 else "missing_critical_tokens"
             )
@@ -1301,7 +1537,7 @@ async def warmup_page_for_http(
             f"[WARMUP] Profile not fully valid after {max_retries} attempts for {correlation_id or 'unknown'}. "
             f"Reason={final_reason}, missing={warmup_info.get('missing_critical')}"
         )
-        return _finish(False, dict(warmup_info))
+        return await _finish(False, dict(warmup_info))
 
     except Exception as e:
         logger.warning(f"[WARMUP] Error during warmup for {correlation_id or 'unknown'}: {e}", exc_info=True)
@@ -1325,7 +1561,19 @@ async def warmup_page_for_http(
                 "missing_optional": [],
             }
         )
-        return _finish(False, dict(warmup_info))
+        return await _finish(False, dict(warmup_info))
+
+    finally:
+        response_listener_active = False
+        if page is not None and callable(getattr(page, "remove_listener", None)):
+            try:
+                page.remove_listener("response", _schedule_warmup_response)
+            except Exception:
+                logger.debug("Warmup listener cleanup failed", exc_info=True)
+        for task in response_tasks:
+            task.cancel()
+        if response_tasks:
+            await asyncio.gather(*response_tasks, return_exceptions=True)
 
 
 def _coerce_bool(value, default: bool) -> bool:
@@ -1406,7 +1654,7 @@ class EngagementResult:
     def accept_http_main_confirmation(self) -> None:
         """Apply the same HTTP main confirmation rule as the user-schema flow."""
         main = self.main_comment
-        if not (settings.TIKTOK_NETWORK_FIRST and settings.TIKTOK_NETWORK_IMPL_READY):
+        if not http_first_enabled(settings):
             return
         if not (
             main.get("success") and main.get("posted") and main.get("network_confirmed")
@@ -1487,6 +1735,9 @@ class EngagementResult:
                 or bool(self.main_comment.get("local_confirmation_without_id"))
             )
         )
+        main_submitted_unconfirmed = bool(main_submitted_unconfirmed or (
+            self.main_comment.get("submitted_unconfirmed") and self.main_comment.get("publication_attempted")
+        ))
         if http_first_enabled(settings):
             main_success = bool(main_success and self.main_comment.get("network_confirmed")
                                 and str(self.main_comment.get("method") or "").startswith("http")
@@ -1498,7 +1749,7 @@ class EngagementResult:
         boost_ok = (not self.boost_enabled) or (not provider_enabled) or self.boost_order_id is not None
         boost_requested = self.boost_enabled and provider_enabled
 
-        if mode == "engagement_only":
+        if mode in {"engagement_only", "keyword_replies"}:
             main_core_confirmed = self.comment_found
         elif not self.main_comment.get("comment_id") and self.comment_id:
             main_core_confirmed = self.comment_found
@@ -1589,9 +1840,12 @@ class EngagementResult:
             main_payload["local_confirmed"] = False
             reply_payload = [{**row, "success": confirmed_reply(row), "local_confirmed": False} for row in self.replies]
 
+        partial = mode in {"engagement_only", "keyword_replies"} and successful_replies > 0 and not core_success and not submitted_unconfirmed
+        result_status = ("success" if core_success else "submitted_unconfirmed" if submitted_unconfirmed
+                         else "partial" if partial else "fail")
         result = {
-            "status": "success" if core_success else ("submitted_unconfirmed" if submitted_unconfirmed else "fail"),
-            "core_status": "success" if core_success else ("submitted_unconfirmed" if submitted_unconfirmed else "fail"),
+            "status": result_status,
+            "core_status": result_status,
             "comment_id": self.comment_id or self.main_comment.get("comment_id"),
             "error": error_message,
             "warnings": warnings,
@@ -1603,6 +1857,7 @@ class EngagementResult:
                 "replies": {
                     "ok": successful_replies,
                     "total": len(self.replies),
+                    "expected": max(self.expected_reply_variants, len(self.replies)),
                     "submitted": successful_replies + submitted_unconfirmed_replies,
                     "submitted_unconfirmed": submitted_unconfirmed_replies,
                     "items": reply_payload
@@ -1633,6 +1888,7 @@ class EngagementResult:
         try:
             from services.task_execution_ledger import attach_url_execution_ledger
 
+            explicit_publication_flags(result)
             attach_url_execution_ledger(result)
         except Exception:
             logger.debug("Failed to attach engagement execution ledger", exc_info=True)
@@ -1677,7 +1933,7 @@ async def find_comment_for_engagement(
         normalized_comment_id = str(comment_id).strip()
         logger.info(f"Task {task_id}: Verifying provided comment_id: {normalized_comment_id[:20]}")
 
-        max_attempts = max(1, settings.MAX_RETRY_ACCOUNTS)
+        max_attempts = candidate_scan_limit(settings)
         tried_account_ids: list[int] = []
 
         for attempt in range(max_attempts):
@@ -2030,9 +2286,13 @@ async def _attempt_publish_on_account(
                 outcome_dict["posted"] = True
                 outcome_dict["network_confirmed"] = True
                 outcome_dict["method"] = "bas"
+            await record_publication("reply" if is_reply else "main", {**(outcome_dict or {}),
+                "reply_id" if is_reply else "comment_id": bas_result.comment_id, "text": text,
+                "parent_comment_id": parent_comment_id, "account_id": account.id,
+                "network_confirmed": True, "success": True, "publication_attempted": True})
             return bas_result.comment_id, None, "bas"
         if bas_result.status == "redirected":
-            mark_needs_reauth(db, account.id, reason=bas_result.error_reason or "bas_redirected")
+            mark_soft_error(db, account.id, bas_result.error_reason or "bas_redirected")
             return None, bas_result.error_reason, "bas"
         if bas_result.error_reason == "bas_not_running":
             logger.error(
@@ -2090,7 +2350,6 @@ async def _attempt_publish_on_account(
 
                 if not profile_valid:
                     reason = str(warmup_info.get("reason_code") or "warmup_failed")
-                    _record_http_account_result(account.id, "soft_fail")
                     logger.info(
                         "Task %s: HTTP warmup unavailable for account %s (%s); stopping account attempt",
                         task_id, account.id, reason,
@@ -2113,7 +2372,7 @@ async def _attempt_publish_on_account(
                         _register_runtime_failure(db, account, "missing_aweme_id")
                         return None, "missing_aweme_id", "http"
 
-                    http_client = await PlaywrightHttpClient.from_page(page)
+                    http_client = await PlaywrightHttpClient.from_page(page, runtime_profile=warmup_info.get("_runtime_profile"))
                     if is_reply:
                         if str(os.getenv("LIKE_PARENT_BEFORE_REPLY", "1")).strip().lower() not in {"0", "false", "no", "off"} and parent_comment_id:
                             clean_parent_id = str(parent_comment_id).strip()
@@ -2173,6 +2432,10 @@ async def _attempt_publish_on_account(
                                 outcome_dict["response_parent_id"] = (meta or {}).get("response_parent_id")
                                 outcome_dict["response_reply_to_reply_id"] = (meta or {}).get("response_reply_to_reply_id")
                                 outcome_dict["response_root_comment_id"] = (meta or {}).get("response_root_comment_id")
+                            await record_publication("reply" if is_reply else "main", {**(outcome_dict or {}),
+                                "reply_id" if is_reply else "comment_id": comment_id, "text": text,
+                                "parent_comment_id": parent_comment_id, "account_id": account.id,
+                                "network_confirmed": True, "success": True, "publication_attempted": True})
                             return comment_id, None, "http"
                     else:
                         success, comment_id, error_msg, error_type = await http_client.publish_main_comment(
@@ -2197,6 +2460,10 @@ async def _attempt_publish_on_account(
                                 request_meta = getattr(http_client, "last_request_meta", {})
                                 if isinstance(request_meta, dict):
                                     outcome_dict["comment_author"] = request_meta.get("comment_author")
+                            await record_publication("reply" if is_reply else "main", {**(outcome_dict or {}),
+                                "reply_id" if is_reply else "comment_id": comment_id, "text": text,
+                                "parent_comment_id": parent_comment_id, "account_id": account.id,
+                                "network_confirmed": True, "success": True, "publication_attempted": True})
                             return comment_id, None, "http"
 
                     reason = error_msg or ("http_reply_failed" if is_reply else "http_failed")
@@ -2207,6 +2474,10 @@ async def _attempt_publish_on_account(
 
                     if outcome_dict is not None:
                         outcome_dict["publication_attempted"] = request_attempted
+                    if getattr(error_type, "value", error_type) == "submitted_unconfirmed":
+                        if outcome_dict is not None:
+                            outcome_dict.update(submitted_unconfirmed=True, method="http", posted=True)
+                        return None, reason, "submitted_unconfirmed"
                     if not request_attempted:
                         logger.info(
                             "Task %s: %s HTTP stopped before TikTok request on account %s "
@@ -2246,7 +2517,7 @@ async def _attempt_publish_on_account(
                 enrich_result.log_summary(account.id, correlation_id)
 
                 if enrich_result.redirected:
-                    mark_needs_reauth(db, account.id, reason="enrichment_redirect_dead_session")
+                    mark_soft_error(db, account.id, "enrichment_redirect_dead_session")
                     return None, "dead_session_during_enrichment", "enrichment"
 
                 if enrich_result.success and enrich_result.all_cookies_json:
@@ -2306,7 +2577,7 @@ async def _attempt_publish_on_account(
                         account.id,
                         enrich_result.new_cookies,
                     )
-                    mark_needs_reauth(db, account.id, reason="no_login_auth_after_enrichment")
+                    mark_soft_error(db, account.id, "no_login_auth_after_enrichment")
                     return None, "dead_session: no_login_auth_after_enrichment", "enrichment"
             except Exception as enrich_exc:
                 reason = f"enrichment_exception:{str(enrich_exc)[:80]}"
@@ -2343,7 +2614,7 @@ async def _attempt_publish_on_account(
         )
 
         if boot.status == "dead_session":
-            mark_needs_reauth(db, account.id, reason=boot.dead_reason or "dead_session")
+            mark_soft_error(db, account.id, boot.dead_reason or "dead_session")
             return None, f"dead_session: {boot.dead_reason}", "bootstrap"
 
         if boot.status == "navigation_failed":
@@ -2371,7 +2642,7 @@ async def _attempt_publish_on_account(
                 )
                 return None, reason, "bootstrap"
 
-            mark_needs_reauth(db, account.id, reason="weak_session_no_login_auth")
+            mark_soft_error(db, account.id, "weak_session_no_login_auth")
             return None, "weak_session_no_login_auth", "bootstrap"
 
         try:
@@ -2488,7 +2759,6 @@ async def _attempt_publish_on_account(
             if browser_state != "logged_out":
                 if not is_reply:
                     try:
-                        import os
                         os.makedirs("diagnostics", exist_ok=True)
                         import time
                         ts = int(time.time())
@@ -2538,7 +2808,6 @@ async def _attempt_publish_on_account(
 
             if not is_reply:
                 try:
-                    import os
                     os.makedirs("diagnostics", exist_ok=True)
                     import time
                     ts = int(time.time())
@@ -2550,17 +2819,17 @@ async def _attempt_publish_on_account(
                     logger.info(f"Task {task_id}: Diagnostic screenshot saved: {path}")
                 except Exception:
                     pass
-                mark_needs_reauth(db, account.id, reason="input_not_found_logged_out")
+                mark_runtime_cooldown(db, account.id, "input_not_found_logged_out", cooldown_minutes=5, category="unknown_ui")
                 logger.warning(
-                    "Task %s: Account %s — input_not_found, session likely dead. "
-                    "Marked reauth_needed.",
+                    "Task %s: Account %s — input_not_found, login UI observed. "
+                    "Applied temporary runtime cooldown.",
                     task_id, account.id,
                 )
             else:
-                mark_needs_reauth(db, account.id, reason="reply_input_not_found_logged_out")
+                mark_runtime_cooldown(db, account.id, "reply_input_not_found_logged_out", cooldown_minutes=5, category="unknown_ui", scope=REPLY_SCOPE)
                 logger.warning(
-                    "Task %s: Reply account %s — input_not_found, session dead. "
-                    "Marked reauth_needed.",
+                    "Task %s: Reply account %s — input_not_found, session not confirmed. "
+                    "Applied temporary runtime cooldown.",
                     task_id, account.id,
                 )
             return None, result.error_reason, "publish"
@@ -2586,10 +2855,14 @@ async def _attempt_publish_on_account(
                     else "dom_publish_success"
                 )
                 outcome_dict["method"] = "hybrid_dom"
+            await record_publication("reply" if is_reply else "main", {**(outcome_dict or {}),
+                "reply_id" if is_reply else "comment_id": result.comment_id, "text": text,
+                "parent_comment_id": parent_comment_id, "account_id": account.id,
+                "network_confirmed": bool(getattr(result, "network_captured", False)), "success": True, "publication_attempted": True})
             return result.comment_id, None, "hybrid"
 
         if result.status == "redirected":
-            mark_needs_reauth(db, account.id, reason=result.error_reason or "redirected")
+            mark_soft_error(db, account.id, result.error_reason or "redirected")
             return None, result.error_reason, "publish"
 
         if _is_ambiguous_post_submit_result(result):
@@ -2873,8 +3146,11 @@ async def execute_replies_http(
         last_error: Optional[str] = None
         reply_id: Optional[str] = None
         reply_completed = False
+        publication_attempts = 0
 
-        for attempt_num in range(1, max(1, settings.MAX_RETRY_ACCOUNTS) + 1):
+        for attempt_num in range(1, candidate_scan_limit(settings) + 1):
+            if publication_attempts >= 6:
+                break
             reply_account = get_free_account_for_reply(
                 db,
                 exclude_ids=used_account_ids if used_account_ids else None,
@@ -2896,7 +3172,8 @@ async def execute_replies_http(
             if http_first_enabled(settings) and strategy not in {"http_first", "http_cautious"}:
                 last_error = "cookies_not_http_ready"
                 continue
-            if not http_first_enabled(settings) and (force_dom_text_parent or strategy == "dom_first"):
+            from services.order_transport import current_order_transport, DOM
+            if not http_first_enabled(settings) and (force_dom_text_parent or strategy == "dom_first" or current_order_transport() == DOM):
                 try:
                     post_reply_func = globals().get("post_reply")
                     if post_reply_func is None:
@@ -2964,7 +3241,7 @@ async def execute_replies_http(
                 continue
 
             logger.info(
-                f"Task {task_id}: Reply attempt {attempt_num}/{settings.MAX_RETRY_ACCOUNTS} "
+                f"Task {task_id}: Reply candidate {attempt_num}/{candidate_scan_limit(settings)} "
                 f"on account {reply_account.id}"
             )
 
@@ -2980,6 +3257,8 @@ async def execute_replies_http(
                 correlation_id=f"task_{task_id}_reply_{reply_idx + 1}_a{attempt_num}",
                 outcome_dict=reply_outcome,
             )
+            if reply_outcome.get("publication_attempted"):
+                publication_attempts += 1
 
             reply_local_no_id_accepted = (
                 stage == "reply_local_no_id"
@@ -2988,6 +3267,14 @@ async def execute_replies_http(
                 and bool(reply_outcome.get("local_confirmed"))
                 and bool(reply_outcome.get("local_confirmation_without_id"))
             )
+
+            if stage == "submitted_unconfirmed":
+                results.append({"variant_index": reply_idx + 1, "text": reply_text,
+                                "success": False, "submitted_unconfirmed": True,
+                                "visibility_status": "submitted_unconfirmed", "error": err,
+                                "account_id": reply_account.id, "method": "http"})
+                reply_completed = True
+                break
 
             if reply_id or reply_local_no_id_accepted:
                 result_method = "http" if stage == "http" else "hybrid"
@@ -3103,6 +3390,76 @@ async def execute_replies_http(
     return results
 
 
+async def _resolve_auto_engagement_parent(db, video_url, *, pool_owner_user_id=None,
+                                          task_id=None, comment_author=None, stop_requested=None):
+    """Read one valid top-level parent before reply workers fan out; never POST here."""
+    if not http_first_enabled(settings):
+        return None, "auto_parent_requires_http"
+    from executor import user_schema as schema
+    from executor.http.comment_discovery import fetch_comment_page
+    excluded = []
+    browser_attempts = 0
+    browser_limit = max(1, min(6, int(settings.MAX_RETRY_ACCOUNTS)))
+    for _ in range(candidate_scan_limit(settings)):
+        if stop_requested and stop_requested():
+            return None, "stopped_by_user"
+        if browser_attempts >= browser_limit:
+            break
+        try:
+            account = get_free_account_for_reply(db, exclude_ids=excluded, reserve=True,
+                                                 pool_owner_user_id=pool_owner_user_id)
+        except Exception:
+            return None, "auto_parent_selection_error"
+        if account is None:
+            break
+        excluded.append(account.id)
+        context = page = None
+        corr = f"task_{task_id}_reply_auto_parent_acc{account.id}"
+        try:
+            deny = await schema._preflight_cookie_http_gate(db, account, correlation_id=corr, phase="auto_parent_pre_browser")
+            if deny:
+                continue
+            browser_attempts += 1
+            context, page = await create_page_for_account(account)
+            ready, _ = await schema._ensure_account_login_ready(db, page, account, video_url,
+                                                                timeout_ms=5000, correlation_id=corr)
+            if not ready:
+                continue
+            _, ready, _ = await warmup_page_for_http(page, video_url, correlation_id=corr, account=account, db=db)
+            if not ready:
+                continue
+            media_id = extract_video_id(getattr(page, "url", "")) or extract_video_id(video_url)
+            if not media_id:
+                return None, "video_id_unavailable"
+            payload = await fetch_comment_page(page, media_id, count=5)
+            if payload is None:
+                meta = getattr(page, "_comment_list_http_meta", {})
+                return None, "parent_api_unavailable:" + str(meta.get("reason") or "unknown")
+            wanted = str(comment_author or "").strip().lstrip("@").casefold()
+            for row in payload.get("comments", []):
+                if not isinstance(row, dict) or not valid_comment_id(row.get("cid")):
+                    continue
+                if str(row.get("reply_id") or "0") != "0" or row.get("is_deleted") in (True, 1, "1"):
+                    continue
+                user = row.get("user") if isinstance(row.get("user"), dict) else {}
+                author = str(user.get("unique_id") or user.get("nickname") or "").strip()
+                if wanted and author.lstrip("@").casefold() != wanted:
+                    continue
+                return {"cid": str(row["cid"]), "text": str(row.get("text") or ""),
+                        "author": author or None}, None
+            return None, "auto_parent_not_found"
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            logger.debug("Auto parent read failed account=%s: %s", account.id, type(exc).__name__)
+        finally:
+            try:
+                await schema._safe_close(context, page, reason="auto_parent_checked", correlation_id=corr)
+            finally:
+                schema.release_reply_account_reservation(account.id)
+    return None, "no_auto_parent_accounts"
+
+
 async def execute_engagement_only_replies_via_full_flow(
     db: Session,
     video_url: str,
@@ -3114,28 +3471,42 @@ async def execute_engagement_only_replies_via_full_flow(
     task_id: Optional[int] = None,
     pool_owner_user_id: Optional[int] = None,
     stop_requested: Optional[Callable[[], bool]] = None,
+    parent_phrase_match: bool = True,
+    close_pool_after_phase: bool = True,
+    prepublish_failed_account_ids: Optional[set[int]] = None,
+    variant_indices: Optional[List[int]] = None,
 ) -> tuple[List[Dict[str, Any]], Optional[str], Optional[str]]:
-    """Run engagement-only replies through the same DOM flow as full orders.
+    """Reuse the shared account/session and reply publication workflow.
 
-    The old engagement-only path first burned viewer accounts for a separate
-    DOM verification and then used a different reply implementation. Full
-    orders already have the safer logic: login probe, cookie enrichment, URL
-    guard, strict comment drawer opening, scoped parent search, and
-    publish_reply_hybrid. Reuse that path here without touching the full order
-    orchestration.
+    In HTTP mode known numeric CIDs go directly to the HTTP publisher; API
+    parent discovery is reserved for candidates without an ID. Keyword orders
+    supply known CIDs, own the complete browser-pool phase, and can share
+    pre-publication account exclusions across their matched parents. Other
+    callers retain their selected HTTP/DOM mode and default phase ownership.
     """
+    if variant_indices is not None and (len(variant_indices) != len(replies) or len(set(variant_indices)) != len(variant_indices) or any(type(i) is not int or i < 1 for i in variant_indices)):
+        raise ValueError("Invalid original reply variant indices")
     if not replies:
         return [], (str(comment_id).strip() if comment_id else None), comment_author
 
     anchor_text = (comment_text or "").strip()
     anchor_id = str(comment_id or "").strip() or None
+    auto_error = None
+    if not anchor_text and not anchor_id:
+        selected, auto_error = await _resolve_auto_engagement_parent(
+            db, video_url, pool_owner_user_id=pool_owner_user_id, task_id=task_id,
+            comment_author=comment_author, stop_requested=stop_requested,
+        )
+        if selected:
+            anchor_id, anchor_text = selected["cid"], selected["text"]
+            comment_author = selected["author"]
     if not normalize_search_phrase(anchor_text) and not anchor_id:
         return [
             {
                 "text": reply_text,
                 "success": False,
                 "method": None,
-                "error": "engagement_reply_anchor_missing" if not anchor_text else "empty_search_phrase",
+                "error": auto_error or ("engagement_reply_anchor_missing" if not anchor_text else "empty_search_phrase"),
                 "reply_id": None,
                 "http_error_type": None,
                 "parent_confirmed": False,
@@ -3219,6 +3590,7 @@ async def execute_engagement_only_replies_via_full_flow(
     submitted_parent_keys_by_variant: Dict[int, set[str]] = {}
     soft_submitted_reply_keys_by_variant: Dict[int, set[str]] = {}
     last_outcomes_by_variant: Dict[int, List[Any]] = {}
+    publication_attempted_by_variant: Dict[int, bool] = {}
     last_reply_account_by_variant: Dict[int, Optional[int]] = {}
     missed_search_account_ids: set[int] = set()
     confident_empty_rotation_account_ids: set[int] = set()
@@ -3308,6 +3680,16 @@ async def execute_engagement_only_replies_via_full_flow(
         value = str(reason or "").strip().lower()
         if not value:
             return None
+        if "captcha" in value:
+            return "captcha"
+        if "stealth_reject" in value or "empty_body" in value:
+            return "empty_body"
+        if "signer" in value or "runtime_profile" in value:
+            return "signer_or_runtime"
+        if "comment_api" in value or "comment_list" in value or "parent_api_unavailable" in value:
+            return "comment_api"
+        if "timeout" in value or "timed out" in value:
+            return "timeout"
         if (
             "goto_failed" in value
             or "connection timeout" in value
@@ -3381,7 +3763,11 @@ async def execute_engagement_only_replies_via_full_flow(
             scheduler_stats.get("selection_scan_skipped", 0),
         )
 
-    async def _select_reply_account(attempt_db: Session) -> Tuple[Optional[Account], Optional[str]]:
+    def _selection_excluded_ids() -> list[int]:
+        return [*used_reply_accounts,
+                *sorted((prepublish_failed_account_ids or set()) - set(used_reply_accounts))]
+
+    async def _select_reply_account(attempt_db: Session, variant_idx: int) -> Tuple[Optional[Account], Optional[str]]:
         async with reply_selection_lock:
             # P0 scheduler: while a recent selection already concluded that every
             # active proxy is at capacity, short-circuit instead of re-scanning
@@ -3397,7 +3783,9 @@ async def execute_engagement_only_replies_via_full_flow(
                 return None, temporary_reply_selection_error
             strict_degraded_categories = {"captcha", "page_blocked"}
             capacity_blocked_proxies: set[str] = set()
-            for _ in range(max(1, parallel_browser_capacity + 2)):
+            for _ in range(max(30, parallel_browser_capacity * 5 + 10)):
+                if reply_account_tries.get(variant_idx, 0) >= candidate_scan_limit(settings):
+                    return None, "candidate_budget_exhausted"
                 exclude_proxies = (
                     set(active_reply_proxy_counts) | set(used_reply_proxy_values)
                     if dynamic_worker_pool_enabled
@@ -3406,7 +3794,7 @@ async def execute_engagement_only_replies_via_full_flow(
                 exclude_proxies |= capacity_blocked_proxies
                 candidate = get_free_account_for_reply(
                     attempt_db,
-                    exclude_ids=list(used_reply_accounts),
+                    exclude_ids=_selection_excluded_ids(),
                     exclude_proxies=exclude_proxies,
                     exclude_degraded_categories=strict_degraded_categories,
                     pool_owner_user_id=pool_owner_user_id,
@@ -3434,7 +3822,7 @@ async def execute_engagement_only_replies_via_full_flow(
                         )
                         candidate = get_free_account_for_reply(
                             attempt_db,
-                            exclude_ids=list(used_reply_accounts),
+                            exclude_ids=_selection_excluded_ids(),
                             exclude_proxies=balanced_exclude_proxies,
                             exclude_proxy_source_hosts=False,
                             exclude_degraded_categories=strict_degraded_categories,
@@ -3448,7 +3836,7 @@ async def execute_engagement_only_replies_via_full_flow(
                         )
                         candidate = get_free_account_for_reply(
                             attempt_db,
-                            exclude_ids=list(used_reply_accounts),
+                            exclude_ids=_selection_excluded_ids(),
                             exclude_proxies=capacity_blocked_proxies,
                             exclude_degraded_categories=strict_degraded_categories,
                             pool_owner_user_id=pool_owner_user_id,
@@ -3487,6 +3875,25 @@ async def execute_engagement_only_replies_via_full_flow(
                         max_active_browsers_per_proxy,
                     )
                     continue
+                from executor.user_schema import _preflight_cookie_http_gate
+                reply_account_tries[variant_idx] = reply_account_tries.get(variant_idx, 0) + 1
+                preflight_deny = await _preflight_cookie_http_gate(
+                    attempt_db,
+                    candidate,
+                    correlation_id=f"task_{task_id}_select_acc{candidate.id}",
+                    phase="reply_selection",
+                )
+                if preflight_deny:
+                    logger.info(
+                        "Task %s: engagement_only candidate account %s failed cookie preflight (%s); discarding and continuing selection",
+                        task_id,
+                        candidate.id,
+                        preflight_deny,
+                    )
+                    used_reply_accounts.append(candidate.id)
+                    if prepublish_failed_account_ids is not None:
+                        prepublish_failed_account_ids.add(candidate.id)
+                    continue
                 used_reply_accounts.append(candidate.id)
                 if proxy_value:
                     used_reply_proxy_values.add(proxy_value)
@@ -3520,6 +3927,8 @@ async def execute_engagement_only_replies_via_full_flow(
             return False
 
     async def _close_parallel_phase_browsers(phase: str) -> None:
+        if not close_pool_after_phase:
+            return  # The keyword-order caller owns the complete parent batch.
         try:
             from executor.browser_pool import close_browser_pool
 
@@ -3583,6 +3992,10 @@ async def execute_engagement_only_replies_via_full_flow(
             "success": False,
             "method": None,
             "error": error,
+            # No selected account means these resource failures happened
+            # before any publishing worker could send a request. An earlier
+            # worker/unknown attempt must keep the conservative unknown flag.
+            "publication_attempted": bool(publication_attempted_by_variant.get(variant_index) or delivery_state({"error": error, "attempts": attempts}) != "not_sent"),
             "reply_id": None,
             "http_error_type": None,
             "parent_confirmed": False,
@@ -3770,10 +4183,10 @@ async def execute_engagement_only_replies_via_full_flow(
         from db.database import get_sync_db_context
 
         with get_sync_db_context() as attempt_db:
-            if reply_account_tries.get(variant_idx, 0) >= max(1, settings.MAX_RETRY_ACCOUNTS):
+            if reply_account_tries.get(variant_idx, 0) >= candidate_scan_limit(settings):
                 attempt_info["error"] = "no_free_reply_accounts"
                 return attempt_info
-            reply_account, selection_error = await _select_reply_account(attempt_db)
+            reply_account, selection_error = await _select_reply_account(attempt_db, variant_idx)
             if not reply_account:
                 if selection_error == temporary_reply_selection_error:
                     logger.info(
@@ -3791,7 +4204,6 @@ async def execute_engagement_only_replies_via_full_flow(
                 return attempt_info
 
             attempt_info["account_id"] = reply_account.id
-            reply_account_tries[variant_idx] = reply_account_tries.get(variant_idx, 0) + 1
             attempt_info["proxy_value"] = _account_proxy_value(reply_account)
             last_reply_account_by_variant[variant_idx] = reply_account.id
             correlation_id = (
@@ -3829,7 +4241,7 @@ async def execute_engagement_only_replies_via_full_flow(
                         soft_submitted_reply_keys=soft_submitted_reply_keys,
                         require_parent_author_match=author_hints_present,
                         allow_parent_author_fallback=False,
-                        parent_phrase_match=True,
+                        parent_phrase_match=parent_phrase_match,
                         parent_search_progress_sink=parent_search_progress,
                         shared_parent_cache=shared_parent_cache,
                         on_resolved_video_url=_adopt_resolved_video_url,
@@ -3844,6 +4256,7 @@ async def execute_engagement_only_replies_via_full_flow(
                     reply_account.id,
                     reply_worker_attempt_timeout_seconds,
                 )
+                publication_attempted_by_variant[variant_idx] = bool(publication_attempted_by_variant.get(variant_idx) or parent_search_progress.get("publication_attempted"))
                 attempt_info["pre_publish_failure"] = not bool(parent_search_progress.get("publication_attempted"))
                 attempt_info["error"] = f"parallel_reply_attempt_timeout:{reply_worker_attempt_timeout_seconds:.1f}s"
                 attempt_info["parent_search_max_seen_rows"] = int(
@@ -3875,6 +4288,7 @@ async def execute_engagement_only_replies_via_full_flow(
                     reply_account.id,
                     str(exc)[:120],
                 )
+                publication_attempted_by_variant[variant_idx] = bool(publication_attempted_by_variant.get(variant_idx) or parent_search_progress.get("publication_attempted"))
                 attempt_info["pre_publish_failure"] = not bool(parent_search_progress.get("publication_attempted"))
                 attempt_info["error"] = f"reply_attempt_exception:{str(exc)[:80]}"
                 return attempt_info
@@ -3890,6 +4304,26 @@ async def execute_engagement_only_replies_via_full_flow(
                         reply_proxy_slot_released.set()
 
         outcomes = list(attempt_result.replies or [])
+        publication_attempted_by_variant[variant_idx] = bool(
+            publication_attempted_by_variant.get(variant_idx) or parent_search_progress.get("publication_attempted")
+            or any(o.publication_attempted or o.reply_comment_id or o.submitted_unconfirmed for o in outcomes))
+        if prepublish_failed_account_ids is not None:
+            for outcome in outcomes:
+                reason = str(outcome.error or "")
+                attempted = getattr(outcome, "publication_attempted", None)
+                session_refusal = (str(outcome.method or "").startswith("http_user_schema")
+                                   and attempted is False)
+                account_refusal = is_pre_publish_account_failure(reason, publication_attempted=None)
+                if (reason and not reason.startswith(("parent_", "reply_parent_", "remaining_main_comments_"))
+                        and not outcome.success and not outcome.submitted_unconfirmed
+                        and not outcome.reply_comment_id and not outcome.counts_as_submitted
+                        and not outcome.soft_submitted
+                        and (session_refusal or account_refusal)
+                        and is_pre_publish_account_failure(reason, publication_attempted=attempted)):
+                    # Retain account/session readiness failures across keyword
+                    # parents. Confirmed and uncertain sends remain reusable only
+                    # through their normal receipt/health rules, never this gate.
+                    prepublish_failed_account_ids.add(outcome.account_id or reply_account.id)
         attempt_info["pre_publish_failure"] = pre_publish_outcomes(outcomes)
         found_mains = list(getattr(attempt_result, "found_mains", None) or [])
         if not found_mains and outcomes:
@@ -4014,7 +4448,7 @@ async def execute_engagement_only_replies_via_full_flow(
 
     pending_reply_variants: List[Tuple[int, str]] = [
         (variant_idx, str(reply_text or "").strip())
-        for variant_idx, reply_text in enumerate(replies, start=1)
+        for variant_idx, reply_text in zip(variant_indices or range(1, len(replies) + 1), replies)
         if str(reply_text or "").strip()
     ]
     reply_rounds: Dict[int, int] = {}
@@ -4102,6 +4536,12 @@ async def execute_engagement_only_replies_via_full_flow(
                                 reply_rounds[variant_idx],
                             )
                         )
+                        def _consume_task_error(t: asyncio.Task) -> None:
+                            try:
+                                t.exception()
+                            except (asyncio.CancelledError, Exception):
+                                pass
+                        task_obj.add_done_callback(_consume_task_error)
                         active_reply_tasks[task_obj] = (variant_idx, reply_text)
                         inflight_reply_variants.add(variant_idx)
                         logger.debug(
@@ -4208,8 +4648,10 @@ async def execute_engagement_only_replies_via_full_flow(
                     for variant_idx, reply_text, raw_result in completed_reply_results:
                         if raw_result.get("pre_publish_failure"):
                             reply_rounds[variant_idx] = max(0, reply_rounds.get(variant_idx, 0) - 1)
+
                         if raw_result.get("error") == temporary_reply_selection_error:
                             reply_rounds[variant_idx] = max(0, reply_rounds.get(variant_idx, 0) - 1)
+
                             pending_reply_variants.append((variant_idx, reply_text))
                             capacity_waiting_for_slot_release = bool(
                                 active_reply_tasks and not slot_release_observed
@@ -4542,8 +4984,10 @@ async def execute_engagement_only_replies_via_full_flow(
 
             if raw_result.get("pre_publish_failure"):
                 reply_rounds[variant_idx] = max(0, reply_rounds.get(variant_idx, 0) - 1)
+
             if raw_result.get("error") == temporary_reply_selection_error:
                 reply_rounds[variant_idx] = max(0, reply_rounds.get(variant_idx, 0) - 1)
+
                 retry_variants.append((variant_idx, reply_text))
                 logger.info(
                     "Task %s: engagement_only reply variant %s deferred until a proxy/browser slot frees up",
@@ -4699,6 +5143,8 @@ def _engagement_reply_outcome_to_dict(outcome: Any, *, attempts: int) -> Dict[st
             and getattr(outcome, "reply_confirmation", None) == "network_comment_id"))),
         "network_confirmed": bool(http_transport and valid_comment_id(getattr(outcome, "reply_comment_id", None))
                                   and getattr(outcome, "reply_confirmation", None) == "network_comment_id"),
+        "publication_attempted": (bool(outcome.publication_attempted or outcome.reply_comment_id or outcome.submitted_unconfirmed)
+                                  if outcome.publication_attempted is not None else delivery_state({"error": outcome.error}) != "not_sent"),
         "method": outcome.method,
         "error": outcome.error,
         "reply_id": getattr(outcome, "reply_comment_id", None),
@@ -4847,7 +5293,7 @@ async def execute_hybrid_full(
     result.resolved_video_url = video_url
     result.aweme_id = resolved_video_id or extract_video_id(video_url)
 
-    max_attempts = max(1, settings.MAX_RETRY_ACCOUNTS)
+    max_attempts = candidate_scan_limit(settings)
     tried_account_ids: List[int] = []
     reserved_main_account_ids: set[int] = set()
     
@@ -4864,7 +5310,10 @@ async def execute_hybrid_full(
             finally:
                 reserved_main_account_ids.discard(account_id)
     
+    publication_attempts = 0
     for attempt_num in range(1, max_attempts + 1):
+        if publication_attempts >= 6:
+            break
         candidate = get_free_account_for_main_comment(
             db,
             exclude_ids=tried_account_ids,
@@ -4904,6 +5353,14 @@ async def execute_hybrid_full(
             and bool(result.main_comment.get("posted"))
             and bool(result.main_comment.get("local_confirmed"))
         )
+        if result.main_comment.get("publication_attempted"):
+            publication_attempts += 1
+
+        if stage == "submitted_unconfirmed":
+            result.main_comment.update(success=False, submitted_unconfirmed=True, error=err)
+            release_main_account_reservation(candidate.id)
+            reserved_main_account_ids.discard(candidate.id)
+            break
 
         if comment_id:
             if http_first_enabled(settings):
@@ -5297,16 +5754,15 @@ async def execute_engagement_only(
     initial_comment_id = str(comment_id or "").strip()
     initial_author = (username or "").strip() or None
     if replies_to_post and not initial_comment_id and not (comment_text or "").strip():
-        result.main_comment["error"] = "comment_found_but_reply_anchor_incomplete"
-        logger.error(
-            "Task %s: Comment was found for engagement_only, but replies cannot "
-            "be anchored because both comment_id and comment_text are missing. "
-            "has_text=%s, author=%s",
-            task_id,
-            bool(comment_text),
-            initial_author,
+        selected, auto_error = await _resolve_auto_engagement_parent(
+            db, video_url, pool_owner_user_id=pool_owner_user_id, task_id=task_id,
+            comment_author=username, stop_requested=stop_requested,
         )
-        return result
+        if not selected:
+            result.main_comment["error"] = auto_error or "auto_parent_not_found"
+            return result
+        initial_comment_id, comment_text, initial_author = selected["cid"], selected["text"], selected["author"]
+        result.main_comment["auto_parent_selected"] = True
 
     # For engagement-only we do not publish a main comment. Treat the provided
     # text/ID as the parent anchor, then let the full-order reply flow prove it

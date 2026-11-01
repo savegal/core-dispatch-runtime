@@ -305,7 +305,7 @@ async def _release_proxy_lock_safe(lock_acquired: bool, proxy_obj, account_id: i
     """
     if lock_acquired and proxy_obj:
         try:
-            await release_proxy_lock(proxy_obj.id)
+            await release_proxy_lock(lock_acquired)
             logger.debug(f"[UnifiedParser] Released lock for mobile proxy {proxy_obj.id}")
         except Exception as lock_err:
             logger.warning(f"[UnifiedParser] Failed to release proxy lock for account {account_id or 'unknown'}: {lock_err}")

@@ -22,8 +22,10 @@ MIGRATION_MODULES: List[str] = [
     "add_user_full_access_override_migration",
     "add_dedicated_user_proxy_migration",
     "add_account_assignment_migration",
+    "add_account_device_seed_migration",
     "add_monitor_scheduler_migration",
     "add_adaptive_monitoring_migration",
+    "add_keyword_reply_targets_migration",
 ]
 
 

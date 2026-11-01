@@ -9,6 +9,8 @@ from urllib.parse import parse_qsl, parse_qs, urlencode, urlparse, urlunparse
 from patchright.async_api import Page
 
 from executor.http.request_profile import RequestProfile
+from executor.http.page_runtime import activate_page_input, document_generation
+from executor.browser_reads import await_browser_read
 
 logger = logging.getLogger("executor.http.signature_runtime")
 
@@ -16,26 +18,30 @@ logger = logging.getLogger("executor.http.signature_runtime")
 _SIGNATURE_PARAM_KEYS = ("X-Bogus", "X-Gnarly", "a_bogus")
 _SIGNER_READY_JS = """
 () => {
-    // Only signed TikTok resource traffic proves the interceptor is active.
+    let sdk_present = false;
+    let signed_dispatch_seen = false;
+    try {
+        if (window.byted_acrawler && (
+            typeof window.byted_acrawler.frontierSign === "function" ||
+            typeof window.byted_acrawler.sign === "function"
+        )) {
+            sdk_present = true;
+        }
+    } catch (error) {}
     try {
         const entries = performance.getEntriesByType("resource");
         for (let i = entries.length - 1; i >= 0; i--) {
             const url = new URL(String(entries[i].name || ""), location.href);
             const isTikTok = url.hostname === "tiktok.com" || url.hostname.endsWith(".tiktok.com");
-            if (isTikTok && ["X-Bogus", "X-Gnarly"].every(key => url.searchParams.get(key))) {
-                return true;
+            // X-Gnarly alone prevents a blind POST retry, but is not accepted
+            // as standalone signing evidence for comment reads/readiness.
+            if (isTikTok && ["X-Bogus", "a_bogus"].some(key => url.searchParams.get(key))) {
+                signed_dispatch_seen = true;
+                break;
             }
         }
-    } catch (error) {
-        // Ignore performance inspection failures.
-    }
-    return false;
-}
-"""
-_SIGNER_WAKE_JS = """
-() => {
-    try { window.scrollBy(0, 80); } catch (error) {}
-    try { window.dispatchEvent(new Event("mousemove")); } catch (error) {}
+    } catch (error) {}
+    return {sdk_present, signed_dispatch_seen};
 }
 """
 
@@ -148,7 +154,7 @@ def borrow_signature_bundle_from_cookies(cookies: Optional[Dict[str, str]]) -> S
     )
 
 
-async def wait_for_runtime_signer_ready(page: Optional[Page], timeout_ms: int = 1200) -> bool:
+async def wait_for_runtime_signer_ready(page: Optional[Page], timeout_ms: int = 1500) -> bool:
     if page is None or not callable(getattr(page, "evaluate", None)):
         return False
     # Patchright evaluate defaults to an isolated world, which cannot see the
@@ -160,19 +166,41 @@ async def wait_for_runtime_signer_ready(page: Optional[Page], timeout_ms: int = 
         remaining = deadline - loop.time()
         if remaining <= 0:
             return False
+        probe = None
         try:
-            if await asyncio.wait_for(page.evaluate(_SIGNER_READY_JS, isolated_context=False), timeout=remaining):
+            generation = document_generation(page)
+            probe = getattr(page, "_http_signer_probe", None)
+            if not (isinstance(probe, tuple) and len(probe) == 2
+                    and probe[0] == generation and isinstance(probe[1], asyncio.Future)):
+                async def read_state(captured_generation=generation):
+                    state = await await_browser_read(
+                        lambda: page.evaluate(_SIGNER_READY_JS, isolated_context=False))
+                    if isinstance(state, dict) and document_generation(page) == captured_generation:
+                        page._http_signer_state = state
+                    return state
+
+                task = asyncio.create_task(read_state())
+                # A short poll can expire before the driver answers. Keep one
+                # read per document and consume late errors on navigation/close.
+                task.add_done_callback(lambda done: None if done.cancelled() else done.exception())
+                probe = (generation, task)
+                page._http_signer_probe = probe
+            state = await asyncio.wait_for(asyncio.shield(probe[1]), timeout=remaining)
+            if getattr(page, "_http_signer_probe", None) is probe:
+                page._http_signer_probe = None
+            if document_generation(page) != generation:
+                continue
+            if isinstance(state, dict) and (state.get("sdk_present") is True or state.get("signed_dispatch_seen") is True):
                 return True
             if not wake_attempted and timeout_ms >= 200:
                 wake_attempted = True
-                remaining = deadline - loop.time()
-                if remaining <= 0:
-                    return False
-                await asyncio.wait_for(page.evaluate(_SIGNER_WAKE_JS, isolated_context=False), timeout=remaining)
+                await activate_page_input(page)
         except (AttributeError, TypeError):
             return False
         except Exception:
-            pass
+            if (isinstance(probe, tuple) and probe[1].done()
+                    and getattr(page, "_http_signer_probe", None) is probe):
+                page._http_signer_probe = None
         remaining = deadline - loop.time()
         if remaining <= 0:
             return False
@@ -180,6 +208,7 @@ async def wait_for_runtime_signer_ready(page: Optional[Page], timeout_ms: int = 
 
 
 async def generate_runtime_signature_bundle(page: Optional[Page], unsigned_url: str) -> SignatureBundle:
+    """Diagnostic/custom-endpoint URL signer; native comment fetch bypasses it."""
     if page is None:
         return SignatureBundle()
 
@@ -314,8 +343,8 @@ async def harvest_signature_from_traffic(
     timeout_ms: int = 5000,
 ) -> SignatureBundle:
     """
-    Watches TikTok's own page traffic and captures any recently generated
-    X-Bogus / a_bogus values as a best-effort fallback.
+    Diagnostic capture of TikTok traffic; never used to sign comment mutations.
+    Captured values describe their original request and must not be replayed.
     """
     if page is None:
         return SignatureBundle()
@@ -401,12 +430,13 @@ async def resolve_request_signature(
     cookies: Optional[Dict[str, str]],
     runtime_profile: Optional[Dict[str, Any]],
     allow_cookie_fallback: bool,
+    request_parts: Optional[Tuple[Dict[str, str], Dict[str, str]]] = None,
 ) -> Tuple[Dict[str, Any], str, SignatureBundle]:
     clean_dynamic_params, explicit_bundle = split_explicit_signature_params(dynamic_params)
     native_comment_request = page is not None and urlparse(profile.endpoint).path.rstrip("/") in {
-        "/api/comment/publish", "/api/comment/list", "/api/comment/list/reply",
+        "/api/comment/publish", "/api/comment/list", "/api/comment/list/reply", "/api/comment/digg",
     }
-    unsigned_url = build_unsigned_request_url(
+    unsigned_url = profile.build_url_from_params(request_parts[0]) if request_parts is not None else build_unsigned_request_url(
         profile,
         clean_dynamic_params,
         cookies=cookies,
@@ -432,10 +462,6 @@ async def resolve_request_signature(
     runtime_bundle = await generate_runtime_signature_bundle(page, unsigned_url)
     if runtime_bundle.has_any():
         return clean_dynamic_params, apply_signature_bundle_to_url(unsigned_url, runtime_bundle), runtime_bundle
-
-    harvest_bundle = SignatureBundle()
-    if harvest_bundle.has_any():
-        return clean_dynamic_params, apply_signature_bundle_to_url(unsigned_url, harvest_bundle), harvest_bundle
 
     if allow_cookie_fallback and page is None:
         cookie_bundle = borrow_signature_bundle_from_cookies(cookies)

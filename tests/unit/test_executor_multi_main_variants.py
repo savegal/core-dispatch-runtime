@@ -1,4 +1,5 @@
 import pytest
+import ast
 import inspect
 import copy
 
@@ -185,7 +186,7 @@ def test_reply_visibility_exhaustion_is_fatal_for_remaining_order_urls():
 
     source = inspect.getsource(executor.process_task)
     assert source.count("if _reply_visibility_exhausted(result_dict):") == 2
-    assert "unconfirmed_urls.append(video_url)" in source
+    assert "unconfirmed_urls.append(video_urls[idx])" in source
 
 
 def test_merge_full_results_preserves_fatal_reply_visibility_after_shadowed_variant():
@@ -220,11 +221,18 @@ def test_merge_full_results_preserves_fatal_reply_visibility_after_shadowed_vari
 
 @pytest.mark.unit
 def test_process_task_engagement_only_does_not_fall_through_to_full_flow():
-    source = inspect.getsource(executor.process_task)
-    engagement_start = source.index('if task_kind == "engagement_only":')
-    full_start = source.index("HYBRID FULL", engagement_start)
-    engagement_block = source[engagement_start:full_start]
-
-    assert "db.commit()" in engagement_block
-    assert "if _reply_visibility_exhausted(result_dict):" in engagement_block
-    assert "break\n                    continue" in engagement_block
+    tree = ast.parse(inspect.getsource(executor.process_task))
+    branch = next(node for node in ast.walk(tree) if isinstance(node, ast.If)
+        and any(isinstance(test, ast.Compare) and isinstance(test.left, ast.Name)
+                and test.left.id == "task_kind" and isinstance(test.ops[0], ast.In)
+                for test in ast.walk(node.test)))
+    kind_check = next(test for test in ast.walk(branch.test) if isinstance(test, ast.Compare)
+                      and isinstance(test.left, ast.Name) and test.left.id == "task_kind")
+    assert ast.literal_eval(kind_check.comparators[0]) == {"engagement_only", "keyword_replies"}
+    reply_flow = next(node for node in branch.body if isinstance(node, ast.Try))
+    assert isinstance(reply_flow.body[-1], ast.Continue)
+    assert all(isinstance(handler.body[-1], ast.Continue) for handler in reply_flow.handlers)
+    calls = [node.func for node in ast.walk(reply_flow) if isinstance(node, ast.Call)]
+    assert any(isinstance(func, ast.Attribute) and func.attr == "commit" for func in calls)
+    assert any(isinstance(func, ast.Name) and func.id == "_reply_visibility_exhausted" for func in calls)
+    assert {"execute_keyword_replies", "execute_engagement_only"} <= {func.id for func in calls if isinstance(func, ast.Name)}

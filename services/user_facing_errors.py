@@ -6,12 +6,16 @@ import re
 from collections.abc import Mapping
 from typing import Any
 
-from services.task_execution_ledger import build_task_execution_ledger, LEDGER_VERSION, visibility_checks_complete
+from services.task_execution_ledger import build_task_execution_ledger, LEDGER_VERSION, visibility_checks_complete, has_confirmed_publications
 
 
 _SUMMARY_RE = re.compile(r"успешно:\s*(\d+)\s*/\s*(\d+)", re.IGNORECASE)
 
 _MESSAGES: dict[str, tuple[str, str]] = {
+    "keyword_http_only": ("Нужен HTTP-транспорт", "Ответы по ключевым словам выполняются только через HTTP. Проверьте доступность транспорта."),
+    "keyword_no_matches": ("Совпадений не найдено", "В доступном списке нет комментариев с заданными ключевыми словами."),
+    "keyword_scan_incomplete": ("Список прочитан не полностью", "TikTok не отдал весь список комментариев. Обработаны найденные совпадения; полный охват не подтверждён."),
+    "keyword_delivery_unconfirmed": ("Отправка требует проверки", "Исход одного из ответов неизвестен. Автоматический повтор отключён, чтобы не создать дубль."),
     "reply_visibility_unconfirmed": (
         "Видимость ответов не подтверждена",
         "Ответы отправлены, но проверка с других аккаунтов не подтвердила видимость всех ответов.",
@@ -131,6 +135,14 @@ def _extract_first_error_line(text: str) -> str | None:
 
 def _detect_error_code(text: str) -> str | None:
     lower = text.lower()
+    if "keyword_http_only" in lower:
+        return "keyword_http_only"
+    if "keyword_no_matches" in lower:
+        return "keyword_no_matches"
+    if any(code in lower for code in ("keyword_delivery_unconfirmed", "keyword_parent_mismatch")):
+        return "keyword_delivery_unconfirmed"
+    if any(code in lower for code in ("keyword_scan", "keyword_pagination", "keyword_comment_list", "keyword_discovery")):
+        return "keyword_scan_incomplete"
     if "reply_visibility_unconfirmed" in lower:
         return "reply_visibility_unconfirmed"
     if "main_visibility_unconfirmed" in lower:
@@ -573,9 +585,9 @@ def build_task_execution_summary(task: Mapping[str, Any] | None) -> dict[str, An
                     if not isinstance(variant, Mapping):
                         continue
                     if (bool(variant["public_confirmed"]) if "public_confirmed" in variant
-                            else bool(variant.get("network_confirmed") or variant.get("local_confirmed"))):
+                            else _clean_text(variant.get("visibility_status")) == "public_confirmed"):
                         verified_count += 1
-            elif main.get("verified"):
+            elif main.get("public_confirmed") is True or main.get("visibility_status") == "public_confirmed":
                 verified_count = submitted_count
             main_expected += expected if expected > 0 else submitted_count
             main_submitted += submitted_count
@@ -610,7 +622,7 @@ def build_task_execution_summary(task: Mapping[str, Any] | None) -> dict[str, An
                     reply_parent_ui_confirmed += 1
                 visibility_status = _clean_text(item.get("visibility_status"))
                 if (bool(item["public_confirmed"]) if "public_confirmed" in item
-                        else visibility_status in {"confirmed_local", "network_confirmed", "public_confirmed"}):
+                        else visibility_status == "public_confirmed"):
                     reply_visibility_confirmed += 1
                 elif visibility_status == "submitted_unconfirmed" or item.get("submitted_unconfirmed"):
                     item_unconfirmed += 1
@@ -663,6 +675,9 @@ def build_task_execution_summary(task: Mapping[str, Any] | None) -> dict[str, An
     only_successful_video_results = known_video_count > 0 and video_failed == 0 and video_pending == 0
     if status in {"error", "partial"} and only_successful_video_results:
         effective_status = "done"
+    elif status == "error" and any(has_confirmed_publications(row)
+            or (isinstance(row, Mapping) and row.get("status") == "partial") for row in url_results.values()):
+        effective_status = "partial"
 
     if effective_status == "done" and warnings:
         display_status = "done_warning"
@@ -713,6 +728,7 @@ def build_task_execution_summary(task: Mapping[str, Any] | None) -> dict[str, An
         },
         "main": {
             "posted": main_posted,
+            **{k: (task_ledger.get("summary", {}).get("main", {}).get(k, 0)) for k in ("accepted_with_id", "visible_to_observer", "visibility_not_checked", "visibility_inconclusive")},
             "verified": main_verified,
             "method": _compress_method(main_methods),
             "comment_id": main_comment_id,
@@ -723,6 +739,7 @@ def build_task_execution_summary(task: Mapping[str, Any] | None) -> dict[str, An
         },
         "replies": {
             "ok": replies_ok,
+            **{k: (task_ledger.get("summary", {}).get("replies", {}).get(k, 0)) for k in ("accepted_with_id", "visible_to_observer", "visibility_not_checked", "visibility_inconclusive")},
             "total": replies_total,
             "requested": replies_requested,
             "submitted": replies_submitted,

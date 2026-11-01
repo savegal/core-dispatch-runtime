@@ -45,6 +45,21 @@ def sanitize_url(value: str, max_length: int = 160) -> str:
         return value
 
     raw_value = str(value)
+    # Legacy provider exports have no '@' for urlparse to recognize as auth.
+    legacy = re.fullmatch(r"([^:/\s]+):(\d+):([^:]*):(.*)", raw_value)
+    if legacy:
+        return f"{legacy.group(1)}:{legacy.group(2)}:***REDACTED***"[:max_length]
+    # Redact userinfo before urlparse; raw '#'/'?' in a password would
+    # otherwise move credentials into the fragment or query in the log.
+    if "@" in raw_value:
+        before, address = raw_value.rsplit("@", 1)
+        if "://" in before:
+            scheme, userinfo = before.split("://", 1)
+            prefix = scheme + "://"
+        else:
+            userinfo, prefix = before, ""
+        if ":" in userinfo:
+            raw_value = prefix + "***REDACTED***@" + address
     has_explicit_scheme = "://" in raw_value
     parse_value = raw_value if has_explicit_scheme else f"//{raw_value}"
     try:

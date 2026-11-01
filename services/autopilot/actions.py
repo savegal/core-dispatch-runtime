@@ -12,8 +12,9 @@ from sqlalchemy import delete, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from config.settings import get_settings
-from db.models import CreatorSource, CreatorVideo, MonitorOutbox, PendingEnqueue, Task, Transaction, User
-from services.app_settings_service import COMMENTING_MODE_KEY, COMMENTING_MODE_OLD, normalize_commenting_mode
+from db.models import AppSettings, CreatorSource, CreatorVideo, MonitorOutbox, PendingEnqueue, Task, Transaction, User
+from services.app_settings_service import COMMENTING_MODE_KEY, COMMENTING_MODE_OLD, normalize_commenting_mode, SOFTWARE_MODE_KEY
+from services.task_replay import retryable_video_urls, find_existing_retry, serialize_retry_creation
 from services.autopilot.cache import clear_cache as clear_autopilot_cache
 from services.autopilot.dashboard import collect_dashboard, get_app_setting
 from services.autopilot.models import ActionResult
@@ -686,6 +687,8 @@ async def hide_task(db: AsyncSession, user_id: int, task_id: int) -> dict[str, A
 
 
 RUNTIME_SETTING_KEYS = {
+    "keyword_scans",
+    "keyword_video_bindings",
     "url_results",
     "failed_urls",
     "idempotency_key",
@@ -728,20 +731,31 @@ def _is_free_retry_user(user: User) -> bool:
 
 
 async def _load_retry_context(db: AsyncSession, user_id: int, task_id: int, *, lock_user: bool = False) -> tuple[Task | None, User | None]:
-    row = await db.execute(
-        select(Task).filter(
+    task_query = select(Task).filter(
             Task.id == int(task_id),
             Task.user_id == user_id,
             Task.settings["origin"].as_string().in_(RETRYABLE_ORIGINS),
         )
-    )
+    if lock_user:
+        task_query = task_query.with_for_update().execution_options(populate_existing=True)
+    row = await db.execute(task_query)
     original = row.scalar_one_or_none()
     user_query = select(User).filter(User.id == user_id)
     if lock_user:
-        user_query = user_query.with_for_update()
+        user_query = user_query.with_for_update().execution_options(populate_existing=True)
     user_row = await db.execute(user_query)
     user = user_row.scalar_one_or_none()
     return original, user
+
+
+async def _retry_access_error(db: AsyncSession, user: User) -> str | None:
+    from services.balance_service import has_full_functionality_access
+    if user.is_blocked:
+        return "Пользователь заблокирован"
+    mode = (await db.execute(select(AppSettings.value).where(AppSettings.key == SOFTWARE_MODE_KEY))).scalar_one_or_none()
+    if str(mode or "").strip().lower() == "parsing" and not has_full_functionality_access(user):
+        return "В режиме парсинга создание заказов отключено"
+    return None
 
 
 async def retry_task_preview(db: AsyncSession, user_id: int, task_id: int) -> dict[str, Any]:
@@ -750,6 +764,13 @@ async def retry_task_preview(db: AsyncSession, user_id: int, task_id: int) -> di
         return asdict(ActionResult(success=False, action="retry_preview", code="not_found", message="Заказ не найден"))
     if not user:
         return asdict(ActionResult(success=False, action="retry_preview", code="user_not_found", message="Пользователь не найден"))
+    from services.order_transport import http_transport_available
+    if original.kind == "keyword_replies" and not http_transport_available():
+        return asdict(ActionResult(success=False, action="retry_preview", code="http_unavailable",
+                                   message="Ответы по ключевым словам требуют HTTP-транспорта"))
+    access_error = await _retry_access_error(db, user)
+    if access_error:
+        return asdict(ActionResult(success=False, action="retry_preview", code="access_denied", message=access_error))
     if str(original.status or "").lower() not in {"error", "partial"}:
         return asdict(
             ActionResult(
@@ -760,7 +781,16 @@ async def retry_task_preview(db: AsyncSession, user_id: int, task_id: int) -> di
             )
         )
 
-    video_urls = task_video_urls(original)
+    existing_retry = await find_existing_retry(db, user_id, int(original.id))
+    if existing_retry:
+        return asdict(ActionResult(success=True, action="retry_preview", message="Повтор уже создан",
+            details={"task_id": int(original.id), "retry_task_id": existing_retry.id,
+                     "video_count": len(task_video_urls(existing_retry)), "cost": 0.0,
+                     "required": 0.0, "balance": float(user.balance or 0), "reused": True}))
+    video_urls = retryable_video_urls(original)
+    if not video_urls:
+        return asdict(ActionResult(success=False, action="retry_preview", code="no_retryable_videos",
+            message="Нет видео для безопасного повтора: сохранённые отправки не будут повторены."))
     pricing = await get_pricing_async(db)
     cost = Decimal("0.00") if _is_free_retry_user(user) else calculate_task_cost(len(video_urls), pricing.price_success)
     balance = await get_user_balance_async(db, user_id)
@@ -784,6 +814,7 @@ async def retry_task_preview(db: AsyncSession, user_id: int, task_id: int) -> di
     return asdict(ActionResult(success=True, action="retry_preview", message="Повтор доступен", details=details))
 
 
+@serialize_retry_creation
 async def retry_task(db: AsyncSession, user_id: int, task_id: int) -> dict[str, Any]:
     preview = await retry_task_preview(db, user_id, task_id)
     if not preview.get("success"):
@@ -795,11 +826,22 @@ async def retry_task(db: AsyncSession, user_id: int, task_id: int) -> dict[str, 
         return asdict(ActionResult(success=False, action="retry", code="not_found", message="Заказ не найден"))
     if not user:
         return asdict(ActionResult(success=False, action="retry", code="user_not_found", message="Пользователь не найден"))
+    access_error = await _retry_access_error(db, user)
+    if access_error:
+        return asdict(ActionResult(success=False, action="retry", code="access_denied", message=access_error))
     if str(original.status or "").lower() not in {"error", "partial"}:
         return asdict(ActionResult(success=False, action="retry", code="bad_status", message="Повтор доступен только для ошибок и частичных заказов"))
 
+    existing_retry = await find_existing_retry(db, user_id, int(original.id))
+    if existing_retry:
+        await db.commit()
+        return asdict(ActionResult(success=True, action="retry", message=f"Повтор уже создан: #{existing_retry.id}",
+            details={"task_id": existing_retry.id, "retry_of_task_id": original.id, "cost": 0.0, "reused": True}))
+    video_urls = retryable_video_urls(original)
+    if not video_urls:
+        return asdict(ActionResult(success=False, action="retry", code="no_retryable_videos",
+            message="Нет видео для безопасного повтора: сохранённые отправки не будут повторены."))
     pricing = await get_pricing_async(db)
-    video_urls = task_video_urls(original)
     cost = Decimal("0.00") if _is_free_retry_user(user) else calculate_task_cost(len(video_urls), pricing.price_success)
     balance = await get_user_balance_async(db, user_id)
     if balance < cost:
@@ -817,6 +859,10 @@ async def retry_task(db: AsyncSession, user_id: int, task_id: int) -> dict[str, 
         user.balance = (user.balance or Decimal("0.00")) - cost
 
     settings_dict = _retry_settings(task_settings(original), int(original.id))
+    from services.task_replay import seed_reply_resume
+    seed_reply_resume(original, settings_dict, video_urls)
+    from services.order_transport import ORDER_TRANSPORT_KEY, get_order_transport_async
+    settings_dict[ORDER_TRANSPORT_KEY] = "http" if original.kind == "keyword_replies" else await get_order_transport_async(db)
     settings_dict["commenting_mode"] = normalize_commenting_mode(
         await get_app_setting(db, COMMENTING_MODE_KEY, COMMENTING_MODE_OLD),
         default=COMMENTING_MODE_OLD,

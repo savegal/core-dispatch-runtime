@@ -3414,6 +3414,7 @@ async def test_reply_publish_uses_nudge_and_optimistic_send_for_recoverable_gate
 @pytest.mark.asyncio
 async def test_reply_publish_preserves_exact_draft_when_send_recovery_is_available(monkeypatch):
     page = _FakePage()
+    button = _FakeButton()
     calls = {"nudge": 0, "optimistic": 0}
 
     async def _fake_sleep(_seconds):

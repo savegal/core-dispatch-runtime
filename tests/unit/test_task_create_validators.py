@@ -99,14 +99,14 @@ def test_task_create_requires_main_comment_for_full_kind():
 
 
 @pytest.mark.unit
-def test_task_create_engagement_only_requires_locator_fields():
+def test_task_create_engagement_only_selects_auto_top_without_locator():
     payload = _base_payload()
     payload["engagement_comment_id"] = None
     payload["engagement_username"] = None
     payload["engagement_comment_text"] = None
 
-    with pytest.raises(ValidationError):
-        TaskCreate(**payload)
+    task = TaskCreate(**payload)
+    assert task.settings["engagement_target_mode"] == "auto_top"
 
 
 @pytest.mark.unit

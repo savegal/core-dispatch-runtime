@@ -11,34 +11,22 @@
 import pytest
 
 
-class _FakeResp:
-    def __init__(self, url):
-        self.url = url
-
-
-def _fake_client_factory(captured, resolved_url=None, forbid=False):
-    class _FakeAsyncClient:
-        def __init__(self, *a, **kw):
-            captured["count"] = captured.get("count", 0) + 1
-            captured["proxy"] = kw.get("proxy")
-
-        async def __aenter__(self):
-            return self
-
-        async def __aexit__(self, *a):
-            return None
-
-        async def head(self, *a, **kw):
-            if forbid:
-                raise AssertionError("must not be called")
-            return _FakeResp(resolved_url)
-
-        async def get(self, *a, **kw):
-            if forbid:
-                raise AssertionError("must not be called")
-            return _FakeResp(resolved_url)
-
-    return _FakeAsyncClient
+def _install_pool(monkeypatch, captured, resolved_url=None, forbid=False):
+    from types import SimpleNamespace
+    from unittest.mock import AsyncMock
+    from executor import browser_pool
+    async def resolve(url, **kwargs):
+        if forbid:
+            raise AssertionError("must not be called")
+        captured["count"] = captured.get("count", 0) + 1
+        captured["proxy"] = kwargs.get("proxy")
+        return resolved_url
+    get_pool = AsyncMock(return_value=SimpleNamespace(resolve_shortlink=AsyncMock(side_effect=resolve)))
+    monkeypatch.setattr(browser_pool, "get_browser_pool", get_pool)
+    # These cases exercise browser fallback; never make a real HTTP request.
+    import httpx
+    monkeypatch.setattr(httpx, "AsyncClient", lambda **_: (_ for _ in ()).throw(httpx.ConnectError("fixture HTTP unavailable")))
+    return get_pool
 
 
 @pytest.fixture
@@ -81,7 +69,7 @@ async def test_resolve_shortlink_without_proxy_skips_http(monkeypatch, use_proxy
 
     use_proxy(True)
     captured = {}
-    monkeypatch.setattr(engagement_engine.httpx, "AsyncClient", _fake_client_factory(captured, forbid=True))
+    _install_pool(monkeypatch, captured, forbid=True)
 
     out_url, out_id = await engagement_engine.resolve_video_url("https://vt.tiktok.com/ZS9w8yPEh/")
     assert captured.get("count", 0) == 0, "при USE_PROXY=True без прокси httpx запрос делаться не должен"
@@ -97,10 +85,7 @@ async def test_resolve_shortlink_with_proxy_normalizes_proxy_url(monkeypatch, us
 
     use_proxy(True)
     captured = {}
-    monkeypatch.setattr(
-        engagement_engine.httpx, "AsyncClient",
-        _fake_client_factory(captured, "https://www.tiktok.com/@erjowkaaa/video/7638676938185264404"),
-    )
+    _install_pool(monkeypatch, captured, "https://www.tiktok.com/@erjowkaaa/video/7638676938185264404")
 
     out_url, out_id = await engagement_engine.resolve_video_url(
         "https://vt.tiktok.com/ZS9w8yPEh/",
@@ -118,10 +103,7 @@ async def test_resolve_shortlink_with_full_proxy_url_passes_as_is(monkeypatch, u
 
     use_proxy(True)
     captured = {}
-    monkeypatch.setattr(
-        engagement_engine.httpx, "AsyncClient",
-        _fake_client_factory(captured, "https://www.tiktok.com/@u/video/123"),
-    )
+    _install_pool(monkeypatch, captured, "https://www.tiktok.com/@u/video/123")
 
     await engagement_engine.resolve_video_url("https://vt.tiktok.com/abc/", proxy="socks5://u:p@h:1080")
     assert captured["proxy"] == "socks5://u:p@h:1080"
@@ -136,10 +118,7 @@ async def test_resolve_shortlink_direct_when_use_proxy_disabled(monkeypatch, use
 
     use_proxy(False)
     captured = {}
-    monkeypatch.setattr(
-        engagement_engine.httpx, "AsyncClient",
-        _fake_client_factory(captured, "https://www.tiktok.com/@demo/photo/7635267329407913230"),
-    )
+    _install_pool(monkeypatch, captured, "https://www.tiktok.com/@demo/photo/7635267329407913230")
 
     out_url, out_id = await engagement_engine.resolve_video_url("https://vt.tiktok.com/ZS9w8yPEh/", proxy=given_proxy)
     assert captured["count"] == 1

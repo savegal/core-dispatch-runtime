@@ -148,7 +148,7 @@ async def test_two_negative_reads_then_one_durable_replacement(adapter, interrup
         assert candidates[0].comment_id == PARENT and text == "hello" and not kwargs["fallback_allowed"]
         outcome = adapter.schema.ReplyOutcome("hello", 1, "parent text", PARENT, True,
                     "http_user_schema", None, account.id, reply_comment_id=NEW, reply_confirmation="network_comment_id")
-        kwargs["on_submitted_outcome"](outcome)
+        await kwargs["on_submitted_outcome"](outcome)
         assert adapter.snapshots[-1][visibility.REPORT_KEY]["pending_receipts"][0]["reply_comment_id"] == NEW
         if interrupt == "cleanup":
             raise TimeoutError("cleanup interrupted after successful POST")
@@ -189,7 +189,7 @@ async def test_repeated_full_absence_stops_reply_adapter_and_saves_receipts(adap
             text, 1, "parent text", PARENT, True, "http_user_schema", None, account.id,
             reply_comment_id=str(int(CID) + 100 + account.id), reply_confirmation="network_comment_id",
         )
-        kwargs["on_submitted_outcome"](outcome)
+        await kwargs["on_submitted_outcome"](outcome)
         return adapter.schema.ReplyAttemptResult(replies=[outcome])
 
     adapter.scan.side_effect = scan
@@ -347,7 +347,7 @@ async def test_rejected_duplicate_replacement_never_replaces_original_slot(adapt
     async def duplicate(db, account, url, candidates, text, **kwargs):
         outcome = adapter.schema.ReplyOutcome("hello", 1, "parent text", PARENT, True, "http", None,
                     account.id, reply_comment_id=OTHER, reply_confirmation="network_comment_id")
-        kwargs["on_submitted_outcome"](outcome)
+        await kwargs["on_submitted_outcome"](outcome)
         return adapter.schema.ReplyAttemptResult(replies=[outcome])
     adapter.publish.side_effect = duplicate
     row = result(item(), item(OTHER, account=2))
@@ -370,7 +370,7 @@ async def test_interrupted_replacement_cannot_restore_a_superseded_reply_id(adap
         cid = next(receipts)
         outcome = adapter.schema.ReplyOutcome("hello", 1, "parent", PARENT, True, "http", None,
                     account.id, reply_comment_id=cid, reply_confirmation="network_comment_id")
-        kwargs["on_submitted_outcome"](outcome)
+        await kwargs["on_submitted_outcome"](outcome)
         if account.id == 22:
             raise TimeoutError("interrupted cleanup with a previously superseded ID")
         return adapter.schema.ReplyAttemptResult(replies=[outcome])
@@ -421,7 +421,7 @@ async def test_independent_keyboard_toggles_preserve_each_other():
     from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton
     from bot.services.main_visibility_ui import visibility_keyboard, set_visibility_option, set_reply_visibility_option
     markup = visibility_keyboard(InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="Go", callback_data="go")]]), True, False)
-    state = SimpleNamespace(update_data=AsyncMock())
+    state = SimpleNamespace(update_data=AsyncMock(), get_data=AsyncMock(return_value={}))
     callback = SimpleNamespace(data="order:reply_visibility:1", answer=AsyncMock(),
                 message=SimpleNamespace(reply_markup=markup, edit_reply_markup=AsyncMock()))
     await set_reply_visibility_option(callback, state)
@@ -448,18 +448,25 @@ async def test_preview_buttons_default_off_and_keep_explicit_options():
 
 async def test_replies_only_confirmation_sends_toggle_to_api(monkeypatch):
     from bot.handlers import engagement_wizard as wizard
+    from aiogram.fsm.context import FSMContext
+    from aiogram.fsm.storage.base import StorageKey
+    from aiogram.fsm.storage.memory import MemoryStorage
     monkeypatch.setattr(wizard, "get_user_backend_id", AsyncMock(return_value=7))
     monkeypatch.setattr(wizard, "_boost_likes_ui_config", AsyncMock(return_value=(False, 0)))
     create = AsyncMock(return_value={"task_id": 13})
     monkeypatch.setattr(wizard.api_client, "create_task", create)
-    state = SimpleNamespace(get_data=AsyncMock(return_value={"video_url": URL, "comment_text": "parent",
-        "replies": ["hello"], "account_pool_mode": "shared", "verify_reply_visibility": True}), clear=AsyncMock())
+    storage = MemoryStorage()
+    state = FSMContext(storage, StorageKey(bot_id=1, chat_id=123, user_id=123))
+    await state.update_data(video_url=URL, comment_text="parent", replies=["hello"], account_pool_mode="shared",
+                            verify_reply_visibility=True, order_create_token="test-confirmation")
     callback = SimpleNamespace(from_user=SimpleNamespace(id=123), answer=AsyncMock(), message=SimpleNamespace(edit_text=AsyncMock()))
     await wizard.confirm_engagement_order(callback, state)
     create.assert_awaited_once()
     assert create.call_args.kwargs["settings"]["verify_reply_visibility"] is True
     assert create.call_args.kwargs["kind"] == "engagement_only"
-    state.clear.assert_awaited_once()
+    assert create.call_args.kwargs["idempotency_key"].startswith("engagement-")
+    assert await state.get_data() == {}
+    await storage.close()
 
 
 async def test_reply_mode_receipts_are_not_success_and_prevent_blind_resume():

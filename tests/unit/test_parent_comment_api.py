@@ -1,6 +1,6 @@
 import json
 from types import SimpleNamespace
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, Mock
 
 import pytest
 from urllib.parse import parse_qs, urlparse
@@ -26,7 +26,6 @@ def api_page(response):
 @pytest.mark.parametrize("first", [
     {"status":200, "text":"", "url":"https://www.tiktok.com/api/comment/list/?X-Bogus=x&X-Gnarly=y"},
     {"status":200, "text":"", "url":"https://www.tiktok.com/api/comment/list/"},
-    {"status":200, "text":'{"comments":[]}', "url":"https://www.tiktok.com/api/comment/list/?X-Bogus=x"},
     {"status":200, "text":'{"comments":[]}', "url":"https://www.tiktok.com/api/comment/list/?X-Gnarly=y"},
 ])
 async def test_comment_get_retries_initial_empty_or_unsigned_response_once(monkeypatch, first):
@@ -44,7 +43,8 @@ async def test_comment_get_retries_initial_empty_or_unsigned_response_once(monke
     assert await api.fetch_comment_page(page, "123", cursor=50) == {"comments":[]}
     delay.assert_awaited_once_with(2.0)
     calls = [call for call in page.evaluate.await_args_list if len(call.args) > 1]
-    assert len(calls) == 2 and calls[0].args[1] == calls[1].args[1]
+    assert len(calls) == 2
+    assert parse_qs(urlparse(calls[0].args[1]).query) == parse_qs(urlparse(calls[1].args[1]).query)
     assert page._comment_list_http_meta["attempts"] == 2
     assert page._comment_list_http_meta["retry_count"] == 1
 
@@ -59,6 +59,21 @@ async def test_comment_get_persistent_empty_body_stops_after_two_retries(monkeyp
     assert page.evaluate.await_count == 4  # Runtime read plus exactly three GETs.
     assert page._comment_list_http_meta["reason"] == "empty_body"
     assert page._comment_list_http_meta["retry_count"] == 2
+
+
+@pytest.mark.parametrize("ready", [False, True])
+async def test_known_unready_runtime_is_rechecked_before_manual_get(monkeypatch, ready):
+    page = api_page({"status": 200, "text": '{"comments":[]}'})
+    page._warmup_signer_ready = False
+    readiness = AsyncMock(return_value=ready)
+    monkeypatch.setattr("executor.http.signature_runtime.wait_for_runtime_signer_ready", readiness)
+    payload = await api.fetch_comment_page(page, "123")
+    assert (payload is not None) is ready
+    assert page.evaluate.await_count == (2 if ready else 1)  # Runtime extraction; optional GET.
+    assert page._comment_list_http_meta["runtime_readiness_rechecked"] is ready
+    if not ready:
+        assert page._comment_list_http_meta["reason"] == "signer_not_ready"
+    readiness.assert_awaited_once()
 
 
 @pytest.mark.parametrize("status", [401,403,429,500])
@@ -204,19 +219,24 @@ async def test_shortlink_direct_resolution_requires_explicit_direct_mode(monkeyp
     from executor import engagement_engine
     monkeypatch.setattr(engagement_engine.settings, "USE_PROXY", use_proxy)
     target = "https://www.tiktok.com/@demo/video/7635267329407913230"
-    client = SimpleNamespace(head=AsyncMock(return_value=SimpleNamespace(url=target)), get=AsyncMock())
-    context = AsyncMock()
-    context.__aenter__.return_value = client
-    from unittest.mock import Mock
-    factory = Mock(return_value=context)
-    monkeypatch.setattr(engagement_engine.httpx, "AsyncClient", factory)
+    from executor import browser_pool
+    import httpx
+    http_client = AsyncMock()
+    http_client.__aenter__.return_value = http_client
+    http_client.get.return_value = httpx.Response(200, request=httpx.Request("GET", target))
+    http_factory = Mock(return_value=http_client)
+    monkeypatch.setattr(httpx, "AsyncClient", http_factory)
+    pool = SimpleNamespace(resolve_shortlink=AsyncMock(return_value=target))
+    factory = AsyncMock(return_value=pool)
+    monkeypatch.setattr(browser_pool, "get_browser_pool", factory)
     original = "https://vt.tiktok.com/demo/"
     url, _ = await engagement_engine.resolve_video_url(original)
     assert url == (original if use_proxy else target)
-    assert factory.call_count == int(not use_proxy)
+    factory.assert_not_awaited()
+    assert http_factory.call_count == int(not use_proxy)
     if not use_proxy:
-        assert factory.call_args.kwargs["proxy"] is None
-        assert factory.call_args.kwargs["trust_env"] is False
+        assert http_factory.call_args.kwargs["proxy"] is None
+
 
 
 @pytest.mark.parametrize("dynamic", [True, False])
@@ -254,7 +274,7 @@ async def test_main_replaces_dead_accounts_within_separate_account_limit(monkeyp
     monkeypatch.setattr(user_schema.random, "uniform", lambda *a: 0)
     monkeypatch.setattr(browser_pool, "ensure_thread_browser_pool_capacity", lambda *a: None)
     monkeypatch.setattr(browser_pool, "close_browser_pool", AsyncMock())
-    for name, value in {"USE_PROXY": False, "MAX_RETRY_ACCOUNTS": 3, "PARALLEL_MAIN_ACCOUNT_SLOTS": 1,
+    for name, value in {"USE_PROXY": False, "MAX_RETRY_ACCOUNTS": 3, "MAX_ACCOUNT_CANDIDATES": 3, "PARALLEL_MAIN_ACCOUNT_SLOTS": 1,
                         "PARALLEL_COMMENTING_MAX_MAIN_ATTEMPTS": 1, "PARALLEL_DYNAMIC_WORKER_POOL_ENABLED": dynamic}.items():
         monkeypatch.setattr(user_schema._settings, name, value)
     result = await user_schema.execute_user_schema_parallel(

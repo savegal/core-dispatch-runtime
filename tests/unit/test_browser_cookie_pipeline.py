@@ -87,21 +87,24 @@ async def test_warmup_persists_new_linkage_and_restored_session_in_database(db_s
         {"name": "tt_csrf_token", "value": "new-csrf", "domain": "www.tiktok.com", "sameSite": "Lax"},
     ]
     context = SimpleNamespace(cookies=AsyncMock(return_value=records), add_cookies=AsyncMock())
+    context.add_cookies.side_effect = lambda added: records.extend(added)
     page = SimpleNamespace(
         url="https://www.tiktok.com/@demo/video/1234567890123456789",
         context=context, goto=AsyncMock(), reload=AsyncMock(), wait_for_load_state=AsyncMock(),
     )
-    monkeypatch.setattr(engagement_engine, "wait_for_runtime_signer_ready", AsyncMock(return_value=False))
+    monkeypatch.setattr(engagement_engine, "wait_for_runtime_signer_ready", AsyncMock(return_value=True))
+    monkeypatch.setattr("executor.http.comment_discovery.fetch_comment_page", AsyncMock(return_value={"comments": []}))
     monkeypatch.setattr(engagement_engine.asyncio, "sleep", AsyncMock())
 
     cookies, valid, info = await engagement_engine.warmup_page_for_http(page, page.url, account=account)
 
     assert valid is True
     assert info["cookies_saved"] is True
-    assert info["signer_ready"] is False
+    assert info["signer_ready"] is True
     assert info["degraded_http"] is False
     page.reload.assert_not_awaited()
-    context.add_cookies.assert_awaited_once()
+    injected_names = {item["name"] for call in context.add_cookies.await_args_list for item in call.args[0]}
+    assert {"sessionid", "s_v_web_id"} <= injected_names
     db_session.refresh(account)
     saved = parse_cookies_to_dict(account.cookies)
     assert saved["ttwid"] == cookies["ttwid"] == "new-wid"
@@ -111,7 +114,7 @@ async def test_warmup_persists_new_linkage_and_restored_session_in_database(db_s
 
 
 def test_warmup_cookie_persistence_does_not_commit_unchanged_linkage():
-    account = SimpleNamespace(id=1, cookies='{"ttwid":"wid","tt_csrf_token":"csrf"}')
+    account = SimpleNamespace(id=-241025, cookies='{"ttwid":"wid","tt_csrf_token":"csrf","device_id":"7611111111111111111","s_v_web_id":"verify_native_fixture"}')
     db = Mock()
     assert not save_warmed_cookies_for_account(account, {"ttwid": "wid", "tt_csrf_token": "csrf"}, db)
     db.query.assert_not_called()
@@ -138,13 +141,23 @@ def test_warmup_cookie_persistence_saves_rotated_odin_and_mstoken(db_session):
 @pytest.mark.parametrize("scope", [MAIN_SCOPE, REPLY_SCOPE])
 async def test_user_schema_prepares_minimal_session_without_global_signer(monkeypatch, scope):
     account = account_with_minimal_cookies()
-    records = normalize_cookies_for_browser(session_records()) + [{"name": "ttwid", "value": "wid"}]
+    records = normalize_cookies_for_browser(session_records()) + [
+        {"name": "ttwid", "value": "wid"}, {"name": "tt_csrf_token", "value": "csrf"},
+    ]
     page = SimpleNamespace(
         url="https://www.tiktok.com/@demo/video/1234567890123456789",
-        context=SimpleNamespace(cookies=AsyncMock(return_value=records)),
+        context=SimpleNamespace(cookies=AsyncMock(return_value=records), add_cookies=AsyncMock()),
         goto=AsyncMock(), reload=AsyncMock(), wait_for_load_state=AsyncMock(),
     )
     monkeypatch.setattr(engagement_engine, "wait_for_runtime_signer_ready", AsyncMock(return_value=False))
+    async def signed_probe(*args, **kwargs):
+        page._comment_list_http_meta = {
+            "security_params": {"X-Bogus": "native", "msToken": "web"},
+            "security_params_source": "request_event",
+        }
+        return {"comments": []}
+    monkeypatch.setattr("executor.http.comment_discovery.fetch_comment_page", signed_probe)
+    monkeypatch.setattr("executor.http.comment_discovery.activate_comment_list_via_page", signed_probe)
     monkeypatch.setattr(engagement_engine.asyncio, "sleep", AsyncMock())
     monkeypatch.setattr(user_schema, "_visible_captcha_reason", AsyncMock(return_value=None))
     monkeypatch.setattr(user_schema, "get_browser_login_state", AsyncMock(return_value={"state": "unknown"}))
@@ -158,4 +171,5 @@ async def test_user_schema_prepares_minimal_session_without_global_signer(monkey
     assert session is not None
     assert session.client is client
     assert session.cookies["sessionid"] == "b" * 32
+    assert page._warmup_signer_ready is True
     page.reload.assert_not_awaited()

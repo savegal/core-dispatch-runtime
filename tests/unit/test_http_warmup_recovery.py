@@ -28,67 +28,65 @@ def warmup(monkeypatch):
     page = SimpleNamespace(
         url=URL, goto=AsyncMock(), reload=AsyncMock(), wait_for_load_state=AsyncMock(),
         evaluate=AsyncMock(return_value={"current_url": URL, "navigation_url": URL, "age_ms": 5000, "dom_ready_ms": 500}),
-        context=SimpleNamespace(cookies=AsyncMock(return_value=cookies("sessionid", "ttwid", "tt_csrf_token", "msToken"))),
+        context=SimpleNamespace(cookies=AsyncMock(return_value=cookies("sessionid", "ttwid", "tt_csrf_token", "msToken")), add_cookies=AsyncMock()),
     )
     comments = AsyncMock(return_value={"comments": []})
     monkeypatch.setattr(engagement_engine.asyncio, "sleep", sleep)
     monkeypatch.setattr(engagement_engine.time, "monotonic", lambda: clock[0])
     monkeypatch.setattr(engagement_engine, "wait_for_runtime_signer_ready", AsyncMock(return_value=True))
     monkeypatch.setattr("executor.http.comment_discovery.fetch_comment_page", comments)
+    monkeypatch.setattr("executor.http.comment_discovery.activate_comment_list_via_page", comments)
     return page, comments, sleeps
 
 
 @pytest.mark.parametrize("path", ["video", "photo"])
 @pytest.mark.parametrize("age_ms,dom_ready_ms", [(0, 0), (140, 0), (2500, 2400), (4000, 3900), (5000, 500)])
-async def test_first_comment_get_and_exit_require_a_mature_target_page(warmup, path, age_ms, dom_ready_ms):
+async def test_target_waits_only_for_remaining_navigation_and_dom_age(warmup, path, age_ms, dom_ready_ms):
     page, comments, sleeps = warmup
     url = URL.replace("/video/", f"/{path}/")
     page.url = url
     page.evaluate.return_value = {"current_url": url, "navigation_url": url, "age_ms": age_ms, "dom_ready_ms": dom_ready_ms}
-    page.context.cookies.return_value = cookies("sessionid", "ttwid", "msToken")
+    page.context.cookies.return_value = cookies("sessionid", "ttwid", "tt_csrf_token", "msToken")
     dom_age = (age_ms - dom_ready_ms) / 1000 if dom_ready_ms else 0
+    expected_wait = max(0.0, 2.0 - age_ms / 1000, 1.5 - dom_age)
 
     async def fetch(*args, **kwargs):
-        assert sum(sleeps) + age_ms / 1000 >= 3.2 - 1e-6
-        assert sum(sleeps) + dom_age >= 1.8 - 1e-6
+        assert sum(sleeps) == pytest.approx(expected_wait)
         return {"comments": []}
 
     comments.side_effect = fetch
     _, valid, info = await engagement_engine.warmup_page_for_http(page, url, max_retries=1)
-    assert valid and info["target_page_age_ms"] >= 3200
-    assert info["target_dom_age_ms"] >= 1800
-    assert sum(sleeps) == pytest.approx(max(0, 3.2 - age_ms / 1000, 1.8 - dom_age))
+    assert valid and info["minimum_age_wait_ms"] == round(expected_wait * 1000)
+    assert sum(sleeps) == pytest.approx(expected_wait)
     page.wait_for_load_state.assert_awaited_once_with("domcontentloaded", timeout=5000)
-    comments.assert_awaited_once()
+    comments.assert_not_awaited()
 
 
 async def test_old_document_from_another_video_cannot_bypass_minimum_age(warmup):
     page, comments, sleeps = warmup
     page.evaluate.return_value = {"current_url": URL, "navigation_url": URL.replace("7635267329407913230", "1111111111111111111"), "age_ms": 100000}
     _, valid, info = await engagement_engine.warmup_page_for_http(page, URL, max_retries=1)
-    assert valid and info["minimum_age_wait_ms"] == 3200
-    assert sum(sleeps) == pytest.approx(3.2)
+    assert valid and info["minimum_age_wait_ms"] == 2000
+    assert sum(sleeps) == pytest.approx(2.0)
     comments.assert_not_awaited()
 
 
-async def test_redirect_during_minimum_age_wait_cannot_reach_comment_api(monkeypatch, warmup):
+async def test_redirect_during_signer_check_cannot_reach_comment_api(monkeypatch, warmup):
     page, comments, sleeps = warmup
     page.evaluate.return_value = {"current_url": URL, "navigation_url": URL, "age_ms": 0}
     page.context.cookies.return_value = cookies("sessionid", "ttwid", "msToken")
-    original_sleep = engagement_engine.asyncio.sleep
-
-    async def redirect(seconds):
-        await original_sleep(seconds)
+    async def redirect(*args, **kwargs):
         page.url = "https://www.tiktok.com/login"
+        return True
 
-    monkeypatch.setattr(engagement_engine.asyncio, "sleep", redirect)
+    monkeypatch.setattr(engagement_engine, "wait_for_runtime_signer_ready", redirect)
     _, valid, info = await engagement_engine.warmup_page_for_http(page, URL, max_retries=1)
     assert not valid and info["reason_code"] == "redirect_not_video"
-    assert sum(sleeps) == pytest.approx(3.2)
+    assert not sleeps
     comments.assert_not_awaited()
 
 
-async def test_load_state_wait_is_not_credited_as_time_after_dom_ready(warmup):
+async def test_newly_completed_dom_still_gets_its_remaining_maturity_delay(warmup):
     page, _, sleeps = warmup
 
     async def wait_for_dom(*args, **kwargs):
@@ -97,13 +95,13 @@ async def test_load_state_wait_is_not_credited_as_time_after_dom_ready(warmup):
     page.wait_for_load_state.side_effect = wait_for_dom
     page.evaluate.return_value = {"current_url": URL, "navigation_url": URL, "age_ms": 5000, "dom_ready_ms": 5000}
     _, valid, info = await engagement_engine.warmup_page_for_http(page, URL, max_retries=1)
-    assert valid and info["target_dom_age_ms"] >= 1800
-    assert sleeps == pytest.approx([1.6, 1.8])
+    assert valid and info["minimum_age_wait_ms"] == 1500
+    assert sleeps == pytest.approx([1.6, 1.5])
 
 
 async def test_existing_ttwid_waits_for_interceptor_before_first_comment_get(monkeypatch, warmup):
     page, comments, sleeps = warmup
-    page.context.cookies.return_value = cookies("sessionid", "ttwid", "msToken")
+    page.context.cookies.return_value = cookies("sessionid", "ttwid", "tt_csrf_token", "msToken")
     ready = AsyncMock(side_effect=[False, False, True])
     monkeypatch.setattr(engagement_engine, "wait_for_runtime_signer_ready", ready)
 
@@ -115,7 +113,9 @@ async def test_existing_ttwid_waits_for_interceptor_before_first_comment_get(mon
     comments.side_effect = fetch
     _, valid, info = await engagement_engine.warmup_page_for_http(page, URL)
     assert valid and info["signer_ready"] and info["attempts"] == 1
-    comments.assert_awaited_once()
+    comments.assert_not_awaited()
+    assert ready.await_count == 3
+    assert sleeps == [0.2, 0.2]
     page.goto.assert_not_awaited()
     page.reload.assert_not_awaited()
 
@@ -125,11 +125,12 @@ async def test_existing_cookies_do_not_skip_bounded_signer_wait(monkeypatch, war
     ready = AsyncMock(return_value=False)
     monkeypatch.setattr(engagement_engine, "wait_for_runtime_signer_ready", ready)
     _, valid, info = await engagement_engine.warmup_page_for_http(page, URL, max_retries=1)
-    assert valid and info["signer_ready"] is False
+    assert not valid and info["signer_ready"] is False
+    assert "signer_not_ready" in info["reason_code"]
     assert sleeps == [0.2] * 30
     assert round(sum(sleeps), 2) == 6.0
     assert ready.await_count == 30
-    comments.assert_not_awaited()
+    comments.assert_awaited_once()
 
 
 async def test_signer_poll_time_is_included_in_six_second_deadline(monkeypatch, warmup):
@@ -148,10 +149,11 @@ async def test_signer_poll_time_is_included_in_six_second_deadline(monkeypatch, 
     monkeypatch.setattr(engagement_engine.asyncio, "sleep", sleep)
     monkeypatch.setattr(engagement_engine, "wait_for_runtime_signer_ready", signer)
     _, valid, info = await engagement_engine.warmup_page_for_http(page, URL, max_retries=1)
-    assert valid and info["signer_ready"] is False
+    assert not valid and info["signer_ready"] is False
+    assert "signer_not_ready" in info["reason_code"]
     assert round(clock[0], 6) == 6.0
     assert signer.await_count == 15
-    comments.assert_not_awaited()
+    comments.assert_awaited_once()
 
 
 @pytest.mark.parametrize("missing", ["tt_csrf_token", "msToken", "both"])
@@ -172,17 +174,14 @@ async def test_comment_get_primes_missing_tokens_without_waiting(warmup, missing
     assert valid and result["ttwid"] and result["tt_csrf_token"]
     assert info["attempts"] == 1 and info["comment_api_ready"]
     assert 0.2 not in sleeps
-    assert comments.await_count == int(missing != "msToken")
-    if missing != "msToken":
-        assert getattr(page, "_cached_first_comment_page", None) is not None
-    else:
-        assert info.get("comment_api_skipped") is True
+    comments.assert_awaited_once()
+    assert getattr(page, "_cached_first_comment_page", None) is not None
     page.reload.assert_not_awaited()
     page.goto.assert_not_awaited()
 
 
 @pytest.mark.parametrize("missing", ["ttwid", "tt_csrf_token"])
-async def test_only_missing_ttwid_requires_a_bounded_six_second_wait(warmup, missing):
+async def test_missing_ttwid_or_csrf_is_bounded_and_blocks_publication(warmup, missing):
     page, comments, sleeps = warmup
     page.context.cookies.return_value = cookies("sessionid", "msToken", "ttwid" if missing == "tt_csrf_token" else "tt_csrf_token")
     _, valid, info = await engagement_engine.warmup_page_for_http(page, URL, max_retries=1)
@@ -190,11 +189,11 @@ async def test_only_missing_ttwid_requires_a_bounded_six_second_wait(warmup, mis
     if missing == "ttwid":
         assert round(sum(sleeps[:30]), 2) == 6.0
     else:
-        assert sum(sleeps) < 0.5
-    assert valid is (missing == "tt_csrf_token")
+        assert 0.8 <= sum(sleeps) < 1.0
+    assert not valid
     assert comments.await_count == int(missing == "tt_csrf_token")
     if not valid:
-        assert info["reason_code"] == "missing_ttwid"
+        assert info["reason_code"] == f"missing_{missing}"
     page.reload.assert_not_awaited()
 
 
@@ -203,21 +202,22 @@ async def test_first_get_waits_for_delayed_ttwid(warmup):
     reads = []
     async def read():
         reads.append(1)
-        return cookies("sessionid", "msToken") if len(reads) < 5 else cookies("sessionid", "msToken", "ttwid")
+        return cookies("sessionid", "msToken", "tt_csrf_token") if len(reads) < 5 else cookies("sessionid", "msToken", "tt_csrf_token", "ttwid")
     async def fetch(*args, **kwargs):
         assert len(reads) == 5 and sleeps == [0.2] * 4
         return {"comments": []}
     page.context.cookies.side_effect = read
     comments.side_effect = fetch
     _, valid, info = await engagement_engine.warmup_page_for_http(page, URL)
-    assert valid and info["comment_api_ready"] and info["attempts"] == 1
-    comments.assert_awaited_once()
+    assert valid and info["comment_api_skipped"] and info["attempts"] == 1
+    comments.assert_not_awaited()
+    assert sleeps == [0.2] * 4
     page.reload.assert_not_awaited()
 
 
 async def test_missing_ttwid_after_priming_is_bounded_and_does_not_repeat_get(warmup):
     page, comments, sleeps = warmup
-    page.context.cookies.return_value = cookies("sessionid")
+    page.context.cookies.return_value = cookies("sessionid", "msToken", "tt_csrf_token")
     comments.return_value = None
     _, valid, info = await engagement_engine.warmup_page_for_http(page, URL, max_retries=1)
     assert not valid and info["reason_code"] == "missing_ttwid"
@@ -227,12 +227,13 @@ async def test_missing_ttwid_after_priming_is_bounded_and_does_not_repeat_get(wa
 
 async def test_empty_priming_with_existing_ttwid_does_not_add_wait_or_duplicate_get(warmup):
     page, comments, sleeps = warmup
-    page.context.cookies.return_value = cookies("sessionid", "ttwid")
+    page.context.cookies.return_value = cookies("sessionid", "ttwid", "tt_csrf_token", "msToken")
     comments.return_value = None
-    _, valid, info = await engagement_engine.warmup_page_for_http(page, URL)
+    _, valid, info = await engagement_engine.warmup_page_for_http(page, URL, max_retries=1)
     assert valid and not info["comment_api_ready"]
+    assert info["reason_code"] == "ready" and info["comment_api_skipped"]
     assert 0.2 not in sleeps
-    comments.assert_awaited_once()
+    comments.assert_not_awaited()
 
 
 @pytest.mark.parametrize("phase", ["signer", "priming_get", "ttwid_poll", "cookie_sync"])
@@ -314,7 +315,7 @@ async def test_retry_waits_for_ttwid_without_page_reload_and_recovers_aborted_go
     _, valid, info = await engagement_engine.warmup_page_for_http(page, URL)
     assert valid is (goto_error is None or "ERR_ABORTED" in goto_error)
     assert page.goto.await_count == (2 if goto_error and "ERR_ABORTED" in goto_error else 1)
-    assert comments.await_count == 0
+    comments.assert_not_awaited()
     page.reload.assert_not_awaited()
     if valid:
         assert info["reason_code"] == "ready"
@@ -434,7 +435,7 @@ async def test_reply_preparation_failures_preserve_publish_budget_but_stop_at_ac
     monkeypatch.setattr(browser_pool, "close_browser_pool", AsyncMock())
     for name, value in {
         "USE_PROXY": False, "TIKTOK_NETWORK_FIRST": True, "TIKTOK_NETWORK_IMPL_READY": True,
-        "PARALLEL_COMMENTING_DOM_FIRST": False, "MAX_RETRY_ACCOUNTS": 3, "PARALLEL_MAIN_ACCOUNT_SLOTS": 1,
+        "PARALLEL_COMMENTING_DOM_FIRST": False, "MAX_RETRY_ACCOUNTS": 3, "MAX_ACCOUNT_CANDIDATES": 3, "PARALLEL_MAIN_ACCOUNT_SLOTS": 1,
         "PARALLEL_COMMENTING_MAX_MAIN_ATTEMPTS": 1, "PARALLEL_COMMENTING_MAX_REPLY_ATTEMPTS": 1,
         "PARALLEL_DYNAMIC_WORKER_POOL_ENABLED": dynamic,
     }.items():
@@ -460,10 +461,12 @@ async def test_warmup_rejects_visible_auth_challenges_before_publish(monkeypatch
     page.reload.assert_not_awaited()
 
 
-async def test_http_preflight_immediately_rejects_unconfirmed_passport_and_caches_username(monkeypatch):
+async def test_http_preflight_softly_rejects_unconfirmed_passport_and_caches_username(monkeypatch):
     monkeypatch.setattr(user_schema, "_http_first_for_correlation", Mock(return_value=True))
     dead_marks = Mock()
     monkeypatch.setattr(user_schema, "_register_dead_session", dead_marks)
+    soft_marks = Mock()
+    monkeypatch.setattr(user_schema, "mark_soft_error", soft_marks)
     validate = AsyncMock(return_value={"status": "inconclusive", "username": None,
                                        "error": "Passport response did not confirm authentication"})
     monkeypatch.setattr("services.cookie_validator.validate_account_http", validate)
@@ -472,8 +475,9 @@ async def test_http_preflight_immediately_rejects_unconfirmed_passport_and_cache
     reason = await user_schema._preflight_cookie_http_gate(
         None, dead_acc, correlation_id="task_1218_parallel_main_v1_a1_acc2560", phase="main",
     )
-    assert reason and reason.startswith("dead_session:http_preflight:")
-    dead_marks.assert_called_once()
+    assert reason and reason.startswith("http_preflight:inconclusive:")
+    dead_marks.assert_not_called()
+    soft_marks.assert_called_once()
 
     validate.return_value = {"status": "valid", "valid": True, "username": "fast_user_2563", "error": None}
     live_acc = SimpleNamespace(id=2563, cookies='[{"name":"sessionid","value":"y"}]', cookie_file=None, proxy=None)

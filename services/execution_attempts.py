@@ -1,6 +1,14 @@
 """Account replacement before submission does not consume a publish attempt."""
 
 
+def candidate_scan_limit(settings) -> int:
+    """Monotonic candidate cap, independent of the budget for real attempts."""
+    try:
+        return max(1, int(getattr(settings, "MAX_ACCOUNT_CANDIDATES", 50) or 50))
+    except (TypeError, ValueError):
+        return 50
+
+
 def is_pre_publish_account_failure(reason, *, publication_attempted=None) -> bool:
     if publication_attempted:
         return False
@@ -13,6 +21,7 @@ def is_pre_publish_account_failure(reason, *, publication_attempted=None) -> boo
         "dead_session", "visible_login_button", "visible_login_ui", "account_login_failed",
         "proxy_edge_access_denied", "goto_failed", "captcha_challenge", "cookies_expired",
         "warmup_exception", "parent_api_unavailable", "http_session_not_ready",
+        "http_preflight", "proxy_route:",
     ))
 
 

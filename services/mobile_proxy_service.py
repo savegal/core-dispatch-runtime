@@ -6,6 +6,7 @@ import logging
 import asyncio
 import time
 import uuid
+from dataclasses import dataclass, field
 import httpx
 import redis
 from typing import Optional, Tuple, Any, Iterable
@@ -17,7 +18,13 @@ from services.redis_service import get_redis_client
 
 logger = logging.getLogger("services.mobile_proxy")
 settings = get_settings()
-_held_proxy_lock_tokens: dict[int, str] = {}
+_held_proxy_lock_tokens: dict[str, str] = {}
+
+
+@dataclass(frozen=True)
+class ProxyLockHandle:
+    proxy_id: int
+    token: str = field(repr=False)
 
 # ИСПРАВЛЕНО: Используем централизованный Redis клиент
 def get_redis():
@@ -77,7 +84,7 @@ def get_locked_proxy_ids(proxy_ids: Iterable[int]) -> set[int]:
 
 
 def clear_proxy_locks(proxy_ids: Iterable[int]) -> int:
-    """Force-clear Redis locks for known proxy ids during single-worker startup recovery."""
+    """Release only locally owned handles; other workers' leases expire naturally."""
     ids: list[int] = []
     for proxy_id in proxy_ids:
         try:
@@ -90,16 +97,21 @@ def clear_proxy_locks(proxy_ids: Iterable[int]) -> int:
     try:
         redis_client = get_redis()
         keys = [_proxy_lock_key(proxy_id) for proxy_id in ids]
-        deleted = redis_client.delete(*keys)
-        for proxy_id in ids:
-            _held_proxy_lock_tokens.pop(proxy_id, None)
+        deleted = 0
+        for token, key in list(_held_proxy_lock_tokens.items()):
+            if key in keys:
+                deleted += redis_client.eval(
+                    "if redis.call('get', KEYS[1]) == ARGV[1] then return redis.call('del', KEYS[1]) else return 0 end",
+                    1, key, token,
+                )
+                _held_proxy_lock_tokens.pop(token, None)
         return int(deleted or 0)
     except Exception as exc:
         logger.warning("Failed to clear mobile proxy locks during startup recovery: %s", exc)
         return 0
 
 
-async def acquire_proxy_lock(proxy_id: int, timeout: int = 30) -> bool:
+async def acquire_proxy_lock(proxy_id: int, timeout: int = 30) -> ProxyLockHandle | None:
     """
     Захватывает блокировку прокси через Redis.
     
@@ -134,9 +146,9 @@ async def acquire_proxy_lock(proxy_id: int, timeout: int = 30) -> bool:
                 result = redis_client.set(lock_key, lock_token, nx=True, ex=lock_ttl)
                 
                 if result:
-                    _held_proxy_lock_tokens[int(proxy_id)] = lock_token
+                    _held_proxy_lock_tokens[lock_token] = lock_key
                     logger.debug(f"Acquired lock for proxy {proxy_id}")
-                    return True
+                    return ProxyLockHandle(int(proxy_id), lock_token)
                 
                 # Блокировка занята - выходим из retry цикла и ждём
                 break
@@ -170,7 +182,7 @@ async def acquire_proxy_lock(proxy_id: int, timeout: int = 30) -> bool:
         await asyncio.sleep(0.5)  # Ждём 500ms перед следующей попыткой
 
 
-async def release_proxy_lock(proxy_id: int) -> None:
+async def release_proxy_lock(handle: ProxyLockHandle) -> None:
     """
     Освобождает блокировку прокси.
     Включает retry при временных ошибках Redis.
@@ -181,8 +193,11 @@ async def release_proxy_lock(proxy_id: int) -> None:
     Raises:
         ProxyLockError: при ошибке Redis
     """
+    if not isinstance(handle, ProxyLockHandle):
+        raise ProxyLockError("release requires the operation's ProxyLockHandle")
+    proxy_id, lock_token = handle.proxy_id, handle.token
     lock_key = _proxy_lock_key(proxy_id)
-    lock_token = _held_proxy_lock_tokens.pop(int(proxy_id), None)
+    _held_proxy_lock_tokens.pop(lock_token, None)
     max_retries = 3
     
     for retry in range(max_retries):
@@ -278,94 +293,25 @@ async def _mark_proxy_rotated_now(proxy_id: int, ttl: int = 3600) -> None:
         logger.debug(f"Failed to write rotation timestamp for proxy {proxy_id}: {exc}")
 
 
-async def get_current_ip(proxy_string: str) -> Optional[str]:
-    """
-    Получает текущий IP через прокси.
-    
-    Args:
-        proxy_string: Строка прокси (для использования в httpx)
-    
-    Returns:
-        IP адрес или None при ошибке
-    """
+async def get_current_ip(proxy_string):
+    from services.proxy_normalizer import ProxyRoute
+    route = ProxyRoute.parse(proxy_string)
     try:
-        # Парсим прокси для httpx
-        proxy_dict = _parse_proxy_for_httpx(proxy_string)
-        
-        # ИСПРАВЛЕНО: Используем правильный API httpx - прокси передаём через transport
-        if proxy_dict:
-            # httpx принимает прокси как строку URL
-            proxy_url = proxy_dict.get("http://") or proxy_dict.get("https://")
-            if proxy_url:
-                # ИСПРАВЛЕНО: Увеличен таймаут для проверки IP через прокси
-                # После ротации прокси может быть нестабильным, нужно больше времени
-                from httpx import AsyncHTTPTransport
-                transport = AsyncHTTPTransport(proxy=proxy_url)
-                async with httpx.AsyncClient(
-                    transport=transport,
-                    timeout=httpx.Timeout(30.0, connect=10.0)
-                ) as client:
-                    response = await client.get(settings.MOBILE_PROXY_CHECK_IP_URL)
-                    response.raise_for_status()
-                    data = response.json()
-                    return data.get("ip") or data.get("origin")  # Поддержка разных форматов ответа
-            else:
-                async with httpx.AsyncClient(
-                    timeout=httpx.Timeout(30.0, connect=10.0)
-                ) as client:
-                    response = await client.get(settings.MOBILE_PROXY_CHECK_IP_URL)
-                    response.raise_for_status()
-                    data = response.json()
-                    return data.get("ip") or data.get("origin")
-        else:
-            async with httpx.AsyncClient(
-                timeout=httpx.Timeout(30.0, connect=10.0)
-            ) as client:
-                response = await client.get(settings.MOBILE_PROXY_CHECK_IP_URL)
-                response.raise_for_status()
-                data = response.json()
-                return data.get("ip") or data.get("origin")  # Поддержка разных форматов ответа
-            
-    except Exception as e:
-        logger.warning(
-            "Failed to get current IP via proxy %s: %s",
-            sanitize_url(str(proxy_string or ""), max_length=80),
-            e,
-        )
+        async with httpx.AsyncClient(proxy=route.url, trust_env=False, timeout=httpx.Timeout(30.0, connect=10.0)) as client:
+            response = await client.get(settings.MOBILE_PROXY_CHECK_IP_URL)
+            response.raise_for_status()
+            data = response.json()
+            return data.get('ip') or data.get('origin')
+    except httpx.HTTPError as exc:
+        logger.warning('IP probe failed through %s: %s', sanitize_url(route.url), type(exc).__name__)
         return None
 
+def _parse_proxy_for_httpx(proxy_string):
+    from services.proxy_normalizer import ProxyRoute
+    route = ProxyRoute.parse(proxy_string)
+    return {'http://': route.url, 'https://': route.url}
 
-def _parse_proxy_for_httpx(proxy_string: str) -> Optional[dict]:
-    """
-    Парсит строку прокси для httpx.
-    
-    Args:
-        proxy_string: Строка прокси (например: "socks5://user:pass@ip:port")
-    
-    Returns:
-        Dict с настройками прокси для httpx или None
-    """
-    if not proxy_string or not proxy_string.strip():
-        return None
-    
-    proxy_string = proxy_string.strip()
-    
-    # Если уже полный URL - используем как есть
-    if "://" in proxy_string:
-        return {"http://": proxy_string, "https://": proxy_string}
-    
-    # Если нет протокола - добавляем socks5 (по умолчанию для мобильных прокси)
-    if "@" in proxy_string:
-        return {"http://": f"socks5://{proxy_string}", "https://": f"socks5://{proxy_string}"}
-    
-    # Просто ip:port - предполагаем http
-    if ":" in proxy_string:
-        return {"http://": f"http://{proxy_string}", "https://": f"http://{proxy_string}"}
-    
-    return None
-
-
-async def rotate_proxy_ip(proxy: Proxy) -> Tuple[bool, Optional[str]]:
+async def _rotate_proxy_ip(proxy: Proxy) -> Tuple[bool, Optional[str]]:
     """
     Выполняет ротацию IP для мобильного прокси.
     
@@ -388,7 +334,7 @@ async def rotate_proxy_ip(proxy: Proxy) -> Tuple[bool, Optional[str]]:
         # ИСПРАВЛЕНО: Увеличен таймаут до 60 секунд для мобильных прокси
         # Мобильные прокси могут перезагружаться 10-30 секунд, нужно дать им время
         # 1. Отправляем запрос на ротацию IP
-        async with httpx.AsyncClient(timeout=httpx.Timeout(60.0, connect=10.0)) as client:
+        async with httpx.AsyncClient(timeout=httpx.Timeout(60.0, connect=10.0), trust_env=False) as client:
             response = await client.get(proxy.rotation_url)
             response.raise_for_status()
         
@@ -421,7 +367,7 @@ async def rotate_proxy_ip(proxy: Proxy) -> Tuple[bool, Optional[str]]:
         raise ProxyRotationError(f"Unexpected error: {e}")
 
 
-async def ensure_proxy_ip_rotated(
+async def _ensure_proxy_ip_rotated(
     proxy: Proxy,
     db: Session,
     previous_ip: Optional[str] = None,
@@ -493,7 +439,7 @@ async def ensure_proxy_ip_rotated(
     # Выполняем ротацию с retry
     for attempt in range(settings.MOBILE_PROXY_MAX_RETRIES):
         try:
-            success, new_ip = await rotate_proxy_ip(proxy)
+            success, new_ip = await _rotate_proxy_ip(proxy)
             
             if not success or not new_ip:
                 logger.warning(f"Proxy {proxy.id} rotation attempt {attempt + 1} failed to get new IP")
@@ -531,6 +477,18 @@ async def ensure_proxy_ip_rotated(
         f"Failed to rotate IP for proxy {proxy.id} after {settings.MOBILE_PROXY_MAX_RETRIES} attempts. "
         f"IP did not change or rotation failed."
     )
+
+
+async def rotate_proxy_ip(proxy: Proxy) -> Tuple[bool, Optional[str]]:
+    from services.proxy_concurrency_service import proxy_operation
+    async with proxy_operation(proxy.proxy, rotation=True):
+        return await _rotate_proxy_ip(proxy)
+
+
+async def ensure_proxy_ip_rotated(proxy: Proxy, db: Session, previous_ip=None, *, force_rotation=False) -> str:
+    from services.proxy_concurrency_service import proxy_operation
+    async with proxy_operation(proxy.proxy, rotation=True):
+        return await _ensure_proxy_ip_rotated(proxy, db, previous_ip, force_rotation=force_rotation)
 
 
 async def get_proxy_last_ip(proxy_id: int) -> Optional[str]:
@@ -629,6 +587,8 @@ async def prepare_mobile_proxy_for_account(
         ProxyRotationError: при ошибке ротации IP
         ProxyLockError: при ошибке блокировки
     """
+    from services.proxy_normalizer import account_proxy_route
+    account_proxy_route(account)
     if not account.proxy:
         return False, None
 
@@ -659,12 +619,12 @@ async def prepare_mobile_proxy_for_account(
             await save_proxy_last_ip(proxy.id, new_ip)
             
         logger.info(f"Mobile proxy {proxy.id} prepared for account {account.id}: IP {new_ip}")
-        return True, proxy
+        return lock_acquired, proxy
         
     except Exception as e:
         # При ошибке освобождаем блокировку и пробрасываем исключение
         try:
-            await release_proxy_lock(proxy.id)
+            await release_proxy_lock(lock_acquired)
         except Exception:
             pass
         raise

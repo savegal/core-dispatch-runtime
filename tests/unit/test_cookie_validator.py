@@ -122,14 +122,16 @@ def test_playwright_expiry_overrides_conflicting_export_expiry():
 
 
 @pytest.mark.parametrize("expiry_key", ["expires", "expirationDate", "expiration"])
-def test_startup_cleanup_drops_synthetic_ms_token_and_stale_csrf(expiry_key):
+def test_startup_cleanup_keeps_exported_ms_token_as_session_cookie_and_drops_stale_csrf(expiry_key):
     from services.cookie_validator import normalize_cookies_for_browser
     records = [
         {"name": "sessionid", "value": "session", "domain": ".tiktok.com"},
         {"name": "tt_csrf_token", "value": "stale-csrf", "domain": ".tiktok.com"},
         {"name": "msToken", "value": "stale-token", "domain": ".tiktok.com", expiry_key: 2_147_483_647},
     ]
-    assert {row["name"] for row in normalize_cookies_for_browser(records)} == {"sessionid"}
+    startup = normalize_cookies_for_browser(records)
+    assert {row["name"] for row in startup} == {"sessionid", "msToken"}
+    assert "expires" not in next(row for row in startup if row["name"] == "msToken")
     assert {row["name"] for row in normalize_cookies_for_browser(records, drop_stale_antifraud=False)} == {
         "sessionid", "msToken", "tt_csrf_token",
     }
@@ -288,6 +290,7 @@ async def test_browser_runtime_uses_same_cookie_normalization(monkeypatch, runti
     else:
         monkeypatch.setattr(engine, "dismiss_cookie_banners", AsyncMock())
         monkeypatch.setattr(engine, "wait_for_runtime_signer_ready", AsyncMock(return_value=True))
+        monkeypatch.setattr("executor.http.comment_discovery.fetch_comment_page", AsyncMock(return_value={"comments": []}))
         cookies, valid, _ = await engine.warmup_page_for_http(page, url, max_retries=1)
         assert valid is True
     assert cookies["msToken"] == "web"

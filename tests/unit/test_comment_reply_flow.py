@@ -53,9 +53,9 @@ async def test_execute_request_publish_requires_comment_id():
     )
 
     assert success is False
-    assert error_type == HttpErrorType.API_ERROR
+    assert error_type == HttpErrorType.SUBMITTED_UNCONFIRMED
     assert error_msg is not None
-    assert "missing confirmation" in error_msg.lower()
+    assert "missing_comment_id" in error_msg.lower()
 
 
 @pytest.mark.unit
@@ -66,7 +66,7 @@ async def test_execute_request_publish_does_not_recover_api_receipt_from_dom(mon
     client = PlaywrightHttpClient(
         request_context,
         retry_policy=RetryPolicy(max_retries=0),
-        page=SimpleNamespace(context=SimpleNamespace(cookies=AsyncMock(return_value=[])), evaluate=AsyncMock(return_value={
+        page=SimpleNamespace(url="https://www.tiktok.com/@fixture/video/123", context=SimpleNamespace(cookies=AsyncMock(return_value=[])), evaluate=AsyncMock(return_value={
             "status": 200, "headers": response.headers, "text": await response.text(),
         })),
     )
@@ -90,8 +90,8 @@ async def test_execute_request_publish_does_not_recover_api_receipt_from_dom(mon
     )
 
     assert success is False
-    assert error_type == HttpErrorType.API_ERROR
-    assert error_msg and "missing confirmation" in error_msg
+    assert error_type == HttpErrorType.SUBMITTED_UNCONFIRMED
+    assert error_msg and "missing_comment_id" in error_msg
     assert response_data is None
 
 
@@ -103,7 +103,7 @@ async def test_execute_request_reply_does_not_use_main_comment_dom_recovery(monk
     client = PlaywrightHttpClient(
         request_context,
         retry_policy=RetryPolicy(max_retries=0),
-        page=SimpleNamespace(context=SimpleNamespace(cookies=AsyncMock(return_value=[])), evaluate=AsyncMock(return_value={
+        page=SimpleNamespace(url="https://www.tiktok.com/@fixture/video/123", context=SimpleNamespace(cookies=AsyncMock(return_value=[])), evaluate=AsyncMock(return_value={
             "status": 200, "headers": response.headers, "text": await response.text(),
         })),
     )
@@ -125,9 +125,9 @@ async def test_execute_request_reply_does_not_use_main_comment_dom_recovery(monk
     )
 
     assert success is False
-    assert error_type == HttpErrorType.API_ERROR
+    assert error_type == HttpErrorType.SUBMITTED_UNCONFIRMED
     assert error_msg is not None
-    assert "missing confirmation" in error_msg.lower()
+    assert "missing_comment_id" in error_msg.lower()
 
 
 @pytest.mark.unit
@@ -190,7 +190,7 @@ async def test_execute_request_short_circuits_local_retries_on_proxy_timeout():
     )
 
     assert success is False
-    assert error_type == HttpErrorType.TIMEOUT
+    assert error_type == HttpErrorType.SUBMITTED_UNCONFIRMED
     assert error_msg is not None
     assert request_context.calls == 1
 

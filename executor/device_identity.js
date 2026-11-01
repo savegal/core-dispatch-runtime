@@ -41,12 +41,15 @@ function installAccountIdentity(profile) {
     });
     const workerRealm = typeof window === 'undefined';
     const proto = Object.getPrototypeOf(navigator);
-    const values = {platform: profile.platform, hardwareConcurrency: profile.hardware.hardwareConcurrency,
-        deviceMemory: profile.hardware.deviceMemory, webdriver: false};
-    if (!workerRealm) values.vendor = profile.vendor;
-    if (workerRealm && profile.language) {
-        values.language = profile.language;
-        values.languages = Object.freeze(profile.languages);
+    const values = {};
+    if (profile.platform) {
+        values.platform = profile.platform;
+    }
+    if (profile.hardware?.hardwareConcurrency) {
+        values.hardwareConcurrency = profile.hardware.hardwareConcurrency;
+    }
+    if (profile.hardware?.deviceMemory) {
+        values.deviceMemory = profile.hardware.deviceMemory;
     }
     for (const [key, value] of Object.entries(values)) {
         const descriptor = Object.getOwnPropertyDescriptor(proto, key);
@@ -57,7 +60,7 @@ function installAccountIdentity(profile) {
             })});
     }
     if (!workerRealm && profile.hardware?.width && profile.hardware?.height) {
-        for (const [key, size] of [['outerWidth', profile.hardware.width], ['outerHeight', profile.hardware.height]]) {
+        for (const [key, size] of [['outerWidth', profile.geometry.outerWidth], ['outerHeight', profile.geometry.outerHeight]]) {
             const descriptor = Object.getOwnPropertyDescriptor(window, key) || Object.getOwnPropertyDescriptor(Object.getPrototypeOf(window), key);
             if (descriptor?.get) Object.defineProperty(window, key, {...descriptor,
                 get: nativeHook(descriptor.get, function() {
@@ -66,7 +69,7 @@ function installAccountIdentity(profile) {
                 })});
         }
         if (globalThis.Screen?.prototype) {
-            for (const [key, size] of [['availWidth', profile.hardware.width], ['availHeight', profile.hardware.height - 40]]) {
+            for (const [key, size] of [['availWidth', profile.geometry.availWidth], ['availHeight', profile.geometry.availHeight]]) {
                 const descriptor = Object.getOwnPropertyDescriptor(Screen.prototype, key);
                 if (descriptor?.get) Object.defineProperty(Screen.prototype, key, {...descriptor,
                     get: nativeHook(descriptor.get, function() {
@@ -99,16 +102,44 @@ function installAccountIdentity(profile) {
             replaceMethod(Context.prototype, 'readPixels', function readPixels(...args) {
                 const result = Reflect.apply(originalReadPixels, this, args);
                 const pixels = args[6];
+                // Only the RGBA byte-array overload at offset zero uses the
+                // layout below. Leave other WebGL2 layouts and native coercions alone.
+                if (args[4] !== 0x1908 || args[5] !== 0x1401 ||
+                    (args[7] !== undefined && args[7] !== 0) ||
+                    !args.slice(0, 4).every(value => typeof value === 'number')) return result;
                 const width = args[2] >> 0, height = args[3] >> 0;
                 const sx = args[0] >> 0, sy = args[1] >> 0;
-                if (pixels && ArrayBuffer.isView(pixels) && pixels.BYTES_PER_ELEMENT === 1 && width > 0 && height > 0) {
-                    const maxPixels = Math.min(width * height, (pixels.length / 4) >> 0);
-                    for (let idx = 0; idx < maxPixels; idx++) {
-                        const x = idx % width, y = (idx / width) >> 0;
-                        const offset = idx * 4;
-                        if (!pixels[offset + 3]) continue;
-                        const seed = mix(profile.canvasSeed ^ Math.imul(x + sx + 1, 0x1f123bb5) ^ Math.imul(y + sy + 1, 0x5f356495));
-                        for (let c = 0; c < 3; c++) pixels[offset + c] = (pixels[offset + c] & 254) | ((seed >>> c) & 1);
+                if (pixels && ArrayBuffer.isView(pixels) && pixels.BYTES_PER_ELEMENT === 1 &&
+                    pixels.length >= width * height * 4 && width > 1 && height > 0) {
+                    let count = 0;
+                    for (let y = 0; y < height && count < 12; y++) {
+                        for (let x = 1; x < width && count < 12; x++) {
+                            const offset = (y * width + x) * 4;
+                            if (offset + 3 >= pixels.length) break;
+                            const prevOffset = offset - 4;
+                            if (!pixels[offset + 3] && !pixels[prevOffset + 3]) continue;
+                            if (pixels[offset] !== pixels[prevOffset] ||
+                                pixels[offset + 1] !== pixels[prevOffset + 1] ||
+                                pixels[offset + 2] !== pixels[prevOffset + 2] ||
+                                pixels[offset + 3] !== pixels[prevOffset + 3]) {
+                                let targetChannel = -1;
+                                for (const c of [2, 1, 0, 3]) {
+                                    const val = pixels[offset + c];
+                                    if (val > 4 && val < 251) {
+                                        targetChannel = c;
+                                        break;
+                                    }
+                                }
+                                if (targetChannel !== -1) {
+                                    const seed = mix(profile.canvasSeed ^ Math.imul(x + sx + 1, 0x1f123bb5) ^ Math.imul(y + sy + 1, 0x5f356495));
+                                    if ((seed & 3) === 0) {
+                                        pixels[offset + targetChannel] ^= 1;
+                                        count++;
+                                        x++;
+                                    }
+                                }
+                            }
+                        }
                     }
                 }
                 return result;
@@ -116,15 +147,39 @@ function installAccountIdentity(profile) {
         }
     }
 
-    // Set the lowest RGB bit, using absolute coordinates for cropped reads.
-    // This is idempotent, so repeated reads do not accumulate noise.
+    // Set lowest bit on at most 12 antialiased boundary pixels.
+    // Pure uniform fills (fillRect) and solid areas remain completely untouched.
     const noisePixels = (image, sx = 0, sy = 0) => {
         const {data, width, height} = image;
-        for (let y = 0; y < height; y++) for (let x = 0; x < width; x++) {
-            const seed = mix(profile.canvasSeed ^ Math.imul(x + sx + 1, 0x1f123bb5) ^ Math.imul(y + sy + 1, 0x5f356495));
-            const offset = (y * width + x) * 4;
-            if (!data[offset + 3]) continue;
-            for (let c = 0; c < 3; c++) data[offset + c] = (data[offset + c] & 254) | ((seed >>> c) & 1);
+        if (!data || width <= 1 || height <= 0) return image;
+        let count = 0;
+        for (let y = 0; y < height && count < 12; y++) {
+            for (let x = 1; x < width && count < 12; x++) {
+                const offset = (y * width + x) * 4;
+                const prevOffset = offset - 4;
+                if (!data[offset + 3] && !data[prevOffset + 3]) continue;
+                if (data[offset] !== data[prevOffset] ||
+                    data[offset + 1] !== data[prevOffset + 1] ||
+                    data[offset + 2] !== data[prevOffset + 2] ||
+                    data[offset + 3] !== data[prevOffset + 3]) {
+                    let targetChannel = -1;
+                    for (const c of [2, 1, 0, 3]) {
+                        const val = data[offset + c];
+                        if (val > 4 && val < 251) {
+                            targetChannel = c;
+                            break;
+                        }
+                    }
+                    if (targetChannel !== -1) {
+                        const seed = mix(profile.canvasSeed ^ Math.imul(x + sx + 1, 0x1f123bb5) ^ Math.imul(y + sy + 1, 0x5f356495));
+                        if ((seed & 3) === 0) {
+                            data[offset + targetChannel] ^= 1;
+                            count++;
+                            x++;
+                        }
+                    }
+                }
+            }
         }
         return image;
     };
@@ -249,7 +304,7 @@ function installAccountIdentity(profile) {
                 }
                 if (url.protocol === 'blob:') activeWorkerBlobs.add(url.href);
                 const options = args[1];
-                const workerProfile = {...profile, language:navigator.language, languages:[...navigator.languages],
+                const workerProfile = {...profile,
                     workerBase:url.href, workerType:options?.type || 'classic'};
                 let source = '(' + installAccountIdentity.toString() + ')(' + JSON.stringify(workerProfile) + ');';
                 if (options?.type === 'module') {

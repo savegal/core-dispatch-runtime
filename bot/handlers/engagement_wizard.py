@@ -1,9 +1,12 @@
-﻿"""
+from bot.services.order_creation_ui import current_order_transport_label
+from services.order_transport import order_transport_label
+"""
 Wizard для создания engagement_only заказов (Только ответы на существующий комментарий).
 """
 from aiogram import Router, F
 from aiogram.types import Message, CallbackQuery, InlineKeyboardMarkup, InlineKeyboardButton
 from aiogram.fsm.context import FSMContext
+from bot.services.mention_choice import ensure_mention_choice
 from aiogram.filters import StateFilter
 from bot.services.validators import validate_video_url
 from bot.services.api_client import api_client
@@ -25,8 +28,12 @@ from bot.services.formatting import markdown_inline_code
 from bot.utils.markdown_escape import escape_markdown_simple
 from services.likes_config import BOOST_LIKES_DEFAULT, coerce_likes_quantity
 from services.comment_search import normalize_search_phrase
+from services.keyword_replies import KEYWORD_ORDER_KIND, normalize_keywords
 import logging
 import re
+import hashlib
+import json
+import uuid
 
 from bot.services.main_visibility_ui import REPLY_CALLBACK_PREFIX, reply_visibility_keyboard, set_reply_visibility_option
 
@@ -39,7 +46,8 @@ ENGAGEMENT_TEMPLATES_PER_PAGE = 8
 
 @router.callback_query(F.data.startswith(REPLY_CALLBACK_PREFIX))
 async def engagement_reply_visibility_option(callback: CallbackQuery, state: FSMContext):
-    await set_reply_visibility_option(callback, state)
+    keyword_order = (await state.get_data()).get("order_kind") == KEYWORD_ORDER_KIND
+    await set_reply_visibility_option(callback, state, replace_missing=not keyword_order)
 
 
 
@@ -153,6 +161,8 @@ def _template_choice_keyboard(templates: list[dict], page: int = 0) -> tuple[Inl
 
 
 @router.callback_query(F.data == "menu:engagement_only")
+@router.callback_query(F.data == "menu:keyword_replies")
+@router.callback_query(F.data.startswith("engagement:from_template:"))
 async def start_engagement_wizard(callback: CallbackQuery, state: FSMContext):
     """Начинает создание engagement_only заказа."""
     try:
@@ -175,14 +185,40 @@ async def start_engagement_wizard(callback: CallbackQuery, state: FSMContext):
             await callback.answer("Доступ запрещён", show_alert=True)
             return
         
+        selected_template = None
+        if (callback.data or "").startswith("engagement:from_template:"):
+            template_id = int(callback.data.split(":")[-1])
+            selected_template = await api_client.get_task_template(template_id, user_data.get("id"))
+            if not isinstance(selected_template, dict) or not _template_reply_list(selected_template):
+                await callback.answer("Шаблон недоступен или не содержит ответов", show_alert=True)
+                return
         await state.clear()
+        keyword_order = callback.data == "menu:keyword_replies"
+        await state.update_data(order_kind=KEYWORD_ORDER_KIND if keyword_order else "engagement_only",
+                                order_create_token=uuid.uuid4().hex)
+        if selected_template:
+            selected_replies = _template_reply_list(selected_template)
+            await state.update_data(
+                replies=selected_replies, template_id=selected_template["id"],
+                template_name=_template_display_name(selected_template),
+                template_usage="replies_only", reply_source="template",
+                verify_reply_visibility=(selected_template.get("settings") or {}).get("verify_reply_visibility") is True,
+            )
         
-        await callback.message.edit_text(
+        intro = (
+            "*Ответы по ключевым словам · HTTP*\n\n"
+            "Найдём все доступные комментарии основного списка с любым из ваших ключей. "
+            "Под каждым отправим один ответ. Если вариантов ответа несколько, они будут чередоваться.\n\n"
+            "*Шаг 1:* Отправьте ссылку на видео TikTok:"
+        ) if keyword_order else (
             "*⚡ Только ответы*\n\n"
             "Этот тип заказа работает с *уже существующим* комментарием: главные комментарии не публикуются.\n"
             "Софт отвечает на первый найденный комментарий со словом или фразой из вашего запроса. "
             "Регистр и смайлики не учитываются. Можно ограничить поиск username автора.\n\n"
-            "🔗 *Шаг 1:* Отправьте ссылку на видео TikTok:",
+            "🔗 *Шаг 1:* Отправьте ссылку на видео TikTok:"
+        )
+        await callback.message.edit_text(
+            intro,
             reply_markup=InlineKeyboardMarkup(inline_keyboard=[
                 [InlineKeyboardButton(text="❌ Отмена", callback_data="menu:main")]
             ]),
@@ -211,8 +247,18 @@ async def process_video_url(message: Message, state: FSMContext):
             )
             return
         
-        await state.update_data(video_url=video_url)
-        
+        await state.update_data(video_url=video_url, video_urls=[video_url])
+        if (await state.get_data()).get("order_kind") == KEYWORD_ORDER_KIND:
+            await message.answer(
+                "*Ключевые слова · шаг 2*\n\n"
+                "Отправьте слова или фразы через запятую либо с новой строки.\n"
+                "Например: `где купить, цена, доставка`\n\n"
+                "Достаточно совпадения любого ключа. Слова и фразы ищем целиком, "
+                "без учёта регистра и смайликов. До 50 ключей.",
+                reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                    [InlineKeyboardButton(text="❌ Отмена", callback_data="menu:main")]]), parse_mode="Markdown")
+            await state.set_state(EngagementStates.INPUT_COMMENT_TEXT)
+            return
         await message.answer(
             "*⚡ Только ответы*\n\n"
             "🔍 *Шаг 2:* Отправьте слово или фразу для поиска.\n\n"
@@ -235,6 +281,19 @@ async def process_video_url(message: Message, state: FSMContext):
 async def process_comment_text(message: Message, state: FSMContext):
     """Обрабатывает текст комментария."""
     try:
+        if (await state.get_data()).get("order_kind") == KEYWORD_ORDER_KIND:
+            try:
+                keywords = normalize_keywords(message.text or "")
+            except ValueError as exc:
+                await message.answer(str(exc))
+                return
+            await state.update_data(keywords=keywords, comment_text="\n".join(keywords),
+                                    comment_id=None, username=None, boost_likes_enabled=False)
+            if _engagement_replies_from_state(await state.get_data()):
+                await show_engagement_preview(message, state)
+            else:
+                await ask_for_reply_source(message, state)
+            return
         username, comment_text = _parse_comment_locator(message.text or "")
         
         if not comment_text:
@@ -251,7 +310,11 @@ async def process_comment_text(message: Message, state: FSMContext):
             boost_likes_enabled=True,
         )
 
-        await ask_for_reply_source(message, state)
+        selected = await state.get_data()
+        if selected.get("reply_source") == "template" and selected.get("replies"):
+            await show_engagement_preview(message, state)
+        else:
+            await ask_for_reply_source(message, state)
         
     except Exception as e:
         logger.error(f"Error processing comment_text: {e}", exc_info=True)
@@ -260,8 +323,9 @@ async def process_comment_text(message: Message, state: FSMContext):
 
 async def ask_for_reply_source(message: Message, state: FSMContext):
     """Asks whether replies should be entered manually or loaded from a template."""
+    keyword_order = (await state.get_data()).get("order_kind") == KEYWORD_ORDER_KIND
     await message.answer(
-        "*⚡ Только ответы*\n\n"
+        ("*Ответы по ключевым словам*\n\n" if keyword_order else "*⚡ Только ответы*\n\n") +
         "💬 *Шаг 3:* Откуда взять ответы?\n\n"
         "Можно ввести ответы вручную или выбрать существующий шаблон. "
         "Из шаблона будут использованы *только ответы* — главные комментарии из шаблона публиковаться не будут.",
@@ -398,7 +462,7 @@ async def ask_for_replies(message: Message, state: FSMContext):
     if data.get("reply_source") != "template":
         await state.update_data(replies=[], reply1=None, reply2=None, reply3=None)
     await message.answer(
-        "*⚡ Только ответы*\n\n"
+        ("*Ответы по ключевым словам*\n\n" if data.get("order_kind") == KEYWORD_ORDER_KIND else "*⚡ Только ответы*\n\n") +
         f"💬 *Шаг 4:* Ответы\n\n"
         f"Отправляйте ответы по одному сообщению. Максимум: *{settings.MAX_REPLIES}*.\n"
         "Когда закончите, нажмите «Готово». Для заказа нужен хотя бы один ответ.",
@@ -438,9 +502,10 @@ def _engagement_replies_keyboard(has_replies: bool = True) -> InlineKeyboardMark
 
 
 async def _ask_for_first_reply_again(message_or_callback: Message | CallbackQuery, state: FSMContext):
+    keyword_order = (await state.get_data()).get("order_kind") == KEYWORD_ORDER_KIND
     await state.update_data(replies=[], reply1=None, reply2=None, reply3=None)
     text = (
-        "*⚡ Только ответы*\n\n"
+        ("*Ответы по ключевым словам*\n\n" if keyword_order else "*⚡ Только ответы*\n\n") +
         "Ответы очищены.\n\n"
         f"*Ответ 1 из {settings.MAX_REPLIES}*\n\n"
         "Отправьте первый ответ отдельным сообщением. Для этого заказа нужен хотя бы один ответ."
@@ -692,16 +757,36 @@ async def show_engagement_preview(message_or_callback: Message | CallbackQuery, 
         video_url = data.get("video_url")
         comment_text = data.get("comment_text")
         replies = _engagement_replies_from_state(data)
-        global_likes_enabled, likes_quantity = await _boost_likes_ui_config()
+        keyword_order = data.get("order_kind") == KEYWORD_ORDER_KIND
+        if keyword_order:
+            global_likes_enabled, likes_quantity = False, 0
+        else:
+            global_likes_enabled, likes_quantity = await _boost_likes_ui_config()
         boost_likes_enabled = bool(data.get("boost_likes_enabled", True) and global_likes_enabled)
         
         # Формируем текст превью
-        preview_text = "*⚡ Только ответы · подтверждение*\n\n"
+        transport_label = order_transport_label("http") if keyword_order else await current_order_transport_label(api_client)
+        preview_text = "*Проверьте заказ · только ответы*\n\n"
+        preview_text += f"Режим: *{transport_label}*\n\n"
         preview_text += f"🔗 *Видео:* {escape_markdown_simple((video_url or '')[:70])}{'...' if video_url and len(video_url) > 70 else ''}\n\n"
 
         preview_text += "🔍 *Поиск:* первое совпадение слова/фразы, без регистра и смайликов\n"
         preview_text += f"📝 *Текст:* {_mono_preview(comment_text, 120)}\n"
-        preview_text += "👤 *Автор:* не проверяем\n\n"
+        author = data.get("username")
+        preview_text += f"👤 *Автор:* {escape_markdown_simple('@' + author) if author else 'любой'}\n\n"
+        if keyword_order:
+            keywords = normalize_keywords(data.get("keywords"))
+            preview_text = "*Проверьте заказ · ответы по ключевым словам*\n\n"
+            preview_text += f"Режим: *{transport_label}*\n"
+            preview_text += f"Видео: {escape_markdown_simple((video_url or '')[:100])}\n\n"
+            if len(data.get("video_urls") or []) > 1:
+                preview_text += f"Всего видео: {len(data['video_urls'])}\n\n"
+            preview_text += "*Ключевые слова:*\n" + "\n".join(_mono_preview(key, 100) for key in keywords[:10])
+            if len(keywords) > 10:
+                preview_text += f"\n… и ещё {len(keywords) - 10}"
+            preview_text += ("\n\nПо одному ответу на каждый найденный комментарий. Варианты чередуются.\n"
+                             "Оплата по действующему тарифу за видео, а не за каждое совпадение.\n"
+                             "Если TikTok отдаст неполный список, заказ покажет частичный результат.\n\n")
 
         if data.get("template_id"):
             preview_text += f"📑 *Шаблон:* {escape_markdown_simple(data.get('template_name') or 'Без названия')}\n"
@@ -715,19 +800,26 @@ async def show_engagement_preview(message_or_callback: Message | CallbackQuery, 
         if not replies:
             preview_text += "Ответы не добавлены\n"
         
-        if global_likes_enabled:
+        if keyword_order:
+            preview_text += "\nПлатные лайки: не заказываются\n\n"
+            if data.get("verify_reply_visibility"):
+                preview_text += "Проверка видимости: без повторной отправки ответа.\n\n"
+        elif global_likes_enabled:
             if boost_likes_enabled:
                 preview_text += f"\n❤️ *Лайки:* добавить {likes_quantity}\n\n"
             else:
                 preview_text += "\n🤍 *Лайки:* не добавлять\n\n"
         else:
             preview_text += "\n🤍 *Лайки:* выключены в настройках сервиса\n\n"
-        preview_text += "🚀 *Запустить заказ?*"
+        preview_text += ("Главные комментарии не создаются: отправляются только ответы под совпадениями." if keyword_order else
+                         "Новый комментарий не создаётся: ответы будут отправлены под найденным комментарием.")
 
         rows = [
-            [InlineKeyboardButton(text="✅ Запустить", callback_data="engagement:confirm")],
+            [InlineKeyboardButton(text="🚀 Создать заказ", callback_data="engagement:confirm")],
             [InlineKeyboardButton(text="↩️ Изменить ответы", callback_data="engagement:edit_replies")],
         ]
+        if keyword_order:
+            rows.append([InlineKeyboardButton(text="🔎 Изменить ключевые слова", callback_data="engagement:edit_keywords")])
         if global_likes_enabled:
             rows.append([
                 InlineKeyboardButton(
@@ -739,7 +831,8 @@ async def show_engagement_preview(message_or_callback: Message | CallbackQuery, 
         rows.append(
             [InlineKeyboardButton(text="❌ Отмена", callback_data="menu:main")]
         )
-        keyboard = reply_visibility_keyboard(InlineKeyboardMarkup(inline_keyboard=rows), bool(data.get("verify_reply_visibility", False)))
+        keyboard = reply_visibility_keyboard(InlineKeyboardMarkup(inline_keyboard=rows),
+            bool(data.get("verify_reply_visibility", False)), replace_missing=not keyword_order)
         
         if isinstance(message_or_callback, Message):
             await message_or_callback.answer(preview_text, reply_markup=keyboard, parse_mode="Markdown")
@@ -761,6 +854,9 @@ async def toggle_engagement_likes(callback: CallbackQuery, state: FSMContext):
     """Toggles optional boost likes for engagement_only order."""
     try:
         data = await state.get_data()
+        if data.get("order_kind") == KEYWORD_ORDER_KIND:
+            await callback.answer("Этот тип заказа создаёт только ответы", show_alert=True)
+            return
         enabled, _quantity = await _boost_likes_ui_config()
         if not enabled:
             await state.update_data(boost_likes_enabled=False)
@@ -773,6 +869,18 @@ async def toggle_engagement_likes(callback: CallbackQuery, state: FSMContext):
     except Exception as e:
         logger.error(f"Error toggling engagement likes: {e}", exc_info=True)
         await callback.answer("Ошибка", show_alert=True)
+
+
+@router.callback_query(F.data == "engagement:edit_keywords", StateFilter(EngagementStates.CONFIRM_ORDER))
+async def edit_keyword_order_keys(callback: CallbackQuery, state: FSMContext):
+    if (await state.get_data()).get("order_kind") != KEYWORD_ORDER_KIND:
+        await callback.answer("Этот заказ не использует ключевые слова", show_alert=True)
+        return
+    await callback.answer()
+    await callback.message.edit_text("*Изменить ключевые слова*\n\nОтправьте новый список через запятую или с новой строки.",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="❌ Отмена", callback_data="menu:main")]]), parse_mode="Markdown")
+    await state.set_state(EngagementStates.INPUT_COMMENT_TEXT)
 
 
 @router.callback_query(F.data == "engagement:edit_replies", StateFilter(EngagementStates.CONFIRM_ORDER))
@@ -793,7 +901,7 @@ async def edit_engagement_replies(callback: CallbackQuery, state: FSMContext):
             else "Лимит ответов достигнут. Нажмите «Готово» или очистите список."
         )
         await callback.message.edit_text(
-            "*⚡ Только ответы*\n\n"
+            ("*Ответы по ключевым словам*\n\n" if data.get("order_kind") == KEYWORD_ORDER_KIND else "*⚡ Только ответы*\n\n") +
             f"Сейчас сохранено ответов: *{len(replies)}*.\n\n"
             f"{prompt_tail}",
             reply_markup=_engagement_replies_keyboard(has_replies=True),
@@ -821,13 +929,23 @@ async def confirm_engagement_order(callback: CallbackQuery, state: FSMContext):
         data = await state.get_data()
         video_url = data.get("video_url")
         comment_text = normalize_user_text(data.get("comment_text") or "") or ""
+        keyword_order = data.get("order_kind") == KEYWORD_ORDER_KIND
+        kind = KEYWORD_ORDER_KIND if keyword_order else "engagement_only"
+        video_urls = data.get("video_urls") if keyword_order else None
+        video_urls = list(video_urls) if isinstance(video_urls, list) and video_urls else [video_url]
+        if keyword_order:
+            try:
+                normalize_keywords(data.get("keywords"))
+            except ValueError as exc:
+                await callback.answer(str(exc), show_alert=True)
+                return
         replies = _engagement_replies_from_state(data)
         reply1 = replies[0] if len(replies) >= 1 else None
         reply2 = replies[1] if len(replies) >= 2 else None
         reply3 = replies[2] if len(replies) >= 3 else None
 
         # Валидация: обязательные поля должны быть заполнены
-        if not video_url or not validate_video_url(video_url):
+        if not video_url or not all(isinstance(url, str) and validate_video_url(url) for url in video_urls):
             await callback.answer("Ссылка на видео потеряна или некорректна. Начните заново.", show_alert=True)
             await state.clear()
             return
@@ -872,29 +990,34 @@ async def confirm_engagement_order(callback: CallbackQuery, state: FSMContext):
             except Exception as exc:
                 logger.warning(f"engagement: pool summary unavailable, fallback to shared: {exc}")
 
-        safe_main_comment = comment_text.strip()
+        safe_main_comment = "Ответы по ключевым словам" if keyword_order else comment_text.strip()
         safe_text_variants = [safe_main_comment] * 3
 
         # Формируем settings
         account_pool_mode = (data.get("account_pool_mode") or "shared").lower()
         if account_pool_mode not in {"shared", "personal"}:
             account_pool_mode = "shared"
-        global_likes_enabled, _likes_quantity = await _boost_likes_ui_config()
-        effective_likes_enabled = bool(data.get("boost_likes_enabled", True) and global_likes_enabled)
+        global_likes_enabled = False
+        if not keyword_order:
+            global_likes_enabled, _likes_quantity = await _boost_likes_ui_config()
+        effective_likes_enabled = bool(not keyword_order and data.get("boost_likes_enabled", True) and global_likes_enabled)
 
         task_settings = {
-            "origin": "engagement_only",
+            "origin": kind,
             "verify_reply_visibility": bool(data.get("verify_reply_visibility", False)),
             "reply_count": len(replies),
             "replies": replies,
-            "delays": True,
-            "shuffle": False,
-            "rotate_accounts": True,
+            "delays": data.get("delays", True),
+            "shuffle": data.get("shuffle", False),
+            "rotate_accounts": data.get("rotate_accounts", True),
             "account_pool_mode": account_pool_mode,
             "engagement_comment_text": comment_text,
             "comment_text_match": "phrase",
             "boost_likes_enabled": effective_likes_enabled,
         }
+        if keyword_order:
+            task_settings["keywords"] = normalize_keywords(data.get("keywords"))
+            task_settings.pop("engagement_comment_text", None)
         if data.get("username"):
             task_settings["engagement_username"] = data.get("username")
         if data.get("template_id"):
@@ -902,11 +1025,34 @@ async def confirm_engagement_order(callback: CallbackQuery, state: FSMContext):
             task_settings["template_name"] = data.get("template_name")
             task_settings["template_usage"] = "replies_only"
         
+        mention_choice = await ensure_mention_choice(
+            callback.message, state, replies, user_id=user_id,
+            resume="engagement:confirm", scope={"video_urls": video_urls, "settings": task_settings},
+        )
+        if mention_choice is None:
+            return
+        task_settings["mention_mode"] = mention_choice.mode
+        request_fingerprint = hashlib.sha256(json.dumps(
+            {"kind": kind, "video_urls": video_urls, "settings": task_settings, "replies": replies},
+            ensure_ascii=False, sort_keys=True,
+        ).encode()).hexdigest()
+        # The wizard nonce exists before confirmation, so concurrent clicks derive
+        # the same key without a read/update race in FSM storage. Legacy states
+        # use the stable preview message as their request namespace.
+        creation_token = data.get("order_create_token") or (
+            f"{user_id}:{getattr(getattr(callback.message, 'chat', None), 'id', user_id)}:"
+            f"{getattr(callback.message, 'message_id', 'legacy')}"
+        )
+        request_key = mention_choice.request_kwargs.get("idempotency_key") or (
+            "engagement-" + hashlib.sha256(f"{creation_token}:{request_fingerprint}".encode()).hexdigest()
+        )
+        await state.update_data(order_creation_request={"fingerprint": request_fingerprint, "key": request_key})
+
         # Создаем заказ через API
         task_result = await api_client.create_task(
             user_id=user_backend_id,
             main_comment=safe_main_comment,
-            video_urls=[video_url],
+            video_urls=video_urls,
             text_variants=safe_text_variants,  # Минимум 3 варианта
             reply1=reply1,
             reply2=reply2,
@@ -914,10 +1060,11 @@ async def confirm_engagement_order(callback: CallbackQuery, state: FSMContext):
             replies=replies,
             likes=0,
             settings=task_settings,
-            kind="engagement_only",  # HYBRID: Тип заказа
+            kind=kind,
             engagement_comment_id=None,
             engagement_username=data.get("username"),
-            engagement_comment_text=comment_text
+            engagement_comment_text=None if keyword_order else comment_text,
+            idempotency_key=request_key,
         )
         
         task_id = task_result.get("task_id")
@@ -925,17 +1072,20 @@ async def confirm_engagement_order(callback: CallbackQuery, state: FSMContext):
         if not task_id:
             await callback.answer("Ошибка создания заказа", show_alert=True)
             return
-        
+
+        video_count_line = f"Видео в заказе: {len(video_urls)}\n" if keyword_order and len(video_urls) > 1 else ""
         await callback.message.edit_text(
-            f"✅ *Заказ создан!*\n\n"
+            f"✅ *Заказ #{task_id} принят*\n\n"
+            f"Режим: {order_transport_label(task_result.get('order_transport_mode'))}\n"
             f"📋 Заказ #{task_id}\n"
-            f"⚡ Тип: Только ответы\n"
-            f"↩️ Ответов: {len(replies)}\n"
-            f"❤️ Лайки: {'добавим' if effective_likes_enabled else 'без лайков'}\n"
-            f"🔗 Видео: {escape_markdown_simple(video_url[:50])}...\n\n"
+            f"Тип: {'Ответы по ключевым словам' if keyword_order else 'Только ответы'}\n"
+            f"↩️ {'Вариантов ответа' if keyword_order else 'Ответов'}: {len(replies)}\n"
+            f"{video_count_line}"
+            f"❤️ {'Платные лайки: не заказываются' if keyword_order else 'Лайки: добавим' if effective_likes_enabled else 'Лайки: без лайков'}\n"
+            f"🔗 Видео: {escape_markdown_simple(video_url[:100])}{'...' if len(video_url) > 100 else ''}\n\n"
             f"Заказ добавлен в очередь обработки.",
             reply_markup=InlineKeyboardMarkup(inline_keyboard=[
-                [InlineKeyboardButton(text="📋 Мои заказы", callback_data="menu:orders")],
+                [InlineKeyboardButton(text="👁 Открыть заказ", callback_data=f"order:detail:{task_id}")],
                 [InlineKeyboardButton(text="🏠 Главное меню", callback_data="menu:main")]
             ]),
             parse_mode="Markdown"

@@ -42,9 +42,13 @@
 from __future__ import annotations
 
 import asyncio
+import weakref
 import json
+import hashlib
+from executor.cache_lock import synchronized
 import logging
-from services.execution_attempts import is_pre_publish_account_failure, pre_publish_outcomes, track_publication_requests
+from services.publication_progress import record_publication, explicit_publication_flags, delivery_state
+from services.execution_attempts import candidate_scan_limit, is_pre_publish_account_failure, pre_publish_outcomes, track_publication_requests
 from executor.http.execution_policy import http_first_enabled, valid_comment_id
 from services.cookie_validator import normalize_cookie_records
 import os
@@ -54,7 +58,7 @@ import threading
 import time
 import uuid
 from dataclasses import dataclass, field
-from typing import Any, Callable, Dict, List, Optional, Tuple
+from typing import Any, Callable, Dict, List, Optional, Tuple, Set
 from urllib.parse import urlparse
 
 from patchright.async_api import Page
@@ -278,11 +282,31 @@ _ACTION_READY_PROBE_SECONDS = 5.0
 _ACTION_READY_PROOF_TTL_SECONDS = 120.0
 _CAPTCHA_MANUAL_WAIT_SECONDS = float(os.getenv("MANUAL_CAPTCHA_WAIT_SECONDS", "15"))
 _CAPTCHA_MANUAL_POLL_SECONDS = 2.0
-_HTTP_PREFLIGHT_VALID_CACHE_TTL_SECONDS = 45.0
+_HTTP_PREFLIGHT_VALID_CACHE_TTL_SECONDS = 300.0
+_HTTP_PREFLIGHT_BROWSER_FALLBACK_TTL_SECONDS = 45.0
 _HTTP_PREFLIGHT_VALID_CACHE: Dict[Any, Tuple[float, str]] = {}
 _HTTP_PREFLIGHT_USERNAME_CACHE: Dict[Any, str] = {}
 _HTTP_PREFLIGHT_USER_ID_CACHE: Dict[Any, str] = {}
 _HTTP_PREFLIGHT_VALID_CACHE_LOCK = threading.RLock()
+_HTTP_PREFLIGHT_CACHE_MAX_ENTRIES = 4096
+
+
+def _drop_http_preflight_cache_entry(key):
+    """All callers hold the preflight cache lock."""
+    _HTTP_PREFLIGHT_VALID_CACHE.pop(key, None)
+    _HTTP_PREFLIGHT_USERNAME_CACHE.pop(key, None)
+    _HTTP_PREFLIGHT_USER_ID_CACHE.pop(key, None)
+
+
+def _prune_http_preflight_cache(now):
+    for key, (checked_at, _) in list(_HTTP_PREFLIGHT_VALID_CACHE.items()):
+        if now - checked_at > _HTTP_PREFLIGHT_VALID_CACHE_TTL_SECONDS:
+            _drop_http_preflight_cache_entry(key)
+    for cache in (_HTTP_PREFLIGHT_USERNAME_CACHE, _HTTP_PREFLIGHT_USER_ID_CACHE):
+        for key in list(cache.keys() - _HTTP_PREFLIGHT_VALID_CACHE.keys()):
+            cache.pop(key, None)
+    while len(_HTTP_PREFLIGHT_VALID_CACHE) > max(1, _HTTP_PREFLIGHT_CACHE_MAX_ENTRIES):
+        _drop_http_preflight_cache_entry(next(iter(_HTTP_PREFLIGHT_VALID_CACHE)))
 _USER_SCHEMA_HTTP_METHOD = "http_user_schema"
 _HTTP_DISABLED_LOGGED_KEYS: set[tuple[str, bool, bool]] = set()
 _MAX_PARALLEL_LIKE_TARGETS = 3
@@ -538,8 +562,25 @@ def _reply_parent_search_error_is_inconclusive(error: Any) -> bool:
 
 
 def _http_preflight_cache_key(account: Account) -> Any:
+    """A positive check belongs to this authentication session and proxy route."""
+    from services.cookie_validator import get_cookies_for_account, parse_cookies_to_dict
+    from services.proxy_normalizer import ProxyRoute, ProxyRouteError
+    from services.dedicated_proxy_service import get_current_dedicated_proxy
     account_id = getattr(account, "id", None)
-    return account_id if account_id is not None else id(account)
+    raw_cookies = get_cookies_for_account(account)
+    cookies = normalize_cookie_records(raw_cookies) if isinstance(raw_cookies, (dict, list)) else parse_cookies_to_dict(raw_cookies)
+    auth = {key: cookies.get(key) for key in (
+        "sessionid", "sessionid_ss", "sid_tt", "sid_guard", "uid_tt", "uid_tt_ss",
+    )}
+    dedicated = get_current_dedicated_proxy()
+    raw_proxy = dedicated.proxy if dedicated else getattr(account, "proxy", None) if _settings.USE_PROXY else None
+    try:
+        route_key = ((ProxyRoute.parse(raw_proxy).url, dedicated.proxy_id if dedicated else None) if raw_proxy
+                     else ("missing_required_proxy" if dedicated or _settings.USE_PROXY else "direct", None))
+    except ProxyRouteError:
+        route_key = ("invalid", str(raw_proxy))
+    fingerprint = hashlib.sha256(json.dumps([auth, route_key], sort_keys=True).encode()).hexdigest()
+    return (account_id if account_id is not None else id(account), fingerprint)
 
 
 def _has_recent_http_preflight_valid(account: Account) -> bool:
@@ -551,7 +592,7 @@ def _has_recent_http_preflight_valid(account: Account) -> bool:
         checked_at, _cached_phase = cached
         if time.monotonic() - checked_at <= _HTTP_PREFLIGHT_VALID_CACHE_TTL_SECONDS:
             return True
-        _HTTP_PREFLIGHT_VALID_CACHE.pop(cache_key, None)
+        _drop_http_preflight_cache_entry(cache_key)
         return False
 
 
@@ -566,6 +607,7 @@ def _get_cached_http_preflight_username(account: Optional[Account]) -> Optional[
         cached = _HTTP_PREFLIGHT_VALID_CACHE.get(cache_key)
         if cached and time.monotonic() - cached[0] <= _HTTP_PREFLIGHT_VALID_CACHE_TTL_SECONDS:
             return _HTTP_PREFLIGHT_USERNAME_CACHE.get(cache_key)
+        _drop_http_preflight_cache_entry(cache_key)
     return None
 
 
@@ -580,6 +622,7 @@ def _get_cached_http_preflight_user_id(account: Optional[Account]) -> Optional[s
         cached = _HTTP_PREFLIGHT_VALID_CACHE.get(cache_key)
         if cached and time.monotonic() - cached[0] <= _HTTP_PREFLIGHT_VALID_CACHE_TTL_SECONDS:
             return _HTTP_PREFLIGHT_USER_ID_CACHE.get(cache_key)
+        _drop_http_preflight_cache_entry(cache_key)
     return None
 
 
@@ -599,9 +642,13 @@ def _forget_http_preflight_valid(account: Optional[Account]) -> None:
         return
     cache_key = _http_preflight_cache_key(account)
     with _HTTP_PREFLIGHT_VALID_CACHE_LOCK:
-        _HTTP_PREFLIGHT_VALID_CACHE.pop(cache_key, None)
-        _HTTP_PREFLIGHT_USERNAME_CACHE.pop(cache_key, None)
-        _HTTP_PREFLIGHT_USER_ID_CACHE.pop(cache_key, None)
+        for key in list(_HTTP_PREFLIGHT_VALID_CACHE):
+            if key == cache_key or (isinstance(key, tuple) and key[0] == cache_key[0]):
+                _drop_http_preflight_cache_entry(key)
+        for key in list(_HTTP_PREFLIGHT_BROWSER_HANDOFFS):
+            if key[0][0] == cache_key[0]:
+                _HTTP_PREFLIGHT_BROWSER_HANDOFFS.pop(key, None)
+    account._http_preflight_requires_browser_warmup = False
     try:
         if hasattr(account, "_cached_tiktok_username"):
             setattr(account, "_cached_tiktok_username", None)
@@ -611,9 +658,9 @@ def _forget_http_preflight_valid(account: Optional[Account]) -> None:
         pass
 
 
-def _register_dead_session(db: Session, account: Account, reason: Optional[str]) -> bool:
+def _register_dead_session(db: Session, account: Account, reason: Optional[str], *, force_retire: bool = False, definitive: bool = False) -> bool:
     _forget_http_preflight_valid(account)
-    return register_dead_session(db, account, reason)
+    return register_dead_session(db, account, reason, force_retire=force_retire, definitive=definitive)
 
 
 def _register_captcha_session(db: Session, account: Account, reason: Optional[str]) -> None:
@@ -985,6 +1032,8 @@ def _http_attempt_failure_reason(
 
 def _http_attempt_failure_status(error_type: Any) -> str:
     error_type_value = (_http_error_type_value(error_type) or "").lower()
+    if error_type_value == "submitted_unconfirmed":
+        return "submitted_unconfirmed"
     if error_type_value in {"timeout", "network_error"}:
         return "timeout"
     return "failed"
@@ -1164,7 +1213,7 @@ async def _prepare_user_schema_http_session(
             return unavailable("visible_login_ui_after_http_warmup")
 
     try:
-        client = await PlaywrightHttpClient.from_page(page)
+        client = await PlaywrightHttpClient.from_page(page, runtime_profile=warmup_info.get("_runtime_profile"))
     except Exception as exc:
         logger.info(
             "[USER_SCHEMA_HTTP] %s: client creation failed for account=%s; HTTP session unavailable: %s",
@@ -1279,7 +1328,8 @@ async def _publish_main_http_first_if_eligible(
 
     try:
         from executor.engagement_engine import _record_http_account_failure_result as record_http_failure
-        record_http_failure(session.account_id, error_type)
+        if _http_error_type_value(error_type) != "submitted_unconfirmed":
+            record_http_failure(session.account_id, error_type)
     except Exception:
         pass
 
@@ -1301,11 +1351,20 @@ async def _publish_main_http_first_if_eligible(
     )
 
 
+async def _call_publication_callback(callback, outcome):
+    import inspect
+    pending = callback(outcome)
+    if inspect.isawaitable(pending):
+        await pending
+
+
 _BRANCH_PUBLISHED_REPLIES: Dict[str, List[Dict[str, Any]]] = {}
 _BRANCH_PARENT_LIKED_ACCOUNTS: Dict[str, Set[str]] = {}
 _MAX_BRANCH_TRACKED = 500
+_BRANCH_STATE_LOCK = threading.RLock()
 
 
+@synchronized(_BRANCH_STATE_LOCK)
 def can_boost_parent(parent_id: Optional[str], account_id: Optional[str]) -> bool:
     clean_p = str(parent_id or "").strip()
     clean_acc = str(account_id or "").strip()
@@ -1316,6 +1375,7 @@ def can_boost_parent(parent_id: Optional[str], account_id: Optional[str]) -> boo
     return clean_acc not in _BRANCH_PARENT_LIKED_ACCOUNTS.get(clean_p, set())
 
 
+@synchronized(_BRANCH_STATE_LOCK)
 def record_parent_boost(parent_id: Optional[str], account_id: Optional[str]) -> None:
     clean_p = str(parent_id or "").strip()
     clean_acc = str(account_id or "").strip()
@@ -1328,6 +1388,7 @@ def record_parent_boost(parent_id: Optional[str], account_id: Optional[str]) -> 
     _BRANCH_PARENT_LIKED_ACCOUNTS.setdefault(clean_p, set()).add(clean_acc)
 
 
+@synchronized(_BRANCH_STATE_LOCK)
 def _record_branch_published_reply(parent_id: Optional[str], variant_index: int, comment_id: Optional[str]) -> None:
     clean_p = str(parent_id or "").strip()
     clean_c = str(comment_id or "").strip()
@@ -1342,10 +1403,13 @@ def _record_branch_published_reply(parent_id: Optional[str], variant_index: int,
         branch.append({"index": int(variant_index or 1), "cid": clean_c, "likes_given": 0, "liked_by": set()})
 
 
+@synchronized(_BRANCH_STATE_LOCK)
 def _get_branch_published_replies(parent_id: Optional[str]) -> List[Dict[str, Any]]:
-    return _BRANCH_PUBLISHED_REPLIES.get(str(parent_id or "").strip(), [])
+    return [{**item, "liked_by": set(item.get("liked_by", set()))}
+            for item in _BRANCH_PUBLISHED_REPLIES.get(str(parent_id or "").strip(), [])]
 
 
+@synchronized(_BRANCH_STATE_LOCK)
 def can_boost_reply(cid: Optional[str], account_id: Optional[str], max_likes: int = 1) -> bool:
     clean_c = str(cid or "").strip()
     clean_acc = str(account_id or "").strip()
@@ -1361,18 +1425,21 @@ def can_boost_reply(cid: Optional[str], account_id: Optional[str], max_likes: in
     return True
 
 
-def record_reply_boost(cid: Optional[str], account_id: Optional[str], parent_id: Optional[str] = None) -> None:
+@synchronized(_BRANCH_STATE_LOCK)
+def record_reply_boost(cid: Optional[str], account_id: Optional[str], parent_id: Optional[str] = None) -> int:
     clean_c = str(cid or "").strip()
     clean_acc = str(account_id or "").strip()
     if not clean_c:
-        return
+        return 0
     found = False
+    likes_given = 0
     for branch in _BRANCH_PUBLISHED_REPLIES.values():
         for item in branch:
             if item.get("cid") == clean_c:
                 if clean_acc:
                     item.setdefault("liked_by", set()).add(clean_acc)
                 item["likes_given"] = len(item.setdefault("liked_by", set()))
+                likes_given = max(likes_given, item["likes_given"])
                 found = True
     if not found and parent_id:
         branch = _BRANCH_PUBLISHED_REPLIES.setdefault(str(parent_id).strip(), [])
@@ -1383,6 +1450,8 @@ def record_reply_boost(cid: Optional[str], account_id: Optional[str], parent_id:
             "likes_given": len(liked_set),
             "liked_by": liked_set,
         })
+        likes_given = len(liked_set)
+    return likes_given
 
 
 async def _publish_reply_http_first_if_eligible(
@@ -1404,73 +1473,6 @@ async def _publish_reply_http_first_if_eligible(
         return None
 
     started = time.monotonic()
-    # Free HTTP auto-boost: like parent comment before replying
-    if _like_parent_before_reply_enabled() and parent_id and can_boost_parent(parent_id, session.account_id):
-        try:
-            like_ok, like_err, _ = await session.client.like_comment(
-                aweme_id=session.aweme_id,
-                cid=parent_id,
-                cookies=session.cookies,
-                correlation_id=f"{correlation_id}_parent_like",
-                video_url=session.video_url,
-            )
-            if like_ok:
-                record_parent_boost(parent_id, session.account_id)
-                logger.info(
-                    "[HTTP_AUTO_BOOST] Liked parent comment %s before reply | account=%s, correlation_id=%s",
-                    parent_id[:20], session.account_id, correlation_id
-                )
-            else:
-                logger.debug("[HTTP_AUTO_BOOST] Like parent comment %s non-ok: %s", parent_id[:20], like_err)
-            await asyncio.sleep(random.uniform(0.6, 1.2))
-        except Exception as exc:
-            logger.debug("[HTTP_AUTO_BOOST] Like parent comment %s failed (non-blocking): %s", parent_id[:20], exc)
-
-    # Targeted reply like boost (configured in order or template)
-    settings_dict = task_settings or {}
-    raw_target = str(settings_dict.get("reply_like_target") or "").strip().lower()
-    raw_count = int(settings_dict.get("reply_like_count") or 0)
-    if raw_count > 0 and raw_target not in {"0", "none", "off", "false", ""}:
-        known_replies = _get_branch_published_replies(parent_id)
-        target_items = []
-        digits = re.findall(r"\d+", raw_target)
-        if digits:
-            target_idx = int(digits[0])
-            target_items = [
-                item for item in known_replies
-                if item.get("index") == target_idx
-                and can_boost_reply(item.get("cid"), session.account_id, max_likes=raw_count)
-            ]
-        elif raw_target == "all":
-            target_items = [
-                item for item in known_replies
-                if can_boost_reply(item.get("cid"), session.account_id, max_likes=raw_count)
-            ]
-
-        for item in target_items:
-            try:
-                reply_like_ok, reply_like_err, _ = await session.client.like_comment(
-                    aweme_id=session.aweme_id,
-                    cid=item["cid"],
-                    cookies=session.cookies,
-                    correlation_id=f"{correlation_id}_target_reply_like_{item['cid'][:12]}",
-                    video_url=session.video_url,
-                )
-                if reply_like_ok:
-                    record_reply_boost(item["cid"], session.account_id, parent_id=parent_id)
-                    logger.info(
-                        "[HTTP_AUTO_BOOST] Reply bot %s liked target reply #%s (%s) [%s/%s likes] in branch %s",
-                        session.account_id, item.get("index"), item["cid"][:20], item.get("likes_given", 1), raw_count, parent_id[:20]
-                    )
-                else:
-                    logger.debug("[HTTP_AUTO_BOOST] Reply bot %s like target reply non-ok: %s", session.account_id, reply_like_err)
-                await asyncio.sleep(random.uniform(0.6, 1.3))
-            except Exception as exc:
-                logger.debug("[HTTP_AUTO_BOOST] Target reply like error (non-blocking): %s", exc)
-
-    # Organic pause before sending reply
-    await asyncio.sleep(random.uniform(1.0, 2.0))
-
     try:
         success, comment_id, error_msg, error_type, meta = await session.client.reply_comment(
             aweme_id=session.aweme_id,
@@ -1512,6 +1514,72 @@ async def _publish_reply_http_first_if_eligible(
         )
 
     if success and comment_id:
+        await record_publication("reply", {"text": reply_text, "variant_index": variant_index,
+            "parent_comment_id": parent_id, "reply_id": str(comment_id), "account_id": session.account_id,
+            "network_confirmed": True, "success": True, "publication_attempted": True, "method": "http_user_schema"})
+        # Free HTTP auto-boost: like parent comment AFTER reply succeeds so digg never blocks reply publish
+        if _like_parent_before_reply_enabled() and parent_id and can_boost_parent(parent_id, session.account_id):
+            try:
+                await asyncio.sleep(random.uniform(0.4, 0.9))
+                like_ok, like_err, _ = await session.client.like_comment(
+                    aweme_id=session.aweme_id,
+                    cid=parent_id,
+                    cookies=session.cookies,
+                    correlation_id=f"{correlation_id}_parent_like",
+                    video_url=session.video_url,
+                )
+                if like_ok:
+                    record_parent_boost(parent_id, session.account_id)
+                    logger.info(
+                        "[HTTP_AUTO_BOOST] Liked parent comment %s after reply | account=%s, correlation_id=%s",
+                        parent_id[:20], session.account_id, correlation_id
+                    )
+                else:
+                    logger.debug("[HTTP_AUTO_BOOST] Like parent comment %s non-ok: %s", parent_id[:20], like_err)
+            except Exception as exc:
+                logger.debug("[HTTP_AUTO_BOOST] Like parent comment %s failed (non-blocking): %s", parent_id[:20], exc)
+
+        # Targeted reply like boost (configured in order or template)
+        settings_dict = task_settings or {}
+        raw_target = str(settings_dict.get("reply_like_target") or "").strip().lower()
+        raw_count = int(settings_dict.get("reply_like_count") or 0)
+        if raw_count > 0 and raw_target not in {"0", "none", "off", "false", ""}:
+            known_replies = _get_branch_published_replies(parent_id)
+            target_items = []
+            digits = re.findall(r"\d+", raw_target)
+            if digits:
+                target_idx = int(digits[0])
+                target_items = [
+                    item for item in known_replies
+                    if item.get("index") == target_idx
+                    and can_boost_reply(item.get("cid"), session.account_id, max_likes=raw_count)
+                ]
+            elif raw_target == "all":
+                target_items = [
+                    item for item in known_replies
+                    if can_boost_reply(item.get("cid"), session.account_id, max_likes=raw_count)
+                ]
+
+            for item in target_items:
+                try:
+                    await asyncio.sleep(random.uniform(0.4, 0.9))
+                    reply_like_ok, reply_like_err, _ = await session.client.like_comment(
+                        aweme_id=session.aweme_id,
+                        cid=item["cid"],
+                        cookies=session.cookies,
+                        correlation_id=f"{correlation_id}_target_reply_like_{item['cid'][:12]}",
+                        video_url=session.video_url,
+                    )
+                    if reply_like_ok:
+                        likes_given = record_reply_boost(item["cid"], session.account_id, parent_id=parent_id)
+                        logger.info(
+                            "[HTTP_AUTO_BOOST] Reply bot %s liked target reply #%s (%s) [%s/%s likes] in branch %s",
+                            session.account_id, item.get("index"), item["cid"][:20], likes_given, raw_count, parent_id[:20]
+                        )
+                    else:
+                        logger.debug("[HTTP_AUTO_BOOST] Reply bot %s like target reply non-ok: %s", session.account_id, reply_like_err)
+                except Exception as exc:
+                    logger.debug("[HTTP_AUTO_BOOST] Target reply like error (non-blocking): %s", exc)
         parent_confirmed = bool((meta or {}).get("parent_confirmed"))
         parent_level = str((meta or {}).get("parent_confirmation_level") or "unconfirmed")
         try:
@@ -1559,7 +1627,8 @@ async def _publish_reply_http_first_if_eligible(
 
     try:
         from executor.engagement_engine import _record_http_account_failure_result as record_http_failure
-        record_http_failure(session.account_id, error_type)
+        if _http_error_type_value(error_type) != "submitted_unconfirmed":
+            record_http_failure(session.account_id, error_type)
     except Exception:
         pass
 
@@ -2592,6 +2661,9 @@ class UserSchemaResult:
                 "main": {
                     "success": main_success,
                     "posted": main_success,
+                    "publication_attempted": bool(main_success or main_unconfirmed or any(
+                        a.get("submitted") or delivery_state({"error": a.get("reason")}) != "not_sent"
+                        for a in self.execution_attempts if a.get("phase") == "main")),
                     "verified": public_main_complete,
                     "comment_id": first.comment_id if first else None,
                     "text_choice": first.text if first else None,
@@ -2619,6 +2691,7 @@ class UserSchemaResult:
                         {
                             "text": p.text,
                             "comment_id": p.comment_id,
+                            "publication_attempted": True,
                             "variant_index": p.variant_index,
                             "target_id": _main_logical_target_id(p),
                             "method": p.method,
@@ -2663,6 +2736,8 @@ class UserSchemaResult:
                             "parent_target_id": getattr(r, "parent_target_id", None),
                             "success": bool(r.success and (not http_first_enabled(_settings) or _http_reply_receipt(r))),
                             "attempted": r.attempted,
+                            "publication_attempted": (bool(r.publication_attempted or r.reply_comment_id or r.submitted_unconfirmed)
+                                                      if r.publication_attempted is not None else None),
                             "submitted_unconfirmed": getattr(r, "submitted_unconfirmed", False),
                             "reply_comment_id": getattr(r, "reply_comment_id", None),
                             "author_username": getattr(r, "author_username", None),
@@ -2714,6 +2789,7 @@ class UserSchemaResult:
         try:
             from services.task_execution_ledger import attach_url_execution_ledger
 
+            explicit_publication_flags(payload)
             attach_url_execution_ledger(payload)
         except Exception:
             logger.debug("Failed to attach user-schema execution ledger", exc_info=True)
@@ -2952,21 +3028,102 @@ async def _persist_cookies_after_success(
         )
 
 
-_HTTP_PREFLIGHT_SEMAPHORES: Dict[Tuple[int, int], asyncio.Semaphore] = {}
+_HTTP_PREFLIGHT_SEMAPHORES = weakref.WeakKeyDictionary()
+_HTTP_PREFLIGHT_SEMAPHORES_LOCK = threading.RLock()
+_HTTP_PREFLIGHT_BROWSER_FALLBACKS = {}
+_HTTP_PREFLIGHT_BROWSER_HANDOFFS = {}
+_HTTP_PREFLIGHT_BROWSER_TASK_STATES = {}
+_HTTP_PREFLIGHT_BROWSER_CHECKS_PER_TASK = 2
+
+
+def _http_preflight_handoff_key(cache_key, correlation_id):
+    task = re.match(r"task_\d+(?:_|$)", str(correlation_id))
+    return cache_key, task.group(0).rstrip("_") if task else str(correlation_id)
+
+
+def _http_browser_task_state(correlation_id):
+    """Access under _HTTP_PREFLIGHT_VALID_CACHE_LOCK; selection shares this budget."""
+    task = re.match(r"task_\d+(?:_|$)", str(correlation_id))
+    if task is None:
+        return None
+    task_key = task.group(0).rstrip("_")
+    now = time.monotonic()
+    state = _HTTP_PREFLIGHT_BROWSER_TASK_STATES.get(task_key)
+    if state is None:
+        for key, old in list(_HTTP_PREFLIGHT_BROWSER_TASK_STATES.items()):
+            if now - old["updated_at"] > 3600:
+                _HTTP_PREFLIGHT_BROWSER_TASK_STATES.pop(key, None)
+        if len(_HTTP_PREFLIGHT_BROWSER_TASK_STATES) >= 4096:
+            _HTTP_PREFLIGHT_BROWSER_TASK_STATES.pop(next(iter(_HTTP_PREFLIGHT_BROWSER_TASK_STATES)))
+        state = {"attempts": 0, "failed_accounts": set(), "updated_at": now}
+        _HTTP_PREFLIGHT_BROWSER_TASK_STATES[task_key] = state
+    state["updated_at"] = now
+    return state
+
+
+def _reject_unconfirmed_http_browser_auth(db, account, correlation_id):
+    reason = "http_auth_unconfirmed:browser_login_state"
+    _forget_http_preflight_valid(account)
+    with _HTTP_PREFLIGHT_VALID_CACHE_LOCK:
+        state = _http_browser_task_state(correlation_id)
+        if state is not None:
+            state["failed_accounts"].add(account.id)
+    mark_soft_error(db, account.id, reason)
+    return False, reason
+
+
+def _allow_guard_browser_bootstrap(account, cache_key, result, *, correlation_id=None) -> bool:
+    """One bounded browser verification per guard import after ambiguous Passport.
+
+    Route errors, transport failures, challenges and definitive auth failures
+    are not reasons to spend a browser slot here.
+    """
+    if result.get("status") != "inconclusive" or result.get("definitive") is not False:
+        return False
+    error = str(result.get("error") or "").lower()
+    if "passport response did not confirm authentication" not in error:
+        return False
+    from services.cookie_validator import get_cookies_for_account, has_guard_session_auth
+    raw_cookies = get_cookies_for_account(account)
+    if not has_guard_session_auth(raw_cookies):
+        return False
+    now = time.monotonic()
+    ttl = _HTTP_PREFLIGHT_BROWSER_FALLBACK_TTL_SECONDS
+    with _HTTP_PREFLIGHT_VALID_CACHE_LOCK:
+        state = _http_browser_task_state(correlation_id)
+        if state is not None and (
+            state["attempts"] >= _HTTP_PREFLIGHT_BROWSER_CHECKS_PER_TASK
+            or account.id in state["failed_accounts"]
+        ):
+            return False
+        previous = _HTTP_PREFLIGHT_BROWSER_FALLBACKS.get(cache_key)
+        if previous is not None and now - previous < ttl:
+            return False
+        if len(_HTTP_PREFLIGHT_BROWSER_FALLBACKS) >= 4096:
+            expired = [key for key, stamp in _HTTP_PREFLIGHT_BROWSER_FALLBACKS.items() if now - stamp >= ttl]
+            for key in expired or list(_HTTP_PREFLIGHT_BROWSER_FALLBACKS)[:512]:
+                _HTTP_PREFLIGHT_BROWSER_FALLBACKS.pop(key, None)
+        _HTTP_PREFLIGHT_BROWSER_FALLBACKS[cache_key] = now
+        if state is not None:
+            state["attempts"] += 1
+    account._http_preflight_requires_browser_warmup = True
+    return True
 
 
 def _get_http_preflight_semaphore() -> asyncio.Semaphore:
     limit = 3 if getattr(_settings, "USE_PROXY", False) else 2
     try:
-        loop_id = id(asyncio.get_running_loop())
+        loop = asyncio.get_running_loop()
     except RuntimeError:
-        loop_id = 0
-    key = (loop_id, limit)
-    sem = _HTTP_PREFLIGHT_SEMAPHORES.get(key)
-    if sem is None:
-        sem = asyncio.Semaphore(limit)
-        _HTTP_PREFLIGHT_SEMAPHORES[key] = sem
-    return sem
+        return asyncio.Semaphore(limit)
+    with _HTTP_PREFLIGHT_SEMAPHORES_LOCK:
+        # Weak values avoid a bound semaphore retaining its weak loop key.
+        limits = _HTTP_PREFLIGHT_SEMAPHORES.setdefault(loop, weakref.WeakValueDictionary())
+        sem = limits.get(limit)
+        if sem is None:
+            sem = asyncio.Semaphore(limit)
+            limits[limit] = sem
+        return sem
 
 
 def _bind_account_country_code(
@@ -3035,12 +3192,25 @@ async def _preflight_cookie_http_gate(
         return None
     if has_cookie_attrs and not getattr(account, "cookies", None) and not getattr(account, "cookie_file", None):
         reason = "http_preflight:no_cookies"
-        _register_dead_session(db, account, reason)
+        _register_dead_session(db, account, reason, definitive=True)
         return f"dead_session:{reason}"
 
     cache_key = _http_preflight_cache_key(account)
     now_monotonic = time.monotonic()
+    handoff_key = _http_preflight_handoff_key(cache_key, correlation_id)
     with _HTTP_PREFLIGHT_VALID_CACHE_LOCK:
+        task_state = _http_browser_task_state(correlation_id)
+        if task_state is not None and account.id in task_state["failed_accounts"]:
+            return "http_preflight:browser_auth_failed_this_task"
+        # Selection and execution can use different ORM instances. Transfer one
+        # bootstrap permission by auth/route/task, and consume it before I/O.
+        if phase == "reply_pre_browser":
+            granted_at = _HTTP_PREFLIGHT_BROWSER_HANDOFFS.pop(handoff_key, None)
+            if (granted_at is not None
+                    and 0 <= now_monotonic - granted_at < _HTTP_PREFLIGHT_BROWSER_FALLBACK_TTL_SECONDS):
+                account._http_preflight_requires_browser_warmup = True
+                logger.info("[USER_SCHEMA] %s: consuming reply selection browser bootstrap in %s", correlation_id, phase)
+                return None
         cached = _HTTP_PREFLIGHT_VALID_CACHE.get(cache_key)
         if cached:
             checked_at, cached_phase = cached
@@ -3076,6 +3246,10 @@ async def _preflight_cookie_http_gate(
             phase,
             str(exc)[:120],
         )
+        if _http_first_for_correlation(REPLY_SCOPE if "reply" in phase else MAIN_SCOPE, correlation_id) or http_first_enabled(_settings):
+            reason = f"http_preflight:inconclusive:{type(exc).__name__}"
+            mark_soft_error(db, account.id, reason)
+            return reason
         return None
 
     status = str(result.get("status") or "").lower()
@@ -3086,12 +3260,14 @@ async def _preflight_cookie_http_gate(
     if detected_country:
         _bind_account_country_code(db, account, str(detected_country))
     if result.get("valid") or status == "valid":
+        account._http_preflight_requires_browser_warmup = False
         with _HTTP_PREFLIGHT_VALID_CACHE_LOCK:
             _HTTP_PREFLIGHT_VALID_CACHE[cache_key] = (time.monotonic(), phase)
             if username:
                 _HTTP_PREFLIGHT_USERNAME_CACHE[cache_key] = username
             if user_id:
                 _HTTP_PREFLIGHT_USER_ID_CACHE[cache_key] = user_id
+            _prune_http_preflight_cache(time.monotonic())
         if user_id:
             setattr(account, "_cached_tiktok_uid", user_id)
         if username:
@@ -3109,12 +3285,7 @@ async def _preflight_cookie_http_gate(
     scope = REPLY_SCOPE if ("reply" in str(phase).lower() or _is_parallel_reply_correlation(correlation_id)) else MAIN_SCOPE
     http_first = _http_first_for_correlation(scope, correlation_id) or http_first_enabled(_settings)
     error_lower = error.lower()
-    passport_unconfirmed = (
-        "passport response did not confirm authentication" in error_lower
-        or "redirected to login" in error_lower
-    )
-
-    if (status == "dead" and bool(result.get("definitive", True))) or (http_first and passport_unconfirmed):
+    if status == "dead" and result.get("definitive") is True:
         with _HTTP_PREFLIGHT_VALID_CACHE_LOCK:
             _HTTP_PREFLIGHT_VALID_CACHE.pop(cache_key, None)
             _HTTP_PREFLIGHT_USERNAME_CACHE.pop(cache_key, None)
@@ -3135,7 +3306,7 @@ async def _preflight_cookie_http_gate(
                 reason,
             )
             return None
-        _register_dead_session(db, account, reason)
+        _register_dead_session(db, account, reason, definitive=True)
         logger.warning(
             "[USER_SCHEMA] %s: skipping browser after HTTP cookie failure in %s: %s",
             correlation_id,
@@ -3151,6 +3322,23 @@ async def _preflight_cookie_http_gate(
         status or "unknown",
         error[:120],
     )
+    if result.get("category") == "proxy_route":
+        return error or "proxy_route:unavailable"
+    if http_first:
+        if _allow_guard_browser_bootstrap(account, cache_key, result, correlation_id=correlation_id):
+            if phase == "reply_selection":
+                with _HTTP_PREFLIGHT_VALID_CACHE_LOCK:
+                    for key, stamp in list(_HTTP_PREFLIGHT_BROWSER_HANDOFFS.items()):
+                        if time.monotonic() - stamp >= _HTTP_PREFLIGHT_BROWSER_FALLBACK_TTL_SECONDS:
+                            _HTTP_PREFLIGHT_BROWSER_HANDOFFS.pop(key, None)
+                    if len(_HTTP_PREFLIGHT_BROWSER_HANDOFFS) >= 4096:
+                        _HTTP_PREFLIGHT_BROWSER_HANDOFFS.pop(next(iter(_HTTP_PREFLIGHT_BROWSER_HANDOFFS)))
+                    _HTTP_PREFLIGHT_BROWSER_HANDOFFS[handoff_key] = time.monotonic()
+            logger.info("[USER_SCHEMA] %s: guard session needs bounded browser verification after inconclusive Passport", correlation_id)
+            return None
+        reason = f"http_preflight:inconclusive:{error or status or 'unknown'}"
+        mark_soft_error(db, account.id, reason)
+        return reason
     return None
 
 
@@ -3208,13 +3396,28 @@ async def _wait_for_visible_captcha_clear(
     return False
 
 
+def _start_http_captcha_probe(page):
+    from executor.http.page_runtime import page_document_key
+    page._http_clear_captcha_probe = None
+    return page_document_key(page)
+
+
+def _remember_clear_http_captcha(page, started):
+    from executor.http.page_runtime import page_document_key
+    if started == page_document_key(page):
+        page._http_clear_captcha_probe = (started, time.monotonic())
+
+
 async def _visible_captcha_reason(page: Page, *, phase: str) -> Optional[str]:
+    started = _start_http_captcha_probe(page)
     try:
         has_captcha, captcha_type = await detect_captcha(page, wait_ms=0)
     except Exception as exc:
         logger.debug("[USER_SCHEMA] captcha preflight failed during %s: %s", phase, exc)
         return None
     if not has_captcha:
+        if has_captcha is False:
+            _remember_clear_http_captcha(page, started)
         return None
     captcha_kind = captcha_type or "unknown"
     if await _wait_for_visible_captcha_clear(page, captcha_kind=captcha_kind, phase=phase):
@@ -3236,9 +3439,11 @@ async def _fast_visible_captcha_reason(
     merely inconclusive and must not be mistaken for captcha or dead cookies.
     The publish path performs another guarded captcha check before typing.
     """
+    started = _start_http_captcha_probe(page)
     try:
+        from executor.browser_reads import await_browser_read
         has_captcha, captcha_type = await _await_reply_hard_timeout(
-            detect_captcha(page, wait_ms=0),
+            await_browser_read(lambda: detect_captcha(page, wait_ms=0)),
             timeout=max(0.2, float(timeout_seconds)),
         )
     except asyncio.TimeoutError:
@@ -3253,6 +3458,8 @@ async def _fast_visible_captcha_reason(
         logger.debug("[USER_SCHEMA] bounded captcha probe failed during %s: %s", phase, exc)
         return None
     if not has_captcha:
+        if has_captcha is False:
+            _remember_clear_http_captcha(page, started)
         return None
     return f"captcha_challenge:{captcha_type or 'unknown'}"
 
@@ -3280,16 +3487,26 @@ def _login_state_logged_out_reason(state: dict, *, phase: str) -> Optional[str]:
 
 
 async def _visible_logged_out_reason(page: Page, *, phase: str) -> Optional[str]:
+    from executor.http.page_runtime import page_document_key
     try:
         await dismiss_cookie_banners(page)
     except Exception:
         pass
+    started = page_document_key(page)
     try:
         state = await get_browser_login_state(page)
     except Exception as exc:
         logger.debug("[USER_SCHEMA] login-state probe failed during %s: %s", phase, exc)
         return None
-    return _login_state_logged_out_reason(state, phase=phase)
+    reason = _login_state_logged_out_reason(state, phase=phase)
+    clear_probe = getattr(page, "_http_clear_captcha_probe", None)
+    now = time.monotonic()
+    if (reason is None and str(state.get("state") or "").lower() == "logged_in"
+            and isinstance(clear_probe, tuple) and len(clear_probe) == 2
+            and clear_probe[0] == started == page_document_key(page)
+            and type(clear_probe[1]) in (int, float) and 0.0 <= now - clear_probe[1] <= 15.0):
+        page._http_auth_verified_at = now
+    return reason
 
 
 async def _deny_if_visible_logged_out(
@@ -3305,8 +3522,9 @@ async def _deny_if_visible_logged_out(
         if timeout_seconds is None:
             reason = await _visible_logged_out_reason(page, phase=phase)
         else:
+            from executor.browser_reads import await_browser_read
             reason = await _await_reply_hard_timeout(
-                _visible_logged_out_reason(page, phase=phase),
+                await_browser_read(lambda: _visible_logged_out_reason(page, phase=phase)),
                 timeout=max(0.2, float(timeout_seconds)),
             )
     except asyncio.TimeoutError:
@@ -3554,6 +3772,7 @@ async def _open_video_and_check(
                 correlation_id=correlation_id,
             )
         )
+        early_open_task.add_done_callback(_consume_detached_reply_task_result)
         try:
             fast_health = await fast_probe
             if fast_health is not None and (
@@ -3671,21 +3890,45 @@ async def _ensure_account_login_ready(
         if _on_target_media() and any(
             cookies.get(name) for name in ("sessionid", "sid_tt", "sessionid_ss")
         ):
-            captcha = await _fast_visible_captcha_reason(page, phase="http_preflight_browser_auth")
-            if captcha:
-                _register_captcha_session(db, account, captcha)
-                return False, captcha
-            denied = await _deny_if_visible_logged_out(
-                db, page, account, correlation_id=correlation_id,
-                phase="http_preflight_browser_auth", timeout_seconds=1.75,
-            )
-            if denied:
-                return False, denied
+            # commit can precede React's auth markers. Wait only for an
+            # inconclusive state; explicit logout/captcha still stops at once.
+            auth_deadline = time.monotonic() + min(6.0, max(0.2, timeout_ms / 1000))
+            while True:
+                remaining = max(0.2, auth_deadline - time.monotonic())
+                captcha = await _fast_visible_captcha_reason(
+                    page, phase="http_preflight_browser_auth", timeout_seconds=min(1.75, remaining),
+                )
+                if captcha:
+                    _register_captcha_session(db, account, captcha)
+                    return False, captcha
+                remaining = max(0.2, auth_deadline - time.monotonic())
+                denied = await _deny_if_visible_logged_out(
+                    db, page, account, correlation_id=correlation_id,
+                    phase="http_preflight_browser_auth", timeout_seconds=min(1.75, remaining),
+                )
+                if denied:
+                    return False, denied
+                if not _on_target_media():
+                    return False, "redirect_not_video"
+                browser_auth_confirmed = _has_recent_http_browser_auth(page)
+                if http_preflight_valid or browser_auth_confirmed:
+                    break
+                remaining = auth_deadline - time.monotonic()
+                if remaining <= 0:
+                    return _reject_unconfirmed_http_browser_auth(db, account, correlation_id)
+                await asyncio.sleep(min(0.2, remaining))
+            if browser_auth_confirmed:
+                cache_key = _http_preflight_cache_key(account)
+                with _HTTP_PREFLIGHT_VALID_CACHE_LOCK:
+                    _HTTP_PREFLIGHT_VALID_CACHE[cache_key] = (time.monotonic(), "browser_auth")
+                    _prune_http_preflight_cache(time.monotonic())
             register_alive_session(db, account)
             page._http_auth_verified_at = time.monotonic()
             logger.info(
-                "[USER_SCHEMA] %s: HTTP passport and browser session cookies accepted; continuing to HTTP warmup",
+                "[USER_SCHEMA] %s: authentication confirmed (passport=%s browser=%s); continuing to HTTP warmup",
                 correlation_id,
+                http_preflight_valid,
+                browser_auth_confirmed,
             )
             return True, None
         return False, "dead_session:missing_browser_session" if _on_target_media() else "redirect_not_video"
@@ -5023,6 +5266,11 @@ async def _publish_all_variants_on_account(
         success_status = result.status == "success"
         success = success_status and bool(result.comment_id)
         network_confirmed = success and bool(getattr(result, "network_captured", False))
+        if network_confirmed:
+            await record_publication("main", {"text": text, "variant_index": idx,
+                "comment_id": str(result.comment_id), "account_id": account.id,
+                "tiktok_username": tiktok_username, "network_confirmed": True,
+                "publication_attempted": True, "method": result.dom_strategy})
         post_was_enabled = bool(getattr(result, "post_was_enabled_at_click", False))
         network_attempted = bool(
             getattr(result, "network_captured", False)
@@ -5242,9 +5490,11 @@ async def _publish_all_variants_on_account(
             author_uid=_publication_author_identity(account, http_session)["author_uid"],
         )
         published.append(published_main)
+        if not network_confirmed:
+            await record_publication("main", published_main)
         if on_published is not None:
             try:
-                on_published(published_main)
+                await _call_publication_callback(on_published, published_main)
             except Exception as exc:
                 logger.debug(
                     "[USER_SCHEMA] %s on_published callback failed: %s",
@@ -5473,7 +5723,7 @@ async def _try_main_account(
                 )
                 enrich_result.log_summary(account.id, correlation_id)
                 if enrich_result.redirected:
-                    mark_needs_reauth(db, account.id, reason="enrichment_redirect_dead_session")
+                    mark_soft_error(db, account.id, "enrichment_redirect_unconfirmed")
                     close_reason = "main_enrichment_redirect_dead_session"
                     return [], "dead_session_during_enrichment"
                 if not enrich_result.success or not enrich_result.all_cookies_json:
@@ -5739,15 +5989,16 @@ async def _verify_order_main_visibility(
     for main in result.published_mains:
         main.public_confirmed = False
 
-    def save_progress():
+    async def save_progress():
         nonlocal checkpoint_failed
         try:
-            _save_main_visibility_checkpoint(db, task, checkpoint_key, result)
+            from services.visibility_checkpoint import run_visibility_checkpoint
+            await run_visibility_checkpoint(db, task, _save_main_visibility_checkpoint, checkpoint_key, result)
         except Exception:
             checkpoint_failed = True
             logger.exception("[MAIN_VISIBILITY] task=%s could not save publication receipts", task_id)
 
-    save_progress()
+    await save_progress()
     aweme_id = extract_tiktok_media_id(video_url)
 
     async def observe(mains, round_index, attempt):
@@ -5873,7 +6124,7 @@ async def _verify_order_main_visibility(
     async def replace(main, round_index):
         if not http_first_enabled(_settings):
             return None, "http_disabled"
-        def capture(receipt):
+        async def capture(receipt):
             if not _looks_like_tiktok_comment_id(receipt.comment_id):
                 return
             if not any(item[1].comment_id == receipt.comment_id for item in repair_receipts):
@@ -5883,13 +6134,13 @@ async def _verify_order_main_visibility(
                     "text": receipt.text, "replaces_comment_id": main.comment_id,
                     "author_uid": receipt.author_uid, "author_username": receipt.tiktok_username,
                 })
-                save_progress()
+                await save_progress()
 
         # Definitive pre-submit refusals can use another account. A write with
         # an ambiguous outcome must return to the controller without retrying.
         browser_attempts = 0
         browser_limit = max(1, int(_settings.MAIN_VISIBILITY_OBSERVER_ATTEMPTS))
-        for _ in range(max(1, int(_settings.MAX_RETRY_ACCOUNTS))):
+        for _ in range(candidate_scan_limit(_settings)):
             if browser_attempts >= browser_limit:
                 break
             if checkpoint_failed or stop_requested():
@@ -5919,7 +6170,7 @@ async def _verify_order_main_visibility(
                     visibility_http_only=True,
                 )
                 for receipt in published:
-                    capture(receipt)
+                    await capture(receipt)
                 if published or holder.get("publication_attempted"):
                     publisher_keys.update(keys)
                     publisher_identities.append(keys)
@@ -5945,7 +6196,7 @@ async def _verify_order_main_visibility(
         stop_requested=lambda: checkpoint_failed or stop_requested(),
         repair_rounds=_settings.MAIN_VISIBILITY_REPAIR_ROUNDS,
         observer_attempts=_settings.MAIN_VISIBILITY_OBSERVER_ATTEMPTS,
-        max_candidate_accounts=_settings.MAX_RETRY_ACCOUNTS,
+        max_candidate_accounts=candidate_scan_limit(_settings),
         initial_delay=_settings.MAIN_VISIBILITY_INITIAL_DELAY_SECONDS,
         recheck_delay=_settings.MAIN_VISIBILITY_RECHECK_DELAY_SECONDS,
         max_seconds=_settings.MAIN_VISIBILITY_MAX_SECONDS,
@@ -5998,16 +6249,17 @@ async def _verify_order_main_visibility(
     if result.main_visibility.get("reason") == "stopped_by_user":
         result.error = "stopped_by_user"
     elif not result.main_found_by_observer:
-        result.error = result.error or "main_visibility_unconfirmed"
+        if checkpoint_failed or not any(m.public_confirmed for m in result.published_mains):
+            result.error = result.error or "main_visibility_unconfirmed"
         result.warnings.append({
             "code": "main_visibility_unconfirmed",
-            "message": "Main visibility is incomplete; replies were not started",
+            "message": "Main visibility is incomplete; replies use only independently confirmed parents",
         })
     logger.info("[MAIN_VISIBILITY] task=%s confirmed=%s/%s missing=%s unknown=%s replacements=%s",
                 task_id, result.main_visibility["confirmed"], len(result.published_mains),
                 result.main_visibility["missing"], result.main_visibility["unknown"],
                 result.main_visibility["replacements"])
-    save_progress()
+    await save_progress()
     if checkpoint_failed:
         result.main_visibility.update(reason="visibility_checkpoint_failed", status="unconfirmed")
         result.main_found_by_observer = False
@@ -7050,6 +7302,8 @@ def _is_http_empty_publish_failure(result: PublishResult) -> bool:
 
 
 def _reply_publish_submitted_unconfirmed(result: PublishResult) -> bool:
+    if result.status == "submitted_unconfirmed":
+        return bool(result.network_request_attempted)
     if getattr(result, "error_reason", None) == "stealth_reject_empty_body":
         return False
     if result.status == "success" and bool(result.comment_id):
@@ -7082,6 +7336,8 @@ def _reply_publish_submitted_unconfirmed(result: PublishResult) -> bool:
 
 
 def _main_publish_submitted_unconfirmed(correlation_id: Optional[str], result: PublishResult) -> bool:
+    if result.status == "submitted_unconfirmed":
+        return bool(result.network_request_attempted)
     if _is_http_empty_publish_failure(result):
         return False
     if result.status == "success" and bool(result.comment_id):
@@ -7374,6 +7630,11 @@ def _all_main_candidates_have_publish_evidence(candidates: List[PublishedMain]) 
     )
 
 
+def eligible_reply_mains(result):
+    mains = _normalize_main_candidates(result.published_mains)
+    return [m for m in mains if m.public_confirmed] if result.main_visibility.get("enabled") else mains
+
+
 async def _prepare_public_mains_before_replies(
     db: Session,
     video_url: str,
@@ -7393,6 +7654,8 @@ async def _prepare_public_mains_before_replies(
     required_texts = _required_main_texts(text_variants)
     if not required_texts:
         return []
+    if result.main_visibility.get("enabled"):
+        return eligible_reply_mains(result)
 
     if _user_schema_http_first_enabled(REPLY_SCOPE):
         network_mains = _latest_main_candidates_for_texts(
@@ -9002,7 +9265,7 @@ async def _observe_main_texts_with_account(
                 )
                 enrich_result.log_summary(account.id, correlation_id)
                 if enrich_result.redirected:
-                    mark_needs_reauth(db, account.id, reason="enrichment_redirect_dead_session")
+                    mark_soft_error(db, account.id, "enrichment_redirect_unconfirmed")
                     return [], "dead_session_during_enrichment"
                 if not enrich_result.success or not enrich_result.all_cookies_json:
                     reason = f"enrichment_failed:{enrich_result.error or 'missing_required_browser_cookies'}"
@@ -9755,7 +10018,7 @@ async def _reply_with_variant_on_all_mains(
                 )
                 enrich_result.log_summary(account.id, correlation_id)
                 if enrich_result.redirected:
-                    mark_needs_reauth(db, account.id, reason="enrichment_redirect_dead_session")
+                    mark_soft_error(db, account.id, "enrichment_redirect_unconfirmed")
                     results.append(
                         ReplyOutcome(
                             text=reply_text,
@@ -10225,10 +10488,11 @@ async def _reply_with_variant_on_all_mains(
                         **_publication_author_identity(account, reply_http_session),
                     )
                     results.append(outcome)
+                    await record_publication("reply", outcome)
                     callback = on_submitted_outcome if success else (on_soft_submitted_outcome if unconfirmed else None)
                     if callback is not None:
                         try:
-                            callback(outcome)
+                            await _call_publication_callback(callback, outcome)
                         except Exception as exc:
                             logger.debug("Direct reply outcome callback failed for %s: %s", sub_corr, str(exc)[:120])
                     if success:
@@ -11331,9 +11595,10 @@ async def _reply_with_variant_on_all_mains(
                             parent_target_id=_main_logical_target_id(main),
                         )
                         results.append(outcome)
+                        await record_publication("reply", outcome)
                         if on_submitted_outcome is not None:
                             try:
-                                on_submitted_outcome(outcome)
+                                await _call_publication_callback(on_submitted_outcome, outcome)
                             except Exception as callback_exc:
                                 logger.debug(
                                     "[USER_SCHEMA] %s submitted reply outcome callback failed: %s",
@@ -11622,9 +11887,10 @@ async def _reply_with_variant_on_all_mains(
                     **_publication_author_identity(account, reply_http_session),
                 )
                 results.append(outcome)
+                await record_publication("reply", outcome)
                 if counts_as_submitted and on_submitted_outcome is not None:
                     try:
-                        on_submitted_outcome(outcome)
+                        await _call_publication_callback(on_submitted_outcome, outcome)
                     except Exception as callback_exc:
                         logger.debug(
                             "[USER_SCHEMA] %s submitted reply outcome callback failed: %s",
@@ -12639,7 +12905,7 @@ async def execute_user_schema_parallel(
     reply_variants: List[str] = _reply_variants_from_task(task)
     result.expected_reply_variants = len(reply_variants)
 
-    retry_account_limit = _positive_int_setting("MAX_RETRY_ACCOUNTS", 30)
+    retry_account_limit = candidate_scan_limit(_settings)
     max_main_attempts = (
         _positive_int_setting("PARALLEL_6X1_MAX_MAIN_ATTEMPTS_PER_SLOT", 6)
         if strict_6x1_main
@@ -12648,7 +12914,9 @@ async def execute_user_schema_parallel(
             _positive_int_setting("PARALLEL_COMMENTING_MAX_MAIN_ATTEMPTS", retry_account_limit),
         )
     )
+    max_main_attempts = min(6, max_main_attempts)
     max_reply_attempts = min(
+        6,
         retry_account_limit,
         _positive_int_setting("PARALLEL_COMMENTING_MAX_REPLY_ATTEMPTS", retry_account_limit),
     )
@@ -13294,7 +13562,7 @@ async def execute_user_schema_parallel(
                 finally:
                     if lock_acquired:
                         try:
-                            await release_proxy_lock(proxy_id)
+                            await release_proxy_lock(lock_acquired)
                         except Exception:
                             logger.warning(
                                 "Task %s: failed to release 6x1 rotation lock for proxy=%s",
@@ -14174,6 +14442,7 @@ async def execute_user_schema_parallel(
         next_main_selection_retry_at = 0.0
         main_selection_waiting_for_active_change = False
         empty_main_attempts_without_any_publication = 0
+        consecutive_main_pre_publish_failures = 0
         # Keep the empty-surface stop as a "two full waves" guard. Each parallel
         # main slot represents one account seat that should publish all main
         # variants, so the guard is based on account slots, not text count.
@@ -14232,6 +14501,7 @@ async def execute_user_schema_parallel(
                     and len(active_main_tasks) < main_worker_target
                     and not _is_stop_requested()
                     and not main_proxy_threshold_reached
+                    and not main_empty_threshold_reached
                 ):
                     if active_main_tasks:
                         if main_selection_waiting_for_active_change:
@@ -14247,6 +14517,7 @@ async def execute_user_schema_parallel(
                             main_attempts_by_slot[slot_index],
                         )
                     )
+                    task_obj.add_done_callback(_consume_detached_reply_task_result)
                     active_main_tasks[task_obj] = (slot_index, list(slot_texts))
                     logger.debug(
                         "Task %s: dynamic main worker started slot=%s attempt=%s active=%s pending=%s",
@@ -14350,8 +14621,11 @@ async def execute_user_schema_parallel(
                         continue
                     if not slot_result.published and is_pre_publish_account_failure(slot_result.error, publication_attempted=slot_result.publication_attempted):
                         main_attempts_by_slot[slot_result.slot_index] = max(0, main_attempts_by_slot.get(slot_result.slot_index, 0) - 1)
-                    if not is_pre_publish_account_failure(slot_result.error, publication_attempted=slot_result.publication_attempted):
-                        processed_non_deferred_main_result = True
+                    processed_non_deferred_main_result = True
+                    if slot_result.published or slot_result.publication_attempted:
+                        consecutive_main_pre_publish_failures = 0
+                    elif slot_result.account_id is not None:
+                        consecutive_main_pre_publish_failures += 1
 
                     if slot_result.resolved_video_url and extract_tiktok_media_id(slot_result.resolved_video_url):
                         _maybe_update_shared_main_video_url(
@@ -14393,7 +14667,7 @@ async def execute_user_schema_parallel(
                             and slot_result.error not in {"no_free_main_accounts", "stopped_by_user"}
                             and main_attempts_by_slot.get(slot_result.slot_index, 0) < max_main_attempts
                         )
-                        if retryable_partial and not main_proxy_threshold_reached:
+                        if retryable_partial and not main_proxy_threshold_reached and not main_empty_threshold_reached:
                             logger.info(
                                 "Task %s: dynamic main slot %s scheduling replacement attempt %s/%s "
                                 "for %s remaining text(s) after partial result: %s",
@@ -14411,6 +14685,7 @@ async def execute_user_schema_parallel(
                         if (
                             retryable_error
                             and not main_proxy_threshold_reached
+                            and not main_empty_threshold_reached
                             and main_attempts_by_slot.get(slot_result.slot_index, 0) < max_main_attempts
                         ):
                             retry_texts = (
@@ -14459,10 +14734,12 @@ async def execute_user_schema_parallel(
                         proxy_main_batches_without_any_publication = 0
                         logger.warning(
                             "Task %s: dynamic parallel main attempt produced zero comments (%s/%s); "
-                            "likely video/comment surface problem if it repeats",
+                            "reason=%s publication_attempted=%s",
                             task_id,
                             empty_main_attempts_without_any_publication,
                             max_empty_main_attempts_before_fail,
+                            slot_result.error or "main_not_published",
+                            slot_result.publication_attempted,
                         )
                     elif total_main_publications <= 0 and not slot_result.published:
                         logger.info(
@@ -14557,21 +14834,22 @@ async def execute_user_schema_parallel(
                 if deferred_main_selection_seen and active_main_tasks:
                     await asyncio.sleep(min(proxy_slot_refill_backoff_seconds, main_refill_poll_seconds))
 
-                if (
-                    total_main_publications <= 0
-                    and empty_main_attempts_without_any_publication >= max_empty_main_attempts_before_fail
+                if not main_empty_threshold_reached and (
+                    consecutive_main_pre_publish_failures >= max_empty_main_attempts_before_fail
+                    or (total_main_publications <= 0
+                        and empty_main_attempts_without_any_publication >= max_empty_main_attempts_before_fail)
                 ):
                     main_empty_threshold_reached = True
                     logger.warning(
                         "Task %s: dynamic parallel main phase reached %s empty attempt(s), "
-                        "but continuing per-slot retries instead of clearing pending main workers "
+                        "stopping new main retries "
                         "(active=%s pending=%s)",
                         task_id,
-                        empty_main_attempts_without_any_publication,
+                        max(empty_main_attempts_without_any_publication, consecutive_main_pre_publish_failures),
                         len(active_main_tasks),
                         len(pending_main_slots),
                     )
-                    empty_main_attempts_without_any_publication = 0
+                    pending_main_slots = []
                 if (
                     total_main_publications <= 0
                     and proxy_main_batches_without_any_publication >= max_empty_main_attempts_before_fail
@@ -15078,6 +15356,8 @@ async def execute_user_schema_parallel(
         stop_requested=_is_stop_requested,
         checkpoint_url=request_video_url,
     )
+    if strict_6x1_main and result.main_visibility.get("enabled") and result.main_visibility.get("status") != "confirmed":
+        result.error = result.error or "main_visibility_unconfirmed"
     if result.error:
         result.elapsed_seconds = time.monotonic() - started
         _log_parallel_order_summary("main_visibility")
@@ -15108,11 +15388,13 @@ async def execute_user_schema_parallel(
             if await _sleep_or_stop(visibility_delay):
                 return _mark_stopped()
 
-    async def _select_reply_account(attempt_db: Session) -> Tuple[Optional[Account], Optional[str]]:
+    async def _select_reply_account(attempt_db: Session, variant_index: int) -> Tuple[Optional[Account], Optional[str]]:
         async with reply_selection_lock:
             strict_degraded_categories = {"captcha", "page_blocked"}
             capacity_blocked_proxies: set[str] = set()
             for _ in range(max(1, parallel_browser_capacity + 2)):
+                if reply_account_tries.get(variant_index, 0) >= retry_account_limit:
+                    return None, "candidate_budget_exhausted"
                 pending_rotation_snapshot = (
                     set(pending_reply_proxy_rotations)
                     | _reply_planned_rotation_blocked_proxies_locked(active_reply_proxy_counts)
@@ -15300,6 +15582,8 @@ async def execute_user_schema_parallel(
                     )
                     continue
                 used_reply_ids.add(candidate.id)
+                # Preparation failures never refund the candidate budget.
+                reply_account_tries[variant_index] = reply_account_tries.get(variant_index, 0) + 1
                 if proxy_value:
                     used_reply_proxy_values.add(proxy_value)
                     used_reply_proxy_counts[proxy_value] = used_reply_proxy_counts.get(proxy_value, 0) + 1
@@ -15406,7 +15690,7 @@ async def execute_user_schema_parallel(
             if reply_account_tries.get(variant_index, 0) >= retry_account_limit:
                 variant_result.error = "no_free_reply_accounts"
                 return variant_result
-            reply_account, selection_error = await _select_reply_account(attempt_db)
+            reply_account, selection_error = await _select_reply_account(attempt_db, variant_index)
             if not reply_account:
                 variant_result.error = selection_error or "no_free_reply_accounts"
                 return variant_result
@@ -15575,7 +15859,6 @@ async def execute_user_schema_parallel(
                             pending_planned_rotation_proxy,
                         )
 
-        reply_account_tries[variant_index] = reply_account_tries.get(variant_index, 0) + 1
         outcomes = attempt_result.replies
         if outcomes and http_first_enabled(_settings):
             for outcome in outcomes:
@@ -15738,7 +16021,7 @@ async def execute_user_schema_parallel(
         )
         return variant_result
 
-    active_mains = _normalize_main_candidates(result.published_mains)
+    active_mains = eligible_reply_mains(result)
     shared_parent_cache = _SharedParentSearchCache()
     await _remember_shared_parent_search_cache(shared_parent_cache, active_mains)
     pending_reply_variants: List[Tuple[int, str]] = [
@@ -16123,6 +16406,7 @@ async def execute_user_schema_parallel(
                                 reply_rounds[variant_index],
                             )
                         )
+                        task_obj.add_done_callback(_consume_detached_reply_task_result)
                         active_reply_tasks[task_obj] = (variant_index, reply_text)
                         inflight_reply_variants.add(variant_index)
                         logger.debug(
@@ -16211,6 +16495,7 @@ async def execute_user_schema_parallel(
                     for variant_index, reply_text, item in completed_reply_results:
                         if item.pre_publish_failure:
                             reply_rounds[item.variant_index] = max(0, reply_rounds.get(item.variant_index, 0) - 1)
+
                         if item.error == temporary_reply_selection_error:
                             reply_rounds[item.variant_index] = max(
                                 0,
@@ -16606,6 +16891,7 @@ async def execute_user_schema_parallel(
         for item in sorted(batch_results, key=lambda value: value.variant_index):
             if item.pre_publish_failure:
                 reply_rounds[item.variant_index] = max(0, reply_rounds.get(item.variant_index, 0) - 1)
+
             if item.error == temporary_reply_selection_error:
                 reply_rounds[item.variant_index] = max(
                     0,
@@ -16827,7 +17113,8 @@ async def execute_user_schema_full(
     result.expected_reply_variants = len(reply_variants)
 
     # ----- MAIN -----
-    max_main_attempts = max(1, int(_settings.MAX_RETRY_ACCOUNTS))
+    main_candidate_limit = candidate_scan_limit(_settings)
+    max_main_attempts = min(6, main_candidate_limit)
     tried_main: List[int] = []
     reserved_main: set[int] = set()
     comment_ui_missing_attempts = 0
@@ -16959,7 +17246,7 @@ async def execute_user_schema_full(
             stop_main_attempts = False
             for variant_index, main_text in enumerate(main_texts_to_publish, start=1):
                 variant_published = False
-                while attempt < max_main_attempts and main_accounts_selected < max_main_attempts:
+                while attempt < max_main_attempts and main_accounts_selected < main_candidate_limit:
                     if _is_stop_requested():
                         logger.info(
                             "Task %s: user stop detected before main-only variant %s/%s",
@@ -17065,17 +17352,19 @@ async def execute_user_schema_full(
                             ),
                         }
                     )
-                    if stop_main_attempts or attempt >= max_main_attempts or main_accounts_selected >= max_main_attempts:
+                    if stop_main_attempts or attempt >= max_main_attempts or main_accounts_selected >= main_candidate_limit:
                         break
 
         remaining_main_texts = list(main_texts_to_publish)
         legacy_main_attempts = (
-            range(1, max_main_attempts + 1)
+            range(1, main_candidate_limit + 1)
             if not publish_main_variants_separately
             else ()
         )
         legacy_publish_attempts = 0
         for account_attempt in legacy_main_attempts:
+            if legacy_publish_attempts >= max_main_attempts:
+                break
             attempt = legacy_publish_attempts + 1
             if not remaining_main_texts:
                 break
@@ -17320,7 +17609,7 @@ async def execute_user_schema_full(
                 pool_owner_user_id=pool_owner_user_id,
             )
         if reply_variants and not result.error:
-            max_reply_attempts = max(2, max(1, int(_settings.MAX_RETRY_ACCOUNTS)) + 1)
+            max_reply_attempts = min(6, max(1, int(_settings.MAX_RETRY_ACCOUNTS)))
             fallback_main_attempts = 0
             task_fallback_used = False
             task_any_account_found_main = bool(result.main_found_by_observer)
@@ -17374,7 +17663,9 @@ async def execute_user_schema_full(
                     full_reply_task_attempt_locks.update(variant_soft_submitted_keys)
 
                 working_reply_attempts = 0
-                for reply_account_attempt in range(1, max(1, int(_settings.MAX_RETRY_ACCOUNTS)) + 1):
+                for reply_account_attempt in range(1, candidate_scan_limit(_settings) + 1):
+                    if working_reply_attempts >= max_reply_attempts:
+                        break
                     reply_attempt = working_reply_attempts + 1
                     if _is_stop_requested():
                         logger.info(

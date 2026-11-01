@@ -120,12 +120,23 @@ def parse_account_line(
     if not line or line.startswith("#"):
         return None, None, False
 
+    # Если вся строка — валидный JSON-массив или JSON-объект cookies, не делим её по ';' или '|'
+    is_pure_json_cookies = False
+    if (line.startswith("[") and line.endswith("]")) or (line.startswith("{") and line.endswith("}")):
+        try:
+            import json
+            json.loads(line)
+            is_pure_json_cookies = True
+        except Exception:
+            is_pure_json_cookies = False
+
     # Определяем разделитель
     delimiter = None
-    for d in [";", "|", "\t"]:
-        if d in line:
-            delimiter = d
-            break
+    if not is_pure_json_cookies:
+        for d in [";", "|", "\t"]:
+            if d in line:
+                delimiter = d
+                break
 
     if delimiter:
         parts = [p.strip() for p in line.split(delimiter)]

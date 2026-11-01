@@ -12,10 +12,52 @@ from hashlib import sha1
 from typing import Any, Mapping
 
 
-LEDGER_VERSION = 4
+LEDGER_VERSION = 5
 _EVENT_LIMIT = 80
 _PREVIEW_LIMIT = 90
 _VIDEO_SUCCESS_STATUSES = {"success", "submitted_unconfirmed", "done"}
+
+
+def has_confirmed_publications(result: Mapping[str, Any] | None) -> bool:
+    """Recognize actual mutation receipts, excluding an engagement parent ID."""
+    if not isinstance(result, Mapping):
+        return False
+    engagement = result.get("engagement")
+    if not isinstance(engagement, Mapping):
+        return False
+    main = engagement.get("main") if isinstance(engagement.get("main"), Mapping) else {}
+    replies = engagement.get("replies") if isinstance(engagement.get("replies"), Mapping) else {}
+    rows = ([main] if main.get("posted") or main.get("publication_attempted") else [])
+    rows += [*(main.get("variants_published") or []), *(replies.get("items") or [])]
+    for row in rows:
+        if not isinstance(row, Mapping) or not row.get("network_confirmed"):
+            continue
+        cid = str(row.get("reply_id") or row.get("reply_comment_id") or row.get("comment_id") or "")
+        if cid.isascii() and cid.isdigit() and 10 <= len(cid) <= 30 and int(cid) > 0:
+            return True
+    return False
+
+
+def has_submission_evidence(result: Mapping[str, Any] | None) -> bool:
+    """Whole-video retries must not replay confirmed or uncertain submissions."""
+    if has_confirmed_publications(result):
+        return True
+    if isinstance(result, Mapping) and result.get("status") in {"submitted_unconfirmed", "delivery_unconfirmed"}:
+        return True
+    engagement = result.get("engagement") if isinstance(result, Mapping) else None
+    if not isinstance(engagement, Mapping):
+        return False
+    main = engagement.get("main") if isinstance(engagement.get("main"), Mapping) else {}
+    replies = engagement.get("replies") if isinstance(engagement.get("replies"), Mapping) else {}
+    if _safe_int(replies.get("submitted_unconfirmed")) > 0:
+        return True
+    if main.get("posted") or any(isinstance(row, Mapping) and row.get("success")
+                                 for row in (replies.get("items") or [])):
+        return True
+    rows = [main, *(replies.get("items") or [])]
+    return any(isinstance(row, Mapping) and (row.get("publication_attempted") is True
+               or row.get("network_request_attempted") is True or row.get("submitted_unconfirmed")
+               or row.get("visibility_status") == "submitted_unconfirmed") for row in rows)
 
 
 def _clean(value: Any) -> str:
@@ -63,12 +105,7 @@ def _status_is_submitted(item: Mapping[str, Any]) -> bool:
 def _status_is_confirmed(item: Mapping[str, Any]) -> bool:
     if "public_confirmed" in item:
         return item.get("public_confirmed") is True
-    visibility_status = _lower(item.get("visibility_status"))
-    return bool(
-        item.get("success")
-        or visibility_status in {"confirmed_local", "network_confirmed"}
-        or item.get("local_visible") is True
-    )
+    return _lower(item.get("visibility_status")) == "public_confirmed"
 
 
 def _reply_attempted(item: Mapping[str, Any]) -> bool:
@@ -297,7 +334,7 @@ def _build_main_summary(main: Mapping[str, Any], events: list[dict[str, Any]], a
             continue
         variant_confirmed = (
             bool(variant["public_confirmed"]) if "public_confirmed" in variant
-            else bool(variant.get("network_confirmed") or variant.get("local_confirmed"))
+            else _status_is_confirmed(variant)
         )
         verified += 1 if variant_confirmed else 0
         network_confirmed += 1 if variant.get("network_confirmed") else 0
@@ -325,7 +362,7 @@ def _build_main_summary(main: Mapping[str, Any], events: list[dict[str, Any]], a
         )
 
     if not variants and posted:
-        verified = 1 if main.get("verified") else 0
+        verified = 1 if _status_is_confirmed(main) else 0
         network_confirmed = 1 if main.get("network_confirmed") else 0
         local_confirmed = 1 if main.get("local_confirmed") else 0
 
@@ -378,7 +415,6 @@ def _build_reply_summary(
 
     aggregate_attempted = _safe_int(replies.get("attempted"))
     aggregate_submitted = _safe_int(replies.get("submitted"))
-    aggregate_confirmed = _safe_int(replies.get("ok"))
     aggregate_unconfirmed = _safe_int(replies.get("submitted_unconfirmed"))
     aggregate_failed = _safe_int(replies.get("failed"))
     item_attempted_count = 0
@@ -514,8 +550,7 @@ def _build_reply_summary(
 
     final_attempted = aggregate_attempted or item_attempted_count
     final_submitted = aggregate_submitted or item_submitted_count
-    checked_publicly = any(isinstance(item, Mapping) and "public_confirmed" in item for item in items)
-    final_confirmed = item_confirmed_count if checked_publicly else aggregate_confirmed or item_confirmed_count
+    final_confirmed = item_confirmed_count
     final_unconfirmed = aggregate_unconfirmed or item_unconfirmed_count
     final_failed = aggregate_failed or item_failed_count
 
@@ -650,6 +685,24 @@ def _build_attempt_summary(
             error=reason if not success else None,
         )
         _add_event(events, {"type": "account_attempt", **row})
+    if not rows:
+        # Legacy attempts are cumulative round numbers, repeated for each parent.
+        # Count one maximum per scope/variant (or an explicit attempt group),
+        # never add these estimates on top of the authoritative event journal.
+        groups = {}
+        engagement = result.get("engagement") or {}
+        main = engagement.get("main") or {}
+        for phase, items in (("main", main.get("variants_published") or [main]),
+                             ("reply", (engagement.get("replies") or {}).get("items") or [])):
+            for item in items:
+                if not isinstance(item, Mapping):
+                    continue
+                key = (phase, item.get("attempt_group") or item.get("variant_index") or 0)
+                groups[key] = max(groups.get(key, 0), max(0, _safe_int(item.get("attempts"))))
+        total = sum(groups.values())
+        return ({"total": total, "successful": 0, "failed": 0, "submitted": 0,
+                 "reasons": {}, "source": "legacy_rounds" if total else "unavailable",
+                 "estimated": bool(total)}, [])
     return (
         {
             "total": len(rows),
@@ -657,6 +710,8 @@ def _build_attempt_summary(
             "failed": failed,
             "submitted": submitted,
             "reasons": dict(reasons),
+            "source": "execution_attempts",
+            "estimated": False,
         },
         rows,
     )
@@ -706,6 +761,21 @@ def build_url_execution_ledger(result: Mapping[str, Any] | None, *, url: str | N
     reply_summary, coverage = _build_reply_summary(replies, main, events, account_signals)
     likes_summary = _build_likes_summary(likes, events)
     attempt_summary, attempt_rows = _build_attempt_summary(result, events, account_signals)
+
+    from services.publication_progress import valid_id
+    for key, report_key, summary in (("main", "main_visibility", main_summary),
+                                      ("replies", "reply_publication_visibility", reply_summary)):
+        section = engagement.get(key) or {}
+        items = (section.get("variants_published") or ([section] if section.get("posted") else [])) if key == "main" else section.get("items") or []
+        accepted = {str(i.get("reply_id") or i.get("reply_comment_id") or i.get("comment_id")): i
+                    for i in items if isinstance(i, Mapping)
+                    and valid_id(i.get("reply_id") or i.get("reply_comment_id") or i.get("comment_id"))
+                    and (i.get("network_confirmed") or i.get("success"))}
+        report = result.get(report_key) or {}
+        visible = sum(_status_is_confirmed(i) for i in accepted.values())
+        summary.update(accepted_with_id=len(accepted), visible_to_observer=visible,
+                       visibility_not_checked=0 if report.get("enabled") else len(accepted) - visible,
+                       visibility_inconclusive=len(accepted) - visible if report.get("enabled") else 0)
 
     error_counter: Counter[str] = Counter(
         str(event.get("error_category"))
@@ -775,6 +845,8 @@ def build_task_execution_ledger(url_results: Mapping[str, Any] | None) -> dict[s
     likes_total: dict[str, int] = defaultdict(int)
     attempts_total: dict[str, int] = defaultdict(int)
     attempt_reasons: Counter[str] = Counter()
+    attempt_sources: set[str] = set()
+    attempts_estimated = False
     likes_targets: list[dict[str, Any]] = []
     error_counter: Counter[str] = Counter()
     parent_targets_total = 0
@@ -809,7 +881,11 @@ def build_task_execution_ledger(url_results: Mapping[str, Any] | None) -> dict[s
         replies = summary.get("replies") if isinstance(summary.get("replies"), Mapping) else {}
         likes = summary.get("likes") if isinstance(summary.get("likes"), Mapping) else {}
         attempts = summary.get("attempts") if isinstance(summary.get("attempts"), Mapping) else {}
-        _sum_into(main_total, main, ("expected", "submitted", "verified", "unconfirmed", "failed"))
+        attempt_sources.add(str(attempts.get("source") or "execution_attempts"))
+        attempts_estimated = attempts_estimated or bool(attempts.get("estimated"))
+        evidence_keys = ("accepted_with_id", "visible_to_observer", "visibility_not_checked", "visibility_inconclusive")
+        _sum_into(main_total, main, ("expected", "submitted", "verified", "unconfirmed", "failed", *evidence_keys))
+        _sum_into(reply_total, replies, evidence_keys)
         _sum_into(
             reply_total,
             replies,
@@ -880,6 +956,8 @@ def build_task_execution_ledger(url_results: Mapping[str, Any] | None) -> dict[s
             "attempts": {
                 **dict(attempts_total),
                 "reasons": dict(attempt_reasons),
+                "source": next(iter(attempt_sources)) if len(attempt_sources) == 1 else "mixed",
+                "estimated": attempts_estimated,
             },
         },
         "coverage": {

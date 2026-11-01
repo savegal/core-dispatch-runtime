@@ -38,6 +38,7 @@ class _CaptureRequestContext:
 
 class _SignaturePage:
     def __init__(self, evaluation_result, response=None):
+        self.url = "https://www.tiktok.com/@fixture/video/123"
         self.evaluation_result = evaluation_result
         self.context = SimpleNamespace(cookies=AsyncMock(return_value=[]))
         self.calls: list[str] = []
@@ -71,7 +72,7 @@ class _ReadyPage:
     async def evaluate(self, _js_code, *, isolated_context=True):
         assert isolated_context is False
         self.evaluate_calls += 1
-        return self.evaluate_result
+        return {"sdk_present": True, "signed_dispatch_seen": self.evaluate_result}
 
 
 @pytest.mark.unit
@@ -99,7 +100,8 @@ async def test_shortlink_publish_uses_resolved_media_referer(reply, path, host):
         result = await client.publish_main_comment("7635267329407913230", "hello", video_url=f"https://{host}/fixture/")
     assert result[0]
     query = parse_qs(urlparse(context.last_url).query)
-    assert query["referer"] == query["root_referer"] == [current_url]
+    assert query["referer"] == [current_url]
+    assert "root_referer" not in query  # empty document.referrer, encoded as an empty query value
 
 
 @pytest.mark.unit
@@ -141,9 +143,14 @@ async def test_execute_request_prefers_runtime_signature_over_cookie_signature()
         page=page,
     )
 
+    custom_profile = RequestProfile(
+        endpoint="/api/item/detail/",
+        method="POST",
+        form_param_keys=("item_id",),
+    )
     success, response_data, error_msg, error_type = await client._execute_request(
-        profile=RequestProfile.like_profile(),
-        dynamic_params={"aweme_id": "123", "cid": "456"},
+        profile=custom_profile,
+        dynamic_params={"item_id": "123"},
         cookies={
             "X-Bogus": "stale_cookie_bogus",
             "X-Gnarly": "stale_cookie_gnarly",
@@ -161,7 +168,7 @@ async def test_execute_request_prefers_runtime_signature_over_cookie_signature()
     assert "X-Bogus=runtime_bogus" in page.last_request["url"]
     assert "X-Gnarly=runtime_gnarly" in page.last_request["url"]
     assert "stale_cookie_bogus" not in page.last_request["url"]
-    assert page.last_request["form_data"] == {"aweme_id": "123", "cid": "456", "digg_type": "1"}
+    assert page.last_request["form_data"] == {"item_id": "123"}
     assert request_context.calls == 0
     assert response_data["__request_signature"]["mode"] == "runtime_signed"
     assert response_data["__request_meta"]["request_attempted"] is True
@@ -191,9 +198,14 @@ async def test_execute_request_accepts_runtime_a_bogus_signature():
         page=page,
     )
 
+    custom_profile = RequestProfile(
+        endpoint="/api/item/detail/",
+        method="POST",
+        form_param_keys=("item_id",),
+    )
     success, response_data, error_msg, error_type = await client._execute_request(
-        profile=RequestProfile.like_profile(),
-        dynamic_params={"aweme_id": "123", "cid": "456"},
+        profile=custom_profile,
+        dynamic_params={"item_id": "123"},
         cookies={},
         correlation_id="runtime_a_bogus_test",
     )
@@ -202,7 +214,7 @@ async def test_execute_request_accepts_runtime_a_bogus_signature():
     assert error_msg is None
     assert error_type is None
     assert "a_bogus=runtime_a_bogus" in page.last_request["url"]
-    assert page.last_request["form_data"] == {"aweme_id": "123", "cid": "456", "digg_type": "1"}
+    assert page.last_request["form_data"] == {"item_id": "123"}
     assert request_context.calls == 0
     assert response_data["__request_signature"]["mode"] == "runtime_signed"
     assert response_data["__request_signature"]["has_a_bogus"] is True
@@ -293,7 +305,7 @@ async def test_execute_request_allows_publish_without_precomputed_signature():
 
 @pytest.mark.unit
 @pytest.mark.asyncio
-async def test_execute_request_allows_unsigned_like_on_page_path():
+async def test_execute_request_delegates_like_signature_to_page_interceptor():
     response = _DummyResponse(status=200, body='{"status_code":0}')
     request_context = _CaptureRequestContext(response)
     page = _SignaturePage(
@@ -324,8 +336,11 @@ async def test_execute_request_allows_unsigned_like_on_page_path():
     assert error_type is None
     assert request_context.calls == 0
     assert len(page.fetch_calls) == 1
-    assert response_data["__request_signature"]["mode"] == "unsigned"
+    assert page.calls == []
+    assert response_data["__request_signature"]["mode"] == "browser_fetch"
     assert response_data["__request_meta"]["request_attempted"] is True
+    assert client.last_request_meta["signature"]["mode"] == "browser_fetch"
+    assert client.last_request_meta["transport"] == "window.fetch"
     assert client.last_request_meta["request_attempted"] is True
 
 
@@ -400,11 +415,15 @@ async def test_signer_wait_wakes_once_only_after_false_check_and_with_time_budge
         nonlocal ready
         assert isolated_context is False
         if script == signature_runtime._SIGNER_READY_JS:
-            return ready
-        wakes.append(script)
+            return {"sdk_present": False, "signed_dispatch_seen": ready}
+        raise AssertionError("Readiness must not dispatch synthetic JS input")
+
+    async def move(x, y):
+        nonlocal ready
+        wakes.append((x, y))
         ready = ready_after_wake
 
-    page = SimpleNamespace(evaluate=evaluate)
+    page = SimpleNamespace(url="https://www.tiktok.com/", evaluate=evaluate, mouse=SimpleNamespace(move=move))
     result = await wait_for_runtime_signer_ready(page, timeout_ms=timeout_ms)
     assert result is (initially_ready or ready_after_wake)
     assert len(wakes) == expected_wakes
@@ -419,10 +438,14 @@ async def test_signer_wake_exception_does_not_repeat_or_report_ready():
         assert isolated_context is False
         if script == signature_runtime._SIGNER_READY_JS:
             return False
-        wakes.append(script)
+        raise AssertionError("Readiness must not dispatch synthetic JS input")
+
+    async def move(x, y):
+        wakes.append((x, y))
         raise RuntimeError("Document changed during activity")
 
-    assert await wait_for_runtime_signer_ready(SimpleNamespace(evaluate=evaluate), timeout_ms=250) is False
+    page = SimpleNamespace(url="https://www.tiktok.com/", evaluate=evaluate, mouse=SimpleNamespace(move=move))
+    assert await wait_for_runtime_signer_ready(page, timeout_ms=250) is False
     assert len(wakes) == 1
 
 
@@ -558,7 +581,7 @@ async def test_browser_transport_failure_does_not_fall_back_to_context(failure, 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("status, body, headers, expected", [
     (200, "", {"content-type": "application/json"}, HttpErrorType.FORBIDDEN),
-    (200, "invalid", {"content-type": "application/json"}, HttpErrorType.API_ERROR),
+    (200, "invalid", {"content-type": "application/json"}, HttpErrorType.SUBMITTED_UNCONFIRMED),
     (200, "<html>challenge</html>", {"content-type": "text/html"}, HttpErrorType.CAPTCHA),
     (403, "{}", {"content-type": "application/json"}, HttpErrorType.FORBIDDEN),
     (429, "{}", {"content-type": "application/json"}, HttpErrorType.RATE_LIMIT),

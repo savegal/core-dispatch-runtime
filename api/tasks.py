@@ -1,7 +1,7 @@
 from fastapi import APIRouter, Depends, HTTPException, Query, Request, Header
 from pydantic import BaseModel, TypeAdapter, field_validator, model_validator
 from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy import delete, select
+from sqlalchemy import delete, select, update, func
 from db.database import get_db
 from db.models import CreatorSource, CreatorVideo, PendingEnqueue, Task, Transaction, User, AppSettings
 from db.constants import TaskStatus
@@ -36,6 +36,9 @@ from services.task_creation_service import (
     get_order_execution_strategy_async,
 )
 from services.user_facing_errors import build_task_display_reason, build_task_execution_summary, collect_task_warnings
+from services.order_transport import get_order_transport_async, ORDER_TRANSPORT_KEY, http_transport_available
+from services.task_replay import serialize_retry_creation
+from services.keyword_replies import KEYWORD_ORDER_KIND, normalize_keywords
 from services.likes_config import (
     BOOST_LIKES_DEFAULT,
     BOOST_LIKES_ENABLED_KEY,
@@ -168,6 +171,16 @@ def _normalize_task_reply_payload(
 class TaskCreate(BaseModel):
     """ÐœÐ¾Ð´ÐµÐ»ÑŒ Ð´Ð»Ñ ÑÐ¾Ð·Ð´Ð°Ð½Ð¸Ñ Ð·Ð°Ð´Ð°Ñ‡Ð¸."""
     user_id: int
+    keywords: list[str] | str | None = None
+
+    @model_validator(mode="before")
+    @classmethod
+    def prepare_keyword_order(cls, value):
+        if isinstance(value, dict) and value.get("kind") == KEYWORD_ORDER_KIND:
+            value = dict(value)
+            if not value.get("text_variants"):
+                value["text_variants"] = ["Ответы по ключевым словам"] * 3
+        return value
     # Ð”Ð»Ñ engagement_only Ð¼Ð¾Ð¶ÐµÑ‚ Ð½Ðµ Ð¿ÐµÑ€ÐµÐ´Ð°Ð²Ð°Ñ‚ÑŒÑÑ: Ñ„Ð°ÐºÑ‚Ð¸Ñ‡ÐµÑÐºÐ¸Ð¹ main_comment Ð±ÐµÑ€ÐµÐ¼ Ð¸Ð· text_variants[0].
     main_comment: str | None = None
     text_variants: list[str]
@@ -193,6 +206,8 @@ class TaskCreate(BaseModel):
             for key in ("verify_main_visibility", "verify_reply_visibility"):
                 if key in value:
                     value[key] = TypeAdapter(bool).validate_python(value[key])
+            from services.mention_policy import MENTION_MODE_KEY, normalize_mention_mode
+            value[MENTION_MODE_KEY] = normalize_mention_mode(value.get(MENTION_MODE_KEY))
         return value
 
     @field_validator('video_urls')
@@ -275,13 +290,37 @@ class TaskCreate(BaseModel):
     @classmethod
     def validate_kind(cls, v: str) -> str:
         """Ð’Ð°Ð»Ð¸Ð´Ð¸Ñ€ÑƒÐµÑ‚ Ñ‚Ð¸Ð¿ Ð·Ð°ÐºÐ°Ð·Ð°."""
-        if v not in ("full", "engagement_only"):
-            raise ValueError('kind must be "full" or "engagement_only"')
+        if v not in ("full", "engagement_only", KEYWORD_ORDER_KIND):
+            raise ValueError('kind must be "full", "engagement_only" or "keyword_replies"')
         return v
 
     @model_validator(mode="after")
     def validate_kind_specific_fields(self):
         """Cross-field validation for full/engagement_only orders."""
+        if self.kind == KEYWORD_ORDER_KIND:
+            task_settings = dict(self.settings or {})
+            self.keywords = normalize_keywords(self.keywords if self.keywords is not None else task_settings.get("keywords"))
+            if "replies" in task_settings and not isinstance(task_settings["replies"], list):
+                raise ValueError("replies must be a list")
+            task_settings, replies = _normalize_task_reply_payload(task_settings, [self.reply1, self.reply2, self.reply3])
+            if not replies:
+                raise ValueError("Для ответов по ключевым словам нужен хотя бы один текст ответа")
+            if self.engagement_comment_id or self.engagement_username or self.engagement_comment_text:
+                raise ValueError("В заказе по ключевым словам нельзя задавать один целевой комментарий")
+            for key in ("keyword_scans", "keyword_video_bindings", "url_results", "execution_ledger", "engagement_target_mode"):
+                task_settings.pop(key, None)
+            task_settings.update(keywords=self.keywords, reply_count=len(replies), boost_likes_enabled=False)
+            self.settings = task_settings
+        if (self.settings or {}).get("mention_mode") == "attempt":
+            from services.mention_policy import find_mentions, MAX_MENTIONS_PER_COMMENT
+            published = list(self.text_variants or []) if self.kind == "full" else []
+            replies = (self.settings or {}).get("replies")
+            if not isinstance(replies, list):
+                replies = [self.reply1, self.reply2, self.reply3, *[
+                    (self.settings or {}).get(f"reply{n}") for n in range(4, settings.MAX_REPLIES + 1)
+                ]]
+            if any(len(find_mentions(text)) > MAX_MENTIONS_PER_COMMENT for text in [*published, *replies] if isinstance(text, str)):
+                raise ValueError("Можно до 3 отметок в одном комментарии; выберите обычный текст или сократите отметки")
         if self.kind != "full" and (self.settings or {}).get("verify_main_visibility"):
             raise ValueError("verify_main_visibility is available only for full orders")
         if self.kind == "full":
@@ -289,12 +328,13 @@ class TaskCreate(BaseModel):
                 raise ValueError("main_comment cannot be empty for full orders")
             return self
 
+        if self.kind == KEYWORD_ORDER_KIND:
+            return self
+
         has_comment_id = bool(self.engagement_comment_id)
         has_comment_text = bool(self.engagement_comment_text)
         if not has_comment_id and not has_comment_text:
-            raise ValueError(
-                "For engagement_only orders, provide either engagement_comment_id or engagement_comment_text"
-            )
+            self.settings = {**(self.settings or {}), "engagement_target_mode": "auto_top"}
         return self
 
     @field_validator('engagement_comment_id')
@@ -493,6 +533,7 @@ async def _get_boost_likes_config(db: AsyncSession) -> tuple[bool, int]:
 
 @router.post("", response_model=dict)
 @limiter.limit("10/minute")  # Ð˜Ð¡ÐŸÐ ÐÐ’Ð›Ð•ÐÐž: Rate limiting Ð´Ð»Ñ ÑÐ¾Ð·Ð´Ð°Ð½Ð¸Ñ Ð·Ð°Ð´Ð°Ñ‡
+@serialize_retry_creation
 async def create_task(
     request: Request,
     task_data: TaskCreate, 
@@ -540,6 +581,8 @@ async def create_task(
         task_data.settings,
         [task_data.reply1, task_data.reply2, task_data.reply3],
     )
+    if task_data.kind == KEYWORD_ORDER_KIND and not http_transport_available(settings):
+        raise HTTPException(status_code=409, detail="Ответы по ключевым словам требуют доступного HTTP-транспорта")
     
     idempotency_key = _normalize_header_key(
         request.headers.get("X-Idempotency-Key") or request.headers.get("Idempotency-Key")
@@ -570,8 +613,42 @@ async def create_task(
                     "task_id": existing_task.id,
                     "status": existing_task.status,
                     "duplicate": True,
-                    "idempotency_reuse": True
+                    "idempotency_reuse": True,
+                    ORDER_TRANSPORT_KEY: existing_settings.get(ORDER_TRANSPORT_KEY),
                 }
+
+    # A retry has a source order; serialize that source before checking for an
+    # existing retry or reserving funds. Independent new orders remain allowed.
+    normalized_task_settings.pop("_reply_resume", None)
+    retry_source = normalized_task_settings.get("retry_of_task_id")
+    if retry_source is not None:
+        from services.task_replay import find_existing_retry, retryable_video_urls
+        try:
+            if isinstance(retry_source, bool) or not isinstance(retry_source, (int, str)):
+                raise ValueError
+            retry_source = int(retry_source)
+            if retry_source <= 0:
+                raise ValueError
+        except (TypeError, ValueError):
+            raise HTTPException(status_code=422, detail="Некорректный исходный заказ для повтора")
+        source_result = await db.execute(select(Task).where(
+            Task.id == retry_source, Task.user_id == task_data.user_id,
+        ).with_for_update().execution_options(populate_existing=True))
+        source_task = source_result.scalar_one_or_none()
+        if source_task is None:
+            raise HTTPException(status_code=404, detail="Исходный заказ не найден")
+        if source_task.status not in {"error", "partial"}:
+            raise HTTPException(status_code=409, detail="Повтор доступен для заказов с ошибками")
+        existing_retry = await find_existing_retry(db, task_data.user_id, retry_source)
+        if existing_retry:
+            return {"task_id": existing_retry.id, "status": existing_retry.status, "duplicate": True,
+                    "idempotency_reuse": True, ORDER_TRANSPORT_KEY: (existing_retry.settings or {}).get(ORDER_TRANSPORT_KEY)}
+        safe_urls = set(retryable_video_urls(source_task))
+        if not set(task_data.video_urls) <= safe_urls:
+            raise HTTPException(status_code=409, detail="В этих видео уже есть отправки; повтор целиком может создать дубли")
+        normalized_task_settings["retry_of_task_id"] = retry_source
+        from services.task_replay import seed_reply_resume
+        seed_reply_resume(source_task, normalized_task_settings, task_data.video_urls)
 
     # Identical content is allowed in separate full and reply orders.
     new_account_pool_mode = _normalize_account_pool_mode_from_settings(normalized_task_settings)
@@ -642,8 +719,25 @@ async def create_task(
                     detail=f"Insufficient balance. Required: {cost} грн, Available: {current_balance} грн"
                 )
             
-            # Ð¡Ð¿Ð¸ÑÑ‹Ð²Ð°ÐµÐ¼ Ð±Ð°Ð»Ð°Ð½Ñ (Ñ…Ð¾Ð»Ð´Ð¸Ñ€ÑƒÐµÐ¼ ÑÑ€ÐµÐ´ÑÑ‚Ð²Ð°) - Ð‘Ð•Ð— commit
-            user.balance = current_balance - cost
+            # A row lock alone is insufficient on SQLite, and an already loaded
+            # ORM identity can retain an older balance even after FOR UPDATE.
+            # Reserve funds with one conditional DB operation in this same
+            # transaction as the task and hold receipt.
+            payment = await db.execute(
+                update(User).where(
+                    User.id == task_data.user_id,
+                    func.coalesce(User.balance, Decimal("0.00")) >= cost,
+                ).values(balance=func.coalesce(User.balance, Decimal("0.00")) - cost)
+                .execution_options(synchronize_session=False)
+            )
+            if payment.rowcount != 1:
+                await db.rollback()
+                available = await get_user_balance_async(db, task_data.user_id)
+                raise HTTPException(
+                    status_code=402,
+                    detail=f"Insufficient balance. Required: {cost} грн, Available: {available} грн",
+                )
+            await db.refresh(user, attribute_names=["balance"])
             
             # Ð¡Ð¾Ð·Ð´Ð°Ñ‘Ð¼ Ð·Ð°Ð¿Ð¸ÑÑŒ Transaction Ð´Ð»Ñ Ð¸ÑÑ‚Ð¾Ñ€Ð¸Ð¸ (Ð‘Ð•Ð— commit)
             from db.models import Transaction
@@ -672,6 +766,7 @@ async def create_task(
     # REFACTOR: Ð¡Ð¾Ñ…Ñ€Ð°Ð½ÑÐµÐ¼ origin Ð² settings (Ð´Ð»Ñ Ñ„Ð¸Ð»ÑŒÑ‚Ñ€Ð°Ñ†Ð¸Ð¸ Ð¸ Ð¾Ñ‚Ð¾Ð±Ñ€Ð°Ð¶ÐµÐ½Ð¸Ñ)
     # WHY: Ð¥Ñ€Ð°Ð½Ð¸Ð¼ Ð² settings, Ð½Ð¾ Ð¼Ð¾Ð¶Ð½Ð¾ Ð»ÐµÐ³ÐºÐ¾ Ñ„Ð¸Ð»ÑŒÑ‚Ñ€Ð¾Ð²Ð°Ñ‚ÑŒ Ñ‡ÐµÑ€ÐµÐ· JSONB queries Ð² Ð±ÑƒÐ´ÑƒÑ‰ÐµÐ¼
     task_settings = dict(normalized_task_settings)
+    task_settings.setdefault("mention_mode", "plain")
     task_settings.setdefault("verify_main_visibility", False)
     task_settings.setdefault("verify_reply_visibility", False)
     task_settings["text_variants"] = task_data.text_variants
@@ -691,7 +786,7 @@ async def create_task(
             requested_boost_likes,
             boost_likes_enabled,
         )
-    if task_data.kind == "full" and not normalized_replies:
+    if (task_data.kind == "full" and not normalized_replies) or task_data.kind == KEYWORD_ORDER_KIND:
         task_boost_likes_enabled = False
     likes_for_task = boost_likes_quantity if task_boost_likes_enabled else 0
     task_settings["boost_likes_enabled"] = task_boost_likes_enabled
@@ -701,6 +796,9 @@ async def create_task(
         BOOST_LIKES_TARGET_SINGLE_TOP,
     )
     task_settings["order_execution_strategy"] = order_execution_strategy
+    # The administrator selects this for all users. Payload/template values
+    # cannot override it; the snapshot also makes a resumed order deterministic.
+    task_settings[ORDER_TRANSPORT_KEY] = "http" if task_data.kind == KEYWORD_ORDER_KIND else await get_order_transport_async(db)
     
     # HYBRID: Ð”Ð»Ñ engagement_only ÑÐ¾Ñ…Ñ€Ð°Ð½ÑÐµÐ¼ Ð¿Ð°Ñ€Ð°Ð¼ÐµÑ‚Ñ€Ñ‹ Ð¿Ð¾Ð¸ÑÐºÐ° ÐºÐ¾Ð¼Ð¼ÐµÐ½Ñ‚Ð°Ñ€Ð¸Ñ
     if task_data.kind == "engagement_only":
@@ -713,10 +811,7 @@ async def create_task(
         
         # Ð’Ð°Ð»Ð¸Ð´Ð°Ñ†Ð¸Ñ: Ð´Ð¾Ð»Ð¶ÐµÐ½ Ð±Ñ‹Ñ‚ÑŒ comment_id Ð¸Ð»Ð¸ (username + text)
         if not task_data.engagement_comment_id and not task_data.engagement_comment_text:
-            raise HTTPException(
-                status_code=400,
-                detail="For engagement_only orders, provide either engagement_comment_id or engagement_comment_text"
-            )
+            task_settings["engagement_target_mode"] = "auto_top"
         
     
     # Ð˜Ð¡ÐŸÐ ÐÐ’Ð›Ð•ÐÐž: Ð¡Ð¾Ð·Ð´Ð°Ð½Ð¸Ðµ Ð·Ð°Ð´Ð°Ñ‡Ð¸ Ð² Ñ‚Ð¾Ð¹ Ð¶Ðµ Ñ‚Ñ€Ð°Ð½Ð·Ð°ÐºÑ†Ð¸Ð¸
@@ -757,7 +852,8 @@ async def create_task(
     # Ð”Ð¾Ð±Ð°Ð²Ð»ÐµÐ½Ð¸Ðµ Ð² Ð¾Ñ‡ÐµÑ€ÐµÐ´ÑŒ Ð¿Ð¾ÑÐ»Ðµ Ñ„Ð¸ÐºÑÐ°Ñ†Ð¸Ð¸ reserve Ð² Ð‘Ð”
     await finalize_reserved_enqueue_async(db, task.id)
 
-    return {"task_id": task.id, "status": task.status}
+    return {"task_id": task.id, "status": task.status,
+            ORDER_TRANSPORT_KEY: task_settings[ORDER_TRANSPORT_KEY]}
 
 
 @router.get("", response_model=List[TaskResponse])
@@ -1143,6 +1239,8 @@ async def update_task_texts(
         task = result.scalar_one_or_none()
         if not task:
             raise HTTPException(status_code=404, detail="Task not found")
+        if task.kind == KEYWORD_ORDER_KIND:
+            raise HTTPException(status_code=409, detail="Для заказа по ключевым словам изменяйте варианты ответа при создании копии заказа")
         if task.status not in ("pending",):
             raise HTTPException(status_code=400, detail="Task must be pending to update texts")
 

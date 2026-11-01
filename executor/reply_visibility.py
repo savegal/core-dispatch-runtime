@@ -18,8 +18,10 @@ from executor.http.comment_scanner import scan_comment_ids, comment_id_key
 from executor.http.execution_policy import http_first_enabled
 from executor.http.execution_policy import valid_comment_id
 from executor.main_visibility import verify_main_publications
+from services.video_parser import extract_video_id
 from executor.visibility_support import account_identity_keys as _identity_keys, identity_is_known, identities_independent, identity_rejection_reason
-from services.execution_attempts import is_pre_publish_account_failure
+from services.execution_attempts import is_pre_publish_account_failure, candidate_scan_limit
+from services.keyword_replies import KEYWORD_ORDER_KIND
 
 logger = logging.getLogger(__name__)
 REPORT_KEY = "reply_publication_visibility"  # reply_visibility already describes parent discovery.
@@ -123,6 +125,8 @@ async def verify_order_reply_visibility(db, task, video_url, result, *, pool_own
     from db.models import Account
 
     settings = get_settings()
+    keyword_order = (getattr(task, "kind", None) == KEYWORD_ORDER_KIND
+                     or result.get("mode") == KEYWORD_ORDER_KIND)
     replies = (result.get("engagement") or {}).get("replies") or {}
     legacy_sections, legacy_mains = _legacy_reply_sections(result)
     legacy_locations = []
@@ -144,9 +148,14 @@ async def verify_order_reply_visibility(db, task, video_url, result, *, pool_own
     slots = [ReplySlot(item, index) for index, item in enumerate(items)
              if isinstance(item, dict) and valid_comment_id(reply_id(item))]
     original_slots_all = list(slots)
-    expected = int(replies.get("expected_submissions") or replies.get("expected")
-                   or replies.get("requested_variants") or len(schema._reply_variants_from_task(task))
-                   or replies.get("total") or len(slots))
+    if keyword_order:
+        # Text variants rotate across discovered parents; they do not request
+        # publications when discovery found no matching comments.
+        expected = max(int(replies.get("expected") or 0), len(items))
+    else:
+        expected = int(replies.get("expected_submissions") or replies.get("expected")
+                       or replies.get("requested_variants") or len(schema._reply_variants_from_task(task))
+                       or replies.get("total") or len(slots))
     if not expected and not slots:
         result[REPORT_KEY] = {"enabled": True, "status": "not_requested", "expected": 0, "confirmed": 0, "replacements": 0}
         return result
@@ -185,10 +194,11 @@ async def verify_order_reply_visibility(db, task, video_url, result, *, pool_own
     original_accounts = {slot.account_id for slot in original_slots_all}
     target = None
 
-    def save():
+    async def save():
         nonlocal checkpoint_failed
         try:
-            save_reply_visibility_checkpoint(db, task, video_url, result)
+            from services.visibility_checkpoint import run_visibility_checkpoint
+            await run_visibility_checkpoint(db, task, save_reply_visibility_checkpoint, video_url, result)
         except Exception:
             checkpoint_failed = True
             logger.exception("[REPLY_VISIBILITY] task=%s checkpoint failed", getattr(task, "id", None))
@@ -428,7 +438,7 @@ async def verify_order_reply_visibility(db, task, video_url, result, *, pool_own
         url, media_id = await resolve_target()
         if not media_id:
             return None, "video_id_unavailable"
-        def capture(outcome):
+        async def capture(outcome):
             if str(outcome.parent_comment_id or "") != parent or not valid_comment_id(outcome.reply_comment_id):
                 return
             item = {**slot.item, **_engagement_reply_outcome_to_dict(outcome, attempts=1),
@@ -439,10 +449,10 @@ async def verify_order_reply_visibility(db, task, video_url, result, *, pool_own
                 return
             captured.append((slot, receipt))
             result[REPORT_KEY]["pending_receipts"].append({**item, "replaces_comment_id": slot.comment_id})
-            save()  # The receipt is durable before browser cleanup can block or be cancelled.
+            await save()  # The receipt is durable before browser cleanup can block or be cancelled.
         browser_attempts = 0
         browser_limit = max(1, int(settings.REPLY_PUBLICATION_VISIBILITY_OBSERVER_ATTEMPTS))
-        for _ in range(max(1, int(settings.MAX_RETRY_ACCOUNTS))):
+        for _ in range(candidate_scan_limit(settings)):
             if browser_attempts >= browser_limit:
                 break
             if checkpoint_failed or stop_requested():
@@ -481,7 +491,7 @@ async def verify_order_reply_visibility(db, task, video_url, result, *, pool_own
                 )
                 for outcome in attempt.replies:
                     if outcome.success:
-                        capture(outcome)
+                        await capture(outcome)
                 receipt = next((new for old, new in captured if old is slot), None)
                 if receipt or publication_attempted:
                     publisher_keys.update(keys)
@@ -496,14 +506,17 @@ async def verify_order_reply_visibility(db, task, video_url, result, *, pool_own
                 schema.release_reply_account_reservation(account.id)
         return None, "replacement_accounts_exhausted"
 
-    save()
+    await save()
     report = {}
     try:
         report = await verify_main_publications(
             slots, observe=observe, replace=replace, stop_requested=lambda: checkpoint_failed or stop_requested(),
-            repair_rounds=settings.REPLY_PUBLICATION_VISIBILITY_REPAIR_ROUNDS,
+            # Keyword orders promise one durable dispatch per matched parent.
+            # Visibility observes that receipt; replacement publications would
+            # bypass the target journal and could repeat on worker recovery.
+            repair_rounds=0 if keyword_order else settings.REPLY_PUBLICATION_VISIBILITY_REPAIR_ROUNDS,
             observer_attempts=settings.REPLY_PUBLICATION_VISIBILITY_OBSERVER_ATTEMPTS,
-            max_candidate_accounts=settings.MAX_RETRY_ACCOUNTS,
+            max_candidate_accounts=candidate_scan_limit(settings),
             initial_delay=settings.REPLY_PUBLICATION_VISIBILITY_INITIAL_DELAY_SECONDS,
             recheck_delay=settings.REPLY_PUBLICATION_VISIBILITY_RECHECK_DELAY_SECONDS,
             max_seconds=settings.REPLY_PUBLICATION_VISIBILITY_MAX_SECONDS, log_label="REPLY_VISIBILITY",
@@ -570,6 +583,11 @@ async def verify_order_reply_visibility(db, task, video_url, result, *, pool_own
             result["error"] = result.get("error") or "reply_visibility_unconfirmed"
             result.setdefault("warnings", []).append({"code": "reply_visibility_unconfirmed"})
             result["has_warnings"] = True
+        if keyword_order:
+            result["publication_complete"] = bool(
+                result.get("status") == "success" and report["status"] == "confirmed"
+                and (result.get("keyword_replies") or {}).get("complete")
+            )
         timing = result.get("timing")
         if isinstance(timing, dict):
             ended = datetime.now(timezone.utc)
@@ -579,12 +597,14 @@ async def verify_order_reply_visibility(db, task, video_url, result, *, pool_own
                 timing["duration_ms"] = max(0, int((ended - beginning).total_seconds() * 1000))
             except (ValueError, TypeError):
                 pass
-        save()
+        await save()
         if checkpoint_failed:
             report.update(status="unconfirmed", reason="checkpoint_failed")
             replies["visibility_complete"] = False
             result["status"] = result["core_status"] = "submitted_unconfirmed"
             result["error"] = "reply_visibility_unconfirmed"
+            if keyword_order:
+                result["publication_complete"] = False
         logger.info("[REPLY_VISIBILITY] task=%s confirmed=%s/%s missing=%s unknown=%s replacements=%s seconds=%s reason=%s",
                     task.id, confirmed, expected, report["missing"], report["unknown"], report["replacements"],
                     report["duration_seconds"], report["reason"])

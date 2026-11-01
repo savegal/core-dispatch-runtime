@@ -46,10 +46,11 @@ async def test_mobile_proxy_lock_uses_monitor_timeout_ttl(monkeypatch):
     monkeypatch.setattr(mobile_proxy_service.settings, "BLOGGER_CHECK_TIMEOUT_SECONDS", 180, raising=False)
     monkeypatch.setattr(mobile_proxy_service.settings, "MOBILE_PROXY_LOCK_EXTRA_SECONDS", 90, raising=False)
 
-    assert await mobile_proxy_service.acquire_proxy_lock(7, timeout=0.1) is True
+    handle = await mobile_proxy_service.acquire_proxy_lock(7, timeout=0.1)
+    assert handle
 
     assert fake_redis.expires["proxy_lock:7"] == 270
-    await mobile_proxy_service.release_proxy_lock(7)
+    await mobile_proxy_service.release_proxy_lock(handle)
     assert "proxy_lock:7" not in fake_redis.store
 
 
@@ -60,10 +61,11 @@ async def test_mobile_proxy_lock_release_does_not_delete_new_owner(monkeypatch):
     mobile_proxy_service._held_proxy_lock_tokens.clear()
     monkeypatch.setattr(mobile_proxy_service, "get_redis", lambda: fake_redis)
 
-    assert await mobile_proxy_service.acquire_proxy_lock(8, timeout=0.1) is True
+    handle = await mobile_proxy_service.acquire_proxy_lock(8, timeout=0.1)
+    assert handle
     fake_redis.store["proxy_lock:8"] = "new-owner-token"
 
-    await mobile_proxy_service.release_proxy_lock(8)
+    await mobile_proxy_service.release_proxy_lock(handle)
 
     assert fake_redis.store["proxy_lock:8"] == "new-owner-token"
 
@@ -71,17 +73,17 @@ async def test_mobile_proxy_lock_release_does_not_delete_new_owner(monkeypatch):
 @pytest.mark.unit
 def test_clear_proxy_locks_removes_startup_stale_locks(monkeypatch):
     fake_redis = FakeRedis()
-    mobile_proxy_service._held_proxy_lock_tokens[6] = "old-token"
+    mobile_proxy_service._held_proxy_lock_tokens["old-token"] = "proxy_lock:6"
     fake_redis.store["proxy_lock:6"] = "old-token"
     fake_redis.store["proxy_lock:7"] = "other-token"
     monkeypatch.setattr(mobile_proxy_service, "get_redis", lambda: fake_redis)
 
     deleted = mobile_proxy_service.clear_proxy_locks([6, 7, "bad-id"])
 
-    assert deleted == 2
+    assert deleted == 1
     assert "proxy_lock:6" not in fake_redis.store
-    assert "proxy_lock:7" not in fake_redis.store
-    assert 6 not in mobile_proxy_service._held_proxy_lock_tokens
+    assert fake_redis.store["proxy_lock:7"] == "other-token"
+    assert "old-token" not in mobile_proxy_service._held_proxy_lock_tokens
 
 
 @pytest.mark.unit
@@ -101,7 +103,7 @@ async def test_recent_mobile_rotation_reuses_previous_ip_when_probe_fails(monkey
     monkeypatch.setattr(mobile_proxy_service, "get_current_ip", fake_get_current_ip)
     monkeypatch.setattr(mobile_proxy_service, "_get_proxy_last_rotation_age_seconds", fake_rotation_age)
     monkeypatch.setattr(mobile_proxy_service, "_adaptive_rotation_cooldown_seconds", lambda: 90)
-    monkeypatch.setattr(mobile_proxy_service, "rotate_proxy_ip", fail_rotate)
+    monkeypatch.setattr(mobile_proxy_service, "_rotate_proxy_ip", fail_rotate)
 
     result = await mobile_proxy_service.ensure_proxy_ip_rotated(
         proxy,
@@ -136,7 +138,7 @@ async def test_forced_mobile_rotation_bypasses_recent_rotation_cooldown(monkeypa
     monkeypatch.setattr(mobile_proxy_service, "get_current_ip", fake_get_current_ip)
     monkeypatch.setattr(mobile_proxy_service, "_get_proxy_last_rotation_age_seconds", fake_rotation_age)
     monkeypatch.setattr(mobile_proxy_service, "_adaptive_rotation_cooldown_seconds", lambda: 90)
-    monkeypatch.setattr(mobile_proxy_service, "rotate_proxy_ip", fake_rotate)
+    monkeypatch.setattr(mobile_proxy_service, "_rotate_proxy_ip", fake_rotate)
     monkeypatch.setattr(
         mobile_proxy_service,
         "_mark_proxy_rotated_now",

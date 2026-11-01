@@ -1,3 +1,4 @@
+from bot.services.order_creation_ui import current_order_transport_label
 """
 Пошаговый мастер создания заказа - УПРОЩЁННАЯ ВЕРСИЯ.
 Режим (A/B/C) определяется автоматически "под капотом".
@@ -5,6 +6,7 @@
 from aiogram import Router, F
 from aiogram.types import Message, CallbackQuery, InlineKeyboardMarkup, InlineKeyboardButton
 from aiogram.fsm.context import FSMContext
+from bot.services.mention_choice import ensure_mention_choice
 from aiogram.filters import StateFilter
 from bot.services.validators import parse_links
 from bot.services.api_client import api_client
@@ -580,6 +582,7 @@ async def wizard_show_preview_from_message(message: Message, state: FSMContext):
         if not text_variants and main_comment:
             text_variants = [main_comment]
         preview_text = build_preview_text(
+            transport_label=await current_order_transport_label(api_client),
             links=draft.links or [],
             text_variants=text_variants,
             replies=replies,
@@ -638,6 +641,7 @@ async def wizard_show_preview(callback: CallbackQuery, state: FSMContext):
         if not text_variants and main_comment:
             text_variants = [main_comment]
         preview_text = build_preview_text(
+            transport_label=await current_order_transport_label(api_client),
             links=draft.links or [],
             text_variants=text_variants,
             replies=replies,
@@ -838,7 +842,7 @@ def _build_wizard_likes_prompt_text(target: str, count: int) -> str:
     return (
         "❤️ *Настройка лайков на ответ*\n\n"
         f"Текущая настройка: *{status}*\n\n"
-        "Выберите, на какой ответ ставить бесплатные HTTP-лайки со свободных аккаунтов задачи:\n\n"
+        "Выберите, на какой ответ ставить лайки на ответы со свободных аккаунтов задачи:\n\n"
         "• *1-й / 2-й / 3-й* — точечный буст конкретного ответа ветки.\n"
         "• *Все* — буст каждого опубликованного ответа ветки.\n"
         "• *Выключить* — без лайков на ответы.\n\n"
@@ -959,6 +963,7 @@ async def show_template_preview_and_confirm(callback: CallbackQuery, state: FSMC
     reply_likes_badge = format_reply_likes_label(reply_like_target, reply_like_count)
 
     text = build_preview_text(
+            transport_label=await current_order_transport_label(api_client),
         links=draft.links or [],
         text_variants=text_variants,
         replies=replies,
@@ -1003,7 +1008,7 @@ async def wizard_confirm_with_template(callback: CallbackQuery, state: FSMContex
         await callback.message.edit_text(
             "❌ Ссылки не найдены",
             reply_markup=InlineKeyboardMarkup(inline_keyboard=[
-                [InlineKeyboardButton(text="🏠 Меню", callback_data="menu:main")]
+                [InlineKeyboardButton(text="🏠 Главное меню", callback_data="menu:main")]
             ])
         )
         return
@@ -1062,6 +1067,14 @@ async def wizard_confirm_with_template(callback: CallbackQuery, state: FSMContex
             )
             return
         
+        mention_choice = await ensure_mention_choice(
+            callback.message, state, [*text_variants, *task_settings["replies"]], user_id=user_id,
+            resume="wizard:confirm_with_template", scope={"links": draft.links, "settings": task_settings},
+        )
+        if mention_choice is None:
+            return
+        task_settings["mention_mode"] = mention_choice.mode
+
         # Создаём заказ (проверка на дубликаты выполняется на сервере)
         task = await api_client.create_task(
             user_id=user_backend_id,
@@ -1073,7 +1086,8 @@ async def wizard_confirm_with_template(callback: CallbackQuery, state: FSMContex
             reply3=replies.get(3),
             replies=replies_dict_to_list(replies)[:reply_count],
             likes=0,
-            settings=task_settings
+            settings=task_settings,
+            **mention_choice.request_kwargs,
         )
         
         task_id = task.get("task_id")
@@ -1082,6 +1096,7 @@ async def wizard_confirm_with_template(callback: CallbackQuery, state: FSMContex
         
         await callback.message.edit_text(
             build_success_text(
+                transport_mode=task.get("order_transport_mode"),
                 task_id=task_id,
                 links_count=len(draft.links),
                 reply_count=reply_count,
@@ -1091,9 +1106,9 @@ async def wizard_confirm_with_template(callback: CallbackQuery, state: FSMContex
                 template_name=template.get("name") or "Без названия",
             ),
             reply_markup=InlineKeyboardMarkup(inline_keyboard=[
-                [InlineKeyboardButton(text="👁 Заказ", callback_data=f"order:detail:{task_id}")],
-                [InlineKeyboardButton(text="➕ Ещё", callback_data="menu:new_order")],
-                [InlineKeyboardButton(text="🏠 Меню", callback_data="menu:main")]
+                [InlineKeyboardButton(text="👁 Открыть заказ", callback_data=f"order:detail:{task_id}")],
+                [InlineKeyboardButton(text="➕ Создать ещё", callback_data="menu:new_order")],
+                [InlineKeyboardButton(text="🏠 Главное меню", callback_data="menu:main")]
             ]),
             parse_mode="Markdown"
         )
@@ -1108,7 +1123,7 @@ async def wizard_confirm_with_template(callback: CallbackQuery, state: FSMContex
             f"❌ Ошибка\n\n{error_msg}",
             reply_markup=InlineKeyboardMarkup(inline_keyboard=[
                 [InlineKeyboardButton(text=f"{Emoji.REFRESH} Снова", callback_data="menu:new_order")],
-                [InlineKeyboardButton(text="🏠 Меню", callback_data="menu:main")]
+                [InlineKeyboardButton(text="🏠 Главное меню", callback_data="menu:main")]
             ])
         )
 
@@ -1140,6 +1155,7 @@ async def ask_save_template_with_preview(message_or_callback: Message | Callback
 
     text_variants = normalize_text_variants_list(state_data.get("text_variants") or [main_comment])
     text = build_preview_text(
+            transport_label=await current_order_transport_label(api_client),
         links=draft.links or [],
         text_variants=text_variants,
         replies=replies,
@@ -1522,7 +1538,7 @@ async def _wizard_create_order_impl(
                 "Обратитесь к администратору"
             )
             keyboard = InlineKeyboardMarkup(inline_keyboard=[
-                [InlineKeyboardButton(text="🏠 Меню", callback_data="menu:main")]
+                [InlineKeyboardButton(text="🏠 Главное меню", callback_data="menu:main")]
             ])
             await loading_msg.edit_text(error_text, reply_markup=keyboard, parse_mode="Markdown")
             return
@@ -1531,7 +1547,7 @@ async def _wizard_create_order_impl(
         if not user_backend_id:
             error_text = "*Ошибка*\n\nПользователь не найден"
             keyboard = InlineKeyboardMarkup(inline_keyboard=[
-                [InlineKeyboardButton(text="🏠 Меню", callback_data="menu:main")]
+                [InlineKeyboardButton(text="🏠 Главное меню", callback_data="menu:main")]
             ])
             await loading_msg.edit_text(error_text, reply_markup=keyboard, parse_mode="Markdown")
             return
@@ -1586,6 +1602,13 @@ async def _wizard_create_order_impl(
             )
             return
         
+        mention_choice = await ensure_mention_choice(
+            loading_msg, state, [*text_variants, *settings_dict["replies"]], user_id=user_id,
+            resume="wizard:confirm", scope={"links": draft.links, "settings": settings_dict},
+        )
+        if mention_choice is None:
+            return
+        settings_dict["mention_mode"] = mention_choice.mode
         try:
             # Проверка на дубликаты выполняется на сервере
             result = await api_client.create_task(
@@ -1598,13 +1621,15 @@ async def _wizard_create_order_impl(
                 reply3=replies.get(3),
                 replies=replies_dict_to_list(replies),
                 likes=0,
-                settings=settings_dict
+                settings=settings_dict,
+                **mention_choice.request_kwargs,
             )
             
             task_id = result.get("task_id")
             
             pool_label = "👤 Мои аккаунты" if account_pool_mode == "personal" else "🌐 Общий пул"
             success_text = build_success_text(
+                transport_mode=result.get("order_transport_mode"),
                 task_id=task_id,
                 links_count=len(draft.links),
                 reply_count=reply_count,
@@ -1616,9 +1641,9 @@ async def _wizard_create_order_impl(
             
             keyboard = InlineKeyboardMarkup(inline_keyboard=[
                 [
-                    InlineKeyboardButton(text="👁 Заказ", callback_data=f"order:detail:{task_id}"),
-                    InlineKeyboardButton(text="➕ Ещё", callback_data="menu:new_order"),
-                    InlineKeyboardButton(text="🏠 Меню", callback_data="menu:main")
+                    InlineKeyboardButton(text="👁 Открыть заказ", callback_data=f"order:detail:{task_id}"),
+                    InlineKeyboardButton(text="➕ Создать ещё", callback_data="menu:new_order"),
+                    InlineKeyboardButton(text="🏠 Главное меню", callback_data="menu:main")
                 ]
             ])
             
@@ -1675,7 +1700,7 @@ async def _wizard_create_order_impl(
         keyboard = InlineKeyboardMarkup(inline_keyboard=[
             [
                 InlineKeyboardButton(text="🔄 Снова", callback_data="menu:new_order"),
-                InlineKeyboardButton(text="🏠 Меню", callback_data="menu:main")
+                InlineKeyboardButton(text="🏠 Главное меню", callback_data="menu:main")
             ]
         ])
         
@@ -1722,7 +1747,7 @@ async def wizard_select_pool(callback: CallbackQuery, state: FSMContext):
             "Выбран пул: " + ("👤 Личный" if mode == "personal" else "🌐 Общий"),
             show_alert=False,
         )
-        await _wizard_create_order_impl(callback.message, state)
+        await _wizard_create_order_impl(callback.message, state, user_id=callback.from_user.id, is_message=False)
     except Exception as e:
         logger.error(f"Error in wizard:pool: {e}", exc_info=True)
         try:

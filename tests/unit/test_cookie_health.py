@@ -324,7 +324,7 @@ def test_register_dead_session_does_not_retire_on_first_failure(monkeypatch):
 
 
 @pytest.mark.unit
-def test_register_dead_session_retires_on_second_consecutive_failure(monkeypatch):
+def test_register_dead_session_repeated_dom_failure_stays_soft(monkeypatch):
     """Второй подряд DEAD → mark_needs_reauth, аккаунт выходит из ротации."""
     from executor import cookie_health
 
@@ -359,10 +359,10 @@ def test_register_dead_session_retires_on_second_consecutive_failure(monkeypatch
     monkeypatch.setattr(cookie_health, "mark_needs_reauth", fake_mark_needs_reauth)
 
     retired = cookie_health.register_dead_session(FakeDb(), account, "logged_out_ui")
-    assert retired is True
+    assert retired is False
     assert account.validation_fail_count == 2
-    assert calls["reauth"] == 1
-    assert calls["soft"] == 0  # ушли в reauth, soft не дёргаем
+    assert calls["reauth"] == 0
+    assert calls["soft"] == 1  # ушли в reauth, soft не дёргаем
 
 
 @pytest.mark.unit
@@ -417,7 +417,7 @@ def test_register_captcha_session_cooldowns_without_bumping_dead_counter(monkeyp
 
 
 @pytest.mark.unit
-def test_register_blocked_session_retires_after_repeated_blocked_ui(monkeypatch):
+def test_register_blocked_session_repeated_dom_blockage_stays_soft(monkeypatch):
     from executor import cookie_health
 
     monkeypatch.setattr(cookie_health._settings, "COOKIE_BLOCKED_RETIRE_THRESHOLD", 2, raising=False)
@@ -452,11 +452,11 @@ def test_register_blocked_session_retires_after_repeated_blocked_ui(monkeypatch)
         "blocked_ui:on_video_empty_dom_after_settle",
     )
 
-    assert retired is True
+    assert retired is False
     assert account.validation_fail_count == 2
-    assert calls == {"soft": 0, "reauth": 1}
-    assert reasons[0][0] == "reauth"
-    assert "blocked_ui_repeat" in reasons[0][1]
+    assert calls == {"soft": 1, "reauth": 0}
+    assert reasons[0][0] == "soft"
+    assert "blocked_ui:" in reasons[0][1]
 
 
 @pytest.mark.unit

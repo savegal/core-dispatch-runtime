@@ -12,9 +12,6 @@ async def test_dismiss_cookie_banners_runs_targeted_cookie_cleanup(monkeypatch):
     calls = {"evaluate": 0, "slept": 0}
 
     class _Page:
-        async def evaluate_handle(self, _script):
-            return _Handle()
-
         async def evaluate(self, script):
             calls["evaluate"] += 1
             assert "allow cookies" in script.lower()

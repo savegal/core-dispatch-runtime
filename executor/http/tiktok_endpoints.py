@@ -1,190 +1,66 @@
-"""
-TikTok API Endpoints.
+"""Compatibility helpers backed by the canonical RequestProfile.
 
-Централизованное хранение всех эндпоинтов TikTok API.
-Все эндпоинты должны быть определены здесь, без хардкодов в бизнес-логике.
-
-ОБНОВЛЕНО: Реальные эндпоинты на основе curl команд.
+POST callers must use *_parts to receive both URL and form body. URL-only
+helpers omit form fields; dispatch/signing belongs to the live-page transport.
 """
 from typing import Optional, Dict, Any
-from urllib.parse import urlencode
-from executor.http.request_profile import _format_browser_version, resolve_request_geo
+from executor.http.request_profile import RequestProfile
 
 
 class TikTokEndpoints:
-    """Класс с эндпоинтами TikTok API."""
-    
     BASE_URL = "https://www.tiktok.com"
     API_BASE = "https://www.tiktok.com/api"
-    
+
     @staticmethod
-    def comment_publish(
-        aweme_id: str,
-        text: str,
-        reply_id: Optional[str] = None,
-        reply_to_reply_id: str = "0",
-        video_url: Optional[str] = None,
+    def comment_publish_parts(
+        aweme_id: str, text: str, reply_id: Optional[str] = None,
+        reply_to_reply_id: str = "0", video_url: Optional[str] = None,
         runtime_profile: Optional[Dict[str, Any]] = None,
-        cookies: Optional[Dict[str, str]] = None,
-        **extra_params
-    ) -> str:
-        """
-        Эндпоинт для публикации комментария (главного или ответа).
-        
-        Args:
-            aweme_id: ID видео (aweme_id)
-            text: Текст комментария
-            reply_id: ID родительского комментария (если это ответ)
-            reply_to_reply_id: ID ответа на ответ (по умолчанию "0")
-            **extra_params: Дополнительные query параметры
-            
-        Returns:
-            str: URL эндпоинта с query параметрами
-        """
-        params = {
-            "aid": "1988",
-            "app_name": "tiktok_web",
-            "aweme_id": aweme_id,
-            "browser_name": "Mozilla",
-            "browser_online": "true",
-            "browser_platform": "Win32",
-            "browser_version": _format_browser_version(),
-            "channel": "tiktok_web",
-            "cookie_enabled": "true",
-            "data_collection_enabled": "true",
-            "device_platform": "web_pc",
-            "focus_state": "true",
-            "from_page": "video",
-            "is_fullscreen": "false",
-            "is_page_visible": "true",
-            "os": "windows",
-            "referer": "https://www.tiktok.com/",
-            "root_referer": "https://www.tiktok.com/",
-            "text": text,
-            "text_extra": "[]",
-            "user_is_login": "true",
-        }
-        
-        # Устанавливаем referer - если есть video_url, используем его, иначе базовый URL
-        if video_url:
-            params["referer"] = video_url
-        else:
-            params["referer"] = "https://www.tiktok.com/"
-        
-        # Если это ответ - добавляем reply_id
-        # ВАЖНО: reply_id должен быть строкой, не числом
-        if reply_id:
-            params["reply_id"] = str(reply_id)
-            params["reply_to_reply_id"] = str(reply_to_reply_id)
-        else:
-            params["reply_id"] = "0"
-            params["reply_to_reply_id"] = "0"
-        
-        # Добавляем дополнительные параметры (msToken, X-Bogus, X-Gnarly, verifyFp и т.д.)
-        # ВАЖНО: X-Bogus и X-Gnarly должны быть в query params, а не в headers
-        params.update(extra_params)
-        params.update(resolve_request_geo(runtime_profile, cookies, extra_params))
-        params.pop("proxy_country_code", None)
-        params.pop("account_country_code", None)
-        
-        # Добавляем стандартные параметры если их нет
-        if "WebIdLastTime" not in params:
-            import time
-            params["WebIdLastTime"] = str(int(time.time()))
-        if "history_len" not in params:
-            params["history_len"] = "8"
-        if "screen_height" not in params:
-            params["screen_height"] = "1080"
-        if "screen_width" not in params:
-            params["screen_width"] = "1920"
-        
-        query_string = urlencode(params, doseq=True)
-        return f"{TikTokEndpoints.API_BASE}/comment/publish/?{query_string}"
-    
+        cookies: Optional[Dict[str, str]] = None, **extra_params,
+    ) -> tuple[str, Dict[str, str]]:
+        reply = bool(reply_id and str(reply_id) != "0")
+        profile = RequestProfile.publish_reply_profile() if reply else RequestProfile.publish_main_profile()
+        dynamic = {"aweme_id": aweme_id, "text": text,
+                   "referer": video_url or (runtime_profile or {}).get("current_url") or TikTokEndpoints.BASE_URL + "/"}
+        if reply:
+            dynamic.update(reply_id=str(reply_id), reply_to_reply_id=str(reply_to_reply_id))
+        dynamic.update(extra_params)
+        query, form = profile.build_request_parts(dynamic, cookies, runtime_profile, include_cookie_signatures=False)
+        return profile.build_url_from_params(query), form
+
     @staticmethod
-    def comment_digg(
-        aweme_id: str,
-        cid: str,
-        digg_type: int = 1,
+    def comment_publish(*args, **kwargs) -> str:
+        """Return only the URL; use comment_publish_parts for POST dispatch."""
+        return TikTokEndpoints.comment_publish_parts(*args, **kwargs)[0]
+
+    @staticmethod
+    def comment_digg_parts(
+        aweme_id: str, cid: str, digg_type: int = 1,
         runtime_profile: Optional[Dict[str, Any]] = None,
-        cookies: Optional[Dict[str, str]] = None,
-        **extra_params
-    ) -> str:
-        """
-        Эндпоинт для лайка комментария.
-        
-        Args:
-            aweme_id: ID видео (aweme_id)
-            cid: ID комментария (cid)
-            digg_type: Тип лайка (1 = like, 0 = unlike)
-            **extra_params: Дополнительные query параметры
-            
-        Returns:
-            str: URL эндпоинта с query параметрами
-        """
-        params = {
-            "aid": "1988",
-            "app_name": "tiktok_web",
-            "aweme_id": aweme_id,
-            "browser_name": "Mozilla",
-            "browser_online": "true",
-            "browser_platform": "Win32",
-            "browser_version": _format_browser_version(),
-            "channel": "tiktok_web",
-            "channel_id": "0",
-            "cid": cid,
-            "cookie_enabled": "true",
-            "data_collection_enabled": "true",
-            "device_id": "",  # Будет заполнено из cookies
-            "device_platform": "web_pc",
-            "digg_type": str(digg_type),
-            "focus_state": "true",
-            "from_page": "video",
-            "is_fullscreen": "false",
-            "is_page_visible": "true",
-            "odinId": "",  # Будет заполнено из cookies
-            "os": "windows",
-            "referer": "https://www.tiktok.com/",
-            "root_referer": "https://www.tiktok.com/",
-            "user_is_login": "true",
-            "verifyFp": "",  # Будет заполнено из cookies
-        }
-        
-        # Добавляем дополнительные параметры (msToken, X-Bogus, X-Gnarly и т.д.)
-        # ВАЖНО: X-Bogus и X-Gnarly должны быть в query params, а не в headers
-        params.update(extra_params)
-        params.update(resolve_request_geo(runtime_profile, cookies, extra_params))
-        params.pop("proxy_country_code", None)
-        params.pop("account_country_code", None)
-        
-        # Добавляем стандартные параметры если их нет
-        if "WebIdLastTime" not in params:
-            import time
-            params["WebIdLastTime"] = str(int(time.time()))
-        if "history_len" not in params:
-            params["history_len"] = "7"
-        if "screen_height" not in params:
-            params["screen_height"] = "1080"
-        if "screen_width" not in params:
-            params["screen_width"] = "1920"
-        if "channel_id" not in params:
-            params["channel_id"] = "0"
-        
-        query_string = urlencode(params, doseq=True)
-        return f"{TikTokEndpoints.API_BASE}/comment/digg/?{query_string}"
-    
+        cookies: Optional[Dict[str, str]] = None, **extra_params,
+    ) -> tuple[str, Dict[str, str]]:
+        # Old callers documented 0=unlike; normalize to the client wire value.
+        digg_type = 2 if digg_type == 0 else digg_type
+        if digg_type not in (1, 2):
+            raise ValueError("digg_type must be 1 (like) or 2 (unlike)")
+        profile = RequestProfile.like_profile()
+        query, form = profile.build_request_parts(
+            {"aweme_id": aweme_id, "cid": cid, "digg_type": digg_type, **extra_params},
+            cookies, runtime_profile, include_cookie_signatures=False,
+        )
+        return profile.build_url_from_params(query), form
+
     @staticmethod
-    def comment_list(aweme_id: str, cursor: int = 0, count: int = 20) -> str:
-        """
-        Эндпоинт для получения списка комментариев.
-        
-        Args:
-            aweme_id: ID видео
-            cursor: Курсор для пагинации
-            count: Количество комментариев
-            
-        Returns:
-            str: URL эндпоинта
-        """
-        # TODO: Добавить полный набор параметров как в других эндпоинтах
-        return f"{TikTokEndpoints.API_BASE}/comment/list/?aweme_id={aweme_id}&cursor={cursor}&count={count}"
+    def comment_digg(*args, **kwargs) -> str:
+        """Return only the URL; use comment_digg_parts for POST dispatch."""
+        return TikTokEndpoints.comment_digg_parts(*args, **kwargs)[0]
+
+    @staticmethod
+    def comment_list(aweme_id: str, cursor: int = 0, count: int = 20, *,
+                     runtime_profile=None, cookies=None, **extra_params) -> str:
+        profile = RequestProfile.comment_list_profile()
+        query, _ = profile.build_request_parts(
+            {"aweme_id": aweme_id, "cursor": cursor, "count": count, **extra_params},
+            cookies, runtime_profile, include_cookie_signatures=False,
+        )
+        return profile.build_url_from_params(query)

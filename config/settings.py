@@ -26,6 +26,11 @@ class Settings(BaseSettings):
     MAX_ACTIONS_PER_ACCOUNT: int = 999999  # ИСПРАВЛЕНО: Убран лимит на комментирование (было 50)
     MAX_THREADS: int = 2  # КРИТИЧНО: Снижено до 2 для работы на ноутбуке
     MAX_CONCURRENT_BROWSERS: int = 1  # КРИТИЧНО: Снижено до 1 для работы на ноутбуке (минимум нагрузки)
+    BROWSER_POOL_CAPACITY_WAIT_SECONDS: float = 15.0
+    BROWSER_POOL_SHARED_PROCESS: bool = True
+    STATIC_ASSET_CACHE_ENABLED: bool = True
+    STATIC_ASSET_CACHE_MAX_MB: int = 128
+    KEYWORD_REPLY_MAX_SCAN_PAGES: int = 100
     # NEW: Лимит задач на один прокси (1-2 для мобильных, 2-3 для серверных)
     # 1 - самый безопасный режим (стабильная ротация, макс. скорость)
     MAX_TASKS_PER_PROXY: int = 1
@@ -145,7 +150,7 @@ class Settings(BaseSettings):
     BOT_RATE_LIMIT_BLOCK_DURATION_MINUTES: int = 5
     TELEGRAM_API_TIMEOUT_SECONDS: int = 120
     REQUIRE_WORKER_APPROVAL: bool = True
-    DEFAULT_PROXY_SCHEME: str = "socks5"
+    DEFAULT_PROXY_SCHEME: str = "http"
     PROXY_SCHEME_DETECT_TIMEOUT: float = 1.5
     PROXY_BAD_TTL_SECONDS: int = 120
     PROXY_BAD_TTL_MAX_SECONDS: int = 1800
@@ -458,6 +463,7 @@ class Settings(BaseSettings):
     
     # Настройки executor
     MAX_RETRY_ACCOUNTS: int = 3  # Максимум попыток с разными аккаунтами для одной задачи
+    MAX_ACCOUNT_CANDIDATES: int = 50  # Independent bound for account/preflight scans
     PARALLEL_COMMENTING_MAX_MAIN_ATTEMPTS: int = 6
     PARALLEL_COMMENTING_MAX_REPLY_ATTEMPTS: int = 6
     PARALLEL_DYNAMIC_WORKER_POOL_ENABLED: bool = True

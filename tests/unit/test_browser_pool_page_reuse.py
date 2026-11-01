@@ -10,7 +10,14 @@ from executor.browser_pool import BrowserPool
 
 @pytest.fixture(autouse=True)
 def proxy_mode(monkeypatch):
+    from unittest.mock import AsyncMock
+    from services import proxy_concurrency_service
     monkeypatch.setattr(browser_pool.settings, "USE_PROXY", True)
+    # This suite exercises the supported per-proxy process compatibility mode.
+    # Shared-process behavior is covered in test_shared_browser_and_asset_cache.
+    monkeypatch.setattr(browser_pool.settings, "BROWSER_POOL_SHARED_PROCESS", False)
+    monkeypatch.setattr(proxy_concurrency_service, "acquire_proxy_usage", AsyncMock(
+        side_effect=lambda *_args, **_kwargs: SimpleNamespace(release=AsyncMock())))
 
 
 class DummyPage:
@@ -47,7 +54,7 @@ class DummyContext:
 
 
 class LaunchProbePage(DummyPage):
-    async def evaluate(self, _script):
+    async def evaluate(self, _script, *args, **kwargs):
         return {
             "innerWidth": 1920,
             "innerHeight": 960,
@@ -154,6 +161,7 @@ def isolated_acquire(monkeypatch):
     monkeypatch.setattr(tiktok_client, "_get_cookies_for_account", lambda _account: "[]")
     monkeypatch.setattr(tiktok_client, "parse_cookies", lambda _raw: [])
     monkeypatch.setattr(browser_pool.settings, "HUMAN_LIKE_BEHAVIOR", False)
+    monkeypatch.setattr(browser_pool.settings, "USE_PROXY", False)
     return SimpleNamespace(id=1, label="driver-test", proxy=None, user_agent=None, country_code="US")
 
 
@@ -346,7 +354,7 @@ def test_resource_blocking_honors_media_toggle(monkeypatch):
 @pytest.mark.parametrize("country_code, idc, proxy_country, locale, timezone_id", [
     ("US", None, None, "en-US", "America/New_York"),
     ("IL", None, None, "he-IL", "Asia/Jerusalem"),
-    (None, "alisg", None, "en-SG", "Asia/Singapore"),
+    (None, "alisg", None, "en", "Etc/UTC"),
     ("US", "useast5", "PL", "pl-PL", "Europe/Warsaw"),
     (None, None, None, "en", "UTC"),
 ])
@@ -387,13 +395,13 @@ async def test_get_page_for_account_blocks_service_workers_when_media_blocked(
                             country_code=country_code, proxy_country_code=proxy_country)
         )
 
-        assert launched_browsers[0].new_context_options[0]["service_workers"] == "block"
+        assert launched_browsers[0].new_context_options[0].get("service_workers") != "block"
         options = launched_browsers[0].new_context_options[0]
         if country_code or proxy_country or idc:
             assert options["locale"] == locale
             assert options["timezone_id"] == timezone_id
         else:
-            assert "locale" not in options and "timezone_id" not in options
+            assert options["locale"] == "en" and options["timezone_id"] == "Etc/UTC"
     finally:
         await pool.close_all()
 
@@ -559,7 +567,8 @@ async def test_account_context_installs_matching_desktop_hardware_only(monkeypat
         size = {"width": profile["width"], "height": profile["height"]}
         assert options["screen"] == size
         assert options["viewport"] == {"width": profile["width"], "height": profile["height"] - 90}
-        assert f'--window-size={profile["width"]},{profile["height"]}' in launch.call_args.kwargs["args"]
+        geometry = browser_pool.desktop_geometry(profile)
+        assert f'--window-size={geometry["outerWidth"]},{geometry["outerHeight"]}' in launch.call_args.kwargs["args"]
     finally:
         await pool.close_all()
 
@@ -686,7 +695,7 @@ async def test_close_already_closed_page_from_pool_keeps_other_live_pages():
 
 @pytest.mark.unit
 @pytest.mark.asyncio
-async def test_close_page_from_pool_removes_empty_context_and_browser():
+async def test_close_page_from_pool_closes_context_and_keeps_idle_browser():
     pool = BrowserPool(max_browsers=1)
     target_page = DummyPage(url="https://www.tiktok.com/@demo/video/1")
     context = DummyContext([target_page])
@@ -701,11 +710,13 @@ async def test_close_page_from_pool_removes_empty_context_and_browser():
     assert closed is True
     assert target_page.is_closed() is True
     assert context._closed is True
-    assert browser.closed is True
+    assert browser.closed is False
     assert 1 not in pool._contexts
     assert 1 not in pool._context_last_used
     assert 1 not in pool._account_browser_ids
-    assert "browser-1" not in pool._browsers
+    assert "browser-1" in pool._browsers
+    await pool.close_all(stop_playwright=True)
+    assert browser.closed
 
 
 @pytest.mark.unit
@@ -766,6 +777,7 @@ async def test_cleanup_unused_browsers_keeps_browser_with_inflight_page_acquire(
 @pytest.mark.unit
 @pytest.mark.asyncio
 async def test_get_page_for_account_does_not_close_busy_pages_when_context_has_many_pages(monkeypatch):
+    monkeypatch.setattr(browser_pool.settings, "USE_PROXY", False)
     pool = BrowserPool(max_browsers=1)
     busy_pages = [
         DummyPage(url=f"https://www.tiktok.com/@demo/video/{index}")
@@ -793,6 +805,7 @@ async def test_get_page_for_account_does_not_close_busy_pages_when_context_has_m
 @pytest.mark.unit
 @pytest.mark.asyncio
 async def test_get_page_for_account_preserves_busy_context_when_new_page_fails(monkeypatch):
+    monkeypatch.setattr(browser_pool.settings, "USE_PROXY", False)
     class BrokenNewPageContext(DummyContext):
         async def new_page(self):
             raise RuntimeError("new page failed")
@@ -820,6 +833,7 @@ async def test_get_page_for_account_preserves_busy_context_when_new_page_fails(m
 @pytest.mark.unit
 @pytest.mark.asyncio
 async def test_get_page_for_account_reuses_available_page(monkeypatch):
+    monkeypatch.setattr(browser_pool.settings, "USE_PROXY", False)
     pool = BrowserPool(max_browsers=1)
     page = DummyPage(url="about:blank")
     page._pool_available = True
@@ -890,7 +904,7 @@ async def test_get_page_for_account_replaces_idle_context_after_proxy_change(mon
     )
 
     assert old_context._closed is True
-    assert old_browser.closed is True
+    assert old_browser.closed is False  # retained until idle TTL/capacity
     assert new_context is not old_context
     assert new_page not in old_context.pages
     assert launched_options[0]["proxy"]["server"] == new_proxy

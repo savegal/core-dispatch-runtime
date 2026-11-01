@@ -29,7 +29,7 @@ from services.proxy_filter_utils import get_proxy_type_filter
 from services.app_settings_service import get_proxy_prefer_mobile
 from services.proxy_health_service import get_bad_proxy_set, is_proxy_bad
 from services.mobile_proxy_service import get_locked_proxy_ids
-from services.cookie_validator import parse_cookies_to_dict, validate_cookies
+from services.cookie_validator import parse_cookies_to_dict, validate_cookies, classify_account_web_readiness
 from services.account_assignment import (
     assignment_order_sql, assignment_rank, available_assignment_filter,
     claim_assignment, release_assignment, extend_assignment,
@@ -1721,6 +1721,21 @@ def get_monitor_pool_stats(db: Session) -> dict[str, Any]:
     return summary
 
 
+def _candidate_ids_by_web_readiness(query, order_by_clauses, limit=None):
+    """Rank before batching so a hot account beyond the first batch can win.
+
+    Stream cookie rows and retain only IDs and integer ranks. Existing SQL
+    ordering remains the stable tie-breaker; locked eligibility checks follow.
+    """
+    rows = query.with_entities(Account.id, Account.cookies).order_by(*order_by_clauses)
+    if limit is not None:
+        rows = rows.limit(limit)
+    ranked = [(account_id, classify_account_web_readiness(cookies))
+              for account_id, cookies in rows.yield_per(256)]
+    ranked.sort(key=lambda item: -item[1])
+    return [account_id for account_id, _ in ranked]
+
+
 def get_free_account_for_main_comment(
     db: Session,
     *,
@@ -1990,9 +2005,7 @@ def get_free_account_for_main_comment(
     )
     # Sort lightweight IDs once. Re-sorting large cookie rows for every OFFSET
     # batch made a scan through 2,500 weak sessions take tens of seconds on SQLite.
-    ordered_sqlite_ids = None
-    if dialect_name == "sqlite":
-        ordered_sqlite_ids = [row[0] for row in query.with_entities(Account.id).order_by(*order_by_clauses).limit(max_candidate_scan).all()]
+    ordered_candidate_ids = _candidate_ids_by_web_readiness(query, order_by_clauses, max_candidate_scan)
 
     ranked_candidates: list[tuple[tuple[Any, ...], Account, dict[str, Any], int]] = []
     runtime_last_resort_candidates: list[tuple[tuple[Any, ...], Account, dict[str, Any], int]] = []
@@ -2006,13 +2019,10 @@ def get_free_account_for_main_comment(
     selection_proxy_cache: dict[str, bool] = {}
     offset = 0
     while offset < max_candidate_scan and len(ranked_candidates) < desired_ranked_candidates:
-        batch_ids = ordered_sqlite_ids[offset:offset + candidate_limit] if ordered_sqlite_ids is not None else None
-        if batch_ids is not None:
-            if not batch_ids:
-                break
-            candidate_query = query.filter(Account.id.in_(batch_ids))
-        else:
-            candidate_query = query.order_by(*order_by_clauses).offset(offset).limit(candidate_limit)
+        batch_ids = ordered_candidate_ids[offset:offset + candidate_limit]
+        if not batch_ids:
+            break
+        candidate_query = query.filter(Account.id.in_(batch_ids))
 
         try:
             if supports_skip_locked:
@@ -2023,14 +2033,11 @@ def get_free_account_for_main_comment(
             logger.warning(f"SELECT FOR UPDATE not supported, falling back to regular candidate query: {lock_error}")
             candidate_batch = candidate_query.all()
 
-        if batch_ids is not None:
-            positions = {account_id: index for index, account_id in enumerate(batch_ids)}
-            candidate_batch.sort(key=lambda account: positions[account.id])
-        if not candidate_batch and batch_ids:
+        positions = {account_id: index for index, account_id in enumerate(batch_ids)}
+        candidate_batch.sort(key=lambda account: positions[account.id])
+        if not candidate_batch:
             offset += candidate_limit
             continue
-        if not candidate_batch:
-            break
         candidates.extend(candidate_batch)
         for batch_index, candidate in enumerate(candidate_batch):
             apply_dedicated_proxy(candidate)
@@ -2058,6 +2065,7 @@ def get_free_account_for_main_comment(
             score = _calculate_scope_quality_score(candidate, state, MAIN_SCOPE, now, lifecycle=lifecycle, session_quality=session_quality, spend_lane=spend_lane)
             ranked_item = (
                 (
+                    -classify_account_web_readiness(candidate.cookies),
                     assignment_rank(candidate),
                     RUNTIME_BUCKET_ORDER.get(state["bucket"], 5),
                     0 if candidate.status == "active" else 1,
@@ -2373,20 +2381,15 @@ def get_free_account_for_reply(
     last_resort_accounts: list[tuple[Account, dict[str, Any], int]] = []
     scanned_count = 0
     selection_proxy_cache: dict[str, bool] = {}
-    ordered_sqlite_ids = None
-    sqlite_offset = 0
-    if dialect_name == "sqlite":
-        ordered_sqlite_ids = [row[0] for row in query.with_entities(Account.id).order_by(*order_by_clauses).all()]
+    ordered_candidate_ids = _candidate_ids_by_web_readiness(query, order_by_clauses)
+    batch_offset = 0
 
     while True:
         batch_query = query
         if seen_ids:
             batch_query = batch_query.filter(~Account.id.in_(list(seen_ids)))
-        batch_ids = ordered_sqlite_ids[sqlite_offset:sqlite_offset + batch_size] if ordered_sqlite_ids is not None else None
-        if batch_ids is not None:
-            batch_query = batch_query.filter(Account.id.in_(batch_ids))
-        else:
-            batch_query = batch_query.order_by(*order_by_clauses).limit(batch_size)
+        batch_ids = ordered_candidate_ids[batch_offset:batch_offset + batch_size]
+        batch_query = batch_query.filter(Account.id.in_(batch_ids))
 
         try:
             if locking_enabled:
@@ -2403,12 +2406,11 @@ def get_free_account_for_reply(
                 continue
             raise
 
-        if batch_ids is not None:
-            sqlite_offset += batch_size
-            positions = {account_id: index for index, account_id in enumerate(batch_ids)}
-            accounts.sort(key=lambda account: positions[account.id])
-            if not accounts and sqlite_offset < len(ordered_sqlite_ids):
-                continue
+        batch_offset += batch_size
+        positions = {account_id: index for index, account_id in enumerate(batch_ids)}
+        accounts.sort(key=lambda account: positions[account.id])
+        if not accounts and batch_offset < len(ordered_candidate_ids):
+            continue
         if not accounts:
             if runtime_last_resort_accounts:
                 logger.warning(
@@ -2608,6 +2610,7 @@ def get_free_account_for_reply(
                 ranked_available.append(
                     (
                         (
+                            -classify_account_web_readiness(acc.cookies),
                             assignment_rank(acc),
                             RUNTIME_BUCKET_ORDER.get(state["bucket"], 5),
                             0 if acc.status == "active" else 1,
@@ -2694,6 +2697,9 @@ def get_free_account_for_reply(
 
 def mark_soft_error(db: Session, account_id: int, error_message: str = None) -> None:
     """Marks a temporary account error and escalates to status=error only after the threshold."""
+    if "browser_pool_capacity_busy" in str(error_message or ""):
+        logger.info("Account %s postponed by local browser capacity; health unchanged", account_id)
+        return
     account = db.query(Account).filter(Account.id == account_id).with_for_update().first()
     if account:
         account.error_count_recent = (account.error_count_recent or 0) + 1

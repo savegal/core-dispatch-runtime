@@ -4,17 +4,21 @@ Playwright HTTP Client - HTTP-клиент с транспортом через 
 Использует живые cookies и headers из browser context для выполнения запросов к TikTok API.
 Это более надежный подход, чем попытка генерировать подписи вручную.
 """
+import threading
+from executor.cache_lock import synchronized
 import logging
 import json
 import asyncio
+import time
 from urllib.parse import parse_qs, urlparse
 from typing import Optional, Dict, Any, Tuple
 from datetime import datetime, timezone
 from patchright.async_api import APIRequestContext, Page, BrowserContext
 from executor.http.request_profile import RequestProfile
+from executor.http.page_runtime import document_generation, prepared_runtime_profile, target_page_matches
 from executor.http.execution_policy import valid_comment_id
 from services.execution_attempts import track_publication_requests
-from executor.http.signature_runtime import resolve_request_signature
+from executor.http.signature_runtime import resolve_request_signature, split_explicit_signature_params
 from executor.http.request_evidence import observe_request_security, resolve_security_evidence
 from services.cookie_validator import normalize_cookie_records
 from executor.http.retry_policy import (
@@ -27,7 +31,7 @@ LIKE_FAST_POLICY = RetryPolicy(max_retries=0, base_delay=0.5, max_delay=1.0)
 logger = logging.getLogger("executor.http.playwright_client")
 _SHORTLINK_HOST_MARKERS = ("vt.tiktok.com", "vm.tiktok.com")
 _PAGE_FETCH_JS = """
-async ({url, method, headers, form_data, timeout_ms}) => {
+async ({url, method, headers, form_data, timeout_ms, referrer}) => {
     const controller = new AbortController();
     let timedOut = false;
     const timer = setTimeout(() => {
@@ -41,6 +45,16 @@ async ({url, method, headers, form_data, timeout_ms}) => {
             credentials: "include",
             signal: controller.signal,
         };
+        if (referrer) {
+            try {
+                const target = new URL(url, location.href);
+                const source = new URL(referrer, location.href);
+                if (target.origin === location.origin && source.origin === location.origin) {
+                    source.hash = '';
+                    options.referrer = source.href;
+                }
+            } catch (error) {}
+        }
         if (method !== "GET" && method !== "HEAD") {
             options.body = new URLSearchParams(form_data).toString();
             options.headers = {...headers, "content-type": "application/x-www-form-urlencoded; charset=UTF-8"};
@@ -313,6 +327,26 @@ def _classify_api_response_error(response_data: Optional[Dict[str, Any]]) -> Tup
 
 
 _ACCOUNT_WEB_IDENTITY_CACHE: Dict[int, Dict[str, str]] = {}
+_ACCOUNT_WEB_IDENTITY_SEEDS: Dict[int, str] = {}
+_ACCOUNT_WEB_IDENTITY_LOCK = threading.RLock()
+_ACCOUNT_WEB_IDENTITY_MAX_ENTRIES = 4096
+
+
+def _get_account_web_identity(account_id):
+    """Read/touch the bounded process cache; caller holds the identity lock."""
+    entry = _ACCOUNT_WEB_IDENTITY_CACHE.pop(account_id, None)
+    if entry is not None:
+        _ACCOUNT_WEB_IDENTITY_CACHE[account_id] = entry
+    return entry
+
+
+def _store_account_web_identity(account_id, identity):
+    _ACCOUNT_WEB_IDENTITY_CACHE.pop(account_id, None)
+    _ACCOUNT_WEB_IDENTITY_CACHE[account_id] = dict(identity)
+    while len(_ACCOUNT_WEB_IDENTITY_CACHE) > max(1, _ACCOUNT_WEB_IDENTITY_MAX_ENTRIES):
+        oldest = next(iter(_ACCOUNT_WEB_IDENTITY_CACHE))
+        _ACCOUNT_WEB_IDENTITY_CACHE.pop(oldest, None)
+        _ACCOUNT_WEB_IDENTITY_SEEDS.pop(oldest, None)
 
 
 def extract_web_identity_from_cookies(cookies: Any) -> Dict[str, str]:
@@ -338,20 +372,39 @@ def extract_web_identity_from_cookies(cookies: Any) -> Dict[str, str]:
     wid_time = _normalize_identifier(
         parsed.get("WebIdLastTime") or parsed.get("web_id_last_time")
     )
+    vfp = _normalize_identifier(
+        parsed.get("s_v_web_id") or parsed.get("verifyFp") or parsed.get("verify_fp") or parsed.get("verifyFP")
+    )
     if device_id:
         out["device_id"] = device_id
     if odin_id:
         out["odin_id"] = odin_id
     if wid_time:
         out["web_id_last_time"] = wid_time
+    if vfp:
+        out["verify_fp"] = vfp
+        out["s_v_web_id"] = vfp
+        out["verifyFp"] = vfp
     return out
 
 
+@synchronized(_ACCOUNT_WEB_IDENTITY_LOCK)
 def seed_web_identity_from_account(account: Any, context: Any = None) -> Dict[str, str]:
     """Restore persisted web identity from Account.cookies into in-memory cache and context."""
     if account is None:
         return {}
+    from executor.device_profiles import _account_seed_key
+    device_seed = _account_seed_key(account)
     account_id = getattr(account, "id", None)
+    try:
+        account_id = int(account_id) if account_id is not None else None
+    except (TypeError, ValueError):
+        account_id = None
+    same_account = True
+    if account_id is not None:
+        same_account = _ACCOUNT_WEB_IDENTITY_SEEDS.get(int(account_id)) in (None, device_seed)
+    if context is not None and getattr(context, "_account_web_identity_seed", None) not in (None, device_seed):
+        same_account = False
     raw_cookies = getattr(account, "cookies", None)
     if not raw_cookies and getattr(account, "cookie_file", None):
         try:
@@ -360,32 +413,55 @@ def seed_web_identity_from_account(account: Any, context: Any = None) -> Dict[st
         except Exception:
             raw_cookies = None
     seeded = extract_web_identity_from_cookies(raw_cookies)
-    if not seeded:
+    merged: Dict[str, str] = dict(seeded) if seeded else {}
+    if not merged.get("device_id"):
+        from executor.http.request_profile import generate_fallback_device_id
+        merged["device_id"] = generate_fallback_device_id(device_seed)
+        # A legacy creation time without its device ID cannot identify this
+        # newly created fallback. Preserve observed runtime times separately.
+        merged.pop("web_id_last_time", None)
+    if "verify_fp" not in merged and "s_v_web_id" not in merged:
+        try:
+            from executor.device_profiles import _account_seed_key
+            from executor.http.request_profile import generate_tiktok_verify_fp
+            seed = _account_seed_key(account)
+            vfp = generate_tiktok_verify_fp(seed)
+            merged["verify_fp"] = vfp
+            merged["s_v_web_id"] = vfp
+            merged["verifyFp"] = vfp
+        except Exception:
+            pass
+    if not merged:
         return {}
-    merged: Dict[str, str] = dict(seeded)
     if account_id is not None:
         try:
-            acct_cached = _ACCOUNT_WEB_IDENTITY_CACHE.get(int(account_id))
-            if isinstance(acct_cached, dict):
+            acct_cached = _get_account_web_identity(int(account_id))
+            if same_account and isinstance(acct_cached, dict):
+                if (acct_cached.get("device_id") and merged.get("device_id")
+                        and acct_cached["device_id"] != merged["device_id"]):
+                    merged = {}
                 for k, v in acct_cached.items():
                     if v:
                         merged[k] = str(v)
-            _ACCOUNT_WEB_IDENTITY_CACHE[int(account_id)] = dict(merged)
+            _ACCOUNT_WEB_IDENTITY_SEEDS[int(account_id)] = device_seed
+            _store_account_web_identity(int(account_id), merged)
         except (TypeError, ValueError):
             pass
     if context is not None:
         ctx_cached = getattr(context, "_account_web_identity", None)
-        if isinstance(ctx_cached, dict):
+        if same_account and isinstance(ctx_cached, dict):
             for k, v in ctx_cached.items():
                 if v:
                     merged[k] = str(v)
         try:
             setattr(context, "_account_web_identity", dict(merged))
+            setattr(context, "_account_web_identity_seed", device_seed)
         except Exception:
             pass
     return merged
 
 
+@synchronized(_ACCOUNT_WEB_IDENTITY_LOCK)
 def get_cached_web_identity(
     account_id: Optional[int],
     context: Any = None,
@@ -399,18 +475,22 @@ def get_cached_web_identity(
         cached_entry = None
         if acct_id is not None:
             try:
-                cached_entry = _ACCOUNT_WEB_IDENTITY_CACHE.get(int(acct_id))
+                cached_entry = _get_account_web_identity(int(acct_id))
             except (TypeError, ValueError):
                 cached_entry = None
-        if not isinstance(cached_entry, dict) or not (
-            cached_entry.get("device_id") and cached_entry.get("web_id_last_time")
-        ):
+        if not isinstance(cached_entry, dict) or not cached_entry:
             seed_web_identity_from_account(account, context=context)
+        elif acct_id is not None:
+            from executor.device_profiles import _account_seed_key
+            expected_seed = _account_seed_key(account)
+            if (_ACCOUNT_WEB_IDENTITY_SEEDS.get(int(acct_id)) not in (None, expected_seed)
+                    or getattr(context, "_account_web_identity_seed", None) not in (None, expected_seed)):
+                seed_web_identity_from_account(account, context=context)
 
     merged: Dict[str, str] = {}
     if account_id is not None:
         try:
-            acct_cached = _ACCOUNT_WEB_IDENTITY_CACHE.get(int(account_id))
+            acct_cached = _get_account_web_identity(int(account_id))
             if isinstance(acct_cached, dict):
                 merged.update({k: str(v) for k, v in acct_cached.items() if v})
         except (TypeError, ValueError):
@@ -422,6 +502,7 @@ def get_cached_web_identity(
     return merged
 
 
+@synchronized(_ACCOUNT_WEB_IDENTITY_LOCK)
 def cache_web_identity(
     account_id: Optional[int],
     identity: Optional[Dict[str, Any]],
@@ -444,6 +525,9 @@ def cache_web_identity(
     new_wid_time = _normalize_identifier(
         identity.get("web_id_last_time") or identity.get("WebIdLastTime")
     )
+    new_vfp = _normalize_identifier(
+        identity.get("verify_fp") or identity.get("verifyFp") or identity.get("s_v_web_id")
+    )
     explicit_wid_time = bool(identity.get("_web_id_last_time_explicit"))
 
     device_changed = bool(
@@ -458,6 +542,10 @@ def cache_web_identity(
     if new_wid_time:
         if explicit_wid_time or device_changed or "web_id_last_time" not in updated:
             updated["web_id_last_time"] = new_wid_time
+    if new_vfp:
+        updated["verify_fp"] = new_vfp
+        updated["s_v_web_id"] = new_vfp
+        updated["verifyFp"] = new_vfp
 
     if context is not None and updated:
         try:
@@ -466,13 +554,14 @@ def cache_web_identity(
             pass
     if account_id is not None and updated:
         try:
-            _ACCOUNT_WEB_IDENTITY_CACHE[int(account_id)] = dict(updated)
+            _store_account_web_identity(int(account_id), updated)
         except (TypeError, ValueError):
             pass
     return updated
 
 
 async def _extract_runtime_profile(page: Page) -> Dict[str, Any]:
+    generation = document_generation(page)
     current_url = None
     try:
         current_url = page.url
@@ -497,8 +586,43 @@ async def _extract_runtime_profile(page: Page) -> Dict[str, Any]:
                 let odinId = null;
                 let webIdLastTime = null;
                 let webIdLastTimeExplicit = false;
+                let verifyFp = null;
                 try {
-                    const universal = window.__UNIVERSAL_DATA_FOR_REHYDRATION__ || null;
+                    try {
+                        verifyFp = sessionStorage.getItem('s_v_web_id') || localStorage.getItem('s_v_web_id') || null;
+                    } catch (error) {}
+                    const initialSsr = window.__UNIVERSAL_DATA_FOR_REHYDRATION__;
+                    let universal = initialSsr && typeof initialSsr === "object" && !initialSsr.nodeType ? initialSsr : null;
+                    if (!universal) {
+                        try {
+                            const el = document.getElementById("__UNIVERSAL_DATA_FOR_REHYDRATION__");
+                            if (el && el.textContent) {
+                                universal = (() => {
+                                    const raw = el.textContent;
+                                    if (el.__teletanSsrRaw !== raw) {
+                                        el.__teletanSsrValue = JSON.parse(raw);
+                                        el.__teletanSsrRaw = raw;
+                                    }
+                                    return el.__teletanSsrValue;
+                                })();
+                            }
+                        } catch (e) {}
+                    }
+                    if (!universal) {
+                        try {
+                            const sigi = document.getElementById("SIGI_STATE");
+                            if (sigi && sigi.textContent) {
+                                universal = (() => {
+                                    const raw = sigi.textContent;
+                                    if (sigi.__teletanSsrRaw !== raw) {
+                                        sigi.__teletanSsrValue = JSON.parse(raw);
+                                        sigi.__teletanSsrRaw = raw;
+                                    }
+                                    return sigi.__teletanSsrValue;
+                                })();
+                            }
+                        } catch (e) {}
+                    }
                     const scope = universal?.__DEFAULT_SCOPE__ || null;
                     const appCtx = scope?.["webapp.app-context"] || scope?.["webapp.a-context"] || null;
                     const nextData = window.__NEXT_DATA__ || null;
@@ -522,16 +646,14 @@ async def _extract_runtime_profile(page: Page) -> Dict[str, Any]:
                         webIdLastTime = String(rawWidTime).trim();
                         webIdLastTimeExplicit = true;
                     } else if (deviceId || odinId || appCtx || nextAppCtx) {
-                        if (!window.__tt_web_id_last_time) {
-                            window.__tt_web_id_last_time = String(Math.floor(Date.now() / 1000));
-                        }
-                        webIdLastTime = window.__tt_web_id_last_time;
+                        webIdLastTime = window.__tt_web_id_last_time || null;
                     }
                 } catch (error) {
                     nextRegion = null;
                 }
                 const out = {
                     current_url: window.location.href,
+                    root_referer: document.referrer || "",
                     user_agent: navigator.userAgent || null,
                     browser_language: navigator.language || null,
                     languages: Array.isArray(navigator.languages) ? navigator.languages : [],
@@ -558,6 +680,7 @@ async def _extract_runtime_profile(page: Page) -> Dict[str, Any]:
                 if (odinId) out.odin_id = odinId;
                 if (webIdLastTime) out.web_id_last_time = webIdLastTime;
                 if (webIdLastTimeExplicit) out._web_id_last_time_explicit = true;
+                if (verifyFp) out.verify_fp = verifyFp;
                 return out;
             }""",
             isolated_context=False,
@@ -565,8 +688,10 @@ async def _extract_runtime_profile(page: Page) -> Dict[str, Any]:
     except Exception:
         profile = {}
 
+    extracted = isinstance(profile, dict) and bool(profile)
     if not isinstance(profile, dict):
         profile = {}
+    ssr_identity_observed = bool(profile.get("device_id"))
     context = getattr(page, "context", None)
     account_obj = getattr(page, "_pool_account_obj", None) or getattr(context, "_pool_account_obj", None)
     account_id = (
@@ -575,16 +700,25 @@ async def _extract_runtime_profile(page: Page) -> Dict[str, Any]:
         or getattr(account_obj, "id", None)
     )
     cached_identity = cache_web_identity(account_id, profile, context=context, account=account_obj)
-    if account_obj is not None and (cached_identity.get("device_id") or cached_identity.get("web_id_last_time")):
-        try:
-            from services.cookie_persistence_service import save_warmed_cookies_for_account
-            save_warmed_cookies_for_account(account_obj, {}, context=context)
-        except Exception:
-            pass
+    if not (cached_identity.get("verify_fp") or cached_identity.get("verifyFp") or cached_identity.get("s_v_web_id")):
+        # Anonymous/non-pool pages need one context-owned fallback too. Keep
+        # this state at extraction, rather than mutating query builder inputs.
+        from executor.http.request_profile import generate_tiktok_verify_fp
+        from executor.device_profiles import _account_seed_key
+        seed = _account_seed_key(account_obj) if account_obj is not None else None
+        cached_identity = cache_web_identity(account_id, {"verify_fp": generate_tiktok_verify_fp(seed)},
+                                             context=context, account=account_obj)
+    # Extraction is read/cache-only. Warmup and pool disposal persist identity;
+    # no synchronous database/file commit belongs on every page metadata read.
     profile.pop("_web_id_last_time_explicit", None)
-    for key in ("device_id", "odin_id", "web_id_last_time"):
+    for key in ("device_id", "odin_id", "web_id_last_time", "verify_fp", "verifyFp", "s_v_web_id"):
         if cached_identity.get(key):
             profile[key] = cached_identity[key]
+    if account_id is not None:
+        profile["account_id"] = account_id
+    if account_obj is not None:
+        from executor.device_profiles import _account_seed_key
+        profile["device_seed"] = _account_seed_key(account_obj)
     ssr_region = str(profile.get("ssr_region") or "").strip().upper()
     if len(ssr_region) == 2 and ssr_region.isalpha() and ssr_region.isascii():
         profile["ssr_region"] = ssr_region
@@ -598,8 +732,21 @@ async def _extract_runtime_profile(page: Page) -> Dict[str, Any]:
     proxy_in_use = getattr(context, "_account_proxy_in_use", None)
     if isinstance(proxy_in_use, bool):
         profile["proxy_in_use"] = proxy_in_use
+        profile["context_geo_bound"] = True
+    route = getattr(context, "_account_proxy_route", None)
+    if route is not None:
+        profile["proxy_country_code"] = route.country_code
+    account = getattr(context, "_pool_account_obj", None)
+    if account is not None:
+        profile["account_country_code"] = getattr(account, "country_code", None)
     if current_url and not profile.get("current_url"):
         profile["current_url"] = current_url
+    # Explicit, bounded handoff: ordinary extractions still inspect the current
+    # document, including late hydration at the same URL.
+    if extracted and current_url and profile.get("current_url") == current_url and page.url == current_url:
+        profile["_document_generation"] = generation
+        profile["_captured_at"] = time.monotonic()
+        profile["_snapshot_reusable"] = ssr_identity_observed
     return profile
 
 
@@ -699,7 +846,8 @@ class PlaywrightHttpClient:
         return any(marker in haystack for marker in suspicious_response_markers)
 
     @classmethod
-    async def from_page(cls, page: Page, retry_policy: Optional[RetryPolicy] = None) -> "PlaywrightHttpClient":
+    async def from_page(cls, page: Page, retry_policy: Optional[RetryPolicy] = None, *,
+                        runtime_profile: Optional[Dict[str, Any]] = None) -> "PlaywrightHttpClient":
         """
         Создает клиент из Playwright Page.
         
@@ -713,7 +861,7 @@ class PlaywrightHttpClient:
         # Получаем request context из page context
         context = page.context
         request_context = context.request
-        runtime_profile = await _extract_runtime_profile(page)
+        runtime_profile = prepared_runtime_profile(page, runtime_profile) or await _extract_runtime_profile(page)
         return cls(request_context, retry_policy, runtime_profile=runtime_profile, page=page)
     
     @classmethod
@@ -761,6 +909,8 @@ class PlaywrightHttpClient:
         Returns:
             tuple: (success, response_data, error_message, error_type)
         """
+        prepared_mentions = (self.last_request_meta.get("mentions")
+                             if urlparse(profile.endpoint).path.rstrip("/") == "/api/comment/publish" else None)
         self.last_request_meta = {
             "endpoint": profile.endpoint,
             "method": profile.method,
@@ -768,6 +918,14 @@ class PlaywrightHttpClient:
             "attempt_count": 0,
             "transport": "window.fetch" if self.page is not None else "request_context.fetch",
         }
+        if prepared_mentions is not None:
+            self.last_request_meta["mentions"] = prepared_mentions
+        is_publish = profile.method.upper() == "POST" and profile.endpoint.rstrip("/") == "/api/comment/publish"
+
+        def unconfirmed(reason):
+            self.last_request_meta["publication_status"] = "submitted_unconfirmed"
+            self.last_request_meta["unconfirmed_reason"] = reason
+            return False, None, f"submitted_unconfirmed:{reason}", HttpErrorType.SUBMITTED_UNCONFIRMED
         effective_runtime_profile = runtime_profile_override or self.runtime_profile
         effective_retry_policy = retry_policy_override or self.retry_policy
         base_dynamic_params = dict(dynamic_params)
@@ -783,10 +941,28 @@ class PlaywrightHttpClient:
         
         for attempt in range(effective_retry_policy.max_retries + 1):
             try:
+                expected_aweme_id = base_dynamic_params.get("aweme_id")
+                if self.page is not None and expected_aweme_id:
+                    if not target_page_matches(self.page, expected_aweme_id):
+                        return False, None, "target_document_changed", HttpErrorType.API_ERROR
+                    expected_generation = document_generation(self.page)
+                    if (effective_runtime_profile.get("_snapshot_reusable") is True
+                            and prepared_runtime_profile(self.page, effective_runtime_profile) is None):
+                        effective_runtime_profile = await _extract_runtime_profile(self.page)
                 attempt_cookies = dict(cookies or {})
                 if self.page is not None:
                     live_cookies = normalize_cookie_records(await self.page.context.cookies())
                     attempt_cookies.update(live_cookies)
+                rotated_ms_token = getattr(self, "_last_response_ms_token", None)
+                token_baseline = getattr(self, "_last_response_ms_token_cookie_baseline", None)
+                if rotated_ms_token and attempt_cookies.get("msToken") in {None, token_baseline, rotated_ms_token}:
+                    attempt_cookies["msToken"] = rotated_ms_token
+                clean_params, _ = split_explicit_signature_params(base_dynamic_params)
+                request_parts = profile.build_request_parts(
+                    clean_params, attempt_cookies, runtime_profile=effective_runtime_profile,
+                    include_cookie_signatures=False,
+                )
+                _, form_data = request_parts
                 attempt_params, url, signature_bundle = await resolve_request_signature(
                     page=self.page,
                     profile=profile,
@@ -794,14 +970,10 @@ class PlaywrightHttpClient:
                     cookies=attempt_cookies,
                     runtime_profile=effective_runtime_profile,
                     allow_cookie_fallback=self.page is None,
+                    request_parts=request_parts,
                 )
-                headers = profile.build_headers(attempt_cookies, user_agent, runtime_profile=effective_runtime_profile)
-                form_data = profile.build_form_data(
-                    attempt_params,
-                    attempt_cookies,
-                    runtime_profile=effective_runtime_profile,
-                    include_cookie_signatures=False,
-                )
+                headers = (profile.build_browser_headers(attempt_cookies) if self.page is not None else
+                           profile.build_headers(attempt_cookies, user_agent, runtime_profile=effective_runtime_profile))
                 request_signature_meta = {
                     "mode": signature_bundle.mode,
                     "source": signature_bundle.source,
@@ -832,6 +1004,11 @@ class PlaywrightHttpClient:
                 
                 self.last_request_meta["timeout_ms"] = timeout_to_use
                 if self.page is not None:
+                    if expected_aweme_id and (
+                        not target_page_matches(self.page, expected_aweme_id)
+                        or document_generation(self.page) != expected_generation
+                    ):
+                        return False, None, "target_document_changed", HttpErrorType.API_ERROR
                     # Browser-managed headers and cookies come from the live page.
                     browser_headers = {
                         key.lower(): value for key, value in headers.items()
@@ -850,6 +1027,7 @@ class PlaywrightHttpClient:
                                     "headers": browser_headers,
                                     "form_data": form_data,
                                     "timeout_ms": timeout_to_use,
+                                    "referrer": attempt_params.get("referer") or headers.get("referer"),
                                 },
                                 isolated_context=False,
                             )
@@ -878,6 +1056,26 @@ class PlaywrightHttpClient:
                 
                 # ИСПРАВЛЕНО: Проверяем Content-Type ответа перед парсингом
                 # Если TikTok вернул HTML (капча/WAF/редирект) - сразу классифицируем как FORBIDDEN/CAPTCHA
+                if isinstance(response_headers, dict):
+                    for hdr_k, hdr_v in response_headers.items():
+                        if str(hdr_k or "").lower() == "x-ms-token" and str(hdr_v or "").strip():
+                            self._last_response_ms_token = str(hdr_v).strip()
+                            self._last_response_ms_token_cookie_baseline = attempt_cookies.get("msToken")
+                            if self.page is not None:
+                                try:
+                                    records = await self.page.context.cookies()
+                                    updates = [{**record, "value": self._last_response_ms_token} for record in records
+                                               if record.get("name") == "msToken"
+                                               and str(record.get("domain") or "").lstrip(".") in {"tiktok.com", "www.tiktok.com"}]
+                                    if not updates:
+                                        updates = [{"name": "msToken", "value": self._last_response_ms_token,
+                                                    "domain": ".tiktok.com", "path": "/", "secure": True}]
+                                    await self.page.context.add_cookies(updates)
+                                    from services.cookie_validator import remember_observed_ms_token
+                                    remember_observed_ms_token(self.page.context, {"msToken": self._last_response_ms_token})
+                                except Exception:
+                                    logger.debug("Could not persist response msToken in the active browser context", exc_info=True)
+                            break
                 content_type = response_headers.get("content-type", "").lower()
                 self.last_request_meta["response_status"] = status_code
                 self.last_request_meta["response_content_type"] = content_type
@@ -893,14 +1091,20 @@ class PlaywrightHttpClient:
                         self.last_request_meta.get("security_params_source", "unavailable"),
                     )
                     
-                    if status_code == 200 and not str(response_body or "").strip() and profile.endpoint == "/api/comment/publish/":
+                    if status_code == 200 and len(response_body or "") == 0 and is_publish:
                         error_type = HttpErrorType.FORBIDDEN
                         error_msg = "TikTok stealth-reject: empty JSON response (body_len=0). Publication was not confirmed."
                         redirected = any(marker in str(self._page_url_hint(self.page) or "").lower() for marker in ("/login", "/signup", "/verify", "/auth", "/messages", "/inbox"))
                         if self.page is not None and attempt == 0 and effective_retry_policy.max_retries > 0 and not redirected:
+                            from executor.http.page_runtime import activate_page_input
                             self.last_request_meta["empty_body_retry_count"] = 1
+                            self.last_request_meta["empty_body_retry_unconfirmed"] = True
+                            await activate_page_input(self.page)
                             await asyncio.sleep(2.0)
                             continue
+                        self.last_request_meta.update(publication_status="rejected", failure_reason="stealth_reject_empty_body")
+                        # A blank response is not a receipt. Preserve the failure
+                        # classification so orchestration charges this account.
                         return False, None, error_msg, error_type
 
                     # ИСПРАВЛЕНО: Если Content-Type не JSON - это капча/WAF/редирект
@@ -928,6 +1132,8 @@ class PlaywrightHttpClient:
                         # Не JSON и не 200 - это ошибка
                         response_data = {"raw": response_body[:500] if response_body else ""}
                 except (json.JSONDecodeError, Exception) as parse_error:
+                    if is_publish:
+                        return unconfirmed("invalid_json")
                     # ИСПРАВЛЕНО: Если не удалось распарсить JSON - проверяем Content-Type
                     if "application/json" in content_type:
                         # Ожидали JSON, но не смогли распарсить - это ошибка
@@ -970,6 +1176,10 @@ class PlaywrightHttpClient:
                     
                     # КРИТИЧНО: Проверяем status_code в теле ответа
                     if status_code_in_body is None:
+                        if is_publish:
+                            # Even {} is not evidence that a dispatched POST
+                            # failed before being stored. Never blindly repeat it.
+                            return unconfirmed("missing_api_status")
                         # Нет status_code в ответе - считаем ошибкой
                         current_page_url = self._page_url_hint(self.page)
                         response_keys = list(response_data.keys())[:10]
@@ -1001,15 +1211,6 @@ class PlaywrightHttpClient:
                                 f"page_url={current_page_url}, "
                                 f"redirected_page_state={redirected_page_state}"
                             )
-                            if (
-                                self.page is not None and attempt == 0 and effective_retry_policy.max_retries > 0
-                                and not response_body.strip() and not redirected_page_state
-                                and profile.method.upper() == "POST" and "/api/comment/publish/" in profile.endpoint
-                            ):
-                                self.last_request_meta["empty_body_retry_count"] = 1
-                                logger.warning("[HTTP] Empty response; one HTTP retry after 2s initialization delay | correlation_id=%s", correlation_id)
-                                await asyncio.sleep(2.0)
-                                continue
                             return False, None, error_msg, error_type
                         if redirected_page_state:
                             error_type = HttpErrorType.FORBIDDEN
@@ -1043,15 +1244,17 @@ class PlaywrightHttpClient:
                     # Для like: проверяем что ответ не пустой или есть подтверждение
                     # Для reply/publish: желательно есть comment_id
                     has_confirmation = False
-                    if profile.endpoint == "/api/comment/digg/":
+                    if profile.endpoint.rstrip("/") == "/api/comment/digg":
                         # Для лайка: если status_code==0, это уже подтверждение
                         has_confirmation = True
-                    elif profile.endpoint == "/api/comment/publish/":
+                    elif is_publish:
                         # For publish/reply success we require real comment_id.
                         has_confirmation = _extract_comment_id(response_data) is not None
+                    else:
+                        has_confirmation = True
                     
                     if has_confirmation:
-                        if profile.endpoint == "/api/comment/publish/":
+                        if is_publish:
                             self.last_request_meta["comment_author"] = _extract_comment_author(response_data)
                             self.last_request_meta["comment_author_uid"] = _extract_comment_user_id(response_data)
                         response_data = _attach_request_meta(response_data)
@@ -1066,6 +1269,8 @@ class PlaywrightHttpClient:
                         return True, response_data, None, None
                     else:
                         # status_code==0, но нет подтверждающих данных - подозрительно
+                        if is_publish:
+                            return unconfirmed("missing_comment_id")
                         error_type = HttpErrorType.API_ERROR
                         error_msg = "Response OK but missing confirmation data (comment_id)"
                         logger.warning(
@@ -1080,6 +1285,8 @@ class PlaywrightHttpClient:
                             return False, None, error_msg, error_type
                         continue
                 elif error_type == HttpErrorType.SUCCESS and status_code == 200:
+                    if is_publish:
+                        return unconfirmed("invalid_response_format")
                     # HTTP 200, но response_data не dict - ошибка парсинга
                     error_type = HttpErrorType.API_ERROR
                     error_msg = "Invalid response format"
@@ -1120,6 +1327,8 @@ class PlaywrightHttpClient:
                         await asyncio.sleep(delay)
                     
             except Exception as e:
+                if is_publish and self.last_request_meta.get("request_attempted"):
+                    return unconfirmed("transport_after_dispatch")
                 error_type, classified_error_msg = classify_http_error(None, e)
                 error_msg = classified_error_msg[:200]
                 
@@ -1149,6 +1358,50 @@ class PlaywrightHttpClient:
         
         return False, None, error_msg or "Max retries exceeded", error_type
     
+    def _record_mention_receipt(self, response_data):
+        from executor.http.mentions import mention_receipt
+        meta = self.last_request_meta.get("mentions")
+        if isinstance(meta, dict):
+            meta.update(mention_receipt(response_data, meta.get("expected_uids", [])))
+            if meta.get("missing_uids"):
+                logger.warning("[MENTION] Published comment receipt did not retain all requested mentions: %s", meta["confirmation"])
+
+    async def _prepare_publication_mentions(self, text, dynamic_params):
+        from executor.http.mentions import find_mentions, prepare_mentions, validate_text_extra
+        from services.mention_policy import current_mention_mode, normalize_mention_mode, order_mention_identities, PLAIN_TEXT
+        self.last_request_meta = {"request_attempted": False}
+        try:
+            mode = normalize_mention_mode(dynamic_params.pop("mention_mode", current_mention_mode()))
+            if order_mention_identities() is not None and mode != current_mention_mode():
+                raise ValueError("Mention mode conflicts with the saved order choice")
+            if mode == PLAIN_TEXT:
+                dynamic_params["text_extra"] = "[]"
+                self.last_request_meta["mentions"] = {"mode": mode, "requested": [], "resolved": [], "unresolved": []}
+                return None
+            if "text_extra" not in dynamic_params and find_mentions(text):
+                mention_runtime = dict(self.runtime_profile or {})
+                if self.page is not None:
+                    mention_runtime.update(prepared_runtime_profile(self.page, self.runtime_profile) or await _extract_runtime_profile(self.page))
+                    mention_cookies = normalize_cookie_records(await self.page.context.cookies())
+                    mention_runtime.update({key: value for key, value in mention_cookies.items()
+                                            if key in {"msToken", "s_v_web_id"}})
+                normalized, extras, meta = await prepare_mentions(self.page, text, runtime_params=mention_runtime)
+                self.last_request_meta["mentions"] = meta
+                meta["mode"] = mode
+                if meta.get("unresolved"):
+                    raise ValueError(f"Mentions unresolved: {meta['unresolved']}")
+                dynamic_params.update(text=normalized, text_extra=extras)
+            entries = validate_text_extra(dynamic_params.get("text", text), dynamic_params.get("text_extra", "[]"))
+            if entries:
+                self.last_request_meta.setdefault("mentions", {"requested": [u for _, _, u in find_mentions(text)],
+                                                               "resolved": [str(e["user_id"]) for e in entries]})
+                self.last_request_meta["mentions"]["mode"] = mode
+                self.last_request_meta["mentions"]["expected_uids"] = sorted({str(e["user_id"]) for e in entries})
+                dynamic_params["text_extra"] = json.dumps(entries, ensure_ascii=False, separators=(",", ":"))
+        except Exception as exc:
+            return f"Mention preparation failed: {exc}"
+        return None
+
     async def like_comment(
         self,
         aweme_id: str,
@@ -1188,7 +1441,6 @@ class PlaywrightHttpClient:
         if video_url:
             referer_url = self._canonical_referer_url(video_url, self.runtime_profile)
             dynamic_params["referer"] = referer_url
-            dynamic_params["root_referer"] = referer_url
 
         effective_policy = retry_policy or LIKE_FAST_POLICY
         request_runtime_profile = self._runtime_profile_for_request(proxy_country_code)
@@ -1254,39 +1506,10 @@ class PlaywrightHttpClient:
             # Устанавливаем referer через dynamic_params (не мутируем profile)
             referer_url = self._canonical_referer_url(video_url, self.runtime_profile)
             dynamic_params["referer"] = referer_url
-            dynamic_params["root_referer"] = referer_url
 
-        if "text_extra" not in dynamic_params and "@" in text:
-            from executor.http.mentions import find_mentions
-            if find_mentions(text):
-                try:
-                    from executor.http.mentions import prepare_mentions
-                    normalized_text, text_extra_json, mention_meta = await prepare_mentions(
-                        self.page, text, runtime_params=self.runtime_profile
-                    )
-                    if mention_meta.get("unresolved"):
-                        error_msg = f"Mentions unresolved: {mention_meta.get('unresolved')}. Aborting to avoid publishing unclickable plain text."
-                        logger.warning("[MENTION] %s | correlation_id=%s", error_msg, correlation_id)
-                        self.last_request_meta["mentions"] = mention_meta
-                        self.last_request_meta["request_attempted"] = False
-                        return False, None, error_msg, HttpErrorType.API_ERROR, {
-                            "parent_confirmed": False,
-                            "request_attempted": False,
-                            "mentions_unresolved": mention_meta.get("unresolved"),
-                            "request_meta": dict(self.last_request_meta),
-                        }
-                    if text_extra_json and text_extra_json != "[]":
-                        dynamic_params["text"] = normalized_text
-                        dynamic_params["text_extra"] = text_extra_json
-                        self.last_request_meta["mentions"] = mention_meta
-                except Exception as exc:
-                    logger.warning("[MENTION] Error preparing mentions for reply: %s", exc)
-                    self.last_request_meta["request_attempted"] = False
-                    return False, None, f"Mention preparation failed: {exc}", HttpErrorType.API_ERROR, {
-                        "parent_confirmed": False,
-                        "request_attempted": False,
-                        "request_meta": dict(self.last_request_meta),
-                    }
+        mention_error = await self._prepare_publication_mentions(text, dynamic_params)
+        if mention_error:
+            return False, None, mention_error, HttpErrorType.API_ERROR, {"parent_confirmed": False, "request_attempted": False, "request_meta": dict(self.last_request_meta)}
 
         request_runtime_profile = self._runtime_profile_for_request(proxy_country_code)
         success, response_data, error_msg, error_type = await self._execute_request(
@@ -1383,27 +1606,7 @@ class PlaywrightHttpClient:
                         f"Publication returned an ID; parent confirmation remains unconfirmed."
                     )
 
-            if "mentions" in self.last_request_meta:
-                try:
-                    from executor.http.mentions import extract_response_mentions
-                    retained_uids = extract_response_mentions(response_data)
-                    self.last_request_meta["mentions"]["retained_uids"] = retained_uids
-                    if not retained_uids and self.last_request_meta["mentions"].get("resolved"):
-                        self.last_request_meta["mentions"]["stripped_by_server"] = True
-                        logger.warning(
-                            "[MENTION] Server accepted reply %s but stripped text_extra! Target user might have restricted mentions.",
-                            comment_id[:20] if comment_id else "",
-                        )
-                    else:
-                        logger.info(
-                            "[MENTION] Reply comment %s: requested=%s, resolved=%s, retained_uids=%s",
-                            comment_id[:20] if comment_id else "",
-                            self.last_request_meta["mentions"].get("requested"),
-                            self.last_request_meta["mentions"].get("resolved"),
-                            retained_uids,
-                        )
-                except Exception:
-                    pass
+            self._record_mention_receipt(response_data)
 
             return True, comment_id, None, None, {
                 "parent_confirmed": parent_confirmed,
@@ -1467,30 +1670,10 @@ class PlaywrightHttpClient:
             # Устанавливаем referer через dynamic_params (не мутируем profile)
             referer_url = self._canonical_referer_url(video_url, self.runtime_profile)
             dynamic_params["referer"] = referer_url
-            dynamic_params["root_referer"] = referer_url
 
-        if "text_extra" not in dynamic_params and "@" in text:
-            from executor.http.mentions import find_mentions
-            if find_mentions(text):
-                try:
-                    from executor.http.mentions import prepare_mentions
-                    normalized_text, text_extra_json, mention_meta = await prepare_mentions(
-                        self.page, text, runtime_params=self.runtime_profile
-                    )
-                    if mention_meta.get("unresolved"):
-                        error_msg = f"Mentions unresolved: {mention_meta.get('unresolved')}. Aborting to avoid publishing unclickable plain text."
-                        logger.warning("[MENTION] %s | correlation_id=%s", error_msg, correlation_id)
-                        self.last_request_meta["mentions"] = mention_meta
-                        self.last_request_meta["request_attempted"] = False
-                        return False, None, error_msg, HttpErrorType.API_ERROR
-                    if text_extra_json and text_extra_json != "[]":
-                        dynamic_params["text"] = normalized_text
-                        dynamic_params["text_extra"] = text_extra_json
-                        self.last_request_meta["mentions"] = mention_meta
-                except Exception as exc:
-                    logger.warning("[MENTION] Error preparing mentions for main comment: %s", exc)
-                    self.last_request_meta["request_attempted"] = False
-                    return False, None, f"Mention preparation failed: {exc}", HttpErrorType.API_ERROR
+        mention_error = await self._prepare_publication_mentions(text, dynamic_params)
+        if mention_error:
+            return False, None, mention_error, HttpErrorType.API_ERROR
 
         request_runtime_profile = self._runtime_profile_for_request(proxy_country_code)
         success, response_data, error_msg, error_type = await self._execute_request(
@@ -1508,27 +1691,7 @@ class PlaywrightHttpClient:
                 return False, None, "Response OK but missing comment_id", HttpErrorType.API_ERROR
             self.last_request_meta["comment_author"] = _extract_comment_author(response_data)
             self.last_request_meta["comment_author_uid"] = _extract_comment_user_id(response_data)
-            if "mentions" in self.last_request_meta:
-                try:
-                    from executor.http.mentions import extract_response_mentions
-                    retained_uids = extract_response_mentions(response_data)
-                    self.last_request_meta["mentions"]["retained_uids"] = retained_uids
-                    if not retained_uids and self.last_request_meta["mentions"].get("resolved"):
-                        self.last_request_meta["mentions"]["stripped_by_server"] = True
-                        logger.warning(
-                            "[MENTION] Server accepted main comment %s but stripped text_extra! Target user might have restricted mentions.",
-                            comment_id[:20] if comment_id else "",
-                        )
-                    else:
-                        logger.info(
-                            "[MENTION] Main comment %s: requested=%s, resolved=%s, retained_uids=%s",
-                            comment_id[:20] if comment_id else "",
-                            self.last_request_meta["mentions"].get("requested"),
-                            self.last_request_meta["mentions"].get("resolved"),
-                            retained_uids,
-                        )
-                except Exception:
-                    pass
+            self._record_mention_receipt(response_data)
             return True, comment_id, None, None
         else:
             return False, None, error_msg, error_type

@@ -15,6 +15,7 @@ GEO_API_URLS = [
     "https://ipapi.co/{ip}/json/",  # Бесплатный, до 1000 запросов/день
     "https://ip-api.com/json/{ip}?fields=status,message,countryCode",  # Бесплатный, 45 req/min
 ]
+PROXY_PUBLIC_IP_URL = "https://api.ipify.org?format=json"
 
 
 async def detect_proxy_country(proxy_str: str, timeout: float = 10.0) -> Optional[str]:
@@ -28,86 +29,44 @@ async def detect_proxy_country(proxy_str: str, timeout: float = 10.0) -> Optiona
     Returns:
         str: код страны (ISO 3166-1 alpha-2, например "US", "UA") или None
     """
+    from ipaddress import ip_address
+    from services.proxy_normalizer import ProxyRoute
+    from aiohttp_socks import ProxyConnector
+
     try:
-        from services.proxy_service import normalize_proxy_url
-        from aiohttp_socks import ProxyConnector
-        from aiohttp import ClientTimeout, TCPConnector
-        
-        proxy_url = normalize_proxy_url(proxy_str)
-        parsed = urlparse(proxy_url)
-        proxy_type = parsed.scheme.lower()
-        
-        # Создаём connector
-        if proxy_type in ("socks5", "socks4"):
-            connector = ProxyConnector.from_url(proxy_url)
+        route = ProxyRoute.parse(proxy_str)
+        if route.scheme == "socks5":
+            connector = ProxyConnector.from_url(route.url)
             request_kwargs = {}
         else:
-            connector = TCPConnector()
-            request_kwargs = {"proxy": proxy_url}
-        
-        timeout_obj = ClientTimeout(total=timeout)
-        
-        async with aiohttp.ClientSession(connector=connector, timeout=timeout_obj) as session:
-            # Пробуем разные API по очереди
-            for api_url_template in GEO_API_URLS:
-                try:
-                    # Используем простой endpoint для получения нашего IP
-                    test_url = "https://api.ipify.org?format=json"
-                    async with session.get(test_url, **request_kwargs) as response:
-                        if response.status == 200:
-                            data = await response.json()
-                            ip = data.get("ip")
-                            if not ip:
+            connector = aiohttp.TCPConnector()
+            request_kwargs = {"proxy": route.url}
+        async with asyncio.timeout(timeout):
+            async with aiohttp.ClientSession(connector=connector, trust_env=False,
+                                             timeout=aiohttp.ClientTimeout(total=timeout)) as session:
+                async with session.get(PROXY_PUBLIC_IP_URL, **request_kwargs) as response:
+                    if response.status != 200:
+                        return None
+                    ip = str(ip_address((await response.json()).get("ip", "")))
+                for template in GEO_API_URLS:
+                    try:
+                        # Reuse the same routed session for both public IP and
+                        # country lookup. No direct fallback is allowed.
+                        async with session.get(template.format(ip=ip), **request_kwargs) as response:
+                            if response.status != 200:
                                 continue
-                            
-                            # Теперь определяем гео по IP
-                            geo_url = api_url_template.format(ip=ip)
-                            
-                            # Делаем запрос БЕЗ прокси (определяем гео по IP)
-                            async with aiohttp.ClientSession(timeout=timeout_obj) as geo_session:
-                                async with geo_session.get(geo_url) as geo_response:
-                                    if geo_response.status == 200:
-                                        geo_data = await geo_response.json()
-                                        
-                                        # Парсим ответ в зависимости от API
-                                        country_code = None
-                                        if "ipapi.co" in api_url_template:
-                                            country_code = geo_data.get("country_code")
-                                        elif "ip-api.com" in api_url_template:
-                                            if geo_data.get("status") == "success":
-                                                country_code = geo_data.get("countryCode")
-                                        elif "ipwho.is" in api_url_template:
-                                            country_code = geo_data.get("country_code")
-                                        elif "freeipapi.com" in api_url_template:
-                                            country_code = geo_data.get("countryCode")
-                                        elif "ipinfo.io" in api_url_template:
-                                            country_code = geo_data.get("country")
-                                        
-                                        if country_code:
-                                            country_code = country_code.upper()[:2]  # Безопасность: только 2 символа
-                                            logger.info(
-                                                "Detected proxy %s country: %s",
-                                                sanitize_url(proxy_str, max_length=80),
-                                                country_code,
-                                            )
-                                            return country_code
-                except Exception as e:
-                    logger.debug(f"Failed to detect country via {api_url_template}: {e}")
-                    continue
-            
-            logger.warning(
-                "Could not detect country for proxy %s",
-                sanitize_url(proxy_str, max_length=80),
-            )
-            return None
-            
-    except Exception as e:
-        logger.warning(
-            "Error detecting proxy country for %s: %s",
-            sanitize_url(str(proxy_str or ""), max_length=80),
-            e,
-        )
-        return None
+                            data = await response.json()
+                        if data.get("status") in {"fail", "error"} or data.get("success") is False:
+                            continue
+                        country = str(data.get("country_code") or data.get("countryCode") or data.get("country") or "").upper()
+                        if len(country) == 2 and country.isascii() and country.isalpha():
+                            logger.info("Detected proxy %s country: %s", sanitize_url(proxy_str, max_length=80), country)
+                            return country
+                    except (aiohttp.ClientError, ValueError, TypeError):
+                        continue
+    except Exception as exc:
+        logger.warning("Proxy geo lookup failed for %s: %s", sanitize_url(str(proxy_str or ""), max_length=80), type(exc).__name__)
+    return None
 
 
 async def detect_account_country_from_cookies(cookies_str: str) -> Optional[str]:

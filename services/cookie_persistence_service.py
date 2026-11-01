@@ -32,10 +32,12 @@ def _inject_web_identity_records(
     prev = previous if isinstance(previous, dict) else {}
 
     device_id = str(cached.get("device_id") or prev.get("device_id") or prev.get("device-id") or "").strip()
+    previous_device = str(prev.get("device_id") or prev.get("device-id") or "").strip()
+    device_changed = bool(cached.get("device_id") and device_id != previous_device)
     web_id_last_time = str(
         cached.get("web_id_last_time")
-        or prev.get("WebIdLastTime")
-        or prev.get("web_id_last_time")
+        or (prev.get("WebIdLastTime") if not device_changed else None)
+        or (prev.get("web_id_last_time") if not device_changed else None)
         or ""
     ).strip()
     odin_id = str(
@@ -53,15 +55,28 @@ def _inject_web_identity_records(
         identity_map["WebIdLastTime"] = web_id_last_time
     if odin_id:
         identity_map["odinId"] = odin_id
+    cached_fp = str(cached.get("verify_fp") or cached.get("s_v_web_id") or "").strip()
+    if cached_fp and not any(str(row.get("name") or "").lower() == "s_v_web_id" and row.get("value")
+                             and str(row.get("domain") or ".tiktok.com").lstrip(".").lower() in {"tiktok.com", "www.tiktok.com"}
+                             for row in (records or []) if isinstance(row, dict)):
+        # Persist a newly selected fallback once, before it can be lost on a
+        # restart. An observed native FP record keeps its original scope/flags.
+        identity_map["s_v_web_id"] = cached_fp
 
     if not identity_map:
         return list(records or []), identity_map
 
     meta_lower = {k.lower() for k in identity_map}
+    if device_changed and not web_id_last_time:
+        meta_lower.update({"webidlasttime", "web_id_last_time"})
     filtered = [
         dict(r)
         for r in (records or [])
-        if isinstance(r, dict) and str(r.get("name") or "").strip().lower() not in meta_lower
+        if isinstance(r, dict) and (
+            str(r.get("name") or "").strip().lower() not in meta_lower
+            or (str(r.get("name") or "").strip().lower() == "s_v_web_id"
+                and str(r.get("domain") or ".tiktok.com").lstrip(".").lower() not in {"tiktok.com", "www.tiktok.com"})
+        )
     ]
     for name, value in identity_map.items():
         filtered.append(
@@ -101,6 +116,10 @@ async def synchronize_browser_cookies(
         context=context,
         previous=previous,
     )
+    if identity_map.get("s_v_web_id"):
+        await context.add_cookies([row for row in merged_records if row.get("name") == "s_v_web_id"
+                                  and row.get("value") == identity_map["s_v_web_id"]
+                                  and row.get("domain") == ".tiktok.com"])
     cookies = normalize_cookie_records(merged_records)
     for k, v in identity_map.items():
         cookies[k] = v
@@ -174,9 +193,12 @@ def save_warmed_cookies_for_account(
         cookies_str = cookies_to_string(normalized_records)
         if cookies_str and hasattr(account, "cookies"):
             account.cookies = cookies_str
-        setattr(account, "_cookies_warmed_at", now_utc)
-        if hasattr(account, "last_validation_ok"):
-            account.last_validation_ok = now_utc
+        # Saving generated metadata is not authentication or token freshness.
+        # Only newly observed browser token values establish a warm-cookie time;
+        # the account-validation service owns last_validation_ok.
+        if cookies and any(cookies.get(name) and cookies.get(name) != previous.get(name)
+                           for name in ("ttwid", "tt_csrf_token", "msToken", "odin_tt")):
+            setattr(account, "_cookies_warmed_at", now_utc)
     return saved
 
 

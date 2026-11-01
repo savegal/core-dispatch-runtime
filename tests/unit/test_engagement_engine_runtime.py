@@ -11,6 +11,7 @@ def legacy_dom_mode(monkeypatch):
     """Legacy recovery cases opt out; HTTP cases enable the transport explicitly."""
     from config.settings import get_settings
     monkeypatch.setattr(get_settings(), "TIKTOK_NETWORK_FIRST", False)
+    monkeypatch.setattr("executor.user_schema._preflight_cookie_http_gate", AsyncMock(return_value=None))
 
 
 
@@ -35,6 +36,9 @@ class _WarmupContext:
 
     async def cookies(self):
         return list(self._cookies)
+
+    async def add_cookies(self, records):
+        self._cookies.extend(records)
 
     async def close(self):
         return None
@@ -1019,10 +1023,11 @@ async def test_bootstrap_timeout_with_login_auth_is_runtime_failure_not_reauth(d
 
 @pytest.mark.unit
 @pytest.mark.asyncio
-async def test_attempt_main_comment_marks_reauth_when_input_missing_and_browser_logged_out(db_session, monkeypatch):
+async def test_attempt_main_comment_cools_down_when_input_missing_and_login_ui_seen(db_session, monkeypatch):
     monkeypatch.setattr(engagement_engine.settings, "TIKTOK_NETWORK_FIRST", False)
     account = Account(id=30, label="main", status="active", cookies='{"sid_guard":"x","ttwid":"y"}', proxy="http://proxy-main")
     reauth_marks = []
+    cooldowns = []
 
     async def _fake_sleep(_seconds):
         return None
@@ -1063,6 +1068,7 @@ async def test_attempt_main_comment_marks_reauth_when_input_missing_and_browser_
     monkeypatch.setattr(engagement_engine, "_register_runtime_failure", lambda *args, **kwargs: None)
     monkeypatch.setattr(engagement_engine, "mark_needs_reauth", lambda *args, **kwargs: reauth_marks.append((args, kwargs)))
     monkeypatch.setattr(engagement_engine.asyncio, "sleep", _fake_sleep)
+    monkeypatch.setattr(engagement_engine, "mark_runtime_cooldown", lambda *a, **kw: cooldowns.append((a, kw)))
 
     comment_id, error, stage = await engagement_engine.attempt_main_comment_on_account(
         db_session,
@@ -1076,8 +1082,9 @@ async def test_attempt_main_comment_marks_reauth_when_input_missing_and_browser_
     assert comment_id is None
     assert error == "input_not_found: timeout"
     assert stage == "publish"
-    assert reauth_marks
-    assert reauth_marks[0][1]["reason"] == "input_not_found_logged_out"
+    assert not reauth_marks
+    assert cooldowns[0][0][2] == "input_not_found_logged_out"
+    assert cooldowns[0][1]["cooldown_minutes"] == 5
 
 
 @pytest.mark.unit
@@ -2476,7 +2483,10 @@ async def test_engagement_only_dynamic_capacity_defer_waits_before_reselecting(d
         parent = pending_parent[0]
         started.append(variant_index)
         if variant_index == 1:
-            await asyncio.wait_for(release_first_reply.wait(), timeout=2)
+            # The assertion below deliberately waits 1.8 seconds after
+            # capacity selection. Leave room for slower CI scheduling so the
+            # fake publisher cannot release the occupied proxy prematurely.
+            await asyncio.wait_for(release_first_reply.wait(), timeout=10)
         return user_schema.ReplyAttemptResult(
             replies=[
                 user_schema.ReplyOutcome(
@@ -3755,6 +3765,7 @@ async def test_warmup_page_for_http_uses_resolved_username_video_url(monkeypatch
         return True
 
     monkeypatch.setattr(engagement_engine, "wait_for_runtime_signer_ready", _fake_wait_for_runtime_signer_ready)
+    monkeypatch.setattr("executor.http.comment_discovery.fetch_comment_page", AsyncMock(return_value={"comments": []}))
     monkeypatch.setattr(engagement_engine, "log_tokens_safely", lambda *args, **kwargs: None)
     monkeypatch.setattr(engagement_engine.asyncio, "sleep", _fake_sleep)
 
@@ -3806,9 +3817,9 @@ async def test_warmup_page_for_http_rejects_missing_ttwid_independently_of_signe
 
     assert cookies_dict["sessionid"] == "session"
     assert profile_valid is False
-    assert warmup_info["reason_code"] == "missing_ttwid"
+    assert warmup_info["reason_code"] == "missing_critical_tokens"
     assert warmup_info["signer_ready"] is False
-    assert warmup_info["missing_critical"] == ["ttwid"]
+    assert set(warmup_info["missing_critical"]) == {"ttwid", "tt_csrf_token", "msToken", "signer_not_ready"}
     assert page.reload_calls == 0
 
 
@@ -3822,9 +3833,11 @@ async def test_warmup_page_for_http_waits_for_signer_even_with_early_ttwid(monke
             {"name": "sessionid", "value": "session"},
             {"name": "msToken", "value": "mstoken"},
             {"name": "ttwid", "value": "wid"},
+            {"name": "tt_csrf_token", "value": "csrf"},
         ]
     )
     signer_states = iter([False, True])
+    monkeypatch.setattr("executor.http.comment_discovery.fetch_comment_page", AsyncMock(return_value={"comments": []}))
 
     async def _fake_sleep(_seconds):
         return None

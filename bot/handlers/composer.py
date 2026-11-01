@@ -1,3 +1,4 @@
+from bot.services.order_creation_ui import current_order_transport_label, build_success_text
 from aiogram import Router, F
 from aiogram.types import Message, CallbackQuery, InlineKeyboardMarkup, InlineKeyboardButton
 from aiogram.fsm.context import FSMContext
@@ -14,6 +15,7 @@ from bot.services.error_handlers import get_task_creation_error_message
 from bot.services.formatting import Emoji
 from bot.services.likes_ui import LIKES_DISABLED_LABEL
 from bot.services.template_utils import normalize_text_variants_list
+from bot.services.mention_choice import ensure_mention_choice
 from bot.keyboards.composer import get_composer_keyboard, format_composer_summary
 from bot.keyboards.common import get_main_menu_keyboard, get_access_denied_keyboard
 # ИСПРАВЛЕНО: Используем отдельные состояния для композера, чтобы избежать конфликта с order_wizard
@@ -29,7 +31,13 @@ settings = get_settings()
 
 
 async def _format_composer_summary(draft) -> str:
-    return format_composer_summary(draft, likes_label=LIKES_DISABLED_LABEL)
+    return format_composer_summary(draft, likes_label=await _composer_likes_label(draft.replies),
+                                   transport_label=await current_order_transport_label(api_client))
+
+
+async def _composer_likes_label(replies) -> str:
+    from bot.services.likes_ui import get_likes_display_label_for_replies
+    return await get_likes_display_label_for_replies(replies)
 
 
 def _personal_pool_usable_count(summary: dict | None) -> int:
@@ -469,10 +477,8 @@ async def process_template_name(message: Message, state: FSMContext):
 
         draft = get_draft(user_id)
 
-        # Composer не собирает тексты ответов — шаблон создаётся без них
-        reply1 = None
-        reply2 = None
-        reply3 = None
+        replies = draft.replies
+        reply1, reply2, reply3 = (replies + [None] * 3)[:3]
 
         await api_client.create_task_template(
             user_id=user_backend_id,
@@ -482,6 +488,7 @@ async def process_template_name(message: Message, state: FSMContext):
             reply1=reply1,
             reply2=reply2,
             reply3=reply3,
+            replies=replies,
             likes=0,
             settings={
                 "delays": draft.delays,
@@ -554,11 +561,8 @@ async def submit_order(callback: CallbackQuery, state: FSMContext):
                 )
                 return
 
-        # Composer не собирает тексты ответов отдельно.
-        # Ответы подставляются только через шаблоны (quick_order / order_wizard).
-        reply1 = None
-        reply2 = None
-        reply3 = None
+        replies = draft.replies
+        reply1, reply2, reply3 = (replies + [None] * 3)[:3]
         text_variants = normalize_text_variants_list(draft.text_variants)
         if len(text_variants) < 3:
             # Composer не собирает 3 варианта main-комментария сам — это делается
@@ -579,8 +583,20 @@ async def submit_order(callback: CallbackQuery, state: FSMContext):
             )
             return
 
+        mention_choice = await ensure_mention_choice(
+            callback.message, state, [*text_variants, *replies], user_id=user_id,
+            resume="composer:submit", scope={"links": draft.links, "pool": draft.account_pool_mode,
+                "delays": draft.delays, "shuffle": draft.shuffle, "rotate_accounts": draft.rotate_accounts,
+                "reply_like_target": draft.reply_like_target, "reply_like_count": draft.reply_like_count,
+                "verify_main_visibility": draft.verify_main_visibility,
+                "verify_reply_visibility": draft.verify_reply_visibility},
+        )
+        if mention_choice is None:
+            return
+
         # Создаём задачу
         settings = {
+            "mention_mode": mention_choice.mode,
             "delays": draft.delays,
             "shuffle": draft.shuffle,
             "rotate_accounts": draft.rotate_accounts,
@@ -590,6 +606,11 @@ async def submit_order(callback: CallbackQuery, state: FSMContext):
             "reply_like_count": draft.reply_like_count,
             "origin": "composer"  # REFACTOR: Указываем источник заказа
         }
+        settings.update(replies=replies, reply_count=len(replies),
+                        verify_main_visibility=draft.verify_main_visibility,
+                        verify_reply_visibility=draft.verify_reply_visibility)
+        if draft.template_id:
+            settings.update(template_id=draft.template_id, template_name=draft.template_name)
 
         await callback.message.edit_text("Создание заказа...")
 
@@ -601,24 +622,26 @@ async def submit_order(callback: CallbackQuery, state: FSMContext):
             reply1=reply1,
             reply2=reply2,
             reply3=reply3,
+            replies=replies,
             likes=0,
-            settings=settings
+            settings=settings,
+            **mention_choice.request_kwargs,
         )
 
         task_id = result.get("task_id")
         reset_draft(user_id)
+        await state.clear()
 
-        from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup
-        
         if not callback.message:
             await callback.answer("Ошибка: сообщение не найдено", show_alert=True)
             return
         
         await callback.message.edit_text(
-            f"✅ *Заказ создан*\n\n"
-            f"📋 ID: `{task_id}`\n"
-            f"📊 Статус: в очереди\n\n"
-            f"Заказ добавлен в очередь.",
+            build_success_text(task_id=task_id, links_count=len(draft.links),
+                               reply_count=len(replies),
+                               variants_count=len(text_variants),
+                               likes_label=await _composer_likes_label(replies),
+                               transport_mode=result.get("order_transport_mode")),
             reply_markup=InlineKeyboardMarkup(inline_keyboard=[
                 [InlineKeyboardButton(text="👁 Посмотреть заказ", callback_data=f"order:detail:{task_id}")],
                 [InlineKeyboardButton(text="➕ Создать ещё", callback_data="menu:new_order")],

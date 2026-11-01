@@ -129,12 +129,13 @@ def format_template_preview(
     edited_text_variants: list[str] | None = None,
     edited_replies: dict | None = None,
     likes_label: str = "выключены",
+    transport_label: str | None = None,
 ) -> str:
     """
     Форматирует предпросмотр шаблона.
     """
     name = template.get("name") or "Без названия"
-    safe_name = escape_markdown_simple(str(name))
+    safe_name = escape_markdown_simple(str(name)[:80])
     text_variants = edited_text_variants or template_text_variants(template)
     if edited_comment is not None and not edited_text_variants:
         text_variants = [edited_comment] if edited_comment else []
@@ -142,7 +143,9 @@ def format_template_preview(
     main_comment = text_variants[0] if text_variants else template.get("main_comment", "")
     replies_source = template_replies(template)
     if edited_replies is not None:
-        replies_source = [edited_replies[idx] for idx in sorted(edited_replies.keys()) if edited_replies.get(idx)]
+        from bot.services.template_utils import replies_dict_to_list
+        replies_source = replies_dict_to_list(edited_replies)
+    reply_count = min(max(0, reply_count), len(replies_source))
 
     comment_lines = []
     for idx, variant in enumerate(text_variants[:3], start=1):
@@ -151,16 +154,20 @@ def format_template_preview(
     text = (
         "*Проверьте заказ*\n\n"
         f"📑 Шаблон: *{safe_name}*\n"
-        f"💬 Комментарий: *{len(text_variants) if text_variants else 1} вариант(а)*\n"
+        f"💬 Вариантов комментария: *{len(text_variants) if text_variants else 1}*\n"
         f"↩️ Ответов: *{reply_count}*\n"
         f"❤️ Лайки: *{escape_markdown_simple(likes_label)}*\n\n"
         "*Комментарий*\n"
         f"{chr(10).join(comment_lines) if comment_lines else _mono_preview(main_comment, 120)}"
     )
+    if transport_label:
+        text = text.replace("\n\n*Комментарий*", f"\nРежим: *{escape_markdown_simple(transport_label)}*\n\n*Комментарий*", 1)
 
     replies = []
-    for idx, reply in enumerate(replies_source[:reply_count], start=1):
+    for idx, reply in enumerate(replies_source[:min(reply_count, 6)], start=1):
         replies.append(f"{idx}. {_mono_preview(reply, 80)}")
+    if reply_count > 6:
+        replies.append(f"… и ещё {reply_count - 6}")
 
     if replies:
         text += "\n\n*Ответы*\n" + "\n".join(replies)

@@ -84,7 +84,10 @@ def normalize_text_variants_list(items: list[str] | None) -> list[str]:
 
 def replies_dict_to_list(replies: dict[int, str] | None) -> list[str]:
     values: list[str] = []
-    for idx in sorted((replies or {}).keys()):
+    def position(key):
+        value = str(key)
+        return (0, int(value)) if value.isdigit() else (1, value)
+    for idx in sorted((replies or {}).keys(), key=position):
         normalized = normalize_user_text((replies or {}).get(idx))
         if has_meaningful_text(normalized):
             values.append(normalized or "")

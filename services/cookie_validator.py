@@ -8,6 +8,7 @@ import asyncio
 import logging
 import json
 import math
+import hashlib
 import re
 from datetime import datetime, timezone
 from typing import Dict, List, Any, Optional, Tuple
@@ -51,9 +52,9 @@ def _sid_guard_parts(value: str) -> Tuple[str, int]:
 
 
 def _restore_session_cookies(cookies: Dict[str, str]) -> Dict[str, str]:
-    if any(name.lower() in {"sessionid", "sid_tt", "sessionid_ss"} for name in cookies):
+    if any(name in {"sessionid", "sid_tt", "sessionid_ss"} for name in cookies):
         return cookies
-    guard = next((value for name, value in cookies.items() if name.lower() == "sid_guard"), "")
+    guard = cookies.get("sid_guard", "")
     prefix, timestamp = _sid_guard_parts(guard)
     if timestamp <= 0 or not re.fullmatch(r"[0-9a-fA-F]{32}", prefix):
         return cookies
@@ -79,9 +80,9 @@ def normalize_cookie_records(records: List[dict]) -> NormalizedCookies:
         record = {**cookie, "name": name, "value": value}
         expiry = _cookie_expiry(cookie)
         expiry_rank = (expiry < _SYNTHETIC_COOKIE_EXPIRY, expiry if 0 < expiry < _SYNTHETIC_COOKIE_EXPIRY else 0)
-        rank = (_sid_guard_parts(value)[1], *expiry_rank) if name.lower() == "sid_guard" else expiry_rank
+        rank = (_sid_guard_parts(value)[1], *expiry_rank) if name == "sid_guard" else expiry_rank
         domain = str(cookie.get("domain") or "").strip().lower().lstrip(".")
-        if name.lower() in {"mstoken", "ttwid", "tt_csrf_token"}:
+        if name in {"msToken", "ttwid", "tt_csrf_token"}:
             # Exported 2038 expirations are not freshness evidence. Within the
             # web domain prefer the latest real/session cookie, even if its
             # lifetime is shorter than the previously stored value.
@@ -93,8 +94,11 @@ def normalize_cookie_records(records: List[dict]) -> NormalizedCookies:
             scoped_records.pop(scope, None)
             scoped_records[scope] = record
             scoped_ranks[scope] = rank
-        if name.lower() == "mstoken":
+        if name == "msToken":
             # Subdomain cookies (ads/shop/livecenter, etc.) do not apply to www.
+            if domain and domain not in {"www.tiktok.com", "tiktok.com"}:
+                continue
+        if name in {"sessionid", "sessionid_ss", "sid_tt", "sid_guard"}:
             if domain and domain not in {"www.tiktok.com", "tiktok.com"}:
                 continue
         if name not in result or rank >= best_rank[name]:
@@ -102,6 +106,39 @@ def normalize_cookie_records(records: List[dict]) -> NormalizedCookies:
             best_rank[name] = rank
     result.records = list(scoped_records.values())
     return _restore_session_cookies(result)
+
+
+def _ms_token_fingerprint(value: Any) -> str:
+    return hashlib.sha256(str(value).encode()).hexdigest() if value else ""
+
+
+def remember_imported_ms_token(context: Any, records: List[dict]) -> None:
+    """Keep provenance outside browser cookies; an import is not server evidence."""
+    context._http_imported_ms_token_fingerprint = _ms_token_fingerprint(normalize_cookie_records(records).get("msToken"))
+    context._http_observed_ms_token_fingerprint = ""
+
+
+def remember_observed_ms_token(context: Any, cookies: Dict[str, str]) -> None:
+    fingerprint = _ms_token_fingerprint(cookies.get("msToken"))
+    if fingerprint:
+        context._http_observed_ms_token_fingerprint = fingerprint
+
+
+def ms_token_needs_browser_refresh(context: Any, cookies: Dict[str, str], account: Any = None) -> bool:
+    """Require one live read for an unchanged imported token in this context."""
+    imported = getattr(context, "_http_imported_ms_token_fingerprint", None)
+    if imported is None:
+        # Minimal adapters may not go through BrowserPool. Real contexts record
+        # the baseline at import, before cookie persistence can change account.
+        source = get_cookies_for_account(account) if account is not None else ""
+        parsed = normalize_cookie_records(source) if isinstance(source, list) else parse_cookies_to_dict(source)
+        imported = _ms_token_fingerprint(parsed.get("msToken"))
+        context._http_imported_ms_token_fingerprint = imported
+    current = _ms_token_fingerprint(cookies.get("msToken"))
+    if current and current != imported:
+        remember_observed_ms_token(context, cookies)
+    return bool(imported and current == imported
+                and getattr(context, "_http_observed_ms_token_fingerprint", "") != current)
 
 
 def account_has_fresh_antifraud_cookies(account: Any, *, max_age_minutes: float = 30.0) -> bool:
@@ -164,12 +201,14 @@ def normalize_cookies_for_browser(
         name = record["name"]
         if drop_stale_antifraud and name.lower() in stale_antifraud_names:
             continue
-        if drop_stale_antifraud and name.lower() == "mstoken" and _cookie_expiry(record) >= _SYNTHETIC_COOKIE_EXPIRY:
-            continue
-        if name.lower() in {"mstoken", "sid_guard"} and record["value"] != cookies.get(name):
+        if name in {"msToken", "sid_guard"} and record["value"] != cookies.get(name):
             continue
         domain = str(record.get("domain") or ".tiktok.com").strip().lower()
-        if name.lower() == "mstoken" and domain.lstrip(".") not in {"tiktok.com", "www.tiktok.com"}:
+        if domain == "tiktok.com" and name in {"sid_guard", "sessionid", "sessionid_ss", "sid_tt", "msToken", "tt-target-idc"}:
+            # Imported root-host auth must reach the www web session too.
+            # Keep original records intact; only normalize the browser import.
+            domain = ".tiktok.com"
+        if name == "msToken" and domain.lstrip(".") not in {"tiktok.com", "www.tiktok.com"}:
             continue
         # Whitelist browser attributes: hostOnly/session/export fields are not
         # accepted by add_cookies; domain notation already encodes host scope.
@@ -186,7 +225,9 @@ def normalize_cookies_for_browser(
             expiry = record.get("expires", record.get("expirationDate", record.get("expiration")))
             try:
                 expiry = float(expiry)
-                if math.isfinite(expiry):
+                # An export's 2038 sentinel says nothing about the token value.
+                # Import it as a session cookie; do not claim years of validity.
+                if math.isfinite(expiry) and not (name == "msToken" and expiry >= _SYNTHETIC_COOKIE_EXPIRY):
                     cookie["expires"] = expiry if expiry > 0 else -1
             except (TypeError, ValueError):
                 pass
@@ -221,46 +262,65 @@ def prepare_cookies_for_context(
     preserve_fresh = account_has_fresh_antifraud_cookies(account, max_age_minutes=max_age_minutes)
     if isinstance(cookies_source, list):
         records = [dict(r) for r in cookies_source if isinstance(r, dict)]
-        return normalize_cookies_for_browser(
-            records,
-            drop_stale_antifraud=True,
-            preserve_fresh_tokens=preserve_fresh,
-        )
-    cookies_str = str(cookies_source or "")
-    records: List[dict] = []
-    if parse_fn is not None and cookies_str:
-        records = list(parse_fn(cookies_str) or [])
-    elif cookies_str:
-        parsed_dict = parse_cookies_to_dict(cookies_str)
-        records = list(
-            getattr(parsed_dict, "records", None)
-            or [
-                {"name": k, "value": v, "domain": ".tiktok.com", "path": "/"}
-                for k, v in parsed_dict.items()
-            ]
-        )
-    if preserve_fresh and cookies_str:
+    else:
+        cookies_str = str(cookies_source or "")
+        records = []
+        if parse_fn is not None and cookies_str:
+            records = list(parse_fn(cookies_str) or [])
+        elif cookies_str:
+            parsed_dict = parse_cookies_to_dict(cookies_str)
+            records = list(
+                getattr(parsed_dict, "records", None)
+                or [
+                    {"name": k, "value": v, "domain": ".tiktok.com", "path": "/"}
+                    for k, v in parsed_dict.items()
+                ]
+            )
+        if preserve_fresh and cookies_str:
+            try:
+                raw_data = json.loads(cookies_str)
+                raw_records: List[dict] = []
+                if isinstance(raw_data, list):
+                    raw_records = [r for r in raw_data if isinstance(r, dict)]
+                elif isinstance(raw_data, dict):
+                    if isinstance(raw_data.get("cookies"), list):
+                        raw_records = [r for r in raw_data["cookies"] if isinstance(r, dict)]
+                    else:
+                        raw_records = [
+                            {"name": str(k), "value": str(v), "domain": ".tiktok.com", "path": "/"}
+                            for k, v in raw_data.items()
+                            if k and v is not None and not isinstance(v, (dict, list))
+                        ]
+                existing_names = {str(r.get("name") or "").lower() for r in records if isinstance(r, dict)}
+                for r in raw_records:
+                    r_name = str(r.get("name") or "").lower()
+                    if r_name in {"ttwid", "tt_csrf_token", "odin_tt", "s_v_web_id", "mstoken"} and r_name not in existing_names:
+                        records.append(r)
+            except Exception:
+                pass
+
+    existing_cookie_names = {str(r.get("name") or "").lower() for r in records if isinstance(r, dict)}
+    if "s_v_web_id" not in existing_cookie_names:
         try:
-            raw_data = json.loads(cookies_str)
-            raw_records: List[dict] = []
-            if isinstance(raw_data, list):
-                raw_records = [r for r in raw_data if isinstance(r, dict)]
-            elif isinstance(raw_data, dict):
-                if isinstance(raw_data.get("cookies"), list):
-                    raw_records = [r for r in raw_data["cookies"] if isinstance(r, dict)]
-                else:
-                    raw_records = [
-                        {"name": str(k), "value": str(v), "domain": ".tiktok.com", "path": "/"}
-                        for k, v in raw_data.items()
-                        if k and v is not None and not isinstance(v, (dict, list))
-                    ]
-            existing_names = {str(r.get("name") or "").lower() for r in records if isinstance(r, dict)}
-            for r in raw_records:
-                r_name = str(r.get("name") or "").lower()
-                if r_name in {"ttwid", "tt_csrf_token", "odin_tt", "s_v_web_id", "mstoken"} and r_name not in existing_names:
-                    records.append(r)
-        except Exception:
-            pass
+            from executor.device_profiles import _account_seed_key
+            from executor.http.request_profile import generate_tiktok_verify_fp
+            from executor.http.playwright_http_client import cache_web_identity, get_cached_web_identity
+            seed = _account_seed_key(account) if account is not None else None
+            cached = get_cached_web_identity(getattr(account, "id", None), account=account)
+            vfp = cached.get("verify_fp") or cached.get("s_v_web_id") or generate_tiktok_verify_fp(seed)
+            records.append({
+                "name": "s_v_web_id",
+                "value": vfp,
+                "domain": ".tiktok.com",
+                "path": "/",
+                "secure": True,
+                "httpOnly": False,
+            })
+            if account is not None:
+                cache_web_identity(getattr(account, "id", None), {"verify_fp": vfp, "s_v_web_id": vfp}, account=account)
+        except Exception as exc:
+            logger.debug(f"Failed to inject persistent s_v_web_id for context: {exc}")
+
     return normalize_cookies_for_browser(
         records,
         drop_stale_antifraud=True,
@@ -318,6 +378,96 @@ def parse_cookies_to_dict(raw: str) -> Dict[str, str]:
                 result[key] = value
     
     return _restore_session_cookies(result)
+
+
+HOT_WEB_READY = 2
+WARM_AUTH_READY = 1
+COLD_NEEDS_BOOTSTRAP = 0
+
+
+def classify_account_web_readiness(cookies_input: str | list | dict | None) -> int:
+    """Rank available web material, without treating a guard as live session proof."""
+    if isinstance(cookies_input, NormalizedCookies) and cookies_input.records:
+        cookies_input = cookies_input.records
+    if isinstance(cookies_input, str):
+        try:
+            cookies_input = json.loads(cookies_input)
+        except (TypeError, ValueError):
+            cookies_input = {name.strip(): value.strip() for part in cookies_input.split(";") if "=" in part
+                             for name, value in [part.split("=", 1)] if name.strip()}
+    if isinstance(cookies_input, dict):
+        if isinstance(cookies_input.get("cookies"), list):
+            cookies_input = cookies_input["cookies"]
+        else:
+            cookies_input = [{"name": name, "value": value} for name, value in cookies_input.items()
+                             if value is not None and not isinstance(value, (dict, list))]
+    if not isinstance(cookies_input, list):
+        return COLD_NEEDS_BOOTSTRAP
+    now = datetime.now(timezone.utc).timestamp()
+    records = [item for item in cookies_input if isinstance(item, dict)
+               and not 0 < _cookie_expiry(item) <= now]
+    cookies = normalize_cookie_records(records)
+    # normalize_cookie_records can restore compatibility aliases from sid_guard;
+    # only explicit, nonempty session cookies qualify for HOT_WEB_READY.
+    explicit_names = {str(item.get("name") or item.get("Name") or item.get("key") or "") for item in records
+                      if str(item.get("domain") or "").lower().lstrip(".") in {"", "tiktok.com", "www.tiktok.com"}}
+    has_session = any(name in explicit_names and str(cookies.get(name) or "").strip()
+                      for name in ("sessionid", "sessionid_ss", "sid_tt"))
+    if (has_session and cookies.get("ttwid") and (cookies.get("tt_csrf_token") or cookies.get("ctoken"))
+            and cookies.get("msToken")):
+        return HOT_WEB_READY
+    prefix, timestamp = _sid_guard_parts(cookies.get("sid_guard", ""))
+    has_guard = timestamp > 0 and bool(re.fullmatch(r"[0-9a-fA-F]{32}", prefix))
+    if (has_session or has_guard) and cookies.get("ttwid"):
+        return WARM_AUTH_READY
+    return COLD_NEEDS_BOOTSTRAP
+
+
+def has_guard_session_auth(raw: str) -> bool:
+    """Recognize guard-compatible session aliases, never proof of live auth.
+
+    Browser enrichment can add ttwid/CSRF without changing these session keys.
+    Such an import still needs bounded browser verification if Passport is unknown.
+    """
+    parsed = parse_cookies_to_dict(raw)
+    prefix, timestamp = _sid_guard_parts(parsed.get("sid_guard", ""))
+    return bool(timestamp > 0 and re.fullmatch(r"[0-9a-fA-F]{32}", prefix)
+                and all(parsed.get(name) == prefix for name in ("sessionid", "sid_tt", "sessionid_ss")))
+
+
+def has_guard_only_auth(raw: str) -> bool:
+    """Identify a minimal guard import, including its exact compatibility aliases.
+
+    This identifies a bootstrap candidate; it does not establish authentication.
+    """
+    if not isinstance(raw, str) or not raw.strip():
+        return False
+    parsed = parse_cookies_to_dict(raw)
+    guard = parsed.get("sid_guard", "")
+    prefix, timestamp = _sid_guard_parts(guard)
+    if timestamp <= 0 or not re.fullmatch(r"[0-9a-fA-F]{32}", prefix):
+        return False
+    try:
+        original = json.loads(raw)
+    except (ValueError, TypeError):
+        names = {part.partition("=")[0].strip() for part in raw.split(";") if "=" in part}
+    else:
+        if isinstance(original, dict) and isinstance(original.get("cookies"), list):
+            original = original["cookies"]
+        if isinstance(original, list):
+            names = {str(item.get("name") or item.get("Name") or item.get("key") or "")
+                     for item in original if isinstance(item, dict)}
+        elif isinstance(original, dict):
+            names = {str(name) for name in original}
+        else:
+            return False
+    if "sid_guard" not in names:
+        return False
+    explicit = names.intersection({"sessionid", "sid_tt", "sessionid_ss"})
+    if not explicit:
+        return True
+    return (all(parsed.get(name) == prefix for name in explicit)
+            and not (parsed.get("ttwid") and parsed.get("tt_csrf_token")))
 
 
 def get_cookies_for_account(account: Account) -> str:
@@ -390,36 +540,20 @@ def _inconclusive_result(error: str, *, country_code: Optional[str] = None) -> d
     return _result(status="inconclusive", valid=False, error=error, country_code=country_code, definitive=False)
 
 
-def _normalize_proxy_for_aiohttp(proxy_raw: Optional[str]) -> Tuple[Optional[str], Optional[str]]:
-    """Return (proxy_url, reason_if_unsupported).
-
-    We only use the HTTP probe as a hard negative gate when it uses the same
-    network path as the browser. For SOCKS proxies we require aiohttp_socks;
-    without it the caller must treat the HTTP probe as inconclusive.
-    """
-    proxy = (proxy_raw or "").strip()
-    if not proxy:
+def _normalize_proxy_for_aiohttp(proxy_raw):
+    from services.proxy_normalizer import ProxyRoute, ProxyRouteError
+    if not str(proxy_raw or '').strip():
         return None, None
-    lower = proxy.lower()
-    if lower.startswith(("socks4://", "socks5://")):
+    try:
+        route = ProxyRoute.parse(proxy_raw)
+    except ProxyRouteError as exc:
+        return None, str(exc)
+    if route.scheme == 'socks5':
         try:
-            import aiohttp_socks  # noqa: F401
-        except Exception:
-            return None, "socks_proxy_requires_aiohttp_socks"
-        return proxy, None
-    if lower.startswith(("http://", "https://")):
-        return proxy, None
-    if "@" in proxy:
-        return f"http://{proxy}", None
-    parts = proxy.split(":")
-    if len(parts) == 4:
-        host, port, user, password = parts
-        if host and port and user:
-            return f"http://{user}:{password}@{host}:{port}", None
-    if len(parts) == 2:
-        return f"http://{proxy}", None
-    return None, "unsupported_proxy_format"
-
+            import aiohttp_socks
+        except ImportError:
+            return None, 'socks_proxy_requires_aiohttp_socks'
+    return route.url, None
 
 def _html_has_logged_out_marker(text: str) -> Optional[str]:
     lowered = (text or "").lower()
@@ -472,11 +606,13 @@ async def _validate_account_http_tri_state(account: Account, *, strict_passport:
     if not has_session:
         return _dead_result("Missing session cookies", country_code=country_code)
 
-    from services.dedicated_proxy_service import get_current_dedicated_proxy
-    dedicated = get_current_dedicated_proxy()
-    proxy_url, proxy_error = _normalize_proxy_for_aiohttp(
-        dedicated.proxy if dedicated else getattr(account, "proxy", None) if get_settings().USE_PROXY else None
-    )
+    from services.proxy_normalizer import account_proxy_route, ProxyRouteError
+    try:
+        route = account_proxy_route(account)
+    except ProxyRouteError as exc:
+        return {**_inconclusive_result(str(exc), country_code=country_code),
+                "category": "proxy_route", "request_attempted": False}
+    proxy_url, proxy_error = _normalize_proxy_for_aiohttp(route.url if route else None)
     if proxy_error:
         return _inconclusive_result(proxy_error, country_code=country_code)
 
@@ -569,16 +705,6 @@ async def _validate_account_http_tri_state(account: Account, *, strict_passport:
                                     if re.fullmatch(r"[A-Z]{2}", norm_region):
                                         country_code = norm_region
                                         break
-                            if country_code and account is not None and not getattr(account, "country_code", None):
-                                try:
-                                    account.country_code = country_code
-                                    from sqlalchemy.orm import object_session
-                                    sess = object_session(account)
-                                    if sess is not None:
-                                        sess.add(account)
-                                        sess.commit()
-                                except Exception:
-                                    pass
                             if message == "success" and (username or user_id):
                                 logger.info("[VALIDATE] Account %s: VALID (passport API)", getattr(account, "id", "?"))
                                 return _valid_result(username=username, user_id=user_id, country_code=country_code)
@@ -588,11 +714,7 @@ async def _validate_account_http_tri_state(account: Account, *, strict_passport:
                                 # unconfirmed passport responses immediately skip browser launch.
                                 if message in {"not logged in", "login required", "session expired", "invalid session", "not authenticated"}:
                                     return _dead_result(f"Not authenticated: {message}", country_code=country_code)
-                                if strict_passport:
-                                    return _dead_result("Passport response did not confirm authentication", country_code=country_code)
                                 return _inconclusive_result("Passport response did not confirm authentication", country_code=country_code)
-                            if strict_passport:
-                                return _dead_result("Passport response did not confirm authentication", country_code=country_code)
                     elif resp.status in (429, 503):
                         return _inconclusive_result(f"HTTP challenge/rate-limit {resp.status}", country_code=country_code)
             except (aiohttp.ClientError, asyncio.TimeoutError) as exc:
@@ -632,13 +754,16 @@ async def validate_account_http(account: Account, *, strict_passport: bool = Fal
             "country_code": str | None  # Определенный код страны
         }
     """
-    res = await _validate_account_http_tri_state(account, strict_passport=strict_passport)
-    detected_cc = res.get("country_code")
-    if detected_cc and account is not None and not getattr(account, "country_code", None):
-        try:
-            account.country_code = str(detected_cc).strip().upper()
-        except Exception:
-            pass
+    from services.proxy_normalizer import account_proxy_route, ProxyRouteError
+    from services.proxy_concurrency_service import proxy_operation
+    try:
+        route = account_proxy_route(account)
+        async with proxy_operation(route.url if route else None):
+            res = await _validate_account_http_tri_state(account, strict_passport=strict_passport)
+    except ProxyRouteError as exc:
+        return {**_inconclusive_result(str(exc)), "category": "proxy_route", "request_attempted": False}
+    # Network validation returns metadata. Its caller owns ORM mutations and
+    # commit/rollback; a failed hidden commit must not poison that Session.
     return res
 
 
@@ -830,7 +955,7 @@ def validate_cookies(cookies_raw: str) -> CookieValidationResult:
             )
         
         # Создаём нормализованную JSON-строку
-        normalized_cookies = json.dumps(cookies_dict, ensure_ascii=False, separators=(',', ':'))
+        normalized_cookies = json.dumps(getattr(cookies_dict, "records", None) or cookies_dict, ensure_ascii=False, separators=(',', ':'))
         
         # Создаём уникальный ключ на основе ключевых cookies
         key_parts = []
