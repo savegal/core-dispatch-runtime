@@ -727,6 +727,11 @@ async def _extract_runtime_profile(page: Page) -> Dict[str, Any]:
                 setattr(context, "_account_ssr_region", ssr_region)
             except Exception:
                 pass
+        if account_obj is not None:
+            # Keep verified page SSR evidence available to the country resolver.
+            # The extraction is read-only for the ORM; persistence is handled
+            # by the normal account service rather than a browser callback.
+            setattr(account_obj, "_account_ssr_region", ssr_region)
     else:
         profile.pop("ssr_region", None)
     proxy_in_use = getattr(context, "_account_proxy_in_use", None)
