@@ -21,6 +21,10 @@ on:
 jobs:
   regression:
     runs-on: ubuntu-latest
+    env:
+      # Disposable test-only values; never used by a deployed executor.
+      EXECUTOR_API_TOKEN: "isolated-ci-executor-token-value-2026"
+      JWT_SECRET: "isolated-ci-jwt-value-for-unit-tests-2026"
     timeout-minutes: 20
     steps:
       - uses: actions/checkout@v4
