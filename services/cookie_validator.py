@@ -710,16 +710,22 @@ async def _validate_account_http_tri_state(account: Account, *, strict_passport:
                         user_data = data.get("data") if isinstance(data.get("data"), dict) else {}
                         username = str(user_data.get("username") or user_data.get("unique_id") or "").strip() or None
                         user_id = str(user_data.get("user_id_str") or user_data.get("user_id") or user_data.get("uid") or "").strip() or None
-                        for region_key in ("region", "country_code", "priority_region", "store_region", "iso_country_code"):
-                            raw_region = user_data.get(region_key) or data.get(region_key)
-                            if raw_region:
-                                norm_region = str(raw_region).strip().upper()
-                                if re.fullmatch(r"[A-Z]{2}", norm_region):
-                                    country_code = norm_region
-                                    break
+                        from services.geo_detection_service import _trusted_country_code
+                        passport_country = next((
+                            code for key in ("region", "country_code", "priority_region", "store_region", "iso_country_code")
+                            if (code := _trusted_country_code(user_data.get(key) or data.get(key)))
+                        ), None)
                         if message == "success" and (username or user_id):
                             logger.info("[VALIDATE] Account %s: VALID (passport API via curl_cffi)", getattr(account, "id", "?"))
-                            return _valid_result(username=username, user_id=user_id, country_code=country_code)
+                            if passport_country:
+                                # Evidence is trusted only after an authenticated success.
+                                # Let the caller commit; never overwrite a stored DB country.
+                                account._passport_country_code = passport_country
+                            stored_country = getattr(account, "country_code", None)
+                            return _valid_result(
+                                username=username, user_id=user_id,
+                                country_code=stored_country or passport_country or country_code,
+                            )
                         if message and message != "success":
                             if message in {"not logged in", "login required", "session expired", "invalid session", "not authenticated"}:
                                 return _dead_result(f"Not authenticated: {message}", country_code=country_code)
@@ -752,16 +758,22 @@ async def _validate_account_http_tri_state(account: Account, *, strict_passport:
                             user_data = data.get("data") if isinstance(data.get("data"), dict) else {}
                             username = str(user_data.get("username") or user_data.get("unique_id") or "").strip() or None
                             user_id = str(user_data.get("user_id_str") or user_data.get("user_id") or user_data.get("uid") or "").strip() or None
-                            for region_key in ("region", "country_code", "priority_region", "store_region", "iso_country_code"):
-                                raw_region = user_data.get(region_key) or data.get(region_key)
-                                if raw_region:
-                                    norm_region = str(raw_region).strip().upper()
-                                    if re.fullmatch(r"[A-Z]{2}", norm_region):
-                                        country_code = norm_region
-                                        break
+                            from services.geo_detection_service import _trusted_country_code
+                            passport_country = next((
+                                code for key in ("region", "country_code", "priority_region", "store_region", "iso_country_code")
+                                if (code := _trusted_country_code(user_data.get(key) or data.get(key)))
+                            ), None)
                             if message == "success" and (username or user_id):
                                 logger.info("[VALIDATE] Account %s: VALID (passport API)", getattr(account, "id", "?"))
-                                return _valid_result(username=username, user_id=user_id, country_code=country_code)
+                                if passport_country:
+                                # Evidence is trusted only after an authenticated success.
+                                # Let the caller commit; never overwrite a stored DB country.
+                                account._passport_country_code = passport_country
+                            stored_country = getattr(account, "country_code", None)
+                            return _valid_result(
+                                username=username, user_id=user_id,
+                                country_code=stored_country or passport_country or country_code,
+                            )
                             if message and message != "success":
                                 # TikTok also returns generic `error` for challenges and
                                 # incomplete HTTP context; in strict HTTP-first mode,
