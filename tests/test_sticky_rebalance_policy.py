@@ -108,3 +108,18 @@ def test_deleted_source_allows_reassignment(make_case):
     result = _rebalance(db)
     assert account.proxy == RAW_MOBILE
     assert result["changed"] == 1
+
+
+def test_type_filter_does_not_release_an_active_residential_pin(make_case):
+    db, account = make_case()
+    original = account.proxy
+    result = _rebalance(db, force_proxy_type_filter="mobile")
+    assert account.proxy == original
+    assert result["pinned_outside_active_pool"] == 1
+
+
+def test_rebalancing_does_not_infer_account_country_from_proxy(make_case):
+    db, account = make_case(gateway_status="bad", account_country=None)
+    _rebalance(db)
+    assert account.proxy == RAW_MOBILE
+    assert account.country_code is None
