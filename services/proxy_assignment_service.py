@@ -5,7 +5,7 @@ import logging
 import time
 from collections import defaultdict
 from sqlalchemy.orm import Session
-from sqlalchemy import and_, or_
+from sqlalchemy import and_, or_, func
 from db.models import Account, Proxy
 from typing import Any, Dict, Optional
 from config.settings import get_settings
@@ -45,7 +45,7 @@ def invalidate_proxy_cache():
 
 
 def _is_mobile_proxy(proxy_obj: Proxy) -> bool:
-    return str(proxy_obj.is_mobile or "").upper() == "Y"
+    return str(proxy_obj.is_mobile or "").strip().upper() == "Y"
 
 
 def _normalize_proxy_type_filter(value: Optional[str]) -> Optional[str]:
@@ -77,9 +77,9 @@ def _get_active_proxies(
         Proxy.dedicated_user_id.is_(None),
     )
     if normalized_force_filter == "mobile":
-        query = query.filter(Proxy.is_mobile == "Y")
+        query = query.filter(func.upper(func.trim(Proxy.is_mobile)) == "Y")
     elif normalized_force_filter == "residential":
-        query = query.filter(Proxy.is_mobile != "Y")
+        query = query.filter(or_(Proxy.is_mobile.is_(None), func.upper(func.trim(Proxy.is_mobile)) != "Y"))
     else:
         query = apply_proxy_type_filter(query, db)
     return query.order_by(Proxy.created_at.asc(), Proxy.id.asc()).all(), normalized_force_filter
@@ -255,6 +255,7 @@ def rebalance_working_account_proxies(
         len(eligible_items),
         mobile_weight=effective_mobile_weight,
     )
+    from services.proxy_normalizer import resolve_account_sticky_proxy
     usable_proxy_map = {proxy.proxy: proxy for proxy in usable_proxies}
     assigned_by_proxy: dict[str, list[dict[str, Any]]] = {proxy.proxy: [] for proxy in usable_proxies}
     current_by_proxy: dict[str, list[dict[str, Any]]] = defaultdict(list)
@@ -263,8 +264,12 @@ def rebalance_working_account_proxies(
     for item in eligible_items:
         account = item["account"]
         current_proxy = (account.proxy or "").strip()
-        if current_proxy in usable_proxy_map:
-            current_by_proxy[current_proxy].append(item)
+        matching = usable_proxy_map.get(current_proxy)
+        if matching is None:
+            matching = next((proxy for proxy in usable_proxies
+                if resolve_account_sticky_proxy(proxy.proxy, account, default_country=proxy.country_code) == current_proxy), None)
+        if matching is not None:
+            current_by_proxy[matching.proxy].append(item)
         else:
             movable_items.append(item)
 
@@ -310,10 +315,13 @@ def rebalance_working_account_proxies(
         actual_counts[proxy.proxy] = len(items)
         for item in items:
             account = item["account"]
-            if (account.proxy or "").strip() != proxy.proxy:
+            resolved_proxy = resolve_account_sticky_proxy(
+                proxy.proxy, account, default_country=proxy.country_code
+            )
+            if (account.proxy or "").strip() != resolved_proxy:
                 changed += 1
                 if not dry_run:
-                    account.proxy = proxy.proxy
+                    account.proxy = resolved_proxy
                     if not account.country_code and proxy.country_code:
                         account.country_code = proxy.country_code
                         geo_filled += 1
@@ -418,9 +426,9 @@ def assign_proxies_to_accounts(
             Proxy.dedicated_user_id.is_(None),
         )
         if normalized_force_filter == "mobile":
-            query = query.filter(Proxy.is_mobile == "Y")
+            query = query.filter(func.upper(func.trim(Proxy.is_mobile)) == "Y")
         elif normalized_force_filter == "residential":
-            query = query.filter(Proxy.is_mobile != "Y")
+            query = query.filter(or_(Proxy.is_mobile.is_(None), func.upper(func.trim(Proxy.is_mobile)) != "Y"))
         else:
             query = apply_proxy_type_filter(query, db)
         active_proxies = query.order_by(Proxy.created_at.asc()).all()
@@ -448,13 +456,18 @@ def assign_proxies_to_accounts(
         ).distinct().all()
         used_proxy_strings = {p[0] for p in proxy_results if p[0]}
 
+    from services.proxy_normalizer import is_sticky_residential_template, resolve_account_sticky_proxy
+    from services.geo_detection_service import detect_account_country
+
     def _is_mobile_proxy(proxy_obj: Proxy) -> bool:
-        return proxy_obj.is_mobile == "Y" and bool(proxy_obj.rotation_url)
+        return str(proxy_obj.is_mobile or "").strip().upper() == "Y" and bool(proxy_obj.rotation_url)
 
     def _proxy_can_be_reused(proxy_obj: Proxy) -> bool:
         if allow_reuse_within_batch:
             return True
-        if test_shared_residential and proxy_obj.is_mobile != "Y":
+        if test_shared_residential and not _is_mobile_proxy(proxy_obj):
+            return True
+        if is_sticky_residential_template(proxy_obj.proxy):
             return True
         return _is_mobile_proxy(proxy_obj)
 
@@ -493,6 +506,10 @@ def assign_proxies_to_accounts(
     for account in accounts_needing_proxy:
         proxy = None
         matched_by_geo = False
+        if not account.country_code:
+            detected_cc = detect_account_country(account)
+            if detected_cc:
+                account.country_code = detected_cc
 
         if use_geo_matching and account.country_code:
             for p in proxies_by_country.get(account.country_code, []):
@@ -516,7 +533,9 @@ def assign_proxies_to_accounts(
         if not proxy:
             break
 
-        account.proxy = proxy.proxy
+        account.proxy = (
+            resolve_account_sticky_proxy(proxy.proxy, account, default_country=proxy.country_code)
+        )
         if not account.country_code and proxy.country_code:
             account.country_code = proxy.country_code
             logger.info(
