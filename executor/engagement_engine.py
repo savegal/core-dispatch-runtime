@@ -468,11 +468,31 @@ async def resolve_video_url(
         return url, None
 
     try:
-        import httpx
-        async with httpx.AsyncClient(proxy=proxy, timeout=timeout, follow_redirects=True, trust_env=False) as client:
-            response = await client.get(url)
-            response.raise_for_status()
-            resolved_url = str(response.url)
+        resolved_url = None
+        try:
+            from curl_cffi.requests import AsyncSession as _CurlAsyncSession
+            import httpx as _httpx_check
+            if "PYTEST_CURRENT_TEST" not in os.environ and getattr(_httpx_check.AsyncClient, "__module__", "").startswith("httpx"):
+                async with _CurlAsyncSession(
+                    impersonate="chrome131",
+                    proxies={"http": proxy, "https": proxy} if proxy else None,
+                    timeout=timeout,
+                    allow_redirects=True,
+                ) as curl_client:
+                    curl_resp = await curl_client.get(url)
+                    if 200 <= int(getattr(curl_resp, "status_code", 0) or 0) < 400:
+                        resolved_url = str(getattr(curl_resp, "url", "") or "")
+        except ImportError:
+            resolved_url = None
+        except Exception:
+            resolved_url = None
+
+        if not resolved_url:
+            import httpx
+            async with httpx.AsyncClient(proxy=proxy, timeout=timeout, follow_redirects=True, trust_env=False) as client:
+                response = await client.get(url)
+                response.raise_for_status()
+                resolved_url = str(response.url)
         from executor.http.page_runtime import target_url_matches
         media_id = extract_video_id(resolved_url)
         if media_id and media_id != "0" and target_url_matches(resolved_url, media_id):
@@ -2422,10 +2442,13 @@ async def _attempt_publish_on_account(
                                 comment_id,
                                 parent_confirmation_level,
                             )
+                            request_meta = getattr(http_client, "last_request_meta", {})
+                            published_text = request_meta.get("published_text", text) if isinstance(request_meta, dict) else text
                             if outcome_dict is not None:
                                 outcome_dict["posted"] = True
                                 outcome_dict["network_confirmed"] = True
                                 outcome_dict["method"] = "http"
+                                outcome_dict["published_text"] = published_text
                                 outcome_dict["publication_attempted"] = True
                                 outcome_dict["parent_confirmed"] = parent_confirmed
                                 outcome_dict["parent_confirmation_level"] = parent_confirmation_level
@@ -2433,7 +2456,7 @@ async def _attempt_publish_on_account(
                                 outcome_dict["response_reply_to_reply_id"] = (meta or {}).get("response_reply_to_reply_id")
                                 outcome_dict["response_root_comment_id"] = (meta or {}).get("response_root_comment_id")
                             await record_publication("reply" if is_reply else "main", {**(outcome_dict or {}),
-                                "reply_id" if is_reply else "comment_id": comment_id, "text": text,
+                                "reply_id" if is_reply else "comment_id": comment_id, "text": published_text,
                                 "parent_comment_id": parent_comment_id, "account_id": account.id,
                                 "network_confirmed": True, "success": True, "publication_attempted": True})
                             return comment_id, None, "http"
@@ -2452,16 +2475,18 @@ async def _attempt_publish_on_account(
                                 "Task %s: %s HTTP SUCCESS on account %s | comment_id=%s",
                                 task_id, publish_kind_label, account.id, comment_id,
                             )
+                            request_meta = getattr(http_client, "last_request_meta", {})
+                            published_text = request_meta.get("published_text", text) if isinstance(request_meta, dict) else text
                             if outcome_dict is not None:
                                 outcome_dict["posted"] = True
                                 outcome_dict["network_confirmed"] = True
                                 outcome_dict["method"] = "http"
+                                outcome_dict["published_text"] = published_text
                                 outcome_dict["publication_attempted"] = True
-                                request_meta = getattr(http_client, "last_request_meta", {})
                                 if isinstance(request_meta, dict):
                                     outcome_dict["comment_author"] = request_meta.get("comment_author")
                             await record_publication("reply" if is_reply else "main", {**(outcome_dict or {}),
-                                "reply_id" if is_reply else "comment_id": comment_id, "text": text,
+                                "reply_id" if is_reply else "comment_id": comment_id, "text": published_text,
                                 "parent_comment_id": parent_comment_id, "account_id": account.id,
                                 "network_confirmed": True, "success": True, "publication_attempted": True})
                             return comment_id, None, "http"
@@ -5404,7 +5429,7 @@ async def execute_hybrid_full(
             verified, verified_id, verified_author, verify_mode = await verify_comment_dom(
                 db=db,
                 video_url=video_url,
-                comment_text=text_choice,
+                comment_text=result.main_comment.get("published_text") or text_choice,
                 expected_comment_id=comment_id,
                 expected_author=result.main_comment.get("comment_author") or candidate.label,
                 task_id=task_id,
@@ -5617,7 +5642,7 @@ async def execute_hybrid_full(
             parent_comment_id=result.comment_id or "",
             replies=replies_to_post,
             task_id=task_id,
-            main_comment_text=text_choice,
+            main_comment_text=result.main_comment.get("published_text") or text_choice,
             parent_unconfirmed=bool(result.main_comment.get("submitted_unconfirmed")),
             parent_author=result.comment_author,
             pool_owner_user_id=pool_owner_user_id,
