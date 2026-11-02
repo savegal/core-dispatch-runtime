@@ -24,8 +24,11 @@ class Settings(BaseSettings):
 
     # Ограничения
     MAX_ACTIONS_PER_ACCOUNT: int = 999999  # ИСПРАВЛЕНО: Убран лимит на комментирование (было 50)
+    SOFT_DAILY_MAIN_ACTIONS_TARGET: int = 3  # Мягкий ориентир дневной нагрузки для скоринга ротации (main)
+    SOFT_DAILY_REPLY_ACTIONS_TARGET: int = 6  # Мягкий ориентир дневной нагрузки для скоринга ротации (reply)
+    RESIDENTIAL_DEFAULT_COUNTRY: str = "DE"  # Дефолтная страна для sticky-шаблонов резидентских прокси
     MAX_THREADS: int = 2  # КРИТИЧНО: Снижено до 2 для работы на ноутбуке
-    MAX_CONCURRENT_BROWSERS: int = 1  # КРИТИЧНО: Снижено до 1 для работы на ноутбуке (минимум нагрузки)
+    MAX_CONCURRENT_BROWSERS: int = 4  # ОПТИМИЗИРОВАНО: 4 контекста внутри 1 процесса Chromium (BROWSER_POOL_SHARED_PROCESS=True)
     BROWSER_POOL_CAPACITY_WAIT_SECONDS: float = 15.0
     BROWSER_POOL_SHARED_PROCESS: bool = True
     STATIC_ASSET_CACHE_ENABLED: bool = True
