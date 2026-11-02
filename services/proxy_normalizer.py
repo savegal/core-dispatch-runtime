@@ -1,12 +1,15 @@
 """
 Proxy normalization utilities.
-Ensures consistent proxy format with explicit scheme.
+Ensures consistent proxy format with explicit scheme and supports per-account
+sticky residential proxy templates (1 account = 1 unique sticky IP).
 """
 from __future__ import annotations
 
 from urllib.parse import urlparse, quote, unquote
 from dataclasses import dataclass, field
-from typing import Optional
+from typing import Any, Optional
+import hashlib
+import re
 import socket
 
 from config.settings import get_settings
@@ -14,6 +17,16 @@ from config.settings import get_settings
 
 SUPPORTED_PROXY_SCHEMES = ("http", "https", "socks5", "socks5h")
 DEFAULT_PROXY_SCHEME = "http"
+
+_TEMPLATE_PLACEHOLDER_RE = re.compile(
+    r"\{(?:session|session_id|sid|account_id|acc_id)\}",
+    re.IGNORECASE,
+)
+_COUNTRY_PLACEHOLDER_RE = re.compile(r"\{(?:country|cc)\}", re.IGNORECASE)
+_AUTO_SESSION_MARKER_RE = re.compile(
+    r"(?:(?<=-session-)|(?<=_session-)|(?<=-sessid-)|(?<=_sessid-)|(?<=-sid-)|(?<=_sid-)|(?<=sessionid-))auto\b",
+    re.IGNORECASE,
+)
 
 
 class ProxyRouteError(RuntimeError):
@@ -24,6 +37,103 @@ class ProxyRouteError(RuntimeError):
     def __init__(self, reason: str):
         self.reason = reason
         super().__init__(f"proxy_route:{reason}")
+
+
+def is_sticky_residential_template(raw: str | None) -> bool:
+    """Return True when a proxy string contains per-account sticky session placeholders."""
+    text = str(raw or "").strip()
+    if not text:
+        return False
+    return bool(_TEMPLATE_PLACEHOLDER_RE.search(text) or _AUTO_SESSION_MARKER_RE.search(text))
+
+
+def _account_sticky_session_token(account: Any) -> str:
+    """Generate a deterministic, alphanumeric sticky session token for one account."""
+    if account is None:
+        return "acc0"
+    acc_id = getattr(account, "id", None)
+    if acc_id is not None:
+        return f"acc{acc_id}"
+    seed = str(getattr(account, "label", "") or getattr(account, "cookies", "") or id(account))
+    digest = hashlib.sha1(seed.encode("utf-8", errors="ignore")).hexdigest()[:10]
+    return f"acc{digest}"
+
+
+def _resolve_account_geo_code(account: Any, default_country: str | None = None) -> str:
+    """Resolve 2-letter ISO country code for sticky residential proxy routing."""
+    country = str(getattr(account, "country_code", None) or "").strip().upper()
+    if len(country) == 2 and country.isalpha():
+        return country
+    if account is not None:
+        try:
+            from services.geo_detection_service import detect_account_country, _parse_any_cookies
+            detected = detect_account_country(account)
+            if detected and len(detected) == 2 and detected.isalpha():
+                return detected.upper()
+            raw_cookies = getattr(account, "cookies", None)
+            if raw_cookies:
+                cmap = {str(k).strip().lower(): str(v).strip().lower() for k, v in _parse_any_cookies(raw_cookies).items() if v is not None}
+                idc = cmap.get("tt-target-idc") or cmap.get("tt_target_idc") or ""
+                if idc.startswith(("useast", "uswest")):
+                    return "US"
+                if idc.startswith(("alisg", "ap-")):
+                    return "SG"
+        except Exception:
+            pass
+    fallback = str(default_country or "").strip().upper()
+    if len(fallback) == 2 and fallback.isalpha():
+        return fallback
+    try:
+        settings_cc = str(getattr(get_settings(), "RESIDENTIAL_DEFAULT_COUNTRY", "DE") or "DE").strip().upper()
+        if len(settings_cc) == 2 and settings_cc.isalpha():
+            return settings_cc
+    except Exception:
+        pass
+    return "DE"
+
+
+def resolve_account_sticky_proxy(
+    raw: str | None,
+    account: Any = None,
+    *,
+    default_country: str | None = None,
+) -> str | None:
+    """Expand per-account sticky session & geo placeholders in a residential proxy string.
+
+    Supports:
+    - Explicit placeholders: {session}, {session_id}, {sid}, {account_id}, {acc_id}, {country}, {cc}, {COUNTRY}, {CC}
+    - Provider auto-session markers: -session-auto, _session-auto, -sessid-auto, -sid-auto, sessionid-auto
+    Non-template proxy strings are returned unchanged.
+    """
+    if raw is None:
+        return None
+    text = str(raw).strip()
+    if not text or not (is_sticky_residential_template(text) or _COUNTRY_PLACEHOLDER_RE.search(text)):
+        return raw
+
+    session_token = _account_sticky_session_token(account)
+    acc_id_str = str(getattr(account, "id", None) or session_token)
+    country_upper = _resolve_account_geo_code(account, default_country=default_country)
+    country_lower = country_upper.lower()
+
+    replacements = {
+        "session": session_token,
+        "session_id": session_token,
+        "sid": session_token,
+        "account_id": acc_id_str,
+        "acc_id": acc_id_str,
+    }
+    # The recognizer is case-insensitive; the expander must accept the very
+    # same inputs (including provider exports with mixed-case placeholders).
+    resolved = _TEMPLATE_PLACEHOLDER_RE.sub(
+        lambda m: replacements[m.group()[1:-1].lower()], text
+    )
+    resolved = _COUNTRY_PLACEHOLDER_RE.sub(
+        lambda m: country_upper if m.group()[1:-1].isupper() else country_lower,
+        resolved,
+    )
+    resolved = _AUTO_SESSION_MARKER_RE.sub(session_token, resolved)
+    return resolved
 
 
 @dataclass(frozen=True)
@@ -101,23 +211,53 @@ def account_proxy_route(account, *, required: bool | None = None) -> ProxyRoute 
     required = bool(get_settings().USE_PROXY or dedicated) if required is None else required
     if not required:
         return None
-    raw = dedicated.proxy if dedicated else getattr(account, "proxy", None)
+    raw_original = dedicated.proxy if dedicated else getattr(account, "proxy", None)
+    default_cc = dedicated.country_code if dedicated else getattr(account, "proxy_country_code", None)
+    raw = resolve_account_sticky_proxy(raw_original, account, default_country=default_cc)
     route = ProxyRoute.parse(raw)
     country = dedicated.country_code if dedicated else getattr(account, "proxy_country_code", None)
     proxy_id = dedicated.proxy_id if dedicated else None
     if account is not None and dedicated is None:
         from sqlalchemy.orm import object_session
-        from sqlalchemy import or_
-        from db.models import Account, Proxy
+        from db.models import Account
         session = object_session(account) if isinstance(account, Account) else None
         if session is not None:
-            proxy = session.query(Proxy).filter(or_(Proxy.proxy == raw, Proxy.proxy == route.url)).first()
+            proxy = find_account_proxy_record(session, account)
             if proxy is not None:
                 country, proxy_id = proxy.country_code, proxy.id
+    if not country and is_sticky_residential_template(raw_original):
+        country = _resolve_account_geo_code(account, default_country=default_cc)
     country = str(country or "").strip().upper() or None
     if account is not None:
         account.proxy_country_code = country
     return replace(route, country_code=country, proxy_id=proxy_id)
+
+
+def find_account_proxy_record(db, account):
+    """Find the Proxy row even when Account.proxy contains expanded placeholders.
+
+    Prefer exact addresses and only scan provider templates when an exact row is
+    absent, so direct proxies retain their original matching semantics.
+    """
+    from sqlalchemy import func, or_
+    from db.models import Proxy
+
+    current = str(getattr(account, "proxy", "") or "").strip()
+    if not current:
+        return None
+    direct = db.query(Proxy).filter(Proxy.proxy == current).first()
+    if direct is not None:
+        return direct
+    candidates = db.query(Proxy).filter(or_(
+        Proxy.proxy.contains("{"),
+        func.lower(Proxy.proxy).contains("session-auto"),
+        func.lower(Proxy.proxy).contains("sessid-auto"),
+        func.lower(Proxy.proxy).contains("sid-auto"),
+    )).all()
+    for proxy in candidates:
+        if resolve_account_sticky_proxy(proxy.proxy, account, default_country=proxy.country_code) == current:
+            return proxy
+    return None
 
 
 def _resolve_default_scheme(default_scheme: str | None) -> str:
