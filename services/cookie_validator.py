@@ -766,14 +766,14 @@ async def _validate_account_http_tri_state(account: Account, *, strict_passport:
                             if message == "success" and (username or user_id):
                                 logger.info("[VALIDATE] Account %s: VALID (passport API)", getattr(account, "id", "?"))
                                 if passport_country:
-                                # Evidence is trusted only after an authenticated success.
-                                # Let the caller commit; never overwrite a stored DB country.
-                                account._passport_country_code = passport_country
-                            stored_country = getattr(account, "country_code", None)
-                            return _valid_result(
-                                username=username, user_id=user_id,
-                                country_code=stored_country or passport_country or country_code,
-                            )
+                                    # Evidence is trusted only after an authenticated success.
+                                    # Let the caller commit; never overwrite a stored DB country.
+                                    account._passport_country_code = passport_country
+                                stored_country = getattr(account, "country_code", None)
+                                return _valid_result(
+                                    username=username, user_id=user_id,
+                                    country_code=stored_country or passport_country or country_code,
+                                )
                             if message and message != "success":
                                 # TikTok also returns generic `error` for challenges and
                                 # incomplete HTTP context; in strict HTTP-first mode,
