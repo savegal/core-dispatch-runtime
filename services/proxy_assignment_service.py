@@ -250,20 +250,43 @@ def rebalance_working_account_proxies(
             continue
         eligible_items.append({"account": account, "score": int(score)})
 
-    targets = _calculate_proxy_targets(
-        usable_proxies,
-        len(eligible_items),
-        mobile_weight=effective_mobile_weight,
+    from services.proxy_normalizer import (
+        account_sticky_proxy_matches_template,
+        resolve_account_sticky_proxy,
     )
-    from services.proxy_normalizer import resolve_account_sticky_proxy
+    # Query ALL source rows, not just the active / currently filtered pool.
+    # An already-expanded sticky account must not be moved merely because its
+    # gateway is temporarily unhealthy, disabled, or excluded by a type filter.
+    # Only a deleted source row or a persisted 'bad' status releases the pin.
+    source_templates = db.query(Proxy).filter(or_(
+        Proxy.proxy.contains("{"),
+        func.lower(Proxy.proxy).contains("session-auto"),
+        func.lower(Proxy.proxy).contains("sessid-auto"),
+        func.lower(Proxy.proxy).contains("sid-auto"),
+    )).order_by(Proxy.id.asc()).all()
     usable_proxy_map = {proxy.proxy: proxy for proxy in usable_proxies}
     assigned_by_proxy: dict[str, list[dict[str, Any]]] = {proxy.proxy: [] for proxy in usable_proxies}
     current_by_proxy: dict[str, list[dict[str, Any]]] = defaultdict(list)
     movable_items: list[dict[str, Any]] = []
+    pinned_sticky = 0
+    pinned_outside_pool = 0
 
     for item in eligible_items:
         account = item["account"]
         current_proxy = (account.proxy or "").strip()
+        source = next((
+            proxy for proxy in source_templates
+            if proxy.proxy != current_proxy
+            and account_sticky_proxy_matches_template(proxy.proxy, account, current_proxy)
+        ), None)
+        if source is not None and str(source.status or "").strip().lower() != "bad":
+            pinned_sticky += 1
+            if source.proxy in usable_proxy_map:
+                assigned_by_proxy[source.proxy].append(item)
+            else:
+                pinned_outside_pool += 1
+            continue
+
         matching = usable_proxy_map.get(current_proxy)
         if matching is None:
             matching = next((proxy for proxy in usable_proxies
@@ -273,12 +296,19 @@ def rebalance_working_account_proxies(
         else:
             movable_items.append(item)
 
+    # Accounts pinned to an out-of-pool source remain unchanged and consume no
+    # quota on the currently usable pool.
+    targets = _calculate_proxy_targets(
+        usable_proxies,
+        len(eligible_items) - pinned_outside_pool,
+        mobile_weight=effective_mobile_weight,
+    )
     for proxy in usable_proxies:
         current_items = current_by_proxy.get(proxy.proxy, [])
         current_items.sort(key=lambda item: (-int(item["score"]), int(item["account"].id)))
-        target_count = targets.get(proxy.proxy, 0)
-        assigned_by_proxy[proxy.proxy].extend(current_items[:target_count])
-        movable_items.extend(current_items[target_count:])
+        remaining = max(0, targets.get(proxy.proxy, 0) - len(assigned_by_proxy[proxy.proxy]))
+        assigned_by_proxy[proxy.proxy].extend(current_items[:remaining])
+        movable_items.extend(current_items[remaining:])
 
     needed_by_proxy = {
         proxy.proxy: max(0, targets.get(proxy.proxy, 0) - len(assigned_by_proxy[proxy.proxy]))
@@ -290,6 +320,13 @@ def rebalance_working_account_proxies(
             if needed_by_proxy.get(proxy.proxy, 0) > 0:
                 slot_proxies.append(proxy)
                 needed_by_proxy[proxy.proxy] -= 1
+
+    # Fixed sticky pins can exceed their weighted quota. In that case the
+    # remaining movable accounts still need slots rather than silently dropping.
+    extra_slots = len(movable_items) - len(slot_proxies)
+    if extra_slots > 0 and usable_proxies:
+        for idx in range(extra_slots):
+            slot_proxies.append(usable_proxies[idx % len(usable_proxies)])
 
     movable_items.sort(key=lambda item: (-int(item["score"]), int(item["account"].id)))
     for item in movable_items:
@@ -322,9 +359,7 @@ def rebalance_working_account_proxies(
                 changed += 1
                 if not dry_run:
                     account.proxy = resolved_proxy
-                    if not account.country_code and proxy.country_code:
-                        account.country_code = proxy.country_code
-                        geo_filled += 1
+                    # Proxy geography is not evidence of the account's country.
 
     if not dry_run:
         try:
@@ -348,6 +383,8 @@ def rebalance_working_account_proxies(
         "changed": changed,
         "unchanged": max(0, len(eligible_items) - changed),
         "geo_filled": geo_filled,
+        "pinned_sticky_accounts": pinned_sticky,
+        "pinned_outside_active_pool": pinned_outside_pool,
         "dry_run": bool(dry_run),
         "mobile_weight": effective_mobile_weight,
         "force_proxy_type_filter": normalized_force_filter,
@@ -556,13 +593,7 @@ def assign_proxies_to_accounts(
         account.proxy = (
             resolve_account_sticky_proxy(proxy.proxy, account, default_country=proxy.country_code)
         )
-        if not account.country_code and proxy.country_code:
-            account.country_code = proxy.country_code
-            logger.info(
-                "[GEO] Auto-set country_code %s for account %s from assigned proxy",
-                proxy.country_code,
-                account.id,
-            )
+        # Assignment changes the route, not the account's trusted country.
 
         if not _proxy_can_be_reused(proxy):
             used_proxy_strings.add(proxy.proxy)
