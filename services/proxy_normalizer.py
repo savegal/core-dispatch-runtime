@@ -66,18 +66,10 @@ def _resolve_account_geo_code(account: Any, default_country: str | None = None) 
         return country
     if account is not None:
         try:
-            from services.geo_detection_service import detect_account_country, _parse_any_cookies
+            from services.geo_detection_service import detect_account_country
             detected = detect_account_country(account)
-            if detected and len(detected) == 2 and detected.isalpha():
+            if detected and len(detected) == 2 and detected.isalpha() and detected.isascii():
                 return detected.upper()
-            raw_cookies = getattr(account, "cookies", None)
-            if raw_cookies:
-                cmap = {str(k).strip().lower(): str(v).strip().lower() for k, v in _parse_any_cookies(raw_cookies).items() if v is not None}
-                idc = cmap.get("tt-target-idc") or cmap.get("tt_target_idc") or ""
-                if idc.startswith(("useast", "uswest")):
-                    return "US"
-                if idc.startswith(("alisg", "ap-")):
-                    return "SG"
         except Exception:
             pass
     fallback = str(default_country or "").strip().upper()
@@ -134,6 +126,50 @@ def resolve_account_sticky_proxy(
     )
     resolved = _AUTO_SESSION_MARKER_RE.sub(session_token, resolved)
     return resolved
+
+
+def account_sticky_proxy_matches_template(raw: str | None, account: Any, resolved: str | None) -> bool:
+    """Match an existing account-bound route even if its country segment changed.
+
+    Never interpret country-only templates as sticky. Session markers MUST match
+    this account's deterministic token/id; only the ISO country field is flexible.
+    This lets rebalance preserve a previously resolved route when new geographic
+    evidence changes the account's inferred country.
+    """
+    template = str(raw or "").strip()
+    current = str(resolved or "").strip()
+    if not template or not current or not is_sticky_residential_template(template):
+        return False
+
+    session = _account_sticky_session_token(account)
+    acc_id = str(getattr(account, "id", None) or session)
+    tokens = {
+        "session": session,
+        "session_id": session,
+        "sid": session,
+        "account_id": acc_id,
+        "acc_id": acc_id,
+    }
+    parts = []
+    start = 0
+    marker = re.compile(
+        _TEMPLATE_PLACEHOLDER_RE.pattern
+        + "|" + _COUNTRY_PLACEHOLDER_RE.pattern
+        + "|" + _AUTO_SESSION_MARKER_RE.pattern,
+        re.IGNORECASE,
+    )
+    for match in marker.finditer(template):
+        parts.append(re.escape(template[start:match.start()]))
+        key = match.group()
+        if key.startswith("{"):
+            key = key[1:-1].lower()
+            parts.append(r"[A-Za-z]{2}" if key in {"cc", "country"}
+                         else re.escape(tokens[key]))
+        else:
+            parts.append(re.escape(session))
+        start = match.end()
+    parts.append(re.escape(template[start:]))
+    return re.fullmatch("".join(parts), current) is not None
 
 
 @dataclass(frozen=True)
@@ -255,7 +291,8 @@ def find_account_proxy_record(db, account):
         func.lower(Proxy.proxy).contains("sid-auto"),
     )).all()
     for proxy in candidates:
-        if resolve_account_sticky_proxy(proxy.proxy, account, default_country=proxy.country_code) == current:
+        if (resolve_account_sticky_proxy(proxy.proxy, account, default_country=proxy.country_code) == current
+                or account_sticky_proxy_matches_template(proxy.proxy, account, current)):
             return proxy
     return None
 
