@@ -465,7 +465,7 @@ def assign_proxies_to_accounts(
     def _proxy_can_be_reused(proxy_obj: Proxy) -> bool:
         if allow_reuse_within_batch:
             return True
-        if test_shared_residential and not _is_mobile_proxy(proxy_obj):
+        if test_shared_residential and str(proxy_obj.is_mobile or "").strip().upper() != "Y":
             return True
         if is_sticky_residential_template(proxy_obj.proxy):
             return True
