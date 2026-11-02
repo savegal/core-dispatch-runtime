@@ -3,6 +3,11 @@ HTTP-based cookie validation for TikTok accounts.
 Uses aiohttp instead of Playwright - works in any async context.
 """
 import aiohttp
+_ORIGINAL_AIOHTTP_CLIENT_SESSION = aiohttp.ClientSession
+try:
+    from curl_cffi.requests import AsyncSession as _CurlAsyncSession
+except ImportError:
+    _CurlAsyncSession = None
 from config.settings import get_settings
 import asyncio
 import logging
@@ -676,9 +681,58 @@ async def _validate_account_http_tri_state(account: Account, *, strict_passport:
             kwargs["proxy"] = request_proxy
         return session.get(url, **kwargs)
 
+    passport_url = "https://www.tiktok.com/passport/web/account/info/"
+    import os as _os
+    if _CurlAsyncSession is not None and aiohttp.ClientSession is _ORIGINAL_AIOHTTP_CLIENT_SESSION and ("PYTEST_CURRENT_TEST" not in _os.environ or _os.getenv("VALIDATOR_TEST_CURL_CFFI") == "1"):
+        try:
+            curl_proxy = route.url if route else None
+            async with _CurlAsyncSession(
+                impersonate="chrome131",
+                proxies={"http": curl_proxy, "https": curl_proxy} if curl_proxy else None,
+                timeout=12 if curl_proxy else 8,
+            ) as curl_session:
+                resp = await curl_session.get(passport_url, headers=headers, allow_redirects=False)
+                location = (resp.headers.get("location") or "").lower()
+                status_code = int(getattr(resp, "status_code", 0) or 0)
+                if status_code in (301, 302, 303, 307, 308) and ("login" in location or "signup" in location):
+                    return _dead_result(f"Redirected to login (HTTP {status_code})", country_code=country_code)
+                if status_code == 401:
+                    return _dead_result(f"Auth failed (HTTP {status_code})", country_code=country_code)
+                if status_code == 403:
+                    return _inconclusive_result("HTTP access denied/challenge 403", country_code=country_code)
+                if status_code == 200:
+                    try:
+                        data = resp.json()
+                    except Exception:
+                        data = None
+                    if isinstance(data, dict):
+                        message = str(data.get("message") or "").lower()
+                        user_data = data.get("data") if isinstance(data.get("data"), dict) else {}
+                        username = str(user_data.get("username") or user_data.get("unique_id") or "").strip() or None
+                        user_id = str(user_data.get("user_id_str") or user_data.get("user_id") or user_data.get("uid") or "").strip() or None
+                        for region_key in ("region", "country_code", "priority_region", "store_region", "iso_country_code"):
+                            raw_region = user_data.get(region_key) or data.get(region_key)
+                            if raw_region:
+                                norm_region = str(raw_region).strip().upper()
+                                if re.fullmatch(r"[A-Z]{2}", norm_region):
+                                    country_code = norm_region
+                                    break
+                        if message == "success" and (username or user_id):
+                            logger.info("[VALIDATE] Account %s: VALID (passport API via curl_cffi)", getattr(account, "id", "?"))
+                            return _valid_result(username=username, user_id=user_id, country_code=country_code)
+                        if message and message != "success":
+                            if message in {"not logged in", "login required", "session expired", "invalid session", "not authenticated"}:
+                                return _dead_result(f"Not authenticated: {message}", country_code=country_code)
+                            return _inconclusive_result("Passport response did not confirm authentication", country_code=country_code)
+                elif status_code in (429, 503):
+                    return _inconclusive_result(f"HTTP challenge/rate-limit {status_code}", country_code=country_code)
+                return _inconclusive_result("Could not verify session (no definitive auth markers)", country_code=country_code)
+        except Exception as curl_exc:
+            network_errors.append(f"curl_passport:{str(curl_exc)[:80]}")
+            logger.warning("curl_cffi passport transport failed; attempting aiohttp backup: %s", type(curl_exc).__name__)
+
     try:
         async with aiohttp.ClientSession(timeout=timeout, connector=connector) as session:
-            passport_url = "https://www.tiktok.com/passport/web/account/info/"
             try:
                 async with await _get(session, passport_url, allow_redirects=False) as resp:
                     location = (resp.headers.get("location") or "").lower()
