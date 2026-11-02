@@ -280,6 +280,9 @@ def rebalance_working_account_proxies(
             and account_sticky_proxy_matches_template(proxy.proxy, account, current_proxy)
         ), None)
         if source is not None and str(source.status or "").strip().lower() != "bad":
+            # Preserve the already-expanded URL byte-for-byte, including its
+            # original country segment, through the final assignment loop.
+            item["sticky_pinned"] = True
             pinned_sticky += 1
             if source.proxy in usable_proxy_map:
                 assigned_by_proxy[source.proxy].append(item)
@@ -351,6 +354,8 @@ def rebalance_working_account_proxies(
         items = assigned_by_proxy.get(proxy.proxy, [])
         actual_counts[proxy.proxy] = len(items)
         for item in items:
+            if item.get("sticky_pinned"):
+                continue
             account = item["account"]
             resolved_proxy = resolve_account_sticky_proxy(
                 proxy.proxy, account, default_country=proxy.country_code
