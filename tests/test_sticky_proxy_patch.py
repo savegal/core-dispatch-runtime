@@ -30,3 +30,28 @@ def test_spintax_does_not_modify_literal_braces():
     assert expand_spintax("Hello {username}") == "Hello {username}"
     expanded = expand_spintax("{Hello|Hi} {username}", seed="example")
     assert expanded in {"Hello {username}", "Hi {username}"}
+
+def test_existing_sticky_country_drift_still_matches_original_source():
+    from services.proxy_normalizer import account_sticky_proxy_matches_template
+
+    account = SimpleNamespace(id=42, country_code="DE")
+    template = "http://u-{SeSsIoN}-{COUNTRY}:p@gateway.example:8080"
+    # The account used UA when its sticky session was first expanded.
+    saved = "http://u-acc42-UA:p@gateway.example:8080"
+    assert account_sticky_proxy_matches_template(template, account, saved)
+    assert not account_sticky_proxy_matches_template(
+        template, SimpleNamespace(id=43, country_code="UA"), saved
+    )
+    assert not account_sticky_proxy_matches_template(
+        "http://u-{country}:p@gateway.example:8080", account, saved
+    )
+
+
+def test_provider_auto_session_matches_only_its_owner():
+    from services.proxy_normalizer import account_sticky_proxy_matches_template
+
+    template = "http://u-session-auto-{country}:p@gateway.example:8080"
+    assert account_sticky_proxy_matches_template(
+        template, SimpleNamespace(id=42, country_code="DE"),
+        "http://u-session-acc42-UA:p@gateway.example:8080",
+    )
