@@ -33,7 +33,7 @@ class Settings(BaseSettings):
     BROWSER_POOL_SHARED_PROCESS: bool = True
     STATIC_ASSET_CACHE_ENABLED: bool = True
     STATIC_ASSET_CACHE_MAX_MB: int = 128
-    KEYWORD_REPLY_MAX_SCAN_PAGES: int = 100
+    KEYWORD_REPLY_MAX_SCAN_PAGES: int = Field(default=10, ge=1, le=100)
     # NEW: Лимит задач на один прокси (1-2 для мобильных, 2-3 для серверных)
     # 1 - самый безопасный режим (стабильная ротация, макс. скорость)
     MAX_TASKS_PER_PROXY: int = 1
@@ -218,14 +218,14 @@ class Settings(BaseSettings):
     # ИСПРАВЛЕНО: Настройки для надёжной верификации комментариев (рекомендации ChatGPT)
     COMMENT_APPEARANCE_TIMEOUT: int = 90  # Максимальное время ожидания появления комментария (секунды, 90 секунд)
     MAIN_VISIBILITY_REPAIR_ROUNDS: int = Field(default=2, ge=0, le=3)
-    MAIN_VISIBILITY_OBSERVER_ATTEMPTS: int = Field(default=6, ge=2, le=12)
-    MAIN_VISIBILITY_MAX_PAGES: int = Field(default=20, ge=1, le=100)
+    MAIN_VISIBILITY_OBSERVER_ATTEMPTS: int = Field(default=2, ge=2, le=12)
+    MAIN_VISIBILITY_MAX_PAGES: int = Field(default=5, ge=1, le=100)
     MAIN_VISIBILITY_INITIAL_DELAY_SECONDS: float = Field(default=10.0, ge=0, le=60)
     MAIN_VISIBILITY_RECHECK_DELAY_SECONDS: float = Field(default=10.0, ge=0, le=60)
     MAIN_VISIBILITY_MAX_SECONDS: float = Field(default=300.0, ge=1, le=900)
     REPLY_PUBLICATION_VISIBILITY_REPAIR_ROUNDS: int = Field(default=2, ge=0, le=3)
-    REPLY_PUBLICATION_VISIBILITY_OBSERVER_ATTEMPTS: int = Field(default=6, ge=2, le=12)
-    REPLY_PUBLICATION_VISIBILITY_MAX_PAGES: int = Field(default=20, ge=1, le=100)
+    REPLY_PUBLICATION_VISIBILITY_OBSERVER_ATTEMPTS: int = Field(default=2, ge=2, le=12)
+    REPLY_PUBLICATION_VISIBILITY_MAX_PAGES: int = Field(default=5, ge=1, le=100)
     REPLY_PUBLICATION_VISIBILITY_INITIAL_DELAY_SECONDS: float = Field(default=10.0, ge=0, le=60)
     REPLY_PUBLICATION_VISIBILITY_RECHECK_DELAY_SECONDS: float = Field(default=10.0, ge=0, le=60)
     REPLY_PUBLICATION_VISIBILITY_MAX_SECONDS: float = Field(default=300.0, ge=1, le=900)
