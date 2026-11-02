@@ -47,59 +47,31 @@ def _parse_any_cookies(cookies_str: Any) -> Dict[str, str]:
     return {}
 
 
-def detect_country_from_cookies(cookies_str: str) -> Optional[str]:
-    """
-    Определяет страну аккаунта из cookies.
+def _trusted_country_code(value: Any) -> Optional[str]:
+    """Only accept an unambiguous ASCII ISO-style two-letter country value."""
+    code = str(value or "").strip().upper()
+    return code if re.fullmatch(r"[A-Z]{2}", code) else None
 
-    Проверяет:
-    1. Явные региональные cookies: store-region, store_region, priority_region, region, country_code
-    2. Языковые cookies: locale, i18next, lang (поддерживает en_US и en-US)
-    3. Валютные cookies: currency, tt_currency
-    4. Однозначные дата-центры: tt-target-idc (useast/uswest -> US, alisg -> SG)
-    """
-    if not cookies_str:
-        return None
 
+def detect_country_from_cookies(cookies_str: Any) -> Optional[str]:
+    """Conservative last-resort account country from explicit region cookies.
+
+    Language, currency, and unsigned IDC/datacenter names are not account
+    country evidence. In particular tt-target-idc-sign is usually an opaque
+    signature: never guess a country from its prefix, alphabet or hash.
+    """
     try:
-        cookies_dict = _parse_any_cookies(cookies_str)
-        if not cookies_dict:
-            return None
-
-        lower_map = {str(k).strip().lower(): str(v).strip() for k, v in cookies_dict.items() if v is not None}
-
-        # 1. Explicit store-region / priority_region
-        for region_key in ("store-region", "store_region", "priority_region", "region", "country_code", "tt-country-code"):
-            raw_region = lower_map.get(region_key)
-            if raw_region:
-                code = raw_region.split(",")[0].split("-")[0].split("_")[0].strip().upper()
-                if len(code) == 2 and code.isalpha():
-                    return code
-
-        # 2. Locale cookie (e.g., "en_US", "en-US", "uk_UA", "de-DE")
-        locale = lower_map.get("locale") or lower_map.get("i18next") or lower_map.get("lang")
-        if locale:
-            locale_parts = re.split(r"[_-]", locale)
-            if len(locale_parts) >= 2:
-                country_code = locale_parts[-1].upper()
-                if len(country_code) == 2 and country_code.isalpha():
-                    return country_code
-
-        # 3. Currency cookie
-        currency = lower_map.get("currency") or lower_map.get("tt_currency")
-        if currency:
-            currency_to_country = {
-                "USD": "US", "EUR": "DE", "GBP": "GB", "UAH": "UA",
-                "RUB": "RU", "PLN": "PL", "CAD": "CA", "AUD": "AU",
-            }
-            if currency.upper() in currency_to_country:
-                return currency_to_country[currency.upper()]
-
-        # Note: tt-target-idc is a datacenter cluster label, not a country code.
-
-    except Exception as e:
-        logger.debug(f"Error detecting country from cookies: {e}")
-        return None
-
+        cookies = _parse_any_cookies(cookies_str)
+        values = {str(k).strip().lower(): v for k, v in cookies.items()}
+        for key in ("store-region", "store_region"):
+            region = _trusted_country_code(values.get(key))
+            if region:
+                return region
+        # A provider may export a literal ISO country in this field. Accept
+        # ONLY that explicit value; an opaque signature is not decodable.
+        return _trusted_country_code(values.get("tt-target-idc-sign"))
+    except Exception as exc:
+        logger.debug("Unable to parse trusted account-region cookies: %s", exc)
     return None
 
 
@@ -113,52 +85,45 @@ def detect_country_from_user_agent(user_agent: Optional[str]) -> Optional[str]:
 
 
 def detect_account_country(account: Account) -> Optional[str]:
+    """Country evidence precedence: stored DB > authenticated Passport > SSR > cookies.
+
+    Passport/SSR values must be recorded by their respective validated paths
+    as transient evidence; a locale, proxy, currency, or header is not enough.
     """
-    Определяет страну аккаунта из доступных данных.
-
-    Приоритет:
-    1. country_code в БД (если уже установлен)
-    2. cookies (store-region, locale, currency, tt-target-idc)
-    3. user_agent (менее надежно)
-    """
-    if getattr(account, "country_code", None):
-        return account.country_code
-
-    cookies_val = getattr(account, "cookies", None)
-    if cookies_val:
-        country = detect_country_from_cookies(cookies_val)
-        if country:
-            return country
-
-    user_agent_val = getattr(account, "user_agent", None)
-    if user_agent_val:
-        country = detect_country_from_user_agent(user_agent_val)
-        if country:
-            return country
-
-    return None
+    if account is None:
+        return None
+    persisted = getattr(account, "country_code", None)
+    if persisted:
+        return persisted
+    passport = _trusted_country_code(getattr(account, "_passport_country_code", None))
+    if passport:
+        return passport
+    ssr = _trusted_country_code(getattr(account, "_account_ssr_region", None))
+    if ssr:
+        return ssr
+    return detect_country_from_cookies(getattr(account, "cookies", None))
 
 
 def update_account_country_if_needed(db: Session, account: Account, force: bool = False) -> bool:
+    """Fill missing country from trusted evidence; never replace a DB value.
+
+    The legacy force argument is retained for API compatibility but may not
+    override a manually specified or previously persisted country.
     """
-    Обновляет country_code аккаунта, если он не установлен или force=True.
-    """
-    if not force and account.country_code:
+    if getattr(account, "country_code", None):
         return False
-
     try:
-        detected_country = detect_account_country(account)
-        if detected_country and detected_country != account.country_code:
-            account.country_code = detected_country
-            db.commit()
-            logger.info(f"Updated country_code for account {account.id} ({(account.label or '')[:20]}): {detected_country}")
-            return True
-    except Exception as e:
+        country = _trusted_country_code(detect_account_country(account))
+        if not country:
+            return False
+        account.country_code = country
+        db.commit()
+        logger.info("Set trusted country_code for account %s: %s", account.id, country)
+        return True
+    except Exception:
         db.rollback()
-        logger.error(f"Error updating country_code for account {account.id}: {e}", exc_info=True)
+        logger.exception("Error persisting account %s country_code", getattr(account, "id", "?"))
         raise
-
-    return False
 
 
 def detect_country_from_tiktok_url(url: str) -> Optional[str]:
