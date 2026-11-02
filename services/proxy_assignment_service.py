@@ -478,6 +478,26 @@ def assign_proxies_to_accounts(
             return True
         return proxy_obj.proxy not in used_proxy_strings
 
+    if not reuse_existing:
+        # A country-only provider template expands to an account URL, but has
+        # no per-account session. Its source Proxy row must still count as used
+        # when a prior batch already assigned that expanded address.
+        country_only_templates = [
+            proxy for proxy in active_proxies
+            if "{" in (proxy.proxy or "") and not _proxy_can_be_reused(proxy)
+        ]
+        if country_only_templates:
+            assigned_accounts = db.query(Account).filter(
+                Account.proxy.isnot(None), Account.proxy != ""
+            ).all()
+            for proxy in country_only_templates:
+                if any(
+                    resolve_account_sticky_proxy(proxy.proxy, account, default_country=proxy.country_code)
+                    == account.proxy
+                    for account in assigned_accounts
+                ):
+                    used_proxy_strings.add(proxy.proxy)
+
     free_proxies = [p for p in active_proxies if _proxy_available(p)]
     free_proxies_before = len(free_proxies)
 
