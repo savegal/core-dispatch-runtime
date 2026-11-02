@@ -921,6 +921,8 @@ class PlaywrightHttpClient:
         if prepared_mentions is not None:
             self.last_request_meta["mentions"] = prepared_mentions
         is_publish = profile.method.upper() == "POST" and profile.endpoint.rstrip("/") == "/api/comment/publish"
+        if is_publish and isinstance(dynamic_params.get("text"), str):
+            self.last_request_meta["published_text"] = dynamic_params["text"]
 
         def unconfirmed(reason):
             self.last_request_meta["publication_status"] = "submitted_unconfirmed"
@@ -1485,6 +1487,9 @@ class PlaywrightHttpClient:
         Returns:
             tuple: (success, comment_id, error_message, error_type, meta)
         """
+        from services.spintax import expand_spintax, has_spintax
+        if has_spintax(text):
+            text = expand_spintax(text)
         profile = RequestProfile.publish_reply_profile()
         extra_params = dict(extra_params or {})
         proxy_country_code = extra_params.pop("proxy_country_code", None)
@@ -1653,6 +1658,9 @@ class PlaywrightHttpClient:
         Returns:
             tuple: (success, comment_id, error_message, error_type)
         """
+        from services.spintax import expand_spintax, has_spintax
+        if has_spintax(text):
+            text = expand_spintax(text)
         profile = RequestProfile.publish_main_profile()
         extra_params = dict(extra_params or {})
         proxy_country_code = extra_params.pop("proxy_country_code", None)
