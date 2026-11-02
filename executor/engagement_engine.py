@@ -2449,6 +2449,9 @@ async def _attempt_publish_on_account(
                                 outcome_dict["network_confirmed"] = True
                                 outcome_dict["method"] = "http"
                                 outcome_dict["published_text"] = published_text
+                                outcome_dict["text_choice"] = published_text
+                                if published_text != text:
+                                    outcome_dict["text_template"] = text
                                 outcome_dict["publication_attempted"] = True
                                 outcome_dict["parent_confirmed"] = parent_confirmed
                                 outcome_dict["parent_confirmation_level"] = parent_confirmation_level
@@ -2482,6 +2485,9 @@ async def _attempt_publish_on_account(
                                 outcome_dict["network_confirmed"] = True
                                 outcome_dict["method"] = "http"
                                 outcome_dict["published_text"] = published_text
+                                outcome_dict["text_choice"] = published_text
+                                if published_text != text:
+                                    outcome_dict["text_template"] = text
                                 outcome_dict["publication_attempted"] = True
                                 if isinstance(request_meta, dict):
                                     outcome_dict["comment_author"] = request_meta.get("comment_author")
