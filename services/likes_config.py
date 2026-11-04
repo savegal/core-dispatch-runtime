@@ -19,6 +19,11 @@ BOOST_LIKES_MAX = 5000
 REPLY_LIKES_MAX = 25
 
 
+def pending_reply_likes(result: dict | None) -> bool:
+    plan = result.get("reply_likes") if isinstance(result, dict) else None
+    return isinstance(plan, dict) and plan.get("state") == "pending" and bool(plan.get("targets"))
+
+
 def reply_like_preferences(settings: dict) -> tuple[str, int]:
     """Read the saved reply index (or 'all') and its per-reply budget."""
     target = str(settings.get("reply_like_target", "1")).strip().lower()

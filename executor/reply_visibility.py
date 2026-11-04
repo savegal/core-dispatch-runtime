@@ -16,12 +16,14 @@ from executor.http.comment_discovery import fetch_reply_page, comment_read_batch
 from executor.http.comment_scanner import scan_comment_ids, comment_id_key
 from executor.http.execution_policy import http_first_enabled
 from executor.http.execution_policy import valid_comment_id
+from executor.http.page_runtime import target_url_matches
 from executor.main_visibility import verify_main_publications
 from services.video_parser import extract_video_id
 from executor.visibility_support import account_identity_keys as _identity_keys, identity_is_known, identities_independent, identity_rejection_reason
 from services.execution_attempts import is_pre_publish_account_failure, candidate_scan_limit
 from services.keyword_replies import KEYWORD_ORDER_KIND
-from services.likes_config import coerce_bool, reply_like_preferences
+from services.likes_config import coerce_bool, pending_reply_likes, reply_like_preferences
+from services.visibility_checkpoint import run_visibility_checkpoint
 
 logger = logging.getLogger(__name__)
 REPORT_KEY = "reply_publication_visibility"  # reply_visibility already describes parent discovery.
@@ -112,6 +114,54 @@ def save_reply_visibility_checkpoint(db, task, url_key, result):
     except Exception:
         db.rollback()
         raise
+
+
+async def resume_reply_likes(db, task, video_url, result, *, pool_owner_user_id=None,
+                             stop_requested=lambda: False):
+    """Run only the persisted like phase. Comment verification and publishing stay separate."""
+    if not pending_reply_likes(result) or stop_requested():
+        return
+    if not coerce_bool(os.getenv("AUTO_BOOST_LIKES"), True) or not http_first_enabled(get_settings()):
+        return
+    url = result.get("resolved_video_url") or video_url
+    media_id = str(result.get("aweme_id") or extract_video_id(url) or "")
+    if not media_id or not target_url_matches(url, media_id):
+        return
+
+    from executor import user_schema as schema
+    plan = result["reply_likes"]
+    attempts = plan.setdefault("attempts", {})
+    checkpoint_failed = False
+
+    async def persist_progress(by_cid=None):
+        nonlocal checkpoint_failed
+        if by_cid is None:
+            by_cid = {
+                cid: sum(status == "confirmed" for status in statuses.values())
+                for cid, statuses in attempts.items()
+            }
+        plan["by_comment_id"].update(by_cid)
+        try:
+            await run_visibility_checkpoint(db, task, save_reply_visibility_checkpoint, video_url, result)
+        except Exception:
+            checkpoint_failed = True
+            logger.exception("[REPLY_LIKES] task=%s checkpoint failed", getattr(task, "id", None))
+        return not checkpoint_failed
+
+    try:
+        by_cid = await schema.boost_target_replies_via_http_pool(
+            db, url, media_id, targets=plan["targets"], max_likes=plan["requested_per_reply"],
+            exclude_account_ids=set(plan["exclude_account_ids"]), pool_owner_user_id=pool_owner_user_id,
+            task_id=getattr(task, "id", None), stop_requested=stop_requested,
+            attempts=attempts, persist_progress=persist_progress,
+        )
+    except Exception:
+        logger.exception("[REPLY_LIKES] task=%s failed", getattr(task, "id", None))
+        return
+    if not checkpoint_failed and not stop_requested():
+        plan["state"] = "completed"
+        if not await persist_progress(by_cid):
+            plan["state"] = "pending"
 
 
 async def verify_order_reply_visibility(db, task, video_url, result, *, pool_owner_user_id=None,
@@ -210,7 +260,6 @@ async def verify_order_reply_visibility(db, task, video_url, result, *, pool_own
     async def save():
         nonlocal checkpoint_failed
         try:
-            from services.visibility_checkpoint import run_visibility_checkpoint
             await run_visibility_checkpoint(db, task, save_reply_visibility_checkpoint, video_url, result)
         except Exception:
             checkpoint_failed = True
@@ -529,6 +578,20 @@ async def verify_order_reply_visibility(db, task, video_url, result, *, pool_own
                 timing["duration_ms"] = max(0, int((ended - beginning).total_seconds() * 1000))
             except (ValueError, TypeError):
                 pass
+        if like_requested:
+            targets = [
+                {"cid": slot.comment_id, "parent_id": comment_id_key(slot.item.get("parent_comment_id"))}
+                for slot in slots
+                if slot.public_confirmed and (like_target == "all" or str(slot.variant_index) == like_target)
+            ]
+            result["reply_likes"] = {
+                "target": like_target, "requested_per_reply": like_count,
+                "by_comment_id": dict.fromkeys((item["cid"] for item in targets), 0),
+            }
+            if targets and not checkpoint_failed and not stop_requested():
+                result["reply_likes"].update(
+                    state="pending", targets=targets, attempts={}, exclude_account_ids=sorted(used, key=str),
+                )
         await save()
         if checkpoint_failed:
             report.update(status="unconfirmed", reason="checkpoint_failed")
@@ -541,26 +604,7 @@ async def verify_order_reply_visibility(db, task, video_url, result, *, pool_own
         logger.info("[REPLY_VISIBILITY] task=%s confirmed=%s/%s missing=%s unknown=%s replacements=%s seconds=%s reason=%s",
                     task.id, confirmed, expected, report["missing"], report["unknown"], report["replacements"],
                     report["duration_seconds"], report["reason"])
-    if like_requested:
-        targets = [
-            {"cid": slot.comment_id, "parent_id": comment_id_key(slot.item.get("parent_comment_id"))}
-            for slot in slots
-            if slot.public_confirmed and (like_target == "all" or str(slot.variant_index) == like_target)
-        ]
-        by_cid = {}
-        if targets and not checkpoint_failed and not stop_requested():
-            try:
-                url, media_id = await resolve_target()
-                if media_id:
-                    by_cid = await schema.boost_target_replies_via_http_pool(
-                        db, url, str(media_id), targets=targets, max_likes=like_count,
-                        exclude_account_ids=used, pool_owner_user_id=pool_owner_user_id,
-                        task_id=getattr(task, "id", None), stop_requested=stop_requested,
-                    )
-            except Exception:
-                logger.exception("[REPLY_LIKES] task=%s failed", getattr(task, "id", None))
-        result["reply_likes"] = {
-            "target": like_target, "requested_per_reply": like_count,
-            "by_comment_id": {item["cid"]: by_cid.get(item["cid"], 0) for item in targets},
-        }
+    if like_requested and not checkpoint_failed:
+        await resume_reply_likes(db, task, video_url, result, pool_owner_user_id=pool_owner_user_id,
+                                 stop_requested=stop_requested)
     return result

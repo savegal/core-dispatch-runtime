@@ -48,7 +48,7 @@ from services.task_service import dequeue_task
 from services.task_service import get_text_stats, record_text_result, requeue_deferred_task, task_queue_priority_level
 from services.app_settings_service import is_parsing_mode
 from services.metrics import increment_counter, record_timing
-from services.likes_config import BOOST_LIKES_DEFAULT, coerce_likes_quantity
+from services.likes_config import BOOST_LIKES_DEFAULT, coerce_likes_quantity, pending_reply_likes
 from services.account_service import (
     get_free_account_for_main_comment,
     get_free_account_for_reply,
@@ -1552,6 +1552,15 @@ def process_task(task_id: int) -> None:
                 and (_url_result_counts_as_success(existing_row) or _visibility_result_has_receipts(existing_row)
                      or has_submission_evidence(existing_row))
             ):
+                if pending_reply_likes(existing_row):
+                    from executor.browser_pool import browser_pool_task_scope
+                    from executor.reply_visibility import resume_reply_likes
+
+                    with browser_pool_task_scope(task_id):
+                        loop.run_until_complete(resume_reply_likes(
+                            db, task, video_url, existing_row, pool_owner_user_id=pool_owner_user_id,
+                            stop_requested=task_stop_requested_now,
+                        ))
                 logger.info(
                     f"Task {task_id}, URL {idx+1}: skipping — already processed "
                     f"(status={existing_row.get('status')}, "
@@ -1569,21 +1578,14 @@ def process_task(task_id: int) -> None:
                 db.commit()
                 continue
 
-            # ANTI-BOT: рандомная пауза между видео.
-            # Без этой паузы три коммента подряд от разных аккаунтов с одного
-            # IP/proxy выглядят как явный бот-кластер. ACCOUNT_COOLDOWN_SECONDS
-            # умножается на случайный множитель в [URL_PROCESSING_DELAY_MIN,
-            # URL_PROCESSING_DELAY_MAX] — типично 30-90с при дефолтах.
-            # Логика восстановлена из старой версии; пользователь может
-            # выключить её через task.settings.delays=False.
+            # The account cooldown applies to account selection only.
             if idx > 0 and delays_enabled:
                 delay_seconds = random.uniform(
-                    settings.ACCOUNT_COOLDOWN_SECONDS * settings.URL_PROCESSING_DELAY_MIN,
-                    settings.ACCOUNT_COOLDOWN_SECONDS * settings.URL_PROCESSING_DELAY_MAX,
+                    settings.URL_PROCESSING_DELAY_BASE_SECONDS * settings.URL_PROCESSING_DELAY_MIN,
+                    settings.URL_PROCESSING_DELAY_BASE_SECONDS * settings.URL_PROCESSING_DELAY_MAX,
                 )
                 logger.info(
-                    f"Task {task_id}, URL {idx+1}: anti-bot inter-video delay "
-                    f"{delay_seconds:.1f}s (cooldown={settings.ACCOUNT_COOLDOWN_SECONDS}s)"
+                    "Task %s, URL %s: inter-video delay %.1fs", task_id, idx + 1, delay_seconds,
                 )
                 if sleep_or_stop(delay_seconds):
                     logger.info(f"Task {task_id}: stop/timeout detected after delay before URL {idx+1}/{len(video_urls)}")
@@ -1971,6 +1973,8 @@ def process_task(task_id: int) -> None:
                             variant_result_dicts.extend(shadowed_results)
                     else:
                         for variant_num, raw_variant in enumerate(raw_variant_choices, start=1):
+                            if task_stop_requested_now():
+                                break
                             text_choice = process_spintax(raw_variant)
                             text_stats = get_text_stats(text_choice)
                             if (

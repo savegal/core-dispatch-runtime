@@ -1154,6 +1154,45 @@ async def test_execute_hybrid_full_resolves_shortlink_before_attempts(db_session
 
 @pytest.mark.unit
 @pytest.mark.asyncio
+async def test_execute_hybrid_full_stops_after_main_receipt(db_session, monkeypatch):
+    from config.settings import get_settings
+
+    monkeypatch.setattr(get_settings(), "TIKTOK_NETWORK_FIRST", True)
+    monkeypatch.setattr(get_settings(), "TIKTOK_NETWORK_IMPL_READY", True)
+    account = SimpleNamespace(id=24, label="main")
+    task = SimpleNamespace(reply1="reply one", reply2=None, reply3=None, settings={})
+    url = "https://www.tiktok.com/@demo/video/1234567890123456789"
+    cid = "7641761192486194454"
+    stopped = False
+    released = []
+
+    async def publish(*args, outcome_dict, **kwargs):
+        nonlocal stopped
+        stopped = True
+        outcome_dict.update(network_confirmed=True, method="http", publication_attempted=True)
+        return cid, None, "http"
+
+    replies = AsyncMock()
+    boost = AsyncMock()
+    monkeypatch.setattr(engagement_engine, "resolve_order_video_url", AsyncMock(return_value=(url, "1234567890123456789")))
+    monkeypatch.setattr(engagement_engine, "get_free_account_for_main_comment", lambda *args, **kwargs: account)
+    monkeypatch.setattr(engagement_engine, "attempt_main_comment_on_account", publish)
+    monkeypatch.setattr(engagement_engine, "execute_replies_http", replies)
+    monkeypatch.setattr(engagement_engine, "_order_boost_likes", boost)
+    monkeypatch.setattr(engagement_engine, "release_main_account_reservation", released.append)
+
+    result = await engagement_engine.execute_hybrid_full(
+        db_session, task, url, "hello", 180, stop_requested=lambda: stopped,
+    )
+
+    assert result.comment_id == cid and result.main_comment["network_confirmed"]
+    assert released == [account.id]
+    replies.assert_not_awaited()
+    boost.assert_not_awaited()
+
+
+@pytest.mark.unit
+@pytest.mark.asyncio
 async def test_execute_hybrid_full_releases_main_account_reservation_on_success(db_session, monkeypatch):
     account = Account(id=24, label="main", status="active", cookies='{"sessionid":"x"}', proxy="http://proxy-main")
     task = SimpleNamespace(reply1="reply one", reply2=None, reply3=None, settings={"reply_count": 1})

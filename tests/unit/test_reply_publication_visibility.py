@@ -143,7 +143,47 @@ async def test_reply_likes_only_send_to_selected_public_cid(adapter, monkeypatch
         assert boost.await_args.kwargs["targets"] == [{"cid": NEW, "parent_id": PARENT}]
         assert boost.await_args.kwargs["max_likes"] == 15
         assert row["reply_likes"]["by_comment_id"] == {NEW: 15}
+        assert any(snapshot.get("reply_likes", {}).get("state") == "pending" for snapshot in adapter.snapshots)
+        assert adapter.snapshots[-1]["reply_likes"]["by_comment_id"] == {NEW: 15}
         assert row["status"] == "success" and row["engagement"]["replies"]["ok"] == 2
+
+
+async def test_reply_like_resume_does_not_redispatch_an_unconfirmed_attempt(adapter, monkeypatch):
+    from executor.http.playwright_http_client import PlaywrightHttpClient
+
+    monkeypatch.setenv("AUTO_BOOST_LIKES", "1")
+    row = result(item())
+    row["reply_likes"] = {
+        "state": "pending", "requested_per_reply": 3, "targets": [{"cid": CID, "parent_id": PARENT}],
+        "by_comment_id": {CID: 0}, "attempts": {}, "exclude_account_ids": [1],
+    }
+    sent = []
+
+    def select(*args, exclude_ids, **kwargs):
+        return next((adapter.accounts[key] for key in (8, 9, 10, 20) if key not in exclude_ids), None)
+
+    async def like(*, correlation_id, **kwargs):
+        account_id = correlation_id.split("_acc")[1].split("_")[0]
+        assert adapter.snapshots[-1]["reply_likes"]["attempts"][CID][account_id] == "unconfirmed"
+        sent.append(account_id)
+        if account_id == "9":
+            raise asyncio.CancelledError
+        return True, None, None
+
+    monkeypatch.setattr(adapter.schema, "get_free_account_for_reply", select)
+    monkeypatch.setattr(PlaywrightHttpClient, "from_page", AsyncMock(return_value=SimpleNamespace(like_comment=like)))
+    with pytest.raises(asyncio.CancelledError):
+        await visibility.resume_reply_likes(adapter.db, adapter.task, URL, row)
+
+    saved = copy.deepcopy(adapter.snapshots[-1])
+    assert saved["reply_likes"]["attempts"] == {CID: {"8": "confirmed", "9": "unconfirmed"}}
+    await visibility.resume_reply_likes(adapter.db, adapter.task, URL, saved)
+
+    assert sent == ["8", "9", "10"]
+    assert adapter.snapshots[-1]["reply_likes"]["by_comment_id"] == {CID: 2}
+    assert adapter.snapshots[-1]["reply_likes"]["state"] == "completed"
+    adapter.publish.assert_not_awaited()
+    adapter.scan.assert_not_awaited()
 
 
 async def test_unconfirmed_priority_does_not_fall_back_to_another_reply(adapter, monkeypatch):

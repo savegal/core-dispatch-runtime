@@ -3173,8 +3173,11 @@ async def execute_replies_http(
     *,
     parent_author: Optional[str] = None,
     pool_owner_user_id: Optional[int] = None,
+    stop_requested: Optional[Callable[[], bool]] = None,
 ) -> List[Dict[str, Any]]:
     results: List[Dict[str, Any]] = []
+    if stop_requested and stop_requested():
+        return results
     if not extract_video_id(video_url):
         video_url, _ = await resolve_video_url(video_url)
 
@@ -3221,6 +3224,8 @@ async def execute_replies_http(
     parent_invalidated = False
 
     for reply_idx, reply_text in enumerate(replies):
+        if stop_requested and stop_requested():
+            break
         if not reply_text:
             continue
 
@@ -3261,6 +3266,8 @@ async def execute_replies_http(
         publication_attempts = 0
 
         for attempt_num in range(1, candidate_scan_limit(settings) + 1):
+            if stop_requested and stop_requested():
+                return results
             if publication_attempts >= 6:
                 break
             reply_account = get_free_account_for_reply(
@@ -5391,8 +5398,12 @@ async def execute_hybrid_full(
     task_id: int,
     *,
     pool_owner_user_id: Optional[int] = None,
+    stop_requested: Optional[Callable[[], bool]] = None,
 ) -> EngagementResult:
     result = EngagementResult()
+    if stop_requested and stop_requested():
+        result.main_comment["error"] = "stopped_by_user"
+        return result
     boost_enabled, boost_quantity = _get_task_boost_config(db, task)
     result.boost_enabled = boost_enabled
     result.boost_quantity = boost_quantity
@@ -5431,9 +5442,18 @@ async def execute_hybrid_full(
                 release_main_account_reservation(account_id)
             finally:
                 reserved_main_account_ids.discard(account_id)
+
+    def _finish_stopped() -> EngagementResult:
+        result.boost_enabled = False
+        if not result.comment_found and not result.main_comment.get("error"):
+            result.main_comment["error"] = "stopped_by_user"
+        _release_reserved_main_accounts()
+        return result
     
     publication_attempts = 0
     for attempt_num in range(1, max_attempts + 1):
+        if stop_requested and stop_requested():
+            return _finish_stopped()
         if publication_attempts >= 6:
             break
         candidate = get_free_account_for_main_comment(
@@ -5498,6 +5518,10 @@ async def execute_hybrid_full(
                 result.comment_author = result.main_comment.get("comment_author") or candidate.label
                 result.comment_found = True
                 break
+            if stop_requested and stop_requested():
+                result.comment_id = str(comment_id)
+                result.main_comment.update(comment_id=result.comment_id, posted=True, submitted_unconfirmed=True)
+                return _finish_stopped()
             if not replies_to_post:
                 main_comment_id = comment_id
                 result.main_comment["comment_id"] = main_comment_id
@@ -5573,6 +5597,9 @@ async def execute_hybrid_full(
             break
 
         if local_no_id_accepted:
+            if stop_requested and stop_requested():
+                result.main_comment["submitted_unconfirmed"] = True
+                return _finish_stopped()
             if not replies_to_post:
                 result.main_comment["success"] = True
                 result.main_comment["verified"] = False
@@ -5662,6 +5689,9 @@ async def execute_hybrid_full(
             )
             break
 
+    if stop_requested and stop_requested():
+        return _finish_stopped()
+
     main_local_confirmed_without_id = bool(
         result.main_comment.get("posted")
         and result.main_comment.get("local_confirmed")
@@ -5743,6 +5773,7 @@ async def execute_hybrid_full(
             parent_unconfirmed=bool(result.main_comment.get("submitted_unconfirmed")),
             parent_author=result.comment_author,
             pool_owner_user_id=pool_owner_user_id,
+            stop_requested=stop_requested,
         )
 
         # If the smart check resolved to "parent doesn't exist", the first
@@ -5772,6 +5803,8 @@ async def execute_hybrid_full(
             return result
 
     result.accept_http_main_confirmation()
+    if stop_requested and stop_requested():
+        return _finish_stopped()
     if boost_enabled and not replies_to_post:
         result.boost_enabled = False
         result.boost_error = None

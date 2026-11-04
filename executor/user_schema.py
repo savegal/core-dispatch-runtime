@@ -58,7 +58,7 @@ import threading
 import time
 import uuid
 from dataclasses import dataclass, field
-from typing import Any, Callable, Dict, List, Optional, Tuple, Set
+from typing import Any, Awaitable, Callable, Dict, List, Optional, Tuple, Set
 from urllib.parse import urlparse
 
 from patchright.async_api import Page
@@ -1465,8 +1465,12 @@ async def boost_target_replies_via_http_pool(
     pool_owner_user_id: Optional[int] = None,
     task_id: Optional[int] = None,
     stop_requested: Optional[Callable[[], bool]] = None,
+    attempts: Optional[Dict[str, Dict[str, str]]] = None,
+    persist_progress: Optional[Callable[[], Awaitable[bool]]] = None,
 ) -> Dict[str, int]:
     """Boost confirmed reply comments up to max_likes using additional free accounts from the pool."""
+    if attempts is not None and persist_progress is None:
+        raise ValueError("Persisted reply like attempts require a checkpoint callback")
     clean_aweme = str(aweme_id or "").strip()
     if not clean_aweme or max_likes <= 0 or not targets:
         return {}
@@ -1481,6 +1485,10 @@ async def boost_target_replies_via_http_pool(
         return {}
     likes_by_cid: Dict[str, int] = {}
     for item in pending_targets:
+        cid = item["cid"]
+        if attempts is not None:
+            likes_by_cid[cid] = sum(status == "confirmed" for status in attempts.get(cid, {}).values())
+            continue
         _record_branch_published_reply(item["parent_id"], 1, item["cid"])
         likes_by_cid[item["cid"]] = next(
             (row["likes_given"] for row in _get_branch_published_replies(item["parent_id"])
@@ -1492,15 +1500,24 @@ async def boost_target_replies_via_http_pool(
     from executor.engagement_engine import warmup_page_for_http
     from executor.http.playwright_http_client import PlaywrightHttpClient
 
+    def has_budget(cid: str, account_id: Optional[int] = None) -> bool:
+        if attempts is None:
+            return can_boost_reply(cid, account_id, max_likes=max_likes)
+        attempted = attempts.get(cid, {})
+        return len(attempted) < max_likes and str(account_id) not in attempted
+
     for attempt_idx in range(max_pool_attempts):
         if stop_requested and stop_requested():
             break
         pending_targets = [
             t for t in pending_targets
-            if can_boost_reply(t["cid"], None, max_likes=max_likes)
+            if has_budget(t["cid"])
         ]
         if not pending_targets:
             break
+        if attempts is not None:
+            already_used = set.intersection(*(set(attempts.get(item["cid"], {})) for item in pending_targets))
+            excluded.update(int(account_id) for account_id in already_used)
         account = get_free_account_for_reply(
             db,
             exclude_ids=list(excluded),
@@ -1534,8 +1551,19 @@ async def boost_target_replies_via_http_pool(
                     break
                 cid = item["cid"]
                 parent_id = item.get("parent_id") or None
-                if not can_boost_reply(cid, account.id, max_likes=max_likes):
+                if not has_budget(cid, account.id):
                     continue
+                account_key = str(account.id)
+                if attempts is not None:
+                    # A worker can die after dispatch and before receiving its receipt.
+                    attempts.setdefault(cid, {})[account_key] = "unconfirmed"
+                    if not await persist_progress():
+                        del attempts[cid][account_key]
+                        return likes_by_cid
+                    if stop_requested and stop_requested():
+                        del attempts[cid][account_key]
+                        await persist_progress()
+                        return likes_by_cid
                 try:
                     ok, _, _ = await client.like_comment(
                         aweme_id=clean_aweme,
@@ -1543,7 +1571,16 @@ async def boost_target_replies_via_http_pool(
                         correlation_id=f"{corr}_reply_{cid[:12]}",
                         video_url=video_url,
                     )
-                    if ok:
+                    if attempts is not None:
+                        not_sent = not ok and client.last_request_meta.get("request_attempted") is False
+                        if ok:
+                            attempts[cid][account_key] = "confirmed"
+                            likes_by_cid[cid] += 1
+                        elif not_sent:
+                            del attempts[cid][account_key]
+                        if (ok or not_sent) and not await persist_progress():
+                            return likes_by_cid
+                    elif ok:
                         given = record_reply_boost(cid, account.id, parent_id=parent_id)
                         likes_by_cid[cid] = given
                         logger.info(

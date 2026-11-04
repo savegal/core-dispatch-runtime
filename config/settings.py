@@ -144,8 +144,9 @@ class Settings(BaseSettings):
     GLOBAL_NETWORK_PROBE_TIMEOUT_SECONDS: float = 3.0
     
     # Задержки для обработки URL
-    URL_PROCESSING_DELAY_MIN: float = 0.5  # Минимальный множитель для задержки между URL
-    URL_PROCESSING_DELAY_MAX: float = 1.5  # Максимальный множитель для задержки между URL
+    URL_PROCESSING_DELAY_BASE_SECONDS: float = Field(default=60.0, ge=0)
+    URL_PROCESSING_DELAY_MIN: float = 0.5  # Минимальный множитель базовой задержки между URL
+    URL_PROCESSING_DELAY_MAX: float = 1.5  # Максимальный множитель базовой задержки между URL
 
     # Compatibility defaults for settings referenced across API/bot/worker code.
     ADMIN_IDS: str = ""
