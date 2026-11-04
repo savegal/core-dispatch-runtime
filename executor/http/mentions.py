@@ -250,21 +250,37 @@ _RESOLVE_USER_JS = """async ({username, timeoutMs, runtimeParams}) => {
     // Phase 1: Native webmssdk-signed fetch to user detail API with full params
     try {
         const p = runtimeParams || {};
+        const ua = String(navigator.userAgent || '');
+        const browserVersion = ua.replace(/^Mozilla\//i, '') || '5.0 (Windows NT 10.0; Win64; x64)';
         const qs = new URLSearchParams({
             aid: '1988',
             app_name: 'tiktok_web',
             device_platform: 'web_pc',
             browser_name: 'Mozilla',
             browser_platform: navigator.platform || 'Win32',
+            browser_version: browserVersion,
             browser_language: navigator.language || 'en-US',
+            browser_online: String(navigator.onLine !== false),
+            cookie_enabled: String(!!navigator.cookieEnabled),
             channel: 'tiktok_web',
+            focus_state: 'true',
+            from_page: 'video',
+            history_len: String(p.history_length || window.history?.length || 4),
+            is_fullscreen: 'false',
+            is_page_visible: 'true',
+            os: 'windows',
+            screen_width: String(p.screen_width || window.screen?.width || 1920),
+            screen_height: String(p.screen_height || window.screen?.height || 1080),
             uniqueId: username,
             secUid: '',
         });
         if (p.device_id) qs.set('device_id', String(p.device_id));
         if (p.odin_id || p.odinId) qs.set('odinId', String(p.odin_id || p.odinId));
         if (p.web_id_last_time || p.WebIdLastTime) qs.set('WebIdLastTime', String(p.web_id_last_time || p.WebIdLastTime));
-        if (p.region) qs.set('region', String(p.region));
+        if (p.region) {
+            qs.set('region', String(p.region));
+            qs.set('priority_region', String(p.region));
+        }
         qs.set('tz_name', String(p.timezone || p.tz_name || Intl.DateTimeFormat().resolvedOptions().timeZone));
         if (p.msToken) qs.set('msToken', String(p.msToken));
         if (p.verifyFp || p.s_v_web_id) qs.set('verifyFp', String(p.verifyFp || p.s_v_web_id));
@@ -386,10 +402,24 @@ async def resolve_mention_user(
         if hit and (cached is None or _validated_user_info(username, cached)):
             return _validated_user_info(username, cached) if cached is not None else None
 
+        fb_hit, fb_cached = _cache_get(username)
+        fallback_info = _validated_user_info(username, fb_cached) if (fb_hit and fb_cached is not None) else None
+
+        def _use_fallback(reason_label: str) -> Optional[Dict[str, str]]:
+            if fallback_info is not None:
+                logger.info(
+                    "[MENTION] @%s live resolve transient failure (%s); using cached identity user_id=%s",
+                    username, reason_label, fallback_info.get("user_id"),
+                )
+                if order_cache is not None:
+                    order_cache[key] = dict(fallback_info)
+                return dict(fallback_info)
+            return None
+
         if page is None:
-            return None
+            return _use_fallback("page_none")
         if getattr(page, "is_closed", None) and page.is_closed() is True:
-            return None
+            return _use_fallback("page_closed")
 
         try:
             result = await asyncio.wait_for(page.evaluate(
@@ -403,11 +433,11 @@ async def resolve_mention_user(
             ), timeout=max(0.1, timeout_ms / 1000) + 0.5)
         except Exception as exc:
             logger.warning("[MENTION] resolve failed for @%s: %s", username, str(exc)[:120])
-            return None  # transient: do not negative-cache page errors
+            return _use_fallback(f"exception:{type(exc).__name__}")  # transient: do not negative-cache page errors
 
         if not isinstance(result, dict):
             logger.warning("[MENTION] @%s returned non-dict JS result: %s", username, result)
-            return None
+            return _use_fallback("non_dict_result")
 
         status = result.get("status")
 
@@ -452,6 +482,10 @@ async def resolve_mention_user(
             if order_cache is not None:
                 order_cache[key] = None
             return None
+        elif status == "transient_error":
+            fb = _use_fallback(f"transient_error:{result.get('reason')}")
+            if fb is not None:
+                return fb
 
         else:
             # transient_error: DO NOT put into negative cache!

@@ -224,9 +224,11 @@ async def _install_resource_blocking_routes(context: BrowserContext, account_id:
 
     async def populate(response):
         try:
+            all_headers = getattr(response, "all_headers", None)
+            headers = await await_browser_read(all_headers) if callable(all_headers) else response.headers
             body = await await_browser_read(response.body)
             if settings.STATIC_ASSET_CACHE_ENABLED:
-                static_asset_cache.put(response.url, response.status, response.headers, body)
+                static_asset_cache.put(response.url, response.status, headers, body)
         except Exception:
             pass  # Closing a tab must never affect other contexts' downloads.
         finally:
@@ -1743,6 +1745,7 @@ class BrowserPool:
                 context._account_proxy_source = proxy_source
                 context._account_proxy_key = self._make_browser_id(proxy_source)
                 context._account_proxy_in_use = bool(proxy_source)
+                context._shared_browser_process = bool(settings.BROWSER_POOL_SHARED_PROCESS and proxy_source)
                 context._account_proxy_route = resolved_route
                 context._account_locale = context_options.get("locale")
                 context._account_accept_language = accept_language if proxy_source else None

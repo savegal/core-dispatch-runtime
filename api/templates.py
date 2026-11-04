@@ -9,6 +9,7 @@ import logging
 from config.limiter import limiter
 from config.settings import get_settings
 from api.auth import verify_user_header, ensure_user_scope
+from services.keyword_replies import normalize_keywords
 
 router = APIRouter(prefix="/api/templates", tags=["templates"])
 logger = logging.getLogger(__name__)
@@ -86,6 +87,12 @@ def _normalize_template_reply_payload(
     payload["reply_count"] = reply_count
     for idx, reply_text in enumerate(replies[3:], start=4):
         payload[f"reply{idx}"] = reply_text
+    template_type = str(payload.get("template_type") or "").strip().lower()
+    if "keywords" in payload or template_type in {"keyword", "keywords", "keyword_replies", "keyword-replies"}:
+        try:
+            payload["keywords"] = normalize_keywords(payload.get("keywords"))
+        except ValueError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
     return payload, replies
 
 

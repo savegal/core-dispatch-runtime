@@ -10,11 +10,15 @@ from bot.services.mention_choice import ensure_mention_choice
 from aiogram.filters import StateFilter
 from bot.services.validators import validate_video_url
 from bot.services.api_client import api_client
+from bot.services.likes_ui import format_reply_likes_label
 from bot.services.template_utils import (
+    filter_keyword_templates,
     filter_reply_source_templates,
+    is_keywords_template,
     is_replies_only_template,
     normalize_user_text,
     preserve_nonempty_lines,
+    template_keywords,
     template_replies,
 )
 from bot.services.user_utils import get_user_backend_id
@@ -28,7 +32,7 @@ from bot.services.formatting import markdown_inline_code
 from bot.utils.markdown_escape import escape_markdown_simple
 from services.likes_config import BOOST_LIKES_DEFAULT, coerce_likes_quantity
 from services.comment_search import normalize_search_phrase
-from services.keyword_replies import KEYWORD_ORDER_KIND, normalize_keywords
+from services.keyword_replies import KEYWORD_ORDER_KIND, normalize_keywords, replies_per_keyword_target
 import logging
 import re
 import hashlib
@@ -163,6 +167,7 @@ def _template_choice_keyboard(templates: list[dict], page: int = 0) -> tuple[Inl
 @router.callback_query(F.data == "menu:engagement_only")
 @router.callback_query(F.data == "menu:keyword_replies")
 @router.callback_query(F.data.startswith("engagement:from_template:"))
+@router.callback_query(F.data.startswith("engagement:from_keyword_template:"))
 async def start_engagement_wizard(callback: CallbackQuery, state: FSMContext):
     """Начинает создание engagement_only заказа."""
     try:
@@ -186,29 +191,73 @@ async def start_engagement_wizard(callback: CallbackQuery, state: FSMContext):
             return
         
         selected_template = None
-        if (callback.data or "").startswith("engagement:from_template:"):
-            template_id = int(callback.data.split(":")[-1])
+        selected_keyword_template = None
+        cb_data = callback.data or ""
+        if cb_data.startswith("engagement:from_template:"):
+            template_id = int(cb_data.split(":")[-1])
             selected_template = await api_client.get_task_template(template_id, user_data.get("id"))
             if not isinstance(selected_template, dict) or not _template_reply_list(selected_template):
                 await callback.answer("Шаблон недоступен или не содержит ответов", show_alert=True)
                 return
+        elif cb_data.startswith("engagement:from_keyword_template:"):
+            template_id = int(cb_data.split(":")[-1])
+            selected_keyword_template = await api_client.get_task_template(template_id, user_data.get("id"))
+            if not isinstance(selected_keyword_template, dict) or not template_keywords(selected_keyword_template):
+                await callback.answer("Шаблон недоступен или не содержит ключевых слов", show_alert=True)
+                return
         await state.clear()
-        keyword_order = callback.data == "menu:keyword_replies"
+        keyword_order = cb_data == "menu:keyword_replies" or selected_keyword_template is not None
         await state.update_data(order_kind=KEYWORD_ORDER_KIND if keyword_order else "engagement_only",
                                 order_create_token=uuid.uuid4().hex)
         if selected_template:
             selected_replies = _template_reply_list(selected_template)
+            tpl_settings = selected_template.get("settings") or {}
+            extra_tpl_state = {
+                k: tpl_settings[k]
+                for k in (
+                    "reply_like_target",
+                    "reply_like_count",
+                    "sort_targets_by_likes",
+                    "max_targets",
+                    "replies_per_target",
+                )
+                if k in tpl_settings and tpl_settings[k] is not None
+            }
             await state.update_data(
                 replies=selected_replies, template_id=selected_template["id"],
                 template_name=_template_display_name(selected_template),
                 template_usage="replies_only", reply_source="template",
-                verify_reply_visibility=(selected_template.get("settings") or {}).get("verify_reply_visibility") is True,
+                verify_reply_visibility=tpl_settings.get("verify_reply_visibility") is True,
+                **extra_tpl_state,
+            )
+        elif selected_keyword_template:
+            kw_list = template_keywords(selected_keyword_template)
+            tpl_replies = _template_reply_list(selected_keyword_template)
+            tpl_settings = selected_keyword_template.get("settings") or {}
+            await state.update_data(
+                keywords=kw_list,
+                comment_text="\n".join(kw_list),
+                keyword_template_id=selected_keyword_template["id"],
+                keyword_template_name=_template_display_name(selected_keyword_template),
+                boost_likes_enabled=False,
+                verify_reply_visibility=tpl_settings.get("verify_reply_visibility") is True,
+                **(
+                    {
+                        "replies": tpl_replies,
+                        "template_id": selected_keyword_template["id"],
+                        "template_name": _template_display_name(selected_keyword_template),
+                        "template_usage": "replies_only",
+                        "reply_source": "template",
+                    }
+                    if tpl_replies
+                    else {}
+                ),
             )
         
         intro = (
             "*Ответы по ключевым словам · HTTP*\n\n"
             "Найдём все доступные комментарии основного списка с любым из ваших ключей. "
-            "Под каждым отправим один ответ. Если вариантов ответа несколько, они будут чередоваться.\n\n"
+            "По умолчанию под каждым отправим один ответ. Количество можно изменить при подтверждении.\n\n"
             "*Шаг 1:* Отправьте ссылку на видео TikTok:"
         ) if keyword_order else (
             "*⚡ Только ответы*\n\n"
@@ -248,14 +297,23 @@ async def process_video_url(message: Message, state: FSMContext):
             return
         
         await state.update_data(video_url=video_url, video_urls=[video_url])
-        if (await state.get_data()).get("order_kind") == KEYWORD_ORDER_KIND:
+        current_data = await state.get_data()
+        if current_data.get("order_kind") == KEYWORD_ORDER_KIND:
+            if current_data.get("keywords"):
+                if _engagement_replies_from_state(current_data):
+                    await show_engagement_preview(message, state)
+                else:
+                    await ask_for_reply_source(message, state)
+                return
             await message.answer(
                 "*Ключевые слова · шаг 2*\n\n"
-                "Отправьте слова или фразы через запятую либо с новой строки.\n"
+                "Отправьте слова или фразы через запятую либо с новой строки, "
+                "или выберите готовый шаблон ключевых слов.\n"
                 "Например: `где купить, цена, доставка`\n\n"
                 "Достаточно совпадения любого ключа. Слова и фразы ищем целиком, "
                 "без учёта регистра и смайликов. До 50 ключей.",
                 reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                    [InlineKeyboardButton(text="📑 Выбрать шаблон ключей", callback_data="engagement:choose_keyword_template")],
                     [InlineKeyboardButton(text="❌ Отмена", callback_data="menu:main")]]), parse_mode="Markdown")
             await state.set_state(EngagementStates.INPUT_COMMENT_TEXT)
             return
@@ -440,6 +498,18 @@ async def select_engagement_template(callback: CallbackQuery, state: FSMContext)
             await callback.answer("В этом шаблоне нет ответов", show_alert=True)
             return
 
+        tpl_settings = template.get("settings") or {}
+        extra_tpl_state = {
+            k: tpl_settings[k]
+            for k in (
+                "reply_like_target",
+                "reply_like_count",
+                "sort_targets_by_likes",
+                "max_targets",
+                "replies_per_target",
+            )
+            if k in tpl_settings and tpl_settings[k] is not None
+        }
         await state.update_data(
             replies=replies,
             reply1=replies[0] if len(replies) >= 1 else None,
@@ -449,6 +519,7 @@ async def select_engagement_template(callback: CallbackQuery, state: FSMContext)
             template_name=_template_display_name(template),
             template_usage="replies_only",
             reply_source="template",
+            **extra_tpl_state,
         )
         await show_engagement_preview(callback, state)
     except Exception as e:
@@ -784,7 +855,11 @@ async def show_engagement_preview(message_or_callback: Message | CallbackQuery, 
             preview_text += "*Ключевые слова:*\n" + "\n".join(_mono_preview(key, 100) for key in keywords[:10])
             if len(keywords) > 10:
                 preview_text += f"\n… и ещё {len(keywords) - 10}"
-            preview_text += ("\n\nПо одному ответу на каждый найденный комментарий. Варианты чередуются.\n"
+            per_target = min(replies_per_keyword_target(data.get("replies_per_target")), max(1, len(replies)))
+            target_limit = int(data.get("max_targets") or 0)
+            target_order = "по лайкам" if data.get("sort_targets_by_likes") else "порядок TikTok"
+            preview_text += (f"\n\nОтветов на комментарий: {per_target}. Варианты чередуются.\n"
+                             f"Порядок целей: {target_order}. Лимит: {target_limit or 'все найденные'}.\n"
                              "Оплата по действующему тарифу за видео, а не за каждое совпадение.\n"
                              "Если TikTok отдаст неполный список, заказ покажет частичный результат.\n\n")
 
@@ -800,17 +875,25 @@ async def show_engagement_preview(message_or_callback: Message | CallbackQuery, 
         if not replies:
             preview_text += "Ответы не добавлены\n"
         
+        reply_likes_badge = format_reply_likes_label(
+            data.get("reply_like_target"),
+            data.get("reply_like_count"),
+        )
         if keyword_order:
+            if data.get("keyword_template_name"):
+                preview_text += f"🔑 *Шаблон ключей:* {escape_markdown_simple(data.get('keyword_template_name'))}\n"
             preview_text += "\nПлатные лайки: не заказываются\n\n"
             if data.get("verify_reply_visibility"):
                 preview_text += "Проверка видимости: без повторной отправки ответа.\n\n"
-        elif global_likes_enabled:
-            if boost_likes_enabled:
-                preview_text += f"\n❤️ *Лайки:* добавить {likes_quantity}\n\n"
-            else:
-                preview_text += "\n🤍 *Лайки:* не добавлять\n\n"
         else:
-            preview_text += "\n🤍 *Лайки:* выключены в настройках сервиса\n\n"
+            if global_likes_enabled:
+                if boost_likes_enabled:
+                    preview_text += f"\n❤️ *Платные лайки:* добавить {likes_quantity}\n"
+                else:
+                    preview_text += "\n🤍 *Платные лайки:* не добавлять\n"
+            else:
+                preview_text += "\n🤍 *Платные лайки:* выключены в настройках сервиса\n"
+            preview_text += f"❤️ *Лайки на ответ (свои аккаунты):* {reply_likes_badge}\n\n"
         preview_text += ("Главные комментарии не создаются: отправляются только ответы под совпадениями." if keyword_order else
                          "Новый комментарий не создаётся: ответы будут отправлены под найденным комментарием.")
 
@@ -820,6 +903,24 @@ async def show_engagement_preview(message_or_callback: Message | CallbackQuery, 
         ]
         if keyword_order:
             rows.append([InlineKeyboardButton(text="🔎 Изменить ключевые слова", callback_data="engagement:edit_keywords")])
+            rows.append([
+                InlineKeyboardButton(text=f"Ответов на цель: {per_target}", callback_data="engagement:keyword_options:replies"),
+                InlineKeyboardButton(text=f"Лимит целей: {target_limit or 'все'}", callback_data="engagement:keyword_options:limit"),
+            ])
+            rows.append([InlineKeyboardButton(
+                text=f"Порядок целей: {target_order}", callback_data="engagement:keyword_options:sort",
+            )])
+            rows.append([
+                InlineKeyboardButton(text="📑 Шаблон ключей", callback_data="engagement:choose_keyword_template"),
+                InlineKeyboardButton(text="💾 Сохранить ключи", callback_data="engagement:save_keyword_template"),
+            ])
+        else:
+            rows.append([
+                InlineKeyboardButton(
+                    text=f"❤️ Лайки на ответ: {reply_likes_badge}",
+                    callback_data="engagement:edit_reply_likes",
+                )
+            ])
         if global_likes_enabled:
             rows.append([
                 InlineKeyboardButton(
@@ -877,8 +978,9 @@ async def edit_keyword_order_keys(callback: CallbackQuery, state: FSMContext):
         await callback.answer("Этот заказ не использует ключевые слова", show_alert=True)
         return
     await callback.answer()
-    await callback.message.edit_text("*Изменить ключевые слова*\n\nОтправьте новый список через запятую или с новой строки.",
+    await callback.message.edit_text("*Изменить ключевые слова*\n\nОтправьте новый список через запятую или с новой строки, либо выберите шаблон ключей.",
         reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="📑 Выбрать шаблон ключей", callback_data="engagement:choose_keyword_template")],
             [InlineKeyboardButton(text="❌ Отмена", callback_data="menu:main")]]), parse_mode="Markdown")
     await state.set_state(EngagementStates.INPUT_COMMENT_TEXT)
 
@@ -1024,6 +1126,21 @@ async def confirm_engagement_order(callback: CallbackQuery, state: FSMContext):
             task_settings["template_id"] = data.get("template_id")
             task_settings["template_name"] = data.get("template_name")
             task_settings["template_usage"] = "replies_only"
+        for opt_key in (
+            "reply_like_target",
+            "reply_like_count",
+            "sort_targets_by_likes",
+            "max_targets",
+            "replies_per_target",
+        ):
+            if keyword_order and opt_key in ("reply_like_target", "reply_like_count"):
+                continue
+            if opt_key in data and data.get(opt_key) is not None:
+                task_settings[opt_key] = data.get(opt_key)
+        if keyword_order and "replies_per_target" in task_settings:
+            task_settings["replies_per_target"] = min(
+                replies_per_keyword_target(task_settings["replies_per_target"]), len(replies),
+            )
         
         mention_choice = await ensure_mention_choice(
             callback.message, state, replies, user_id=user_id,
@@ -1127,3 +1244,403 @@ async def engagement_select_pool(callback: CallbackQuery, state: FSMContext):
             await callback.answer("Ошибка", show_alert=True)
         except Exception:
             pass
+
+
+@router.callback_query(
+    F.data.in_({
+        "engagement:keyword_options:replies",
+        "engagement:keyword_options:limit",
+        "engagement:keyword_options:sort",
+    }),
+    StateFilter(EngagementStates.CONFIRM_ORDER),
+)
+async def update_keyword_options(callback: CallbackQuery, state: FSMContext):
+    data = await state.get_data()
+    if data.get("order_kind") != KEYWORD_ORDER_KIND:
+        await callback.answer("Эта настройка доступна в заказе по ключевым словам.")
+        return
+    option = callback.data.rsplit(":", 1)[-1]
+    if option == "replies":
+        limit = max(1, min(6, len(_engagement_replies_from_state(data))))
+        current = min(limit, replies_per_keyword_target(data.get("replies_per_target")))
+        await state.update_data(replies_per_target=current % limit + 1)
+    elif option == "limit":
+        limits = (0, 1, 3, 5, 10, 20)
+        current = data.get("max_targets") or 0
+        position = limits.index(current) if current in limits else 0
+        await state.update_data(max_targets=limits[(position + 1) % len(limits)])
+    else:
+        await state.update_data(sort_targets_by_likes=not data.get("sort_targets_by_likes"))
+    await callback.answer()
+    await show_engagement_preview(callback, state)
+
+
+def _build_engagement_reply_likes_keyboard(data: dict) -> InlineKeyboardMarkup:
+    target = data.get("reply_like_target")
+    try:
+        count = max(0, min(50, int(data.get("reply_like_count") or 0)))
+    except (TypeError, ValueError):
+        count = 0
+
+    def _target_btn(label: str, val: str, is_selected: bool) -> InlineKeyboardButton:
+        prefix = "🔘 " if is_selected else "⚪ "
+        return InlineKeyboardButton(text=f"{prefix}{label}", callback_data=f"engagement:set_like_target:{val}")
+
+    target_str = str(target or "1").strip().lower()
+    is_all = target_str == "all"
+    target_row_1 = [
+        _target_btn("1-й", "1", not is_all and target_str in ("1", "none", "")),
+        _target_btn("2-й", "2", not is_all and target_str == "2"),
+        _target_btn("3-й", "3", not is_all and target_str == "3"),
+        _target_btn("4-й", "4", not is_all and target_str == "4"),
+    ]
+    target_row_2 = [
+        _target_btn("5-й", "5", not is_all and target_str == "5"),
+        _target_btn("6-й", "6", not is_all and target_str == "6"),
+        _target_btn("Все ответы", "all", is_all),
+    ]
+    presets = [1, 2, 3, 5, 10, 15, 25]
+    count_row_1 = [
+        InlineKeyboardButton(
+            text=f"{'🔘 ' if count == n else ''}{n} ❤️",
+            callback_data=f"engagement:set_like_count:{n}",
+        )
+        for n in presets[:4]
+    ]
+    count_row_2 = [
+        InlineKeyboardButton(
+            text=f"{'🔘 ' if count == n else ''}{n} ❤️",
+            callback_data=f"engagement:set_like_count:{n}",
+        )
+        for n in presets[4:]
+    ]
+    off_row = [
+        InlineKeyboardButton(
+            text=f"{'🔘 ' if count == 0 else ''}🚫 Выключить (0)",
+            callback_data="engagement:set_like_count:0",
+        )
+    ]
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            target_row_1,
+            target_row_2,
+            count_row_1,
+            count_row_2,
+            off_row,
+            [InlineKeyboardButton(text="✅ Готово", callback_data="engagement:return_from_likes")],
+        ]
+    )
+
+
+async def _render_engagement_reply_likes_screen(callback: CallbackQuery, state: FSMContext) -> None:
+    data = await state.get_data()
+    badge = format_reply_likes_label(data.get("reply_like_target"), data.get("reply_like_count"))
+    text = (
+        "*❤️ Лайки на ответ (свои аккаунты)*\n\n"
+        f"Текущая настройка: *{badge}*\n\n"
+        "Выберите приоритетный ответ (1-й..6-й или Все ответы) и сколько лайков поставить "
+        "с ваших аккаунтов после публикации ответов:"
+    )
+    await callback.message.edit_text(
+        text,
+        reply_markup=_build_engagement_reply_likes_keyboard(data),
+        parse_mode="Markdown",
+    )
+
+
+@router.callback_query(F.data == "engagement:edit_reply_likes", StateFilter(EngagementStates.CONFIRM_ORDER))
+async def engagement_edit_reply_likes(callback: CallbackQuery, state: FSMContext):
+    data = await state.get_data()
+    if data.get("order_kind") == KEYWORD_ORDER_KIND:
+        await callback.answer("Для заказов по ключевым словам лайки на ответы не используются", show_alert=True)
+        return
+    await callback.answer()
+    if not data.get("reply_like_target"):
+        await state.update_data(reply_like_target="1")
+    await _render_engagement_reply_likes_screen(callback, state)
+
+
+@router.callback_query(F.data.startswith("engagement:set_like_target:"), StateFilter(EngagementStates.CONFIRM_ORDER))
+async def engagement_set_like_target(callback: CallbackQuery, state: FSMContext):
+    data = await state.get_data()
+    if data.get("order_kind") == KEYWORD_ORDER_KIND:
+        await callback.answer("Недоступно для ключевых слов", show_alert=True)
+        return
+    raw_val = (callback.data or "").split(":")[-1]
+    target_val = "all" if raw_val == "all" else str(max(1, min(6, int(raw_val))))
+    updates = {"reply_like_target": target_val}
+    if not int(data.get("reply_like_count") or 0):
+        updates["reply_like_count"] = 3
+    await state.update_data(**updates)
+    await callback.answer("Цель лайков обновлена")
+    await _render_engagement_reply_likes_screen(callback, state)
+
+
+@router.callback_query(F.data.startswith("engagement:set_like_count:"), StateFilter(EngagementStates.CONFIRM_ORDER))
+async def engagement_set_like_count(callback: CallbackQuery, state: FSMContext):
+    data = await state.get_data()
+    if data.get("order_kind") == KEYWORD_ORDER_KIND:
+        await callback.answer("Недоступно для ключевых слов", show_alert=True)
+        return
+    count_val = max(0, min(50, int((callback.data or "").split(":")[-1])))
+    updates = {"reply_like_count": count_val}
+    if count_val > 0 and not data.get("reply_like_target"):
+        updates["reply_like_target"] = "1"
+    await state.update_data(**updates)
+    await callback.answer("Количество лайков обновлено")
+    await _render_engagement_reply_likes_screen(callback, state)
+
+
+@router.callback_query(F.data == "engagement:return_from_likes", StateFilter(EngagementStates.CONFIRM_ORDER))
+async def engagement_return_from_likes(callback: CallbackQuery, state: FSMContext):
+    await callback.answer()
+    await show_engagement_preview(callback, state)
+
+
+def _keyword_template_choice_keyboard(templates: list[dict], page: int = 0) -> tuple[InlineKeyboardMarkup, int, int]:
+    total_pages = (len(templates) + ENGAGEMENT_TEMPLATES_PER_PAGE - 1) // ENGAGEMENT_TEMPLATES_PER_PAGE if templates else 1
+    current_page = max(0, min(page, total_pages - 1))
+    start = current_page * ENGAGEMENT_TEMPLATES_PER_PAGE
+    shown = templates[start:start + ENGAGEMENT_TEMPLATES_PER_PAGE]
+
+    rows: list[list[InlineKeyboardButton]] = []
+    for template in shown:
+        template_id = template.get("id")
+        if template_id is None:
+            continue
+        kw_count = len(template_keywords(template))
+        name = _template_display_name(template)
+        if len(name) > 26:
+            name = name[:23] + "..."
+        rows.append([
+            InlineKeyboardButton(
+                text=f"🔑 {name} · {kw_count} ключ.",
+                callback_data=f"engagement:keyword_template_select:{template_id}",
+            )
+        ])
+
+    if total_pages > 1:
+        nav: list[InlineKeyboardButton] = []
+        if current_page > 0:
+            nav.append(InlineKeyboardButton(text="◀️", callback_data=f"engagement:keyword_template_page:{current_page - 1}"))
+        if current_page < total_pages - 1:
+            nav.append(InlineKeyboardButton(text="▶️", callback_data=f"engagement:keyword_template_page:{current_page + 1}"))
+        if nav:
+            rows.append(nav)
+
+    rows.append([InlineKeyboardButton(text="✍️ Ввести ключи вручную", callback_data="engagement:edit_keywords_manual")])
+    rows.append([InlineKeyboardButton(text="❌ Отмена", callback_data="menu:main")])
+    return InlineKeyboardMarkup(inline_keyboard=rows), current_page, total_pages
+
+
+async def _show_keyword_template_choice(callback: CallbackQuery, state: FSMContext, page: int = 0):
+    user_backend_id = await get_user_backend_id(callback.from_user.id)
+    if not user_backend_id:
+        await callback.answer("Не удалось найти пользователя", show_alert=True)
+        return
+
+    raw_templates = await api_client.list_task_templates(user_backend_id)
+    if isinstance(raw_templates, dict):
+        raw_templates = raw_templates.get("templates") or raw_templates.get("items") or []
+    templates = filter_keyword_templates([t for t in (raw_templates or []) if isinstance(t, dict)])
+    await state.update_data(engagement_keyword_templates=templates)
+    if not templates:
+        await callback.answer("У вас пока нет сохранённых шаблонов ключевых слов", show_alert=True)
+        return
+
+    keyboard, current_page, total_pages = _keyword_template_choice_keyboard(templates, page=page)
+    text = (
+        "*🔑 Выберите шаблон ключевых слов*\n\n"
+        "Ключевые слова из выбранного шаблона будут подставлены в заказ.\n\n"
+        f"Страница {current_page + 1}/{total_pages}"
+    )
+    await callback.message.edit_text(text, reply_markup=keyboard, parse_mode="Markdown")
+    await state.set_state(EngagementStates.CHOOSE_KEYWORD_TEMPLATE)
+
+
+@router.callback_query(
+    F.data == "engagement:choose_keyword_template",
+    StateFilter(EngagementStates.INPUT_COMMENT_TEXT, EngagementStates.CONFIRM_ORDER, EngagementStates.CHOOSE_KEYWORD_TEMPLATE),
+)
+async def choose_keyword_template(callback: CallbackQuery, state: FSMContext):
+    try:
+        await callback.answer()
+        await _show_keyword_template_choice(callback, state, page=0)
+    except Exception as e:
+        logger.error(f"Error showing keyword templates: {e}", exc_info=True)
+        await callback.answer("Ошибка загрузки шаблонов ключей", show_alert=True)
+
+
+@router.callback_query(F.data.startswith("engagement:keyword_template_page:"), StateFilter(EngagementStates.CHOOSE_KEYWORD_TEMPLATE))
+async def engagement_keyword_template_page(callback: CallbackQuery, state: FSMContext):
+    try:
+        await callback.answer()
+        page = int((callback.data or "").split(":")[-1])
+        await _show_keyword_template_choice(callback, state, page=page)
+    except Exception as e:
+        logger.error(f"Error switching keyword template page: {e}", exc_info=True)
+        await callback.answer("Ошибка", show_alert=True)
+
+
+@router.callback_query(F.data == "engagement:edit_keywords_manual", StateFilter(EngagementStates.CHOOSE_KEYWORD_TEMPLATE))
+async def edit_keywords_manual_from_template_picker(callback: CallbackQuery, state: FSMContext):
+    await callback.answer()
+    await callback.message.edit_text(
+        "*Ключевые слова*\n\n"
+        "Отправьте слова или фразы через запятую либо с новой строки.\n"
+        "Например: `где купить, цена, доставка`",
+        reply_markup=InlineKeyboardMarkup(
+            inline_keyboard=[
+                [InlineKeyboardButton(text="📑 Выбрать шаблон ключей", callback_data="engagement:choose_keyword_template")],
+                [InlineKeyboardButton(text="❌ Отмена", callback_data="menu:main")],
+            ]
+        ),
+        parse_mode="Markdown",
+    )
+    await state.set_state(EngagementStates.INPUT_COMMENT_TEXT)
+
+
+@router.callback_query(F.data.startswith("engagement:keyword_template_select:"), StateFilter(EngagementStates.CHOOSE_KEYWORD_TEMPLATE))
+async def select_keyword_template(callback: CallbackQuery, state: FSMContext):
+    try:
+        await callback.answer()
+        template_id = int((callback.data or "").split(":")[-1])
+        user_backend_id = await get_user_backend_id(callback.from_user.id)
+        if not user_backend_id:
+            await callback.answer("Пользователь не найден", show_alert=True)
+            return
+
+        template: dict | None = None
+        try:
+            loaded = await api_client.get_task_template(template_id, user_backend_id)
+            template = loaded if isinstance(loaded, dict) else None
+        except Exception:
+            data = await state.get_data()
+            for item in data.get("engagement_keyword_templates") or []:
+                if int(item.get("id") or 0) == template_id:
+                    template = item
+                    break
+
+        keywords = template_keywords(template)
+        if not template or not keywords:
+            await callback.answer("В этом шаблоне нет ключевых слов", show_alert=True)
+            return
+
+        await state.update_data(
+            keywords=keywords,
+            comment_text="\n".join(keywords),
+            keyword_template_id=template_id,
+            keyword_template_name=_template_display_name(template),
+            comment_id=None,
+            username=None,
+            boost_likes_enabled=False,
+        )
+        data = await state.get_data()
+        if _engagement_replies_from_state(data):
+            await show_engagement_preview(callback, state)
+        else:
+            await callback.message.edit_text(
+                "*Ответы по ключевым словам*\n\n"
+                f"🔑 Шаблон ключей: *{escape_markdown_simple(_template_display_name(template))}* ({len(keywords)} ключ.)\n\n"
+                "💬 *Шаг 3:* Откуда взять ответы?\n\n"
+                "Можно ввести ответы вручную или выбрать существующий шаблон ответов.",
+                reply_markup=_reply_source_keyboard(),
+                parse_mode="Markdown",
+            )
+            await state.set_state(EngagementStates.CHOOSE_REPLY_SOURCE)
+    except Exception as e:
+        logger.error(f"Error selecting keyword template: {e}", exc_info=True)
+        await callback.answer("Ошибка выбора шаблона ключей", show_alert=True)
+
+
+@router.callback_query(F.data == "engagement:save_keyword_template", StateFilter(EngagementStates.CONFIRM_ORDER))
+async def prompt_save_keyword_template(callback: CallbackQuery, state: FSMContext):
+    data = await state.get_data()
+    if data.get("order_kind") != KEYWORD_ORDER_KIND:
+        await callback.answer("Доступно только для заказов по ключевым словам", show_alert=True)
+        return
+    try:
+        keywords = normalize_keywords(data.get("keywords"))
+    except ValueError as exc:
+        await callback.answer(str(exc), show_alert=True)
+        return
+    await callback.answer()
+    await callback.message.edit_text(
+        "*💾 Сохранить шаблон ключевых слов*\n\n"
+        f"Ключевых слов: *{len(keywords)}*\n\n"
+        "Отправьте название шаблона сообщением или нажмите «Авто-название»:",
+        reply_markup=InlineKeyboardMarkup(
+            inline_keyboard=[
+                [InlineKeyboardButton(text="⚡ Авто-название", callback_data="engagement:save_keyword_template_auto")],
+                [InlineKeyboardButton(text="⬅️ Назад к превью", callback_data="engagement:back_to_preview")],
+            ]
+        ),
+        parse_mode="Markdown",
+    )
+    await state.set_state(EngagementStates.SAVE_KEYWORD_TEMPLATE_NAME)
+
+
+@router.callback_query(
+    F.data == "engagement:back_to_preview",
+    StateFilter(EngagementStates.SAVE_KEYWORD_TEMPLATE_NAME, EngagementStates.CHOOSE_KEYWORD_TEMPLATE),
+)
+async def engagement_back_to_preview(callback: CallbackQuery, state: FSMContext):
+    await callback.answer()
+    await show_engagement_preview(callback, state)
+
+
+@router.callback_query(F.data == "engagement:save_keyword_template_auto", StateFilter(EngagementStates.SAVE_KEYWORD_TEMPLATE_NAME))
+async def save_keyword_template_auto(callback: CallbackQuery, state: FSMContext):
+    try:
+        data = await state.get_data()
+        keywords = normalize_keywords(data.get("keywords"))
+        user_backend_id = await get_user_backend_id(callback.from_user.id)
+        if not user_backend_id:
+            await callback.answer("Пользователь не найден", show_alert=True)
+            return
+        name = f"Ключи: {', '.join(keywords[:2])}"[:40]
+        created = await api_client.create_task_template(
+            user_id=user_backend_id,
+            name=name,
+            template_type="keywords",
+            settings={"keywords": keywords, "template_type": "keywords"},
+        )
+        await state.update_data(
+            keyword_template_id=created.get("id"),
+            keyword_template_name=created.get("name") or name,
+        )
+        await callback.answer("✅ Шаблон ключевых слов сохранён!", show_alert=True)
+        await show_engagement_preview(callback, state)
+    except Exception as e:
+        logger.error(f"Error auto-saving keyword template: {e}", exc_info=True)
+        await callback.answer("Ошибка сохранения шаблона", show_alert=True)
+
+
+@router.message(StateFilter(EngagementStates.SAVE_KEYWORD_TEMPLATE_NAME))
+async def save_keyword_template_named(message: Message, state: FSMContext):
+    try:
+        name = normalize_user_text(message.text or "") or ""
+        if not name or len(name) > 80:
+            await message.answer("❌ Введите название шаблона (от 1 до 80 символов).")
+            return
+        data = await state.get_data()
+        keywords = normalize_keywords(data.get("keywords"))
+        user_backend_id = await get_user_backend_id(message.from_user.id)
+        if not user_backend_id:
+            await message.answer("Ошибка: пользователь не найден.", reply_markup=get_main_menu_keyboard())
+            return
+        created = await api_client.create_task_template(
+            user_id=user_backend_id,
+            name=name,
+            template_type="keywords",
+            settings={"keywords": keywords, "template_type": "keywords"},
+        )
+        await state.update_data(
+            keyword_template_id=created.get("id"),
+            keyword_template_name=created.get("name") or name,
+        )
+        await message.answer(f"✅ Шаблон ключевых слов *{escape_markdown_simple(name)}* сохранён!", parse_mode="Markdown")
+        await show_engagement_preview(message, state)
+    except Exception as e:
+        logger.error(f"Error saving named keyword template: {e}", exc_info=True)
+        await message.answer("Ошибка сохранения шаблона", reply_markup=get_main_menu_keyboard())

@@ -138,8 +138,7 @@ async def test_unknown_browser_auth_is_softly_marked_and_cannot_be_reselected(mo
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("empty_twice", [False, True])
-async def test_one_empty_publish_retry_rotates_header_token_without_overriding_newer_browser_token(monkeypatch, empty_twice):
+async def test_empty_publish_keeps_rotated_header_token_without_retry_or_overriding_newer_browser_token():
     jar = {"msToken": "imported"}
     sent = []
     async def cookies():
@@ -149,18 +148,16 @@ async def test_one_empty_publish_retry_rotates_header_token_without_overriding_n
     async def evaluate(script, request, **_):
         sent.append(parse_qs(urlparse(request["url"]).query).get("msToken", [None])[0])
         return {"status": 200, "headers": {"content-type": "application/json", **({"X-Ms-Token": "server-fresh"} if len(sent) == 1 else {})},
-                "url": request["url"], "text": "" if len(sent) == 1 or empty_twice else '{"status_code":0,"comment":{"cid":"7641761192486194454"}}'}
+                "url": request["url"], "text": "" if len(sent) == 1 else '{"status_code":0,"comment":{"cid":"7641761192486194454"}}'}
     page = SimpleNamespace(url=URL, context=SimpleNamespace(cookies=cookies, add_cookies=add_cookies), evaluate=evaluate)
-    monkeypatch.setattr("executor.http.playwright_http_client.asyncio.sleep", AsyncMock())
     client = PlaywrightHttpClient(SimpleNamespace(), page=page, retry_policy=RetryPolicy(max_retries=3))
     result = await client._execute_request(RequestProfile.publish_main_profile(), {"aweme_id": "7635267329407913230", "text": "fixture"})
-    assert result[0] is (not empty_twice)
-    assert sent == ["imported", "server-fresh"] and jar["msToken"] == "server-fresh"
-    assert client.last_request_meta["empty_body_retry_count"] == 1
-    if not empty_twice:
-        jar["msToken"] = "newer-browser-token"
-        result = await client._execute_request(RequestProfile.publish_main_profile(), {"aweme_id": "7635267329407913230", "text": "next"})
-        assert result[0] and sent[-1] == "newer-browser-token"
+    assert result[0] is False
+    assert sent == ["imported"] and jar["msToken"] == "server-fresh"
+    assert client.last_request_meta["publication_status"] == "submitted_unconfirmed"
+    jar["msToken"] = "newer-browser-token"
+    result = await client._execute_request(RequestProfile.publish_main_profile(), {"aweme_id": "7635267329407913230", "text": "next"})
+    assert result[0] and sent[-1] == "newer-browser-token"
 
 
 @pytest.mark.asyncio

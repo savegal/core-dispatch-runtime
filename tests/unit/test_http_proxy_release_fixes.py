@@ -182,7 +182,7 @@ async def test_late_mobile_release_preserves_second_handle(monkeypatch, isolated
 @pytest.mark.asyncio
 @pytest.mark.parametrize("body", ["", "invalid", '{"status_code":0}'])
 @pytest.mark.parametrize("observed_signed", [True, None])
-async def test_ambiguous_publish_only_allows_one_empty_body_retry(body, observed_signed):
+async def test_ambiguous_publish_never_replays(body, observed_signed):
     from tests.unit.test_http_final_audit import EventPage
     page = EventPage("response", body)
     listeners = {}
@@ -204,10 +204,8 @@ async def test_ambiguous_publish_only_allows_one_empty_body_retry(body, observed
     client = PlaywrightHttpClient(SimpleNamespace(fetch=AsyncMock()), page=page,
                                   retry_policy=RetryPolicy(max_retries=3))
     result = await client._execute_request(RequestProfile.publish_main_profile(), {"aweme_id": "7635267329407913230", "text": "fixture"})
-    assert result[3] == (HttpErrorType.FORBIDDEN if body == "" else HttpErrorType.SUBMITTED_UNCONFIRMED)
-    assert page.evaluate.await_count == (2 if body == "" else 1)
-    if body == "":
-        assert client.last_request_meta["empty_body_retry_count"] == 1
+    assert result[3] == HttpErrorType.SUBMITTED_UNCONFIRMED
+    page.evaluate.assert_awaited_once()
     from executor import user_schema
     from executor.publish_action import PublishResult
     classified = PublishResult(status="submitted_unconfirmed", network_request_attempted=True)

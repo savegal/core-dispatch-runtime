@@ -173,7 +173,7 @@ class TestAccountService:
             status="active",
             cookies='{"sessionid":"old"}',
             today_main_comments=0,
-            last_main_comment_at=datetime.now(timezone.utc) - timedelta(seconds=settings.ACCOUNT_COOLDOWN_SECONDS + 30)
+            last_main_comment_at=datetime.now(timezone.utc) - timedelta(seconds=settings.ACCOUNT_COOLDOWN_SECONDS * 2)
         )
         db_session.add(old_account)
         db_session.commit()

@@ -112,7 +112,7 @@ async def test_publish_reply_http_first_skips_like_when_disabled():
 
 @pytest.mark.unit
 @pytest.mark.asyncio
-async def test_publish_reply_http_first_targeted_reply_like():
+async def test_publish_reply_http_first_leaves_target_likes_to_public_verifier():
     from executor.user_schema import (
         _publish_reply_http_first_if_eligible,
         _record_branch_published_reply,
@@ -162,24 +162,15 @@ async def test_publish_reply_http_first_targeted_reply_like():
     assert result is not None
     assert result.status == "success"
 
-    # Verify both likes occurred: 1) parent comment, 2) target Reply 1
-    assert mock_client.like_comment.await_count == 2
-    mock_client.like_comment.assert_any_await(
+    # The configured reply is handled after independent visibility checks.
+    mock_client.like_comment.assert_awaited_once_with(
         aweme_id="7123456789012345678",
         cid=parent_id,
         cookies={"sessionid": "xyz"},
         correlation_id="corr_test_targeted_parent_like",
         video_url="https://www.tiktok.com/@u/video/7123456789012345678",
     )
-    mock_client.like_comment.assert_any_await(
-        aweme_id="7123456789012345678",
-        cid=reply_1_cid,
-        cookies={"sessionid": "xyz"},
-        correlation_id=f"corr_test_targeted_target_reply_like_{reply_1_cid[:12]}",
-        video_url="https://www.tiktok.com/@u/video/7123456789012345678",
-    )
 
-    # Verify that the same account (account_id=456) does not like the reply twice
     mock_client.like_comment.reset_mock()
     with patch.dict("os.environ", {"LIKE_PARENT_BEFORE_REPLY": "0"}):
         result2 = await _publish_reply_http_first_if_eligible(

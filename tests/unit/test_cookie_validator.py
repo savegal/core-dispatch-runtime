@@ -215,8 +215,10 @@ async def test_http_validation_respects_direct_mode(monkeypatch, use_proxy, save
     (None, None, TimeoutError("passport timed out"), "inconclusive"),
 ])
 async def test_http_preflight_uses_only_one_passport_request(monkeypatch, status, payload, error, expected):
+    from config.settings import get_settings
     from services import cookie_validator
 
+    monkeypatch.setattr(get_settings(), "USE_PROXY", False)
     requested = []
 
     class Response:

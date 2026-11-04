@@ -44,6 +44,7 @@ class Settings(BaseSettings):
     # - 32GB RAM: MAX_CONCURRENT_BROWSERS = 30-40
     RANDOM_DELAY: bool = True
     ACCOUNT_COOLDOWN_SECONDS: int = 60  # Для ноутбука: 60. Для сервера (стабильные аккаунты): 30-20
+    REPLY_ACCOUNT_COOLDOWN_SECONDS: int = 0  # Мягкий кулдаун между ответами одного reply-аккаунта (в .env: 300)
     # Prefer real browser auth (sessionid/sid_tt), but allow sid_guard-only
     # accounts as a last resort. They still must pass browser action-ready and
     # enrichment gates before any DOM publish/search is attempted.
@@ -387,25 +388,25 @@ class Settings(BaseSettings):
     MIN_DELAY_BETWEEN_ACTIONS_MS: int = 500  # Минимальная задержка между действиями (мс)
     MAX_DELAY_BETWEEN_ACTIONS_MS: int = 2000  # Максимальная задержка между действиями (мс)
     
-    # Настройки парсинга видео (для снижения риска капчи)
-    VIDEO_PARSING_WARMUP_ENABLED: bool = True  # Включить warm-up перед парсингом профиля
-    VIDEO_PARSING_WARMUP_SCROLLS_MIN: int = 2  # Минимальное количество скроллов на FYP
-    VIDEO_PARSING_WARMUP_SCROLLS_MAX: int = 3  # Максимальное количество скроллов на FYP
-    VIDEO_PARSING_WARMUP_WATCH_TIME_MIN_MS: int = 2000  # Минимальное время просмотра видео на FYP (мс)
-    VIDEO_PARSING_WARMUP_WATCH_TIME_MAX_MS: int = 5000  # Максимальное время просмотра видео на FYP (мс)
-    VIDEO_PARSING_SCROLL_ITERATIONS_MIN: int = 5  # Минимальное количество скроллов при парсинге
-    VIDEO_PARSING_SCROLL_ITERATIONS_MAX: int = 10  # Максимальное количество скроллов при парсинге
+    # Настройки парсинга видео (HTTP-first мониторинг без лишнего прогрева /foryou и DOM-скролла)
+    VIDEO_PARSING_WARMUP_ENABLED: bool = False  # Отключён прогрев /foryou перед парсингом профиля (экономия трафика и времени)
+    VIDEO_PARSING_WARMUP_SCROLLS_MIN: int = 1  # Минимальное количество скроллов на FYP
+    VIDEO_PARSING_WARMUP_SCROLLS_MAX: int = 2  # Максимальное количество скроллов на FYP
+    VIDEO_PARSING_WARMUP_WATCH_TIME_MIN_MS: int = 1000  # Минимальное время просмотра видео на FYP (мс)
+    VIDEO_PARSING_WARMUP_WATCH_TIME_MAX_MS: int = 2000  # Максимальное время просмотра видео на FYP (мс)
+    VIDEO_PARSING_SCROLL_ITERATIONS_MIN: int = 2  # Минимальное количество скроллов при парсинге
+    VIDEO_PARSING_SCROLL_ITERATIONS_MAX: int = 4  # Максимальное количество скроллов при парсинге
     VIDEO_PARSING_SCROLL_AMOUNT_MIN: int = 300  # Минимальная величина скролла (px)
     VIDEO_PARSING_SCROLL_AMOUNT_MAX: int = 800  # Максимальная величина скролла (px)
-    VIDEO_PARSING_SCROLL_DELAY_MIN_MS: int = 1200  # Минимальная задержка между скроллами (мс)
-    VIDEO_PARSING_SCROLL_DELAY_MAX_MS: int = 2500  # Максимальная задержка между скроллами (мс)
-    VIDEO_PARSING_READ_SIMULATION_CHANCE: float = 0.7  # Вероятность имитации чтения после скролла (0.0-1.0)
-    VIDEO_PARSING_READ_TIME_MIN_MS: int = 1000  # Минимальное время имитации чтения (мс)
-    VIDEO_PARSING_READ_TIME_MAX_MS: int = 3000  # Максимальное время имитации чтения (мс)
-    VIDEO_PARSING_INITIAL_LOAD_DELAY_MIN_MS: int = 2000  # Минимальная задержка после загрузки страницы (мс)
-    VIDEO_PARSING_INITIAL_LOAD_DELAY_MAX_MS: int = 5000  # Максимальная задержка после загрузки страницы (мс)
-    VIDEO_PARSING_MOUSE_MOVEMENT_CHANCE: float = 0.5  # Вероятность случайных движений мыши (0.0-1.0)
-    VIDEO_PARSING_HOVER_CHANCE: float = 0.3  # Вероятность hover на элементы (0.0-1.0)
+    VIDEO_PARSING_SCROLL_DELAY_MIN_MS: int = 600  # Минимальная задержка между скроллами (мс)
+    VIDEO_PARSING_SCROLL_DELAY_MAX_MS: int = 1200  # Максимальная задержка между скроллами (мс)
+    VIDEO_PARSING_READ_SIMULATION_CHANCE: float = 0.2  # Вероятность имитации чтения после скролла (0.0-1.0)
+    VIDEO_PARSING_READ_TIME_MIN_MS: int = 500  # Минимальное время имитации чтения (мс)
+    VIDEO_PARSING_READ_TIME_MAX_MS: int = 1000  # Максимальное время имитации чтения (мс)
+    VIDEO_PARSING_INITIAL_LOAD_DELAY_MIN_MS: int = 400  # Минимальная задержка после загрузки страницы (мс)
+    VIDEO_PARSING_INITIAL_LOAD_DELAY_MAX_MS: int = 900  # Максимальная задержка после загрузки страницы (мс)
+    VIDEO_PARSING_MOUSE_MOVEMENT_CHANCE: float = 0.1  # Вероятность случайных движений мыши (0.0-1.0)
+    VIDEO_PARSING_HOVER_CHANCE: float = 0.0  # Вероятность hover на элементы (0.0-1.0)
     
     # Валидация аккаунтов и прокси
     VALIDATE_BEFORE_TASK: bool = True  # Быстрая проверка куков перед использованием аккаунта

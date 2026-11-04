@@ -119,8 +119,8 @@ async def test_unconfirmed_responses_never_become_success(client_factory, body, 
     assert not success and response is None and error
     assert client.last_request_meta["request_attempted"] is True
     if not body:
-        assert "stealth-reject" in error
-        assert client.last_request_meta["publication_status"] == "rejected"
+        assert error == "submitted_unconfirmed:empty_body"
+    assert client.last_request_meta["publication_status"] == "submitted_unconfirmed"
 
 
 @pytest.mark.asyncio

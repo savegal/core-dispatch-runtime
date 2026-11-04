@@ -338,7 +338,7 @@ async def test_wizard_creates_a_distinct_http_keyword_order(monkeypatch):
     await state.update_data(replies=["Подробности в профиле"], account_pool_mode="shared")
     await wizard.show_engagement_preview(callback, state)
     preview = message.edit_text.await_args.args[0]
-    assert "HTTP" in preview and "каждый найденный комментарий" in preview
+    assert "HTTP" in preview and "Ответов на комментарий: 1" in preview
     assert "по действующему тарифу за видео" in preview
     await wizard.confirm_engagement_order(callback, state)
     payload = create.await_args.kwargs

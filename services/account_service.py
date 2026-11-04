@@ -2559,7 +2559,10 @@ def get_free_account_for_reply(
                         func.lower(Proxy.proxy).contains("sessid-auto"),
                         func.lower(Proxy.proxy).contains("sid-auto"),
                     )).all()
-                    from services.proxy_normalizer import resolve_account_sticky_proxy
+                    from services.proxy_normalizer import (
+                        account_sticky_proxy_matches_template,
+                        resolve_account_sticky_proxy,
+                    )
                     for pool in (available_accounts, runtime_last_resort_accounts, last_resort_accounts):
                         for candidate, _, _ in pool:
                             if candidate.proxy and candidate.proxy not in proxy_map:
@@ -2567,6 +2570,7 @@ def get_free_account_for_reply(
                                     proxy for proxy in proxies if
                                     resolve_account_sticky_proxy(proxy.proxy, candidate, default_country=proxy.country_code)
                                     == candidate.proxy
+                                    or account_sticky_proxy_matches_template(proxy.proxy, candidate, candidate.proxy)
                                 ), None)
             except Exception as proxy_err:
                 logger.debug(f"[REPLY] Proxy map build failed: {proxy_err}")
@@ -2627,13 +2631,21 @@ def get_free_account_for_reply(
 
         if available_accounts:
             ranked_available = []
+            reply_cooldown_seconds = max(0, int(getattr(settings, "REPLY_ACCOUNT_COOLDOWN_SECONDS", 0) or 0))
             for acc, state, index in available_accounts:
                 lifecycle = _read_account_lifecycle(acc, now)
                 spend_lane = _read_account_spend_lane(acc, REPLY_SCOPE, now)
                 score = _calculate_scope_quality_score(acc, state, REPLY_SCOPE, now)
+                in_reply_cooldown = 0
+                if reply_cooldown_seconds > 0 and getattr(acc, "last_used_at", None) is not None:
+                    raw_used = acc.last_used_at
+                    last_used_dt = raw_used if getattr(raw_used, "tzinfo", None) else raw_used.replace(tzinfo=timezone.utc)
+                    if (now - last_used_dt).total_seconds() < reply_cooldown_seconds:
+                        in_reply_cooldown = 1
                 ranked_available.append(
                     (
                         (
+                            in_reply_cooldown,
                             -classify_account_web_readiness(acc.cookies),
                             assignment_rank(acc),
                             RUNTIME_BUCKET_ORDER.get(state["bucket"], 5),

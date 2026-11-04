@@ -8,6 +8,13 @@ MAX_KEYWORDS = 50
 MAX_KEYWORD_LENGTH = 100
 
 
+def replies_per_keyword_target(value) -> int:
+    try:
+        return max(1, min(6, int(value or 1)))
+    except (TypeError, ValueError, OverflowError):
+        return 1
+
+
 def normalize_keywords(value) -> list[str]:
     if isinstance(value, str):
         value = re.split(r"[,;\n\r]+", value)

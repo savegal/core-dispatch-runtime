@@ -11,7 +11,7 @@ from collections import OrderedDict
 from typing import Any, Optional
 
 from bot.config import load_config
-from bot.services.template_utils import REPLIES_ONLY_MAIN_PLACEHOLDER
+from bot.services.template_utils import KEYWORDS_MAIN_PLACEHOLDER, REPLIES_ONLY_MAIN_PLACEHOLDER
 from config.settings import get_settings
 from services.user_scope_signature import sign_user_scope
 from tenacity import retry, retry_if_exception_type, stop_after_attempt, wait_exponential
@@ -1134,8 +1134,10 @@ class APIClient:
         ).strip().lower()
         if normalized_template_type in {"reply_only", "reply-only", "replies", "replies-only"}:
             normalized_template_type = "replies_only"
-        if normalized_template_type not in {"full", "replies_only"}:
-            raise APIRequestError("Тип шаблона должен быть full или replies_only.")
+        elif normalized_template_type in {"keyword", "keywords", "keyword_replies", "keyword-replies"}:
+            normalized_template_type = "keywords"
+        if normalized_template_type not in {"full", "replies_only", "keywords"}:
+            raise APIRequestError("Тип шаблона должен быть full, replies_only или keywords.")
         normalized_settings["template_type"] = normalized_template_type
 
         normalized_text_variants = [
@@ -1160,6 +1162,19 @@ class APIClient:
             normalized_text_variants = []
             if not normalized_replies and not any((normalized_reply1, normalized_reply2, normalized_reply3)):
                 raise APIRequestError("Для шаблона ответов нужен хотя бы один ответ.")
+        elif normalized_template_type == "keywords":
+            normalized_main_comment = normalized_main_comment or KEYWORDS_MAIN_PLACEHOLDER
+            normalized_text_variants = []
+            raw_kw = normalized_settings.get("keywords") or []
+            normalized_kw = [
+                text
+                for item in (raw_kw if isinstance(raw_kw, list) else [])
+                for text in [self._meaningful_user_text(item)]
+                if text
+            ]
+            if not normalized_kw:
+                raise APIRequestError("Для шаблона ключевых слов укажите хотя бы одно ключевое слово.")
+            normalized_settings["keywords"] = normalized_kw
         else:
             if normalized_text_variants:
                 normalized_main_comment = normalized_text_variants[0]

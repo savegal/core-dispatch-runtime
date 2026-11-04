@@ -114,6 +114,53 @@ async def test_disabled_reply_mode_does_not_allocate_accounts(adapter, key, valu
     adapter.selector.assert_not_called()
 
 
+@pytest.mark.parametrize("kind", ["full", "engagement_only", "keyword_replies"])
+async def test_reply_likes_only_send_to_selected_public_cid(adapter, monkeypatch, kind):
+    monkeypatch.setenv("AUTO_BOOST_LIKES", "1")
+    boost = AsyncMock(return_value={NEW: 15})
+    monkeypatch.setattr(adapter.schema, "boost_target_replies_via_http_pool", boost)
+    adapter.task.kind = kind
+    adapter.task.settings.update(verify_reply_visibility=False, reply_like_target="2", reply_like_count=15)
+    row = result(item(), item(NEW, variant=2))
+    row.update(mode=kind, resolved_video_url=URL, aweme_id=VIDEO)
+    if kind == "full":
+        row["engagement"]["main"] = {"comment_id": PARENT, "account_id": 2}
+    if kind == "keyword_replies":
+        adapter.task.settings["verify_reply_visibility"] = True
+        adapter.task.settings["keyword_repair_rounds"] = 3
+        adapter.scan.return_value = {"found_ids": [NEW], "absent_ids": [CID], "complete": True}
+    else:
+        adapter.scan.return_value = {"found_ids": [NEW], "absent_ids": [], "complete": False}
+
+    await visibility.verify_order_reply_visibility(adapter.db, adapter.task, URL, row)
+
+    adapter.publish.assert_not_awaited()
+    if kind == "keyword_replies":
+        boost.assert_not_awaited()
+        assert "reply_likes" not in row
+    else:
+        assert adapter.scan.await_args.args[3] == [NEW]
+        assert boost.await_args.kwargs["targets"] == [{"cid": NEW, "parent_id": PARENT}]
+        assert boost.await_args.kwargs["max_likes"] == 15
+        assert row["reply_likes"]["by_comment_id"] == {NEW: 15}
+        assert row["status"] == "success" and row["engagement"]["replies"]["ok"] == 2
+
+
+async def test_unconfirmed_priority_does_not_fall_back_to_another_reply(adapter, monkeypatch):
+    monkeypatch.setenv("AUTO_BOOST_LIKES", "1")
+    boost = AsyncMock()
+    monkeypatch.setattr(adapter.schema, "boost_target_replies_via_http_pool", boost)
+    adapter.task.settings.update(reply_like_target="2", reply_like_count=1)
+    adapter.scan.return_value = {"found_ids": [CID], "absent_ids": [], "complete": False}
+    row = result(item(), item(NEW, variant=2))
+
+    await visibility.verify_order_reply_visibility(adapter.db, adapter.task, URL, row)
+
+    boost.assert_not_awaited()
+    assert row["reply_likes"]["by_comment_id"] == {}
+    assert row[visibility.REPORT_KEY]["confirmed"] == 1
+
+
 @pytest.mark.parametrize("format", ["full", "engagement_only"])
 async def test_visible_reply_is_confirmed_without_repost(adapter, format):
     row = result(item())

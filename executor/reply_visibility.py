@@ -6,7 +6,6 @@ import copy
 import logging
 import os
 import random
-import re
 import time
 from collections import defaultdict
 from dataclasses import dataclass
@@ -22,6 +21,7 @@ from services.video_parser import extract_video_id
 from executor.visibility_support import account_identity_keys as _identity_keys, identity_is_known, identities_independent, identity_rejection_reason
 from services.execution_attempts import is_pre_publish_account_failure, candidate_scan_limit
 from services.keyword_replies import KEYWORD_ORDER_KIND
+from services.likes_config import coerce_bool, reply_like_preferences
 
 logger = logging.getLogger(__name__)
 REPORT_KEY = "reply_publication_visibility"  # reply_visibility already describes parent discovery.
@@ -117,16 +117,21 @@ def save_reply_visibility_checkpoint(db, task, url_key, result):
 async def verify_order_reply_visibility(db, task, video_url, result, *, pool_owner_user_id=None,
                                         stop_requested=lambda: False):
     """Post-process both full and replies-only results without repeating the main phase."""
-    if not reply_visibility_enabled(getattr(task, "settings", None)):
+    task_settings = getattr(task, "settings", None) or {}
+    verify_requested = reply_visibility_enabled(task_settings)
+    keyword_order = (getattr(task, "kind", None) == KEYWORD_ORDER_KIND
+                     or result.get("mode") == KEYWORD_ORDER_KIND)
+    settings = get_settings()
+    auto_likes = coerce_bool(os.getenv("AUTO_BOOST_LIKES"), True)
+    like_target, like_count = reply_like_preferences(task_settings)
+    like_requested = bool(like_count and not keyword_order and auto_likes and http_first_enabled(settings))
+    if not verify_requested and not like_requested:
         return result
     started = time.monotonic()
     from executor import user_schema as schema
     from executor.engagement_engine import resolve_order_video_url, _engagement_reply_outcome_to_dict, warmup_page_for_http
     from db.models import Account
 
-    settings = get_settings()
-    keyword_order = (getattr(task, "kind", None) == KEYWORD_ORDER_KIND
-                     or result.get("mode") == KEYWORD_ORDER_KIND)
     replies = (result.get("engagement") or {}).get("replies") or {}
     legacy_sections, legacy_mains = _legacy_reply_sections(result)
     legacy_locations = []
@@ -156,10 +161,16 @@ async def verify_order_reply_visibility(db, task, video_url, result, *, pool_own
         expected = int(replies.get("expected_submissions") or replies.get("expected")
                        or replies.get("requested_variants") or len(schema._reply_variants_from_task(task))
                        or replies.get("total") or len(slots))
+    if not verify_requested:
+        slots = [slot for slot in slots if like_target == "all" or str(slot.variant_index) == like_target]
+        expected = len(slots)
+        if not slots:
+            result["reply_likes"] = {"target": like_target, "requested_per_reply": like_count, "by_comment_id": {}}
+            return result
     if not expected and not slots:
         result[REPORT_KEY] = {"enabled": True, "status": "not_requested", "expected": 0, "confirmed": 0, "replacements": 0}
         return result
-    used = {slot.account_id for slot in slots if slot.account_id is not None}
+    used = {slot.account_id for slot in original_slots_all if slot.account_id is not None}
     main = (result.get("engagement") or {}).get("main") or {}
     invalid_targets = []
     if result.get("mode") == "full":
@@ -181,12 +192,14 @@ async def verify_order_reply_visibility(db, task, video_url, result, *, pool_own
     publisher_identities, observer_identities = [], []
     publisher_account_ids = set(used)
     identities_known = None
-    result[REPORT_KEY] = {"enabled": True, "status": "checking", "expected": expected,
+    report_key = REPORT_KEY if verify_requested else "reply_like_visibility"
+    result[report_key] = {"enabled": True, "status": "checking", "expected": expected,
                           "confirmed": 0, "replacements": 0, "pending_receipts": [], "invalid_targets": invalid_targets}
-    replies.update(ok=0, public_confirmed=0, visibility_complete=False)
-    for item in items:
-        if isinstance(item, dict):
-            item["public_confirmed"] = False
+    if verify_requested:
+        replies.update(ok=0, public_confirmed=0, visibility_complete=False)
+        for item in items:
+            if isinstance(item, dict):
+                item["public_confirmed"] = False
     checkpoint_failed = False
     captured = []
     original_slots = list(slots)
@@ -306,114 +319,32 @@ async def verify_order_reply_visibility(db, task, video_url, result, *, pool_own
             async with comment_read_batch(page):
                 for parent, ids in groups.items():
                     api_check_attempted = True
-                    evidence = await scan_reply_comment_ids(page, media_id, parent, ids, max_pages=settings.REPLY_PUBLICATION_VISIBILITY_MAX_PAGES)
+                    evidence = await scan_reply_comment_ids(
+                        page, media_id, parent, ids,
+                        max_pages=settings.REPLY_PUBLICATION_VISIBILITY_MAX_PAGES,
+                    )
                     branches.append(evidence)
                     found.extend(evidence["found_ids"])
                     absent.extend(evidence["absent_ids"])
                     if evidence["complete"]:
                         complete_ids.extend(ids)
 
-            if str(os.getenv("AUTO_BOOST_LIKES", "1")).strip().lower() not in {"0", "false", "no", "off"} and (found or groups):
+            if verify_requested and auto_likes and found:
                 try:
                     from executor.http.playwright_http_client import PlaywrightHttpClient
                     obs_client = await PlaywrightHttpClient.from_page(page)
-                    boosted_cids = set()
-                    task_settings = getattr(task, "settings", None) or {}
-                    reply_like_target = str(task_settings.get("reply_like_target") or "1").strip().lower()
-                    reply_like_count = int(task_settings.get("reply_like_count") or 0)
-
-                    # 1. Boost per branch: parent comment and specified reply targets
-                    branches_to_boost = [b for b in branches if b.get("parent_comment_id")]
-                    if not branches_to_boost and groups:
-                        branches_to_boost = [{"parent_comment_id": p, "found_ids": [cid for cid in found if cid in ids]} for p, ids in groups.items()]
-
-                    for branch_info in branches_to_boost:
-                        parent_cid = str(branch_info.get("parent_comment_id") or "").strip()
-                        branch_found = [str(x).strip() for x in (branch_info.get("found_ids") or []) if valid_comment_id(str(x).strip())]
-
-                        # 1a. Like parent comment
-                        if (
-                            valid_comment_id(parent_cid)
-                            and parent_cid not in boosted_cids
-                            and schema.can_boost_parent(parent_cid, account.id)
-                        ):
-                            boosted_cids.add(parent_cid)
-                            try:
-                                like_ok, like_err, _ = await obs_client.like_comment(
-                                    aweme_id=media_id,
-                                    cid=parent_cid,
-                                    correlation_id=f"{corr}_boost_parent_{parent_cid[:15]}",
-                                    video_url=url,
-                                )
-                                if like_ok:
-                                    schema.record_parent_boost(parent_cid, account.id)
-                                    logger.info(
-                                        "[HTTP_AUTO_BOOST] Reply observer %s liked parent comment %s",
-                                        account.id, parent_cid[:20]
-                                    )
-                                else:
-                                    logger.debug("[HTTP_AUTO_BOOST] Reply observer %s like parent non-ok: %s", account.id, like_err)
-                                await asyncio.sleep(random.uniform(0.6, 1.3))
-                            except Exception:
-                                pass
-
-                        # 1b. Like target replies in this branch
-                        if reply_like_count > 0 and reply_like_target not in {"0", "none", "off", "false"}:
-                            target_reply_cids = []
-                            digits = re.findall(r"\d+", reply_like_target)
-                            if digits:
-                                target_variant_idx = int(digits[0])
-                                # 1. Поиск по известным веткам публикации (точный variant_index)
-                                known_in_branch = schema._get_branch_published_replies(parent_cid)
-                                for item in known_in_branch:
-                                    if item.get("index") == target_variant_idx and item.get("cid") in branch_found:
-                                        target_reply_cids.append(item.get("cid"))
-
-                                # 2. Если в in-memory реестре ветки нет (напр. другой процесс/рестарт), ищем по слотам
-                                if not target_reply_cids:
-                                    for slot in pending:
-                                        if str(slot.item.get("parent_comment_id") or "").strip() == parent_cid:
-                                            slot_idx = int(slot.item.get("variant_index") or (slot.index + 1) or 0)
-                                            if slot_idx == target_variant_idx and slot.comment_id in branch_found:
-                                                target_reply_cids.append(slot.comment_id)
-
-                                # 3. Резервный фолбэк по позиции в branch_found
-                                if not target_reply_cids and 0 <= (target_variant_idx - 1) < len(branch_found):
-                                    target_reply_cids.append(branch_found[target_variant_idx - 1])
-
-                            elif reply_like_target == "all":
-                                # При выборе 'все' таргетируются ВСЕ найденные ответы этой ветки
-                                target_reply_cids.extend(branch_found)
-
-                            for reply_cid in target_reply_cids:
-                                clean_reply = str(reply_cid).strip()
-                                if (
-                                    valid_comment_id(clean_reply)
-                                    and clean_reply not in boosted_cids
-                                    and schema.can_boost_reply(clean_reply, account.id, max_likes=reply_like_count)
-                                ):
-                                    boosted_cids.add(clean_reply)
-                                    try:
-                                        like_ok, like_err, _ = await obs_client.like_comment(
-                                            aweme_id=media_id,
-                                            cid=clean_reply,
-                                            correlation_id=f"{corr}_boost_reply_{clean_reply[:15]}",
-                                            video_url=url,
-                                        )
-                                        if like_ok:
-                                            # Передаем parent_cid для надежной регистрации в реестре
-                                            schema.record_reply_boost(clean_reply, account.id, parent_id=parent_cid)
-                                            logger.info(
-                                                "[HTTP_AUTO_BOOST] Reply observer %s liked verified reply %s (parent=%s)",
-                                                account.id, clean_reply[:20], parent_cid[:20]
-                                            )
-                                        else:
-                                            logger.debug("[HTTP_AUTO_BOOST] Reply observer %s like reply non-ok: %s", account.id, like_err)
-                                        await asyncio.sleep(random.uniform(0.6, 1.3))
-                                    except Exception:
-                                        pass
-                except Exception as boost_err:
-                    logger.debug("[HTTP_AUTO_BOOST] Reply observer boost failed (non-blocking): %s", boost_err)
+                    for parent, ids in groups.items():
+                        if (valid_comment_id(parent) and any(cid in found for cid in ids)
+                                and schema.can_boost_parent(parent, account.id)):
+                            like_ok, _, _ = await obs_client.like_comment(
+                                aweme_id=media_id, cid=parent,
+                                correlation_id=f"{corr}_boost_parent_{parent[:15]}", video_url=url,
+                            )
+                            if like_ok:
+                                schema.record_parent_boost(parent, account.id)
+                            await asyncio.sleep(random.uniform(0.6, 1.3))
+                except Exception:
+                    logger.debug("[HTTP_AUTO_BOOST] Reply observer parent like failed", exc_info=True)
 
             return {"observer_id": account.id, "found_ids": found, "absent_ids": absent,
                     "complete_ids": complete_ids, "complete": all(b["complete"] for b in branches),
@@ -448,7 +379,7 @@ async def verify_order_reply_visibility(db, task, video_url, result, *, pool_own
             if any(existing.comment_id == receipt.comment_id for _, existing in captured):
                 return
             captured.append((slot, receipt))
-            result[REPORT_KEY]["pending_receipts"].append({**item, "replaces_comment_id": slot.comment_id})
+            result[report_key]["pending_receipts"].append({**item, "replaces_comment_id": slot.comment_id})
             await save()  # The receipt is durable before browser cleanup can block or be cancelled.
         browser_attempts = 0
         browser_limit = max(1, int(settings.REPLY_PUBLICATION_VISIBILITY_OBSERVER_ATTEMPTS))
@@ -511,10 +442,9 @@ async def verify_order_reply_visibility(db, task, video_url, result, *, pool_own
     try:
         report = await verify_main_publications(
             slots, observe=observe, replace=replace, stop_requested=lambda: checkpoint_failed or stop_requested(),
-            # Keyword orders promise one durable dispatch per matched parent.
-            # Visibility observes that receipt; replacement publications would
-            # bypass the target journal and could repeat on worker recovery.
-            repair_rounds=0 if keyword_order else settings.REPLY_PUBLICATION_VISIBILITY_REPAIR_ROUNDS,
+            # Keyword dispatches are fenced by the target journal. A replacement
+            # from this verifier has no corresponding journal entry.
+            repair_rounds=settings.REPLY_PUBLICATION_VISIBILITY_REPAIR_ROUNDS if verify_requested and not keyword_order else 0,
             observer_attempts=settings.REPLY_PUBLICATION_VISIBILITY_OBSERVER_ATTEMPTS,
             max_candidate_accounts=candidate_scan_limit(settings),
             initial_delay=settings.REPLY_PUBLICATION_VISIBILITY_INITIAL_DELAY_SECONDS,
@@ -547,19 +477,20 @@ async def verify_order_reply_visibility(db, task, video_url, result, *, pool_own
                 })
         for slot in slots:
             slot.item["public_confirmed"] = slot.public_confirmed
-            slot.item["visibility_status"] = "public_confirmed" if slot.public_confirmed else "submitted_unconfirmed"
+            if verify_requested or slot.public_confirmed:
+                slot.item["visibility_status"] = "public_confirmed" if slot.public_confirmed else "submitted_unconfirmed"
             items[slot.index] = slot.item
             if slot.index < len(legacy_locations):
                 child_items, child_index = legacy_locations[slot.index]
                 child_items[child_index] = slot.item
-        for section in legacy_sections:
+        for section in legacy_sections if verify_requested else []:
             section["ok"] = sum(bool(item.get("public_confirmed")) for item in section.get("items", []) if isinstance(item, dict))
         confirmed = sum(slot.public_confirmed for slot in slots)
         report.update(enabled=True, expected=expected, confirmed=confirmed,
                       status="confirmed" if expected > 0 and confirmed >= expected and confirmed == len(slots) else "unconfirmed")
         report.setdefault("reason", "reply_parent_not_in_order" if invalid_targets else (
             "verification_interrupted" if not report.get("checks") else "checks_finished"))
-        report["pending_receipts"] = copy.deepcopy(result[REPORT_KEY]["pending_receipts"])
+        report["pending_receipts"] = copy.deepcopy(result[report_key]["pending_receipts"])
         report["invalid_targets"] = invalid_targets
         report["replacements"] = int(report.get("replacements", 0)) + restored
         for entry in report.get("history", []):
@@ -574,10 +505,11 @@ async def verify_order_reply_visibility(db, task, video_url, result, *, pool_own
         report["missing"] = sum(item["status"] == "not_found" for item in report["items"])
         report["unknown"] = max(0, expected - confirmed - report["missing"])
         report["duration_seconds"] = round(time.monotonic() - started, 2)
-        result[REPORT_KEY] = report
-        replies.update(ok=confirmed, public_confirmed=confirmed, visibility_complete=report["status"] == "confirmed",
-                       submitted_unconfirmed=max(0, int(replies.get("submitted") or len(slots)) - confirmed))
-        if report["status"] != "confirmed":
+        result[report_key] = report
+        if verify_requested:
+            replies.update(ok=confirmed, public_confirmed=confirmed, visibility_complete=report["status"] == "confirmed",
+                           submitted_unconfirmed=max(0, int(replies.get("submitted") or len(slots)) - confirmed))
+        if verify_requested and report["status"] != "confirmed":
             if result.get("status") in {"success", "submitted_unconfirmed"}:
                 result["status"] = result["core_status"] = "submitted_unconfirmed"
             result["error"] = result.get("error") or "reply_visibility_unconfirmed"
@@ -600,12 +532,35 @@ async def verify_order_reply_visibility(db, task, video_url, result, *, pool_own
         await save()
         if checkpoint_failed:
             report.update(status="unconfirmed", reason="checkpoint_failed")
-            replies["visibility_complete"] = False
-            result["status"] = result["core_status"] = "submitted_unconfirmed"
-            result["error"] = "reply_visibility_unconfirmed"
-            if keyword_order:
-                result["publication_complete"] = False
+            if verify_requested:
+                replies["visibility_complete"] = False
+                result["status"] = result["core_status"] = "submitted_unconfirmed"
+                result["error"] = "reply_visibility_unconfirmed"
+                if keyword_order:
+                    result["publication_complete"] = False
         logger.info("[REPLY_VISIBILITY] task=%s confirmed=%s/%s missing=%s unknown=%s replacements=%s seconds=%s reason=%s",
                     task.id, confirmed, expected, report["missing"], report["unknown"], report["replacements"],
                     report["duration_seconds"], report["reason"])
+    if like_requested:
+        targets = [
+            {"cid": slot.comment_id, "parent_id": comment_id_key(slot.item.get("parent_comment_id"))}
+            for slot in slots
+            if slot.public_confirmed and (like_target == "all" or str(slot.variant_index) == like_target)
+        ]
+        by_cid = {}
+        if targets and not checkpoint_failed and not stop_requested():
+            try:
+                url, media_id = await resolve_target()
+                if media_id:
+                    by_cid = await schema.boost_target_replies_via_http_pool(
+                        db, url, str(media_id), targets=targets, max_likes=like_count,
+                        exclude_account_ids=used, pool_owner_user_id=pool_owner_user_id,
+                        task_id=getattr(task, "id", None), stop_requested=stop_requested,
+                    )
+            except Exception:
+                logger.exception("[REPLY_LIKES] task=%s failed", getattr(task, "id", None))
+        result["reply_likes"] = {
+            "target": like_target, "requested_per_reply": like_count,
+            "by_comment_id": {item["cid"]: by_cid.get(item["cid"], 0) for item in targets},
+        }
     return result

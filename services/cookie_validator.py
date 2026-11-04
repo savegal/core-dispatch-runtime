@@ -690,6 +690,7 @@ async def _validate_account_http_tri_state(account: Account, *, strict_passport:
                 impersonate="chrome131",
                 proxies={"http": curl_proxy, "https": curl_proxy} if curl_proxy else None,
                 timeout=12 if curl_proxy else 8,
+                trust_env=False,
             ) as curl_session:
                 resp = await curl_session.get(passport_url, headers=headers, allow_redirects=False)
                 location = (resp.headers.get("location") or "").lower()

@@ -327,6 +327,7 @@ async def test_shared_direct_accounts_use_separate_proxyless_process(shared_pool
     ASSET.replace("sf16.", "log."), ASSET.replace("tiktokcdn.com", "eviltiktokcdn.com"),
     ASSET.replace("tiktokcdn.com", "tiktokcdn.com.evil.invalid"),
     ASSET.replace("/assets/", "/passport/"), ASSET.replace("/assets/", "/aweme/"),
+    ASSET + "?verifyFp=secret", ASSET + "?%64evice_id=secret",
 ])
 def test_cache_rejects_dynamic_and_untrusted_urls(url):
     assert not is_cacheable_static_asset("GET", "script", url)
@@ -335,7 +336,7 @@ def test_cache_rejects_dynamic_and_untrusted_urls(url):
 
 def test_cache_lru_limits_and_response_headers():
     cache = StaticAssetCache(max_total_bytes=200, max_item_bytes=150)
-    assert cache.put(ASSET, 200, {"Content-Encoding": "gzip", "Set-Cookie": "secret=1"}, b"a" * 100)
+    assert cache.put(ASSET, 200, {"Content-Encoding": "gzip"}, b"a" * 100)
     second, third = ASSET + "?v=2", ASSET + "?v=3"
     assert cache.put(second, 200, {}, b"b" * 100)
     cache.get(ASSET)
@@ -351,6 +352,15 @@ def test_cache_lru_limits_and_response_headers():
         assert not cache.put(ASSET, status, {}, body)
     assert not is_cacheable_static_asset("POST", "script", ASSET)
     assert not is_cacheable_static_asset("GET", "fetch", ASSET)
+
+
+@pytest.mark.parametrize("headers", [
+    {"Set-Cookie": "secret=1"}, {"Cache-Control": "private, max-age=60"},
+    {"Cache-Control": "no-store"}, {"Vary": "Accept-Encoding, Cookie"},
+    {"Content-Type": "text/html"},
+])
+def test_cache_rejects_personalized_or_non_asset_responses(headers):
+    assert not StaticAssetCache().put(ASSET, 200, headers, b"x" * 100)
 
 
 @pytest.mark.asyncio

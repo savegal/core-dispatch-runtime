@@ -29,14 +29,10 @@ def observe_mock_dispatch(page, responses):
     page.evaluate.side_effect = dispatch
 
 
-@pytest.mark.parametrize("second_body,expected", [
-    ('{"status_code":0,"comment":{"cid":"7641761192486194454"}}', True),
-    ("", False),
-])
-async def test_empty_publish_response_has_one_bounded_http_retry(monkeypatch, second_body, expected):
-    responses = [{"status": 200, "headers": {"content-type": "application/json"}, "text": body,
-                  "url": "https://www.tiktok.com/api/comment/publish/?a_bogus=secret&msToken=secret"}
-                 for body in ("", second_body)]
+@pytest.mark.parametrize("status,body,reason", [(200, "", "empty_body"), (502, "Bad Gateway", "upstream_5xx")])
+async def test_ambiguous_publish_response_is_unconfirmed_after_one_dispatch(monkeypatch, status, body, reason):
+    responses = [{"status": status, "headers": {"content-type": "application/json"}, "text": body,
+                  "url": "https://www.tiktok.com/api/comment/publish/?a_bogus=secret&msToken=secret"}]
     page = SimpleNamespace(url=URL, evaluate=AsyncMock(side_effect=responses),
                            context=SimpleNamespace(cookies=AsyncMock(return_value=[])))
     observe_mock_dispatch(page, responses)
@@ -45,14 +41,14 @@ async def test_empty_publish_response_has_one_bounded_http_retry(monkeypatch, se
     request_context = SimpleNamespace(fetch=AsyncMock())
     client = PlaywrightHttpClient(request_context, page=page, retry_policy=RetryPolicy(max_retries=3))
 
-    success, _, _, _ = await client._execute_request(RequestProfile.publish_main_profile(), {"aweme_id": "7635267329407913230", "text": "hello"})
+    success, _, message, error = await client._execute_request(RequestProfile.publish_main_profile(), {"aweme_id": "7635267329407913230", "text": "hello"})
 
-    assert success is expected
-    assert page.evaluate.await_count == 2
-    sleep.assert_awaited_once_with(2.0)
+    assert not success and error == HttpErrorType.SUBMITTED_UNCONFIRMED
+    assert message == f"submitted_unconfirmed:{reason}"
+    page.evaluate.assert_awaited_once()
+    sleep.assert_not_awaited()
     request_context.fetch.assert_not_awaited()
-    assert client.last_request_meta["attempt_count"] == 2
-    assert client.last_request_meta["empty_body_retry_count"] == 1
+    assert client.last_request_meta["attempt_count"] == 1
     assert client.last_request_meta["observed_security_params"] == {
         "X-Bogus": False, "X-Gnarly": False, "a_bogus": False, "msToken": False,
     }
@@ -150,7 +146,7 @@ async def test_empty_http_result_stops_main_series_before_dom(monkeypatch):
     dom.assert_not_awaited()
 
 
-async def test_live_cookie_rotation_applies_to_retry_and_later_variants(monkeypatch):
+async def test_live_cookie_rotation_applies_to_later_variants_without_replay(monkeypatch):
     def records(version):
         return [{"name": name, "value": f"{name}-{version}", "domain": ".tiktok.com"}
                 for name in ("msToken", "tt_csrf_token", "WebIdLastTime")] + [
@@ -159,8 +155,8 @@ async def test_live_cookie_rotation_applies_to_retry_and_later_variants(monkeypa
 
     success_body = '{"status_code":0,"comment":{"cid":"7641761192486194454"}}'
     responses = [{"status": 200, "headers": {"content-type": "application/json"}, "text": body}
-                 for body in ("", success_body, success_body, success_body)]
-    cookie_reader = AsyncMock(side_effect=[records(i) for i in range(1, 5)])
+                 for body in ("", success_body, success_body)]
+    cookie_reader = AsyncMock(side_effect=[records(i) for i in range(1, 4)])
     page = SimpleNamespace(url=URL, context=SimpleNamespace(cookies=cookie_reader),
                            evaluate=AsyncMock(side_effect=responses))
     observe_mock_dispatch(page, responses)
@@ -172,9 +168,9 @@ async def test_live_cookie_rotation_applies_to_retry_and_later_variants(monkeypa
 
     for text in ("first", "second", "third"):
         result = await client.publish_main_comment("7635267329407913230", text, cookies=original_cookies)
-        assert result[0], result[2]
+        assert result[0] is (text != "first"), result[2]
 
-    assert cookie_reader.await_count == 4
+    assert cookie_reader.await_count == 3
     requests = [call.args[1] for call in page.evaluate.await_args_list]
     for version, request in enumerate(requests, start=1):
         query = parse_qs(urlparse(request["url"]).query)
@@ -183,7 +179,7 @@ async def test_live_cookie_rotation_applies_to_retry_and_later_variants(monkeypa
         assert not any(key.lower().startswith("x-secsdk-") for key in request["headers"])
         assert request["headers"]["tt-csrf-token"] == f"tt_csrf_token-{version}"
         assert "Cookie" not in request["headers"]
-    assert [request["form_data"]["text"] for request in requests] == ["first", "first", "second", "third"]
+    assert [request["form_data"]["text"] for request in requests] == ["first", "second", "third"]
     assert original_cookies["msToken"] == "db-old"
     request_context.fetch.assert_not_awaited()
 

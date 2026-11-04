@@ -11,6 +11,7 @@ import json
 import asyncio
 import time
 from urllib.parse import parse_qs, urlparse
+from types import SimpleNamespace
 from typing import Optional, Dict, Any, Tuple
 from datetime import datetime, timezone
 from patchright.async_api import APIRequestContext, Page, BrowserContext
@@ -693,6 +694,27 @@ async def _extract_runtime_profile(page: Page) -> Dict[str, Any]:
         profile = {}
     ssr_identity_observed = bool(profile.get("device_id"))
     context = getattr(page, "context", None)
+    device_profile = getattr(context, "_account_device_profile", None) if context is not None else None
+    if isinstance(device_profile, dict):
+        hw = (device_profile.get("identity") or {}).get("hardware") or {}
+        opts = device_profile.get("options") or {}
+        vp = opts.get("viewport") or {}
+        if not profile.get("screen_width") and hw.get("width"):
+            profile["screen_width"] = int(hw["width"])
+        if not profile.get("screen_height") and hw.get("height"):
+            profile["screen_height"] = int(hw["height"])
+        if not profile.get("viewport_width") and vp.get("width"):
+            profile["viewport_width"] = int(vp["width"])
+        if not profile.get("viewport_height") and vp.get("height"):
+            profile["viewport_height"] = int(vp["height"])
+        if not profile.get("user_agent") and opts.get("user_agent"):
+            profile["user_agent"] = str(opts["user_agent"])
+        if not profile.get("platform") and (device_profile.get("identity") or {}).get("platform"):
+            profile["platform"] = str(device_profile["identity"]["platform"])
+    if context is not None and not profile.get("browser_language"):
+        ctx_locale = getattr(context, "_account_locale", None)
+        if ctx_locale:
+            profile["browser_language"] = str(ctx_locale)
     account_obj = getattr(page, "_pool_account_obj", None) or getattr(context, "_pool_account_obj", None)
     account_id = (
         getattr(page, "_pool_account_id", None)
@@ -890,7 +912,17 @@ class PlaywrightHttpClient:
             PlaywrightHttpClient: Экземпляр клиента
         """
         request_context = browser_context.request
-        runtime_profile = await _extract_runtime_profile(page) if page is not None else {}
+        if page is not None:
+            runtime_profile = await _extract_runtime_profile(page)
+        else:
+            dummy_page = SimpleNamespace(
+                url=None,
+                context=browser_context,
+                _pool_account_id=getattr(browser_context, "_pool_account_id", None),
+                _pool_account_obj=getattr(browser_context, "_pool_account_obj", None),
+                evaluate=None,
+            )
+            runtime_profile = await _extract_runtime_profile(dummy_page)
         return cls(request_context, retry_policy, runtime_profile=runtime_profile, page=page)
     
     async def _execute_request(
@@ -1101,21 +1133,10 @@ class PlaywrightHttpClient:
                         self.last_request_meta.get("security_params_source", "unavailable"),
                     )
                     
-                    if status_code == 200 and len(response_body or "") == 0 and is_publish:
-                        error_type = HttpErrorType.FORBIDDEN
-                        error_msg = "TikTok stealth-reject: empty JSON response (body_len=0). Publication was not confirmed."
-                        redirected = any(marker in str(self._page_url_hint(self.page) or "").lower() for marker in ("/login", "/signup", "/verify", "/auth", "/messages", "/inbox"))
-                        if self.page is not None and attempt == 0 and effective_retry_policy.max_retries > 0 and not redirected:
-                            from executor.http.page_runtime import activate_page_input
-                            self.last_request_meta["empty_body_retry_count"] = 1
-                            self.last_request_meta["empty_body_retry_unconfirmed"] = True
-                            await activate_page_input(self.page)
-                            await asyncio.sleep(2.0)
-                            continue
-                        self.last_request_meta.update(publication_status="rejected", failure_reason="stealth_reject_empty_body")
-                        # A blank response is not a receipt. Preserve the failure
-                        # classification so orchestration charges this account.
-                        return False, None, error_msg, error_type
+                    if is_publish and status_code == 200 and not (response_body or "").strip():
+                        return unconfirmed("empty_body")
+                    if is_publish and 500 <= status_code < 600:
+                        return unconfirmed("upstream_5xx")
 
                     # ИСПРАВЛЕНО: Если Content-Type не JSON - это капча/WAF/редирект
                     if "application/json" not in content_type and status_code == 200:
@@ -1234,6 +1255,8 @@ class PlaywrightHttpClient:
                             return False, None, error_msg, error_type
                         continue
                     elif type(status_code_in_body) is not int or status_code_in_body != 0:
+                        if is_publish and type(status_code_in_body) is not int:
+                            return unconfirmed("invalid_api_status")
                         error_type, error_msg = _classify_api_response_error(response_data)
                         logger.warning(
                             f"[HTTP] API error in response | "

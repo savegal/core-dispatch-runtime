@@ -448,6 +448,8 @@ async def resolve_video_url(
     if not _is_tiktok_shortlink(url):
         return url, None
 
+    from executor.http.page_runtime import target_url_matches
+
     if not settings.USE_PROXY:
         proxy = None
     if not proxy and settings.USE_PROXY:
@@ -469,15 +471,26 @@ async def resolve_video_url(
 
     try:
         resolved_url = None
+        from executor.browser_identity import desktop_user_agent, sec_ch_ua
+        shortlink_headers = {
+            "User-Agent": desktop_user_agent(),
+            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
+            "Sec-CH-UA": sec_ch_ua(),
+            "Sec-CH-UA-Mobile": "?0",
+            "Sec-CH-UA-Platform": '"Windows"',
+            "Upgrade-Insecure-Requests": "1",
+        }
         try:
             from curl_cffi.requests import AsyncSession as _CurlAsyncSession
             import httpx as _httpx_check
             if "PYTEST_CURRENT_TEST" not in os.environ and getattr(_httpx_check.AsyncClient, "__module__", "").startswith("httpx"):
                 async with _CurlAsyncSession(
                     impersonate="chrome131",
+                    headers=shortlink_headers,
                     proxies={"http": proxy, "https": proxy} if proxy else None,
                     timeout=timeout,
                     allow_redirects=True,
+                    trust_env=False,
                 ) as curl_client:
                     curl_resp = await curl_client.get(url)
                     if 200 <= int(getattr(curl_resp, "status_code", 0) or 0) < 400:
@@ -489,11 +502,16 @@ async def resolve_video_url(
 
         if not resolved_url:
             import httpx
-            async with httpx.AsyncClient(proxy=proxy, timeout=timeout, follow_redirects=True, trust_env=False) as client:
+            async with httpx.AsyncClient(
+                proxy=proxy,
+                headers=shortlink_headers,
+                timeout=timeout,
+                follow_redirects=True,
+                trust_env=False,
+            ) as client:
                 response = await client.get(url)
                 response.raise_for_status()
                 resolved_url = str(response.url)
-        from executor.http.page_runtime import target_url_matches
         media_id = extract_video_id(resolved_url)
         if media_id and media_id != "0" and target_url_matches(resolved_url, media_id):
             return resolved_url, media_id
@@ -504,7 +522,10 @@ async def resolve_video_url(
     try:
         pool = await get_browser_pool()
         resolved_url = await pool.resolve_shortlink(url, proxy=proxy, timeout=timeout, country_code=proxy_country_code)
-        return resolved_url, extract_video_id(resolved_url)
+        media_id = extract_video_id(resolved_url)
+        if media_id and media_id != "0" and target_url_matches(resolved_url, media_id):
+            return resolved_url, media_id
+        return url, None
     except Exception as exc:
         logger.warning("[URL_RESOLVE] Browser redirect failed: %s", getattr(exc, "reason", type(exc).__name__))
         return url, None
@@ -943,6 +964,65 @@ def _register_runtime_success(
         )
 
 
+def install_early_comment_list_interceptor(page: Any, video_url: str) -> None:
+    """Attach an early /api/comment/list/?cursor=0 listener before the initial page.goto."""
+    if page is None or not callable(getattr(page, "on", None)):
+        return
+    if getattr(page, "_early_comment_interceptor_installed", False):
+        return
+    target_aweme_id = extract_video_id(video_url)
+
+    async def _on_early_response(response: Any) -> None:
+        try:
+            if getattr(page, "_cached_first_comment_page", None) is not None:
+                return
+            url = str(getattr(response, "url", "") or "")
+            parsed = urlparse(url)
+            if parsed.hostname != "www.tiktok.com" or parsed.path != "/api/comment/list/":
+                return
+            query = parse_qs(parsed.query)
+            expected_id = target_aweme_id or extract_video_id(getattr(page, "url", ""))
+            if (
+                expected_id
+                and query.get("aweme_id") == [str(expected_id)]
+                and query.get("cursor") == ["0"]
+                and getattr(response, "status", None) == 200
+            ):
+                from executor.http.page_runtime import document_generation
+                from executor.browser_reads import await_browser_read
+                generation = document_generation(page)
+                text = await await_browser_read(response.text)
+                if text and '"comments"' in text:
+                    data = json.loads(text)
+                    payload = data.get("data", data) if isinstance(data, dict) else None
+                    if (
+                        isinstance(payload, dict)
+                        and data.get("status_code") == 0
+                        and isinstance(payload.get("comments"), list)
+                        and document_generation(page) == generation
+                        and (extract_video_id(getattr(page, "url", "")) or expected_id) == expected_id
+                    ):
+                        page._cached_first_comment_page = payload
+                        page._cached_first_comment_aweme_id = str(expected_id)
+        except Exception:
+            pass
+
+    def _schedule_early(response: Any) -> None:
+        try:
+            if "/api/comment/list/" not in str(getattr(response, "url", "") or ""):
+                return
+            task = asyncio.create_task(_on_early_response(response))
+            task.add_done_callback(lambda done: None if done.cancelled() else done.exception())
+        except Exception:
+            pass
+
+    try:
+        page.on("response", _schedule_early)
+        page._early_comment_interceptor_installed = True
+    except Exception:
+        pass
+
+
 async def warmup_page_for_http(
     page: Page,
     video_url: str,
@@ -979,6 +1059,7 @@ async def warmup_page_for_http(
                     and expected_id and query.get("aweme_id") == [str(expected_id)]
                     and query.get("cursor") == ["0"] and getattr(response, "status", None) == 200):
                 from executor.http.page_runtime import document_generation
+                from executor.browser_reads import await_browser_read
                 generation = document_generation(page)
                 text = await await_browser_read(response.text)
                 if text and '"comments"' in text:
@@ -3467,6 +3548,7 @@ async def _resolve_auto_engagement_parent(db, video_url, *, pool_owner_user_id=N
                 meta = getattr(page, "_comment_list_http_meta", {})
                 return None, "parent_api_unavailable:" + str(meta.get("reason") or "unknown")
             wanted = str(comment_author or "").strip().lstrip("@").casefold()
+            candidates = []
             for row in payload.get("comments", []):
                 if not isinstance(row, dict) or not valid_comment_id(row.get("cid")):
                     continue
@@ -3476,8 +3558,15 @@ async def _resolve_auto_engagement_parent(db, video_url, *, pool_owner_user_id=N
                 author = str(user.get("unique_id") or user.get("nickname") or "").strip()
                 if wanted and author.lstrip("@").casefold() != wanted:
                     continue
-                return {"cid": str(row["cid"]), "text": str(row.get("text") or ""),
-                        "author": author or None}, None
+                try:
+                    digg_count = max(0, int(row.get("digg_count") or 0))
+                except (TypeError, ValueError):
+                    digg_count = 0
+                candidates.append((digg_count, {"cid": str(row["cid"]), "text": str(row.get("text") or ""),
+                                                "author": author or None}))
+            if candidates:
+                candidates.sort(key=lambda item: item[0], reverse=True)
+                return candidates[0][1], None
             return None, "auto_parent_not_found"
         except asyncio.CancelledError:
             raise
@@ -3506,6 +3595,7 @@ async def execute_engagement_only_replies_via_full_flow(
     close_pool_after_phase: bool = True,
     prepublish_failed_account_ids: Optional[set[int]] = None,
     variant_indices: Optional[List[int]] = None,
+    task_settings: Optional[Dict[str, Any]] = None,
 ) -> tuple[List[Dict[str, Any]], Optional[str], Optional[str]]:
     """Reuse the shared account/session and reply publication workflow.
 
@@ -4276,6 +4366,7 @@ async def execute_engagement_only_replies_via_full_flow(
                         parent_search_progress_sink=parent_search_progress,
                         shared_parent_cache=shared_parent_cache,
                         on_resolved_video_url=_adopt_resolved_video_url,
+                        task_settings=task_settings,
                     ),
                     timeout=reply_worker_attempt_timeout_seconds,
                 )
@@ -5870,6 +5961,7 @@ async def execute_engagement_only(
             task_id=task_id,
             pool_owner_user_id=pool_owner_user_id,
             stop_requested=stop_requested,
+            task_settings=getattr(task, "settings", None) if task is not None else None,
         )
         if resolved_comment_id:
             result.comment_id = resolved_comment_id

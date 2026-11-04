@@ -76,7 +76,7 @@ async def test_preserved_response_token_capture_updates_only_web_token(header):
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("published", [False, True])
-async def test_preserved_parent_and_reply_likes_follow_successful_publication(monkeypatch, published):
+async def test_parent_likes_follow_successful_publication(monkeypatch, published):
     from executor import user_schema as schema
     parent, previous_reply, new_reply = "7641761192486195000", "7641761192486195001", "7641761192486195002"
     monkeypatch.setattr(schema, "_BRANCH_PUBLISHED_REPLIES", {})
@@ -105,7 +105,7 @@ async def test_preserved_parent_and_reply_likes_follow_successful_publication(mo
     await schema._publish_reply_http_first_if_eligible(session, "fixture", parent_comment_id=parent,
         correlation_id="spec_review_reply_order", variant_index=2,
         task_settings={"reply_like_target": "1", "reply_like_count": 1})
-    expected = ["reply_started", "reply_succeeded", "like:" + parent, "like:" + previous_reply] if published else [
+    expected = ["reply_started", "reply_succeeded", "like:" + parent] if published else [
         "reply_started", "reply_failed"]
     assert events == expected
 

@@ -51,6 +51,9 @@ function installAccountIdentity(profile) {
     if (profile.hardware?.deviceMemory) {
         values.deviceMemory = profile.hardware.deviceMemory;
     }
+    if (profile.family === 'windows') {
+        values.maxTouchPoints = 0;
+    }
     for (const [key, value] of Object.entries(values)) {
         const descriptor = Object.getOwnPropertyDescriptor(proto, key);
         if (descriptor?.get) Object.defineProperty(proto, key, {...descriptor,
@@ -69,7 +72,12 @@ function installAccountIdentity(profile) {
                 })});
         }
         if (globalThis.Screen?.prototype) {
-            for (const [key, size] of [['availWidth', profile.geometry.availWidth], ['availHeight', profile.geometry.availHeight]]) {
+            for (const [key, size] of [
+                ['availWidth', profile.geometry.availWidth],
+                ['availHeight', profile.geometry.availHeight],
+                ['colorDepth', 24],
+                ['pixelDepth', 24],
+            ]) {
                 const descriptor = Object.getOwnPropertyDescriptor(Screen.prototype, key);
                 if (descriptor?.get) Object.defineProperty(Screen.prototype, key, {...descriptor,
                     get: nativeHook(descriptor.get, function() {
@@ -77,6 +85,33 @@ function installAccountIdentity(profile) {
                         return size;
                     })});
             }
+        }
+    }
+    if (globalThis.GPUAdapter?.prototype && profile.hardware?.webglRenderer) {
+        const infoDesc = Object.getOwnPropertyDescriptor(GPUAdapter.prototype, 'info');
+        if (infoDesc?.get) {
+            const rawRenderer = String(profile.hardware.webglRenderer || '');
+            const rawVendor = String(profile.hardware.webglVendor || '').toLowerCase();
+            const gpuVendor = rawVendor.includes('amd') ? 'amd' : (rawVendor.includes('intel') ? 'intel' : 'nvidia');
+            const gpuArch = gpuVendor === 'amd' ? 'rdna-2' : (gpuVendor === 'intel' ? 'alder-lake' : 'ampere');
+            const m = rawRenderer.match(/ANGLE \([^,]+,\s*([^,]+?)(?:\s+Direct3D|\s*,)/i);
+            const gpuDesc = m ? m[1].trim() : rawRenderer;
+            Object.defineProperty(GPUAdapter.prototype, 'info', {
+                ...infoDesc,
+                get: nativeHook(infoDesc.get, function() {
+                    const nativeInfo = Reflect.apply(infoDesc.get, this, []);
+                    if (!nativeInfo || typeof nativeInfo !== 'object') return nativeInfo;
+                    return new Proxy(nativeInfo, {
+                        get(target, prop, receiver) {
+                            if (prop === 'vendor') return gpuVendor;
+                            if (prop === 'architecture') return gpuArch;
+                            if (prop === 'device' || prop === 'description') return gpuDesc;
+                            const val = Reflect.get(target, prop, target);
+                            return typeof val === 'function' ? val.bind(target) : val;
+                        },
+                    });
+                }),
+            });
         }
     }
 
@@ -197,6 +232,24 @@ function installAccountIdentity(profile) {
                 const [x, y, w, h] = coordinates;
                 return noisePixels(image, x + Math.min(0, w), y + Math.min(0, h));
         });
+        if (typeof Type.prototype.measureText === 'function') {
+            const origMeasureText = Type.prototype.measureText;
+            replaceMethod(Type.prototype, 'measureText', function measureText(...args) {
+                const metrics = Reflect.apply(origMeasureText, this, args);
+                if (metrics && typeof metrics.width === 'number' && metrics.width > 0) {
+                    const textStr = String(args[0] ?? '');
+                    const h = mix(profile.canvasSeed ^ Math.imul(textStr.length + 1, 0x1f123bb5));
+                    const delta = ((h / 0xffffffff) - 0.5) * 0.001;
+                    try {
+                        Object.defineProperty(metrics, 'width', {
+                            value: metrics.width + delta,
+                            configurable: true,
+                        });
+                    } catch (_) {}
+                }
+                return metrics;
+            });
+        }
     }
     // Encode a copy: concurrent blob encodes never modify the source canvas.
     const noisySurface = (source, offscreen) => {

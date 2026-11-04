@@ -25,6 +25,8 @@ class EngagementStates(StatesGroup):
 
     # Выбор шаблона с ответами
     CHOOSE_TEMPLATE = State()
+    CHOOSE_KEYWORD_TEMPLATE = State()
+    SAVE_KEYWORD_TEMPLATE_NAME = State()
     
     # Ввод replies
     INPUT_REPLIES = State()

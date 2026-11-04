@@ -48,9 +48,14 @@ class HttpContext:
         # msToken может быть несколько в cookies (берем последний)
         ms_tokens = [v for k, v in cookies_dict.items() if k == "msToken"]
         ms_token = ms_tokens[-1] if ms_tokens else None
-        verify_fp = cookies_dict.get("verifyFp") or cookies_dict.get("s_v_web_id")
         from executor.http.playwright_http_client import get_cached_web_identity
         cached_identity = get_cached_web_identity(getattr(account, "id", None), account=account)
+        verify_fp = (
+            cookies_dict.get("verifyFp")
+            or cookies_dict.get("s_v_web_id")
+            or cached_identity.get("verify_fp")
+            or cached_identity.get("s_v_web_id")
+        )
         device_id = cookies_dict.get("device_id") or cached_identity.get("device_id")
         odin_id = cookies_dict.get("odinId") or cookies_dict.get("odin_tt") or cached_identity.get("odin_id")
         web_id_last_time = cookies_dict.get("WebIdLastTime") or cached_identity.get("web_id_last_time")

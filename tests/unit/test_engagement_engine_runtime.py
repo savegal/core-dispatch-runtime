@@ -1093,6 +1093,7 @@ async def test_execute_hybrid_full_resolves_shortlink_before_attempts(db_session
     """HYBRID FULL should pass the canonical URL through the whole flow once
     resolve_video_url can expand a shortlink.
     """
+    monkeypatch.setattr(engagement_engine.settings, "USE_PROXY", False)
     account = Account(id=21, label="main", status="active", cookies='{"sessionid":"x"}', proxy="http://proxy-main")
     task = SimpleNamespace(reply1="reply one", reply2=None, reply3=None, settings={"reply_count": 1})
     resolved_url = "https://www.tiktok.com/@demo/video/7635267329407913230"

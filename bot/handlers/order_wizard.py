@@ -815,17 +815,27 @@ def _build_wizard_likes_keyboard(current_target: str, current_count: int) -> Inl
     target_str = str(current_target or "1").strip().lower()
     is_active = current_count > 0 and target_str not in {"none", "0", "off", "disabled"}
 
-    # Row 1: Target reply
+    # Row 1: Target reply (1..3, 4..6, Все)
     r1 = []
     for val, lbl in [("1", "1-й"), ("2", "2-й"), ("3", "3-й"), ("all", "Все")]:
         checked = "✅ " if (is_active and target_str == val) else ""
         r1.append(InlineKeyboardButton(text=f"{checked}{lbl}", callback_data=f"wizard:set_like_target:{val}"))
+    r1b = []
+    for val, lbl in [("4", "4-й"), ("5", "5-й"), ("6", "6-й")]:
+        checked = "✅ " if (is_active and target_str == val) else ""
+        r1b.append(InlineKeyboardButton(text=f"{checked}{lbl}", callback_data=f"wizard:set_like_target:{val}"))
 
-    # Row 2: Count of likes
+    # Row 2: Count of likes (1..5)
     r2 = []
     for c in [1, 2, 3, 5]:
         checked = "✅ " if (is_active and current_count == c) else ""
         r2.append(InlineKeyboardButton(text=f"{checked}{c} шт", callback_data=f"wizard:set_like_count:{c}"))
+
+    # Row 2b: High boost counts (10..25 like competitor threads)
+    r2b = []
+    for c in [10, 15, 25]:
+        checked = "✅ " if (is_active and current_count == c) else ""
+        r2b.append(InlineKeyboardButton(text=f"{checked}{c} шт", callback_data=f"wizard:set_like_count:{c}"))
 
     # Row 3: Off
     off_checked = "✅ " if not is_active else ""
@@ -834,7 +844,7 @@ def _build_wizard_likes_keyboard(current_target: str, current_count: int) -> Inl
     # Row 4: Return
     r4 = [InlineKeyboardButton(text="◀️ Сохранить и вернуться", callback_data="wizard:return_from_likes")]
 
-    return InlineKeyboardMarkup(inline_keyboard=[r1, r2, r3, r4])
+    return InlineKeyboardMarkup(inline_keyboard=[r1, r1b, r2, r2b, r3, r4])
 
 
 def _build_wizard_likes_prompt_text(target: str, count: int) -> str:
@@ -1290,6 +1300,9 @@ async def wizard_save_template(message: Message, state: FSMContext):
                 "text_variants": text_variants,
                 "reply_like_target": str(state_data.get("reply_like_target") or draft.reply_like_target or "1"),
                 "reply_like_count": int(state_data.get("reply_like_count") if state_data.get("reply_like_count") is not None else draft.reply_like_count),
+                "mention_mode": str(state_data.get("mention_mode") or getattr(draft, "mention_mode", None) or "plain"),
+                "verify_main_visibility": bool(state_data.get("verify_main_visibility") if state_data.get("verify_main_visibility") is not None else getattr(draft, "verify_main_visibility", False)),
+                "verify_reply_visibility": bool(state_data.get("verify_reply_visibility") if state_data.get("verify_reply_visibility") is not None else getattr(draft, "verify_reply_visibility", False)),
             }
         )
         

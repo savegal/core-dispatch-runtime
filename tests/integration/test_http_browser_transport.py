@@ -19,10 +19,47 @@ pytestmark = [pytest.mark.integration, pytest.mark.asyncio]
 CLOCK_TOLERANCE_MS = int(time.get_clock_info("monotonic").resolution * 1000) + 1
 
 
-@pytest.mark.parametrize("mode,expected_calls,success", [
-    ("signed_empty", 2, True), ("unsigned_first", 2, True), ("invalid_json", 1, False),
-])
-async def test_publish_empty_body_has_one_bounded_retry_without_replaying_invalid_json(browser_page, mode, expected_calls, success):
+async def test_profile_probe_uses_page_fetch_and_the_requested_owner(browser_page):
+    from services.video_parser import _probe_profile_videos_http_first
+
+    requested = []
+    detail = {"userInfo": {"user": {"uniqueId": "fixture", "secUid": "right-owner"}}}
+    item_list = {"itemList": [{"id": "7641761192486194454", "author": "fixture"}]}
+
+    async def serve(route):
+        url = urlparse(route.request.url)
+        if url.path.startswith("/api/"):
+            requested.append((url.path, parse_qs(url.query)))
+            await route.fulfill(json=detail if url.path == "/api/user/detail/" else item_list)
+            return
+        await route.fulfill(content_type="text/html", body="""<script id="SIGI_STATE" type="application/json">
+            {"UserModule":{"users":{"other":{"uniqueId":"other","secUid":"MS4wLjABAAAA-wrong"}}}}
+        </script>""")
+
+    await browser_page.route("**/*", serve)
+    await browser_page.goto("https://www.tiktok.com/@fixture")
+    await browser_page.evaluate("""() => {
+        const nativeFetch = window.fetch;
+        window.fetch = (input, options) => {
+            const url = new URL(input, location.href);
+            url.searchParams.set("fixture-signature", "page");
+            return nativeFetch(url.href, options);
+        };
+    }""", isolated_context=False)
+
+    result = await _probe_profile_videos_http_first(browser_page, "fixture")
+
+    assert result["itemListPayload"] == item_list
+    assert [path for path, _ in requested] == ["/api/user/detail/", "/api/post/item_list/"]
+    assert requested[1][1]["secUid"] == ["right-owner"]
+    assert all(query["fixture-signature"] == ["page"] for _, query in requested)
+    runtime = await browser_page.evaluate("() => [navigator.language, String(screen.width)]", isolated_context=False)
+    assert requested[1][1]["browser_language"] == [runtime[0]]
+    assert requested[1][1]["screen_width"] == [runtime[1]]
+
+
+@pytest.mark.parametrize("mode", ["signed_empty", "unsigned_first", "invalid_json"])
+async def test_publish_empty_or_invalid_body_is_not_replayed(browser_page, mode):
     requests = []
     async def serve(route):
         if urlparse(route.request.url).path != "/api/comment/publish/":
@@ -50,11 +87,10 @@ async def test_publish_empty_body_has_one_bounded_retry_without_replaying_invali
                                   retry_policy=RetryPolicy(max_retries=3))
     result = await client._execute_request(RequestProfile.publish_main_profile(),
                                            {"aweme_id": "7635267329407913230", "text": "fixture"})
-    assert result[0] is success
-    assert len(requests) == expected_calls
+    assert result[0] is False
+    assert len(requests) == 1
     assert client.last_request_meta["security_params_source"] == "request_event"
-    if not success:
-        assert client.last_request_meta["publication_status"] == "submitted_unconfirmed"
+    assert client.last_request_meta["publication_status"] == "submitted_unconfirmed"
 
 
 async def test_mention_resolution_aborts_a_stalled_response_body(browser_page, monkeypatch):

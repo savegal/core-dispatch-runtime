@@ -49,6 +49,7 @@ class OrderStates(StatesGroup):
     
     # === Создание нового шаблона (quick_order) ===
     NEW_TEMPLATE_MAIN_COMMENT = State()
+    NEW_TEMPLATE_KEYWORDS = State()
     NEW_TEMPLATE_REPLIES_ALL = State()  # УПРОЩЕНО: Ввод всех ответов сразу
     NEW_TEMPLATE_REPLY_1 = State()  # Устарело, оставлено для совместимости
     NEW_TEMPLATE_REPLY_2 = State()  # Устарело, оставлено для совместимости
@@ -56,6 +57,7 @@ class OrderStates(StatesGroup):
     
     # === Редактирование шаблона ===
     EDIT_TEMPLATE_COMMENT = State()
+    EDIT_TEMPLATE_KEYWORDS = State()
     EDIT_TEMPLATE_REPLY1 = State()
     EDIT_TEMPLATE_REPLY2 = State()
     EDIT_TEMPLATE_REPLY3 = State()

@@ -9,7 +9,9 @@ app_settings = get_settings()
 
 TEMPLATE_TYPE_FULL = "full"
 TEMPLATE_TYPE_REPLIES_ONLY = "replies_only"
+TEMPLATE_TYPE_KEYWORDS = "keywords"
 REPLIES_ONLY_MAIN_PLACEHOLDER = "__replies_only_template__"
+KEYWORDS_MAIN_PLACEHOLDER = "__keywords_template__"
 
 
 def template_type(template: dict[str, Any] | None) -> str:
@@ -19,18 +21,32 @@ def template_type(template: dict[str, Any] | None) -> str:
         settings_payload.get("template_type")
         or settings_payload.get("template_kind")
         or settings_payload.get("scope")
-        or TEMPLATE_TYPE_FULL
+        or ""
     )
     value = str(raw_type or "").strip().lower()
+    if value in {"keyword", "keywords", "keyword_replies", "keyword-replies"}:
+        return TEMPLATE_TYPE_KEYWORDS
+    if str(template.get("main_comment") or "").strip() == KEYWORDS_MAIN_PLACEHOLDER:
+        return TEMPLATE_TYPE_KEYWORDS
     if value in {"reply_only", "reply-only", "replies", "replies-only"}:
         return TEMPLATE_TYPE_REPLIES_ONLY
     if value == TEMPLATE_TYPE_REPLIES_ONLY:
         return TEMPLATE_TYPE_REPLIES_ONLY
+    if (
+        not value
+        and isinstance(settings_payload.get("keywords"), list)
+        and bool(settings_payload.get("keywords"))
+    ):
+        return TEMPLATE_TYPE_KEYWORDS
     return TEMPLATE_TYPE_FULL
 
 
 def is_replies_only_template(template: dict[str, Any] | None) -> bool:
     return template_type(template) == TEMPLATE_TYPE_REPLIES_ONLY
+
+
+def is_keywords_template(template: dict[str, Any] | None) -> bool:
+    return template_type(template) == TEMPLATE_TYPE_KEYWORDS
 
 
 def is_full_template(template: dict[str, Any] | None) -> bool:
@@ -46,6 +62,27 @@ def filter_reply_source_templates(templates: list[dict[str, Any]] | None) -> lis
         template
         for template in (templates or [])
         if template_replies(template)
+    ]
+
+
+def template_keywords(template: dict[str, Any] | None) -> list[str]:
+    template = template or {}
+    settings_payload = template.get("settings") or {}
+    raw_keywords = settings_payload.get("keywords")
+    if isinstance(raw_keywords, list):
+        return [
+            str(item).strip()
+            for item in raw_keywords
+            if str(item or "").strip()
+        ]
+    return []
+
+
+def filter_keyword_templates(templates: list[dict[str, Any]] | None) -> list[dict[str, Any]]:
+    return [
+        template
+        for template in (templates or [])
+        if is_keywords_template(template) and bool(template_keywords(template))
     ]
 
 
@@ -96,7 +133,7 @@ def replies_dict_to_list(replies: dict[int, str] | None) -> list[str]:
 
 def template_text_variants(template: dict[str, Any] | None) -> list[str]:
     template = template or {}
-    if is_replies_only_template(template):
+    if is_replies_only_template(template) or is_keywords_template(template):
         return []
 
     settings_payload = template.get("settings") or {}
