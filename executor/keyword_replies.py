@@ -125,6 +125,7 @@ def has_more(value):
 
 async def collect_http_targets(page, aweme_id, keywords, *, stop_requested=None):
     from executor.http.comment_discovery import comment_read_batch, fetch_comment_page
+    from executor.http.comment_scanner import reports_unseen_comments
     seen, cursors, targets = set(), set(), []
     cursor = 0
     complete, error = False, None
@@ -145,7 +146,9 @@ async def collect_http_targets(page, aweme_id, keywords, *, stop_requested=None)
                 break
             try:
                 if not has_more(payload.get("has_more")):
-                    complete = True
+                    complete = not reports_unseen_comments(payload, len(seen))
+                    if not complete:
+                        error = "keyword_comment_list_unavailable"
                     break
                 next_cursor = int(payload["cursor"])
                 if next_cursor <= int(cursor) or next_cursor in cursors:

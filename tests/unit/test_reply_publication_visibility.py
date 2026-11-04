@@ -97,6 +97,18 @@ async def test_same_text_different_id_is_missing_only_after_complete_read(monkey
     assert report["absent_ids"] == [CID] and report["complete"]
 
 
+@pytest.mark.parametrize("parent_visible", [False, True])
+async def test_empty_reply_branch_proves_absence_only_if_parent_is_visible(monkeypatch, parent_visible):
+    monkeypatch.setattr(visibility, "fetch_reply_page", AsyncMock(return_value={"comments": [], "has_more": 0, "total": 0}))
+    parent = AsyncMock(return_value={"found_ids": [PARENT] if parent_visible else []})
+    monkeypatch.setattr(visibility, "scan_main_comment_ids", parent)
+    evidence = await visibility.scan_reply_comment_ids(None, VIDEO, PARENT, [CID], max_pages=2)
+    parent.assert_awaited_once_with(None, VIDEO, [PARENT], max_pages=2)
+    assert evidence["complete"] is parent_visible
+    assert evidence["absent_ids"] == ([CID] if parent_visible else [])
+    assert evidence["reason"] == ("exhausted" if parent_visible else "reply_parent_visibility_unconfirmed")
+
+
 async def test_positive_survives_later_api_failure(monkeypatch):
     monkeypatch.setattr(visibility, "fetch_reply_page", AsyncMock(side_effect=[branch(CID, more=1), None]))
     page = SimpleNamespace(_reply_list_http_meta={"reason": "empty_body"})

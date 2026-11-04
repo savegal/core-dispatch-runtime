@@ -17,7 +17,7 @@ from executor.http.comment_scanner import scan_comment_ids, comment_id_key
 from executor.http.execution_policy import http_first_enabled
 from executor.http.execution_policy import valid_comment_id
 from executor.http.page_runtime import target_url_matches
-from executor.main_visibility import verify_main_publications
+from executor.main_visibility import scan_main_comment_ids, verify_main_publications
 from services.video_parser import extract_video_id
 from executor.visibility_support import account_identity_keys as _identity_keys, identity_is_known, identities_independent, identity_rejection_reason
 from services.execution_attempts import is_pre_publish_account_failure, candidate_scan_limit
@@ -56,11 +56,16 @@ def _legacy_reply_sections(result):
 async def scan_reply_comment_ids(page, aweme_id, parent_comment_id, comment_ids, *, max_pages=20):
     """Read fresh exact IDs from the requested parent, without DOM discovery."""
     aweme_id, parent_comment_id = str(aweme_id).strip(), comment_id_key(parent_comment_id)
-    return await scan_comment_ids(
+    evidence = await scan_comment_ids(
         page, aweme_id, comment_ids, max_pages=max_pages, parent_comment_id=parent_comment_id,
         read_page=lambda cursor: fetch_reply_page(page, str(aweme_id), str(parent_comment_id), cursor),
         meta_attr="_reply_list_http_meta",
     )
+    if evidence["absent_ids"] and evidence["scanned"] == 0:
+        parent = await scan_main_comment_ids(page, aweme_id, [parent_comment_id], max_pages=max_pages)
+        if parent_comment_id not in parent["found_ids"]:
+            evidence.update(absent_ids=[], complete=False, reason="reply_parent_visibility_unconfirmed")
+    return evidence
 
 
 @dataclass

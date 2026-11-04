@@ -54,6 +54,7 @@ async def test_scan_reads_next_page_and_ignores_reply_id(monkeypatch):
     ({"comments": []}, "missing_has_more"),
     ({"comments": [None], "has_more": 0}, "invalid_rows"),
     ({"comments": None, "has_more": 0}, "invalid_comments"),
+    ({"comments": [{"cid": OTHER}], "has_more": 0, "total": 9}, "comment_list_total_mismatch"),
 ])
 async def test_incomplete_scan_never_proves_absence(monkeypatch, payload, reason):
     monkeypatch.setattr(visibility, "fetch_comment_page", AsyncMock(return_value=payload))

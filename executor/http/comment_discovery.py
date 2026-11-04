@@ -333,11 +333,12 @@ async def find_parent_comments(page, aweme_id: str, mains, *, phrase_match=False
     Valid JSON with no match is distinct from an unavailable API. A cursor loop
     or a page limit is inconclusive, rather than proof a parent does not exist.
     """
-    from executor.http.comment_scanner import _cursor, _more
+    from executor.http.comment_scanner import _cursor, _more, reports_unseen_comments
 
     matches = {}
     cursor = 0
     seen_cursors = set()
+    seen_comments = set()
     scanned = 0
     available = False
     exhausted = False
@@ -374,6 +375,7 @@ async def find_parent_comments(page, aweme_id: str, mains, *, phrase_match=False
             cid = str(row.get("cid") or "").strip()
             if not cid.isascii() or not cid.isdigit() or not 10 <= len(cid) <= 30:
                 continue
+            seen_comments.add(cid)
             if cid in {hit["cid"] for hit in matches.values()}:
                 continue
             # Only top-level parents belong to this endpoint's discovery flow.
@@ -395,7 +397,7 @@ async def find_parent_comments(page, aweme_id: str, mains, *, phrase_match=False
                     matches[index] = {"cid": cid, "text": text, "author": str(user.get("unique_id") or user.get("nickname") or "")}
                     break
         has_more = _more(payload.get("has_more"))
-        exhausted = has_more is False
+        exhausted = has_more is False and not reports_unseen_comments(payload, len(seen_comments))
         if len(matches) == len(mains) or has_more is not True:
             break
         next_cursor = _cursor(payload.get("cursor"))

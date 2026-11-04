@@ -102,6 +102,7 @@ async def test_http_discovery_visits_all_pages_deduplicates_and_filters(monkeypa
 
 @pytest.mark.parametrize("second,reason", [
     (None, "keyword_comment_list_unavailable"),
+    ({"comments": [], "has_more": 0, "total": 9}, "keyword_comment_list_unavailable"),
     ({"comments": [], "cursor": 20, "has_more": 1}, "keyword_pagination_stalled"),
 ])
 async def test_partial_discovery_does_not_claim_complete_coverage(monkeypatch, second, reason):
