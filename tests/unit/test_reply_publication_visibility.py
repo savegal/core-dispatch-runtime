@@ -186,6 +186,28 @@ async def test_reply_like_resume_does_not_redispatch_an_unconfirmed_attempt(adap
     adapter.scan.assert_not_awaited()
 
 
+async def test_reply_like_keeps_attempt_if_transport_loses_dispatch_event(adapter, monkeypatch):
+    from executor.http.playwright_http_client import PlaywrightHttpClient
+
+    monkeypatch.setenv("AUTO_BOOST_LIKES", "1")
+    row = result(item())
+    row["reply_likes"] = {
+        "state": "pending", "requested_per_reply": 1, "targets": [{"cid": CID, "parent_id": PARENT}],
+        "by_comment_id": {CID: 0}, "attempts": {}, "exclude_account_ids": [1],
+    }
+    client = SimpleNamespace(
+        like_comment=AsyncMock(return_value=(False, "transport failed", None)),
+        last_request_meta={"request_attempted": False, "transport_invoked": True},
+    )
+    monkeypatch.setattr(PlaywrightHttpClient, "from_page", AsyncMock(return_value=client))
+
+    await visibility.resume_reply_likes(adapter.db, adapter.task, URL, row)
+
+    client.like_comment.assert_awaited_once()
+    assert row["reply_likes"]["attempts"] == {CID: {"8": "unconfirmed"}}
+    assert row["reply_likes"]["by_comment_id"] == {CID: 0}
+
+
 async def test_unconfirmed_priority_does_not_fall_back_to_another_reply(adapter, monkeypatch):
     monkeypatch.setenv("AUTO_BOOST_LIKES", "1")
     boost = AsyncMock()

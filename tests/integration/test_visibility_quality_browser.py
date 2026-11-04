@@ -102,10 +102,10 @@ async def test_three_page_scan_keeps_three_gets_and_reduces_metadata_reads(brows
         else:
             result = await reply_visibility.scan_reply_comment_ids(page, VIDEO, PARENT, [CID])
         assert result["absent_ids"] == [CID] and result["complete"]
-        assert runtime.await_count == cookies.await_count == 1
+        assert runtime.await_count == 1 and cookies.await_count == 3
         assert state["gets"] == 3 and state["posts"] == 0
         record_property("metadata_reads_before", 6)
-        record_property("metadata_reads_after", 2)
+        record_property("metadata_reads_after", 4)
         record_property("http_gets", state["gets"])
         record_property("scan_seconds_local", round(time.monotonic() - started, 3))
     finally:

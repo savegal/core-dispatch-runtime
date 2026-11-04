@@ -1,24 +1,5 @@
 import re
-from urllib.parse import urlparse, urlunparse
-
-
-def _is_tiktok_domain(hostname: str | None) -> bool:
-    """Strict hostname check for TikTok domains."""
-    if not hostname:
-        return False
-
-    host = hostname.strip().lower().strip(".")
-    if not host:
-        return False
-
-    allowed_hosts = {
-        "tiktok.com",
-        "www.tiktok.com",
-        "m.tiktok.com",
-        "vm.tiktok.com",
-        "vt.tiktok.com",
-    }
-    return host in allowed_hosts or host.endswith(".tiktok.com")
+from services.tiktok_urls import is_tiktok_shortlink, media_id_from_url
 
 
 def normalize_url(url: str) -> str:
@@ -28,7 +9,7 @@ def normalize_url(url: str) -> str:
     url = url.strip()
     
     # Если нет протокола, добавляем https://
-    if url and not url.startswith(('http://', 'https://')):
+    if url and not url.lower().startswith(('http://', 'https://')):
         url = 'https://' + url
     
     # Убираем лишние символы в конце
@@ -78,15 +59,7 @@ def parse_links(text: str, return_invalid_info: bool = False) -> list[str] | tup
                 continue
             
             # Парсим URL для валидации
-            parsed = urlparse(url)
-            
-            # Проверяем, что это TikTok ссылка
-            hostname = parsed.hostname
-            if not hostname:
-                continue
-                
-            
-            if _is_tiktok_domain(hostname) and parsed.path:
+            if media_id_from_url(url) or is_tiktok_shortlink(url):
                 unique_urls.append(url)
                 seen.add(url)
         except Exception:
@@ -113,41 +86,5 @@ def validate_video_url(url: str) -> bool:
     
     ИСПРАВЛЕНО: Добавлена проверка паттернов для различных форматов TikTok URL.
     """
-    if not url:
-        return False
-    
-    try:
-        # Нормализуем URL
-        url = normalize_url(url)
-        parsed = urlparse(url)
-        
-        # Проверяем домен
-        hostname = parsed.hostname
-        if not _is_tiktok_domain(hostname):
-            return False
-        
-        # ИСПРАВЛЕНО: Проверяем паттерны для различных форматов TikTok URL
-        path = parsed.path.lower()
-        
-        # Паттерны для валидных TikTok URL:
-        # 1. /@username/video/1234567890
-        # 2. /video/1234567890
-        # 3. /ZMHE6tVbs7qR3-CIn5C/ (короткие ссылки)
-        # 4. /t/ZTd... (новый формат коротких ссылок)
-        
-        valid_patterns = [
-            r'/@[\w\.-]+/video/\d+',  # Стандартный формат
-            r'/video/\d+',  # Прямая ссылка на видео
-            r'/[a-z0-9_-]+',  # Короткие ссылки (vm.tiktok.com, vt.tiktok.com)
-            r'/t/[a-z0-9_-]+',  # Новый формат коротких ссылок
-        ]
-        
-        import re
-        has_valid_pattern = any(re.match(pattern, path) for pattern in valid_patterns)
-        
-        # Проверяем, что есть путь (видео)
-        has_path = bool(parsed.path and len(parsed.path) > 1)
-        
-        return has_path and has_valid_pattern
-    except Exception:
-        return False
+    normalized = normalize_url(url) if isinstance(url, str) else ""
+    return bool(media_id_from_url(normalized) or is_tiktok_shortlink(normalized))

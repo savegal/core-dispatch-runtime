@@ -85,15 +85,16 @@ def _bound_video(task_settings, source_url, media_id=None):
     return None
 
 
-def _valid_comment_row(row):
+def _valid_comment_row(row, aweme_id=None):
     return bool(isinstance(row, dict) and valid_comment_id(row.get("cid"))
-                and (row.get("text") is None or isinstance(row["text"], str)))
+                and (row.get("text") is None or isinstance(row["text"], str))
+                and (aweme_id is None or row.get("aweme_id") is None or str(row["aweme_id"]) == str(aweme_id)))
 
 
-def select_targets(rows, keywords, seen):
+def select_targets(rows, keywords, seen, *, aweme_id=None):
     selected = []
     for row in rows:
-        if not _valid_comment_row(row):
+        if not _valid_comment_row(row, aweme_id):
             continue
         cid = str(row["cid"]).strip()
         if cid in seen:
@@ -136,8 +137,8 @@ async def collect_http_targets(page, aweme_id, keywords, *, stop_requested=None)
             if not isinstance(payload, dict) or not isinstance(payload.get("comments"), list):
                 error = "keyword_comment_list_unavailable"
                 break
-            targets.extend(select_targets(payload["comments"], keywords, seen))
-            if not all(_valid_comment_row(row) for row in payload["comments"]):
+            targets.extend(select_targets(payload["comments"], keywords, seen, aweme_id=aweme_id))
+            if not all(_valid_comment_row(row, aweme_id) for row in payload["comments"]):
                 # Keep the valid matches, but malformed rows cannot prove that
                 # every accessible comment was examined successfully.
                 error = "keyword_comment_list_unavailable"

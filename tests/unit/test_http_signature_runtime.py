@@ -580,7 +580,7 @@ async def test_browser_transport_failure_does_not_fall_back_to_context(failure, 
 @pytest.mark.unit
 @pytest.mark.asyncio
 @pytest.mark.parametrize("status, body, headers, expected", [
-    (200, "", {"content-type": "application/json"}, HttpErrorType.FORBIDDEN),
+    (200, "", {"content-type": "application/json"}, HttpErrorType.SUBMITTED_UNCONFIRMED),
     (200, "invalid", {"content-type": "application/json"}, HttpErrorType.SUBMITTED_UNCONFIRMED),
     (200, "<html>challenge</html>", {"content-type": "text/html"}, HttpErrorType.CAPTCHA),
     (403, "{}", {"content-type": "application/json"}, HttpErrorType.FORBIDDEN),

@@ -4,6 +4,7 @@
 """
 import logging
 import asyncio
+from ipaddress import ip_address
 import time
 import uuid
 from dataclasses import dataclass, field
@@ -301,8 +302,9 @@ async def get_current_ip(proxy_string):
             response = await client.get(settings.MOBILE_PROXY_CHECK_IP_URL)
             response.raise_for_status()
             data = response.json()
-            return data.get('ip') or data.get('origin')
-    except httpx.HTTPError as exc:
+            raw_ip = (data.get("ip") or data.get("origin")) if isinstance(data, dict) else None
+            return str(ip_address(raw_ip)) if isinstance(raw_ip, str) else None
+    except (httpx.HTTPError, ValueError) as exc:
         logger.warning('IP probe failed through %s: %s', sanitize_url(route.url), type(exc).__name__)
         return None
 
@@ -508,7 +510,8 @@ async def get_proxy_last_ip(proxy_id: int) -> Optional[str]:
     for retry in range(max_retries):
         try:
             redis_client = get_redis()
-            return redis_client.get(ip_key)
+            value = _decode_redis_value(redis_client.get(ip_key))
+            return str(ip_address(value)) if value is not None else None
         except (redis.ConnectionError, redis.TimeoutError) as e:
             if retry < max_retries - 1:
                 logger.debug(f"Redis error getting last IP (retry {retry + 1}/{max_retries}): {e}")

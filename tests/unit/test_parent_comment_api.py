@@ -29,7 +29,7 @@ def api_page(response):
     {"status":200, "text":'{"comments":[]}', "url":"https://www.tiktok.com/api/comment/list/?X-Gnarly=y"},
 ])
 async def test_comment_get_retries_initial_empty_or_unsigned_response_once(monkeypatch, first):
-    second = {"status":200, "text":'{"comments":[]}', "url":"https://www.tiktok.com/api/comment/list/?X-Bogus=x&X-Gnarly=y"}
+    second = {"status":200, "text":'{"status_code":0,"comments":[]}', "url":"https://www.tiktok.com/api/comment/list/?X-Bogus=x&X-Gnarly=y"}
     page = api_page(first)
     original = page.evaluate.side_effect
     responses = iter([first, second])
@@ -40,7 +40,7 @@ async def test_comment_get_retries_initial_empty_or_unsigned_response_once(monke
     page.evaluate.side_effect = evaluate
     delay = AsyncMock()
     monkeypatch.setattr(api.asyncio, "sleep", delay)
-    assert await api.fetch_comment_page(page, "123", cursor=50) == {"comments":[]}
+    assert await api.fetch_comment_page(page, "123", cursor=50) == {"status_code": 0, "comments": []}
     delay.assert_awaited_once_with(2.0)
     calls = [call for call in page.evaluate.await_args_list if len(call.args) > 1]
     assert len(calls) == 2
@@ -63,7 +63,7 @@ async def test_comment_get_persistent_empty_body_stops_after_two_retries(monkeyp
 
 @pytest.mark.parametrize("ready", [False, True])
 async def test_known_unready_runtime_is_rechecked_before_manual_get(monkeypatch, ready):
-    page = api_page({"status": 200, "text": '{"comments":[]}'})
+    page = api_page({"status": 200, "text": '{"status_code":0,"comments":[]}'})
     page._warmup_signer_ready = False
     readiness = AsyncMock(return_value=ready)
     monkeypatch.setattr("executor.http.signature_runtime.wait_for_runtime_signer_ready", readiness)
@@ -121,9 +121,9 @@ async def test_api_search_respects_requested_pages_up_to_twenty(monkeypatch, max
 
 
 @pytest.mark.parametrize("status,body,valid", [
-    (200, '{"comments":[]}', True),
-    (200, '{"status_code":0,"comments":null}', True),
-    (200, '{"status_code":0,"data":{"comments":null}}', True),
+    (200, '{"comments":[]}', False),
+    (200, '{"status_code":0,"comments":null}', False),
+    (200, '{"status_code":0,"data":{"comments":null}}', False),
     (200, '{"status_code":7,"comments":null}', False),
     (200, '{"comments":{}}', False),
     (200, '{}', False), (200, '', False), (403, '{}', False),
@@ -138,7 +138,7 @@ async def test_fetch_page_requires_valid_json_list_in_main_world(status, body, v
 
 @pytest.mark.parametrize("nested", [False, True])
 async def test_null_comments_are_available_and_exhausted(nested):
-    payload = {"comments": None, "has_more": 0}
+    payload = {"comments": None, "has_more": 0, "total": 0}
     data = {"status_code": 0, "data": payload} if nested else {"status_code": 0, **payload}
     page = api_page({"status": 200, "text": json.dumps(data)})
     matches, info = await api.find_parent_comments(page, "video", [SimpleNamespace(text="hello", tiktok_username=None)])
@@ -172,7 +172,8 @@ async def test_comment_list_uses_full_runtime_profile_and_fresh_web_cookies():
 @pytest.mark.parametrize("status,body,reason", [
     (200, "", "empty_body"), (200, "<html>challenge</html>", "invalid_json"),
     (403, "", "http_status"), (200, '{"status_code":7}', "api_status"),
-    (200, '{}', "missing_comments"),
+    (200, '{}', "missing_api_status"),
+    (200, '{"status_code":0}', "missing_comments"),
 ])
 async def test_comment_list_diagnostics_explain_failure_without_logging_tokens(caplog, status, body, reason):
     page = api_page({"status": status, "text": body})

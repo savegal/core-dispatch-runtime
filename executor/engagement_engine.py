@@ -24,7 +24,8 @@ import re
 import random
 import time
 from typing import Optional, Dict, Any, List, Tuple, Callable
-from urllib.parse import urlparse, parse_qs
+from urllib.parse import urlparse, parse_qs, urljoin
+from services.tiktok_urls import is_tiktok_shortlink as _is_tiktok_shortlink, media_id_from_url, parse_tiktok_url
 from sqlalchemy.orm import Session
 from db.models import Task, Account, Proxy
 from executor.tiktok_client_async import create_page_for_account
@@ -82,7 +83,6 @@ FAST_VERIFY_TIMEOUT_SECONDS = 18
 FAST_VERIFY_INTERVAL_SECONDS = 4
 FAST_VERIFY_MAX_SCROLLS = 4
 FAST_VERIFY_SCROLL_DELAY_MS = 350
-_SHORTLINK_HOST_MARKERS = ("vt.tiktok.com", "vm.tiktok.com")
 ENGAGEMENT_ONLY_REPLY_MAX_ATTEMPTS = 6
 
 
@@ -361,44 +361,7 @@ async def _recover_reply_comment_after_ambiguous_publish(
 
 
 def extract_video_id(video_url: str) -> Optional[str]:
-    """
-    Извлекает video_id (aweme_id) из URL TikTok.
-    
-    Args:
-        video_url: URL видео TikTok
-        
-    Returns:
-        str: aweme_id или None если не удалось извлечь
-    """
-    # Паттерны для различных форматов TikTok URL
-    patterns = [
-        r'/(?:video|photo)/(\d+)',  # Видео и фотокарусели используют общий aweme_id
-        r'video_id=(\d+)',  # Query параметр: ?video_id=1234567890
-        r'aweme_id=(\d+)',  # API формат: ?aweme_id=1234567890
-        r'@[\w.]+/video/(\d+)',  # Формат с username: @user/video/1234567890
-        r'item_id=(\d+)',  # Share link: ?item_id=1234567890
-        r'\b(\d{16,20})\b',  # Fallback: длинный числовой ID в URL
-    ]
-    
-    for pattern in patterns:
-        match = re.search(pattern, video_url)
-        if match:
-            return match.group(1)
-    
-    if _is_tiktok_shortlink(video_url):
-        logger.debug(
-            "TikTok shortlink does not expose video_id before browser resolution: %s",
-            video_url[:100],
-        )
-    else:
-        logger.warning(f"Could not extract video_id from URL: {video_url[:100]}")
-    return None
-
-
-def _is_tiktok_shortlink(url: Optional[str]) -> bool:
-    if not url:
-        return False
-    return (urlparse(str(url)).hostname or "").lower() in _SHORTLINK_HOST_MARKERS
+    return media_id_from_url(video_url)
 
 
 async def _ensure_comment_panel_open(page: Page) -> None:
@@ -463,6 +426,27 @@ async def resolve_video_url(
         )
         return url, None
 
+    async def resolve_redirects(client):
+        target = url
+        async with asyncio.timeout(timeout):
+            for _ in range(8):
+                response = await client.get(target)
+                status = response.status_code
+                if status in {301, 302, 303, 307, 308}:
+                    location = response.headers.get("location")
+                    if not location:
+                        break
+                    if "\\" in location or any(ord(char) <= 32 or ord(char) == 127 for char in location):
+                        return None, True
+                    target = urljoin(target, location)
+                    if not parse_tiktok_url(target):
+                        return None, True
+                    if media_id_from_url(target):
+                        return target, False
+                else:
+                    return str(response.url) if 200 <= status < 300 else None, False
+        return None, False
+
     try:
         from services.proxy_normalizer import ProxyRoute
         proxy = ProxyRoute.parse(proxy).url if proxy else None
@@ -489,12 +473,12 @@ async def resolve_video_url(
                     headers=shortlink_headers,
                     proxies={"http": proxy, "https": proxy} if proxy else None,
                     timeout=timeout,
-                    allow_redirects=True,
+                    allow_redirects=False,
                     trust_env=False,
                 ) as curl_client:
-                    curl_resp = await curl_client.get(url)
-                    if 200 <= int(getattr(curl_resp, "status_code", 0) or 0) < 400:
-                        resolved_url = str(getattr(curl_resp, "url", "") or "")
+                    resolved_url, rejected = await resolve_redirects(curl_client)
+                    if rejected:
+                        return url, None
         except ImportError:
             resolved_url = None
         except Exception:
@@ -506,12 +490,12 @@ async def resolve_video_url(
                 proxy=proxy,
                 headers=shortlink_headers,
                 timeout=timeout,
-                follow_redirects=True,
+                follow_redirects=False,
                 trust_env=False,
             ) as client:
-                response = await client.get(url)
-                response.raise_for_status()
-                resolved_url = str(response.url)
+                resolved_url, rejected = await resolve_redirects(client)
+                if rejected:
+                    return url, None
         media_id = extract_video_id(resolved_url)
         if media_id and media_id != "0" and target_url_matches(resolved_url, media_id):
             return resolved_url, media_id
@@ -748,14 +732,8 @@ def build_canonical_video_url(video_url: str, aweme_id: Optional[str] = None) ->
 
 
 def _build_warmup_video_url(video_url: str, aweme_id: Optional[str] = None) -> str:
-    if aweme_id and not _is_tiktok_shortlink(video_url):
-        try:
-            parsed = urlparse(str(video_url))
-            host = parsed.netloc.lower()
-            if (host == "tiktok.com" or host.endswith(".tiktok.com")) and re.search(r"/(?:video|photo)/\d+", parsed.path):
-                return video_url
-        except Exception:
-            pass
+    if aweme_id and media_id_from_url(video_url) == str(aweme_id):
+        return video_url
 
     return build_canonical_video_url(video_url, aweme_id)
 
@@ -1151,6 +1129,9 @@ async def warmup_page_for_http(
         return cookies_dict, valid, info
 
     try:
+        if not parse_tiktok_url(video_url):
+            warmup_info.update(status="redirect", reason_code="invalid_tiktok_url")
+            return await _finish(False, warmup_info)
         aweme_id = extract_video_id(video_url)
         canonical_url = _build_warmup_video_url(video_url, aweme_id)
         warmup_info["target_url"] = canonical_url

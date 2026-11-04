@@ -161,6 +161,26 @@ async def test_one_supported_signature_is_enough_for_get_without_retry(monkeypat
     assert page.evaluate.await_count == 1 and sleep.await_count == 0
 
 
+@pytest.mark.parametrize(("foreign_path", "reason"), [(False, "missing_api_status"), (True, "unexpected_response_url")])
+async def test_discovery_rejects_unverified_comment_list(monkeypatch, foreign_path, reason):
+    monkeypatch.setattr(discovery, "_extract_runtime_profile", AsyncMock(return_value={}))
+
+    async def evaluate(script, url, **kwargs):
+        response_url = url.replace("/api/comment/list/", "/unrelated/") if foreign_path else url
+        return {"status": 200, "text": '{"comments":[],"has_more":0}', "url": response_url + "&X-Bogus=fixture"}
+
+    page = SimpleNamespace(context=SimpleNamespace(cookies=AsyncMock(return_value=[])), evaluate=evaluate)
+    assert await discovery.fetch_comment_page(page, VIDEO) is None
+    assert page._comment_list_http_meta["reason"] == reason
+
+
+async def test_parent_search_does_not_treat_missing_pagination_as_exhausted(monkeypatch):
+    monkeypatch.setattr(discovery, "fetch_comment_page", AsyncMock(return_value={"comments": []}))
+    parent = SimpleNamespace(text="parent", tiktok_username=None)
+    matches, state = await discovery.find_parent_comments(SimpleNamespace(), VIDEO, [parent])
+    assert not matches and state["available"] and not state["exhausted"]
+
+
 @pytest.mark.parametrize("foreign", [False, True])
 async def test_header_token_rotation_reaches_next_cursor_without_touching_ads_cookie(monkeypatch, foreign):
     monkeypatch.setattr(discovery, "_extract_runtime_profile", AsyncMock(return_value={}))

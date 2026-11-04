@@ -100,7 +100,9 @@ async def test_warmup_reuses_resolved_shortlink_and_parsed_ssr(browser_page):
     browser_page._cached_first_comment_aweme_id = "7635267329407913230"
     before = await browser_page.evaluate("performance.getEntriesByType('navigation')[0].startTime", isolated_context=False)
     _, valid, info = await engagement_engine.warmup_page_for_http(browser_page, SHORT, max_retries=1)
-    assert valid and info["reused_page"] and info["minimum_age_wait_ms"] == 0
+    assert valid and info["reused_page"]
+    assert info["target_page_age_ms"] >= info["required_nav_age_ms"]
+    assert info["target_dom_age_ms"] >= info["required_dom_age_ms"]
     assert await browser_page.evaluate("performance.getEntriesByType('navigation')[0].startTime", isolated_context=False) == before
     client = await PlaywrightHttpClient.from_page(browser_page)
     assert client.runtime_profile["device_id"] == "native-device"

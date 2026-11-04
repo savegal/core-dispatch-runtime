@@ -25,17 +25,24 @@ def is_pre_publish_account_failure(reason, *, publication_attempted=None) -> boo
     ))
 
 
-def track_publication_requests(page, state, *, flag="publication_attempted"):
+def track_publication_requests(page, state, *, flag="publication_attempted", expected_url=None):
     """Record actual POST dispatch even if the surrounding coroutine times out."""
+    from urllib.parse import urlparse
+    from executor.http.request_evidence import same_http_endpoint
+
     def on_request(request):
-        from urllib.parse import urlparse
-        parsed = urlparse(str(getattr(request, "url", "")))
+        if str(getattr(request, "method", "")).upper() != "POST":
+            return
+        url = str(getattr(request, "url", ""))
+        if expected_url is not None and not same_http_endpoint(url, expected_url):
+            return
+        parsed = urlparse(url)
         host = (parsed.hostname or "").lower()
-        if (str(getattr(request, "method", "")).upper() == "POST"
-                and parsed.path.rstrip("/") == "/api/comment/publish"
-                and (host == "tiktok.com" or host.endswith(".tiktok.com"))):
+        publish = parsed.path.rstrip("/") == "/api/comment/publish"
+        if (publish or expected_url is not None) and (host == "tiktok.com" or host.endswith(".tiktok.com")):
             state[flag] = True
-            page._publication_attempted = True
+            if publish:
+                page._publication_attempted = True
 
     if not callable(getattr(page, "on", None)):
         return lambda: None

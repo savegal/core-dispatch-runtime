@@ -13,6 +13,7 @@ from patchright.async_api import Page
 from config.settings import get_settings
 from db.models import Account
 from services.account_service import MONITOR_SCOPE, get_http_execution_strategy
+from services.tiktok_urls import media_id_from_url, parse_tiktok_url
 from executor.dom_actions import dismiss_cookie_banners
 
 logger = logging.getLogger("services.video_parser")
@@ -20,7 +21,6 @@ settings = get_settings()
 _EMPTY_DIAGNOSTIC_LAST_SAVED: dict[str, float] = {}
 _WARMUP_CACHE: dict[str, tuple[float, bool]] = {}
 
-VIDEO_ID_RE = re.compile(r"/video/(\d+)")
 PINNED_DOM_VERIFY_LIMIT = 6
 TIKTOK_API_RATE_LIMIT_STATUS_CODES = {8, 20012, 2190}
 _ITEM_LIST_KEYS = (
@@ -491,11 +491,7 @@ def extract_video_id(url: str) -> str | None:
     Returns:
         str | None: video_id или None если не найден
     """
-    if not url:
-        return None
-    
-    m = VIDEO_ID_RE.search(url)
-    return m.group(1) if m else None
+    return media_id_from_url(url, allow_relative=True)
 
 
 def is_valid_video_url(url: str, username: str) -> bool:
@@ -509,19 +505,9 @@ def is_valid_video_url(url: str, username: str) -> bool:
     Returns:
         bool: True если URL валиден
     """
-    if not url or not isinstance(url, str):
-        return False
-    
     username_lower = username.lower().lstrip("@")
-    url_lower = url.lower()
-    
-    if "tiktok.com" not in url_lower:
-        return False
-    
-    if f"/@{username_lower}/" not in url_lower:
-        return False
-    
-    return bool(re.search(rf"/@{re.escape(username_lower)}/video/\d+", url_lower))
+    parsed = parse_tiktok_url(url)
+    return bool(parsed and parsed.path.lower().startswith(f"/@{username_lower}/") and media_id_from_url(url))
 
 
 async def warmup_before_parsing(page: Page, account: Account) -> dict[str, str | bool]:

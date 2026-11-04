@@ -1572,7 +1572,11 @@ async def boost_target_replies_via_http_pool(
                         video_url=video_url,
                     )
                     if attempts is not None:
-                        not_sent = not ok and client.last_request_meta.get("request_attempted") is False
+                        request_meta = getattr(client, "last_request_meta", {})
+                        not_sent = (
+                            not ok and request_meta.get("request_attempted") is False
+                            and not request_meta.get("transport_invoked")
+                        )
                         if ok:
                             attempts[cid][account_key] = "confirmed"
                             likes_by_cid[cid] += 1
@@ -1630,8 +1634,6 @@ async def _publish_reply_http_first_if_eligible(
             correlation_id=correlation_id,
             video_url=session.video_url,
         )
-        if success and comment_id:
-            _record_branch_published_reply(parent_id, variant_index, comment_id)
     except Exception as exc:
         session.disabled_reason = f"http_exception:{str(exc)[:80]}"
         request_attempted = _http_session_request_attempted(session, error_msg=str(exc))
@@ -1661,16 +1663,21 @@ async def _publish_reply_http_first_if_eligible(
             post_was_enabled_at_click=True,
         )
 
-    published_reply_text = (
-        str((_http_session_request_meta(session) or {}).get("published_text") or "")
-        or reply_text
-    )
+    reply_request_meta = _http_session_request_meta(session)
+    published_reply_text = str(reply_request_meta.get("published_text") or "") or reply_text
     if success and comment_id:
+        parent_confirmed = bool((meta or {}).get("parent_confirmed"))
+        parent_level = str((meta or {}).get("parent_confirmation_level") or "unconfirmed")
+        if parent_confirmed:
+            _record_branch_published_reply(parent_id, variant_index, comment_id)
         await record_publication("reply", {"text": published_reply_text, "variant_index": variant_index,
             "parent_comment_id": parent_id, "reply_id": str(comment_id), "account_id": session.account_id,
-            "network_confirmed": True, "success": True, "publication_attempted": True, "method": "http_user_schema"})
+            "network_confirmed": parent_confirmed, "success": parent_confirmed, "publication_attempted": True,
+            "submitted_unconfirmed": not parent_confirmed, "parent_confirmed": parent_confirmed,
+            "response_parent_id": (meta or {}).get("response_parent_id"),
+            "parent_confirmation_level": parent_level, "method": "http_user_schema"})
         # Free HTTP auto-boost: like parent comment AFTER reply succeeds so digg never blocks reply publish
-        if _like_parent_before_reply_enabled() and parent_id and can_boost_parent(parent_id, session.account_id):
+        if parent_confirmed and _like_parent_before_reply_enabled() and can_boost_parent(parent_id, session.account_id):
             try:
                 await asyncio.sleep(random.uniform(0.4, 0.9))
                 like_ok, like_err, _ = await session.client.like_comment(
@@ -1691,8 +1698,6 @@ async def _publish_reply_http_first_if_eligible(
             except Exception as exc:
                 logger.debug("[HTTP_AUTO_BOOST] Like parent comment %s failed (non-blocking): %s", parent_id[:20], exc)
 
-        parent_confirmed = bool((meta or {}).get("parent_confirmed"))
-        parent_level = str((meta or {}).get("parent_confirmation_level") or "unconfirmed")
         try:
             from executor.engagement_engine import _record_http_account_result as record_http_account_result
             record_http_account_result(session.account_id, "success")
@@ -1721,7 +1726,7 @@ async def _publish_reply_http_first_if_eligible(
                 "parent_mismatch": bool((meta or {}).get("parent_mismatch")),
                 "parent_mismatch_reason": (meta or {}).get("parent_mismatch_reason"),
                 "published_text": published_reply_text,
-                "request_meta": _http_session_request_meta(session),
+                "request_meta": reply_request_meta,
             },
             post_was_enabled_at_click=True,
         )

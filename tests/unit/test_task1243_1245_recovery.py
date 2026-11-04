@@ -115,7 +115,10 @@ async def test_shortlink_http_success_never_starts_browser(monkeypatch, proxy_en
     monkeypatch.setattr(engine.settings, "USE_PROXY", proxy_enabled)
     captured = {}
     client = AsyncMock()
-    client.get.return_value = httpx.Response(200, request=httpx.Request("GET", URL))
+    short = "https://vt.tiktok.com/fixture/"
+    client.get.return_value = httpx.Response(
+        301, headers={"Location": URL}, request=httpx.Request("GET", short),
+    )
     client.__aenter__.return_value = client
     def factory(**kwargs):
         captured.update(kwargs)
@@ -123,8 +126,9 @@ async def test_shortlink_http_success_never_starts_browser(monkeypatch, proxy_en
     monkeypatch.setattr(httpx, "AsyncClient", factory)
     pool = AsyncMock(side_effect=AssertionError("HTTP redirect must not launch Chromium"))
     monkeypatch.setattr(browser_pool, "get_browser_pool", pool)
-    assert await engine.resolve_video_url("https://vt.tiktok.com/fixture/", proxy=proxy) == (URL, "7635267329407913230")
-    assert captured["trust_env"] is False and captured["follow_redirects"] is True
+    assert await engine.resolve_video_url(short, proxy=proxy) == (URL, "7635267329407913230")
+    assert captured["trust_env"] is False and captured["follow_redirects"] is False
+    client.get.assert_awaited_once_with(short)
     assert captured["proxy"] == (("http://" + proxy if "://" not in proxy else proxy) if proxy_enabled else None)
     pool.assert_not_awaited()
 

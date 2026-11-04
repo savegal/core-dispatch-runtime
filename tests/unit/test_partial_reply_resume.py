@@ -161,7 +161,9 @@ async def test_concurrent_checkpoints_and_stale_snapshot(persisted):
 async def test_reply_receipt_is_saved_before_optional_likes_can_interrupt(persisted, monkeypatch):
     db, task = persisted
     from executor import user_schema as schema
-    client = SimpleNamespace(reply_comment=AsyncMock(return_value=(True, receipt(2)["reply_id"], None, None, {})),
+    client = SimpleNamespace(reply_comment=AsyncMock(return_value=(
+        True, receipt(2)["reply_id"], None, None, {"parent_confirmed": True, "parent_confirmation_level": "network_exact"},
+    )),
                              like_comment=AsyncMock(side_effect=asyncio.CancelledError))
     session = SimpleNamespace(scope=schema.REPLY_SCOPE, disabled_reason=None, account_id=1,
                               client=client, aweme_id='7635267329407913230', cookies={}, video_url=URL)
@@ -173,6 +175,34 @@ async def test_reply_receipt_is_saved_before_optional_likes_can_interrupt(persis
     db.refresh(task)
     rows = task.settings['url_results'][URL]['engagement']['replies']['items']
     assert next(r for r in rows if r['variant_index'] == 2)['reply_id'] == receipt(2)['reply_id']
+
+
+@pytest.mark.asyncio
+async def test_reply_receipt_for_wrong_parent_is_saved_as_unconfirmed(persisted, monkeypatch):
+    from executor import user_schema as schema
+
+    db, task = persisted
+    wrong_parent = str(int(PARENT) + 1)
+    client = SimpleNamespace(
+        reply_comment=AsyncMock(return_value=(True, receipt(2)["reply_id"], None, None, {
+            "parent_confirmed": False, "parent_confirmation_level": "network_parent_mismatch",
+            "response_parent_id": wrong_parent,
+        })),
+        like_comment=AsyncMock(),
+    )
+    session = SimpleNamespace(scope=schema.REPLY_SCOPE, disabled_reason=None, account_id=1,
+                              client=client, aweme_id="7635267329407913230", cookies={}, video_url=URL)
+    monkeypatch.setattr(schema, "_like_parent_before_reply_enabled", lambda: True)
+    with publication_scope(db, task, URL):
+        result = await schema._publish_reply_http_first_if_eligible(
+            session, "reply 2", parent_comment_id=PARENT, correlation_id="fixture", variant_index=2,
+        )
+    db.refresh(task)
+    rows = task.settings["url_results"][URL]["engagement"]["replies"]["items"]
+    row = next(r for r in rows if r["reply_id"] == receipt(2)["reply_id"])
+    assert result.status == "failed" and row["submitted_unconfirmed"] and not row["success"]
+    assert row["response_parent_id"] == wrong_parent
+    client.like_comment.assert_not_awaited()
 
 
 @pytest.mark.asyncio

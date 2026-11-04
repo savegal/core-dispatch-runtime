@@ -49,6 +49,7 @@ from services.task_service import get_text_stats, record_text_result, requeue_de
 from services.app_settings_service import is_parsing_mode
 from services.metrics import increment_counter, record_timing
 from services.likes_config import BOOST_LIKES_DEFAULT, coerce_likes_quantity, pending_reply_likes
+from services.tiktok_urls import is_tiktok_shortlink, media_id_from_url
 from services.account_service import (
     get_free_account_for_main_comment,
     get_free_account_for_reply,
@@ -1576,6 +1577,13 @@ def process_task(task_id: int) -> None:
                     has_errors = True
                     error_messages.append(f"{video_url}: {resume_error}")
                 db.commit()
+                continue
+
+            if not (media_id_from_url(video_url) or is_tiktok_shortlink(video_url)):
+                url_results[video_url] = {"status": "fail", "error": "invalid_tiktok_url"}
+                failed_urls.append(video_url)
+                error_messages.append(f"{video_url}: invalid_tiktok_url")
+                has_errors = True
                 continue
 
             # The account cooldown applies to account selection only.

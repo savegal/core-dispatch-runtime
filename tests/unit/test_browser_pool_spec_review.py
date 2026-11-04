@@ -90,7 +90,10 @@ async def test_parent_likes_follow_successful_publication(monkeypatch, published
         events.append("reply_started")
         # An asynchronous publish must finish before any parent/reply like.
         events.append("reply_succeeded" if published else "reply_failed")
-        return published, new_reply if published else None, None if published else "rejected", None, {}
+        return (
+            published, new_reply if published else None, None if published else "rejected", None,
+            {"parent_confirmed": published, "parent_confirmation_level": "network_exact" if published else "unconfirmed"},
+        )
 
     async def like(**kwargs):
         events.append("like:" + kwargs["cid"])

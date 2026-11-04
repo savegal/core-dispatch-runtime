@@ -1,8 +1,60 @@
 import pytest
 import asyncio
+import httpx
 from urllib.parse import parse_qs, urlparse
 
-from bot.services.api_client import APIClient
+from bot.services.api_client import APIClient, APIRequestError
+
+
+@pytest.mark.asyncio
+async def test_balance_change_with_lost_response_uses_timeout_and_is_not_repeated(monkeypatch):
+    calls = []
+
+    async def request(method, url, *, json, headers, timeout):
+        calls.append((method, timeout.as_dict()))
+        raise httpx.ReadError("response lost after commit")
+
+    client = APIClient()
+    monkeypatch.setattr(client._client, "request", request)
+    try:
+        with pytest.raises(APIRequestError, match="Результат изменения баланса неизвестен"):
+            await client.add_user_balance(42, 100)
+        assert calls == [("POST", {"connect": 5.0, "read": 10.0, "write": 10.0, "pool": 10.0})]
+    finally:
+        await client._client.aclose()
+
+
+@pytest.mark.asyncio
+async def test_coalesced_get_recovers_when_owner_is_cancelled(monkeypatch):
+    from tenacity import wait_none
+
+    client = APIClient()
+    started = asyncio.Event()
+    requests = 0
+
+    async def request(method, url, **kwargs):
+        nonlocal requests
+        requests += 1
+        if requests == 1:
+            started.set()
+            await asyncio.Future()
+        return httpx.Response(200, json={"ok": True}, request=httpx.Request(method, url))
+
+    monkeypatch.setattr(client._client, "request", request)
+    monkeypatch.setattr(APIClient._request.retry, "wait", wait_none())
+    owner = asyncio.create_task(client.get_proxy_stats())
+    await started.wait()
+    waiter = asyncio.create_task(client.get_proxy_stats())
+    try:
+        await asyncio.sleep(0)
+        assert client._inflight_get_waiters
+        owner.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await owner
+        assert await asyncio.wait_for(waiter, 1) == {"ok": True}
+        assert requests == 2
+    finally:
+        await client._client.aclose()
 
 
 @pytest.mark.unit

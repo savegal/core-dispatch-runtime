@@ -8,6 +8,7 @@ import re
 import time
 import uuid
 from collections import OrderedDict
+from email.utils import parsedate_to_datetime
 from typing import Any, Optional
 
 from bot.config import load_config
@@ -29,6 +30,23 @@ class RetryableRequestError(Exception):
 
 class APIRequestError(Exception):
     """ÐžÑˆÐ¸Ð±ÐºÐ° API, ÐºÐ¾Ñ‚Ð¾Ñ€ÑƒÑŽ Ð½ÑƒÐ¶Ð½Ð¾ Ð¿Ð¾ÐºÐ°Ð·Ð°Ñ‚ÑŒ Ð¿Ð¾Ð»ÑŒÐ·Ð¾Ð²Ð°Ñ‚ÐµÐ»ÑŽ Ð±ÐµÐ· Ð°Ð²Ñ‚Ð¾Ð¼Ð°Ñ‚Ð¸Ñ‡ÐµÑÐºÐ¾Ð³Ð¾ retry."""
+
+
+_request_backoff = wait_exponential(multiplier=1, min=2, max=10)
+
+
+def _retry_after_seconds(value: str) -> float | None:
+    value = value.strip()
+    try:
+        seconds = int(value) if value.isascii() and value.isdecimal() else parsedate_to_datetime(value).timestamp() - time.time()
+    except (ValueError, TypeError, OverflowError, OSError):
+        return None
+    return max(0, seconds)
+
+
+def _wait_for_request_retry(state):
+    error = state.outcome.exception()
+    return max(_request_backoff(state), getattr(error, "retry_after_seconds", 0))
 
 
 class APIClient:
@@ -352,7 +370,7 @@ class APIClient:
         except ValueError:
             return f"Ошибка сервера: {status_code} ({response_text[:120]})"
 
-        detail = data.get("detail", data)
+        detail = data.get("detail", data) if isinstance(data, dict) else data
         if isinstance(detail, str):
             return detail
         if isinstance(detail, list) and detail:
@@ -400,7 +418,7 @@ class APIClient:
 
     @retry(
         stop=stop_after_attempt(3),
-        wait=wait_exponential(multiplier=1, min=2, max=10),
+        wait=_wait_for_request_retry,
         retry=retry_if_exception_type(RetryableRequestError),
         reraise=True
     )
@@ -454,7 +472,13 @@ class APIClient:
                 # Ð•ÑÐ»Ð¸ Ð½Ðµ ÑÐ¼Ð¾Ð³Ð»Ð¸ Ñ€Ð°ÑÐ¿Ð°Ñ€ÑÐ¸Ñ‚ÑŒ query - Ð¿Ñ€Ð¾ÑÑ‚Ð¾ Ð¸ÑÐ¿Ð¾Ð»ÑŒÐ·ÑƒÐµÐ¼ fallback Ð½Ð° API
                 pass
         self._ensure_user_scope_headers(request_headers)
-        request_timeout = httpx.Timeout(timeout, connect=5.0) if timeout is not None else None
+        request_timeout = httpx.Timeout(timeout if timeout is not None else self.timeout, connect=5.0)
+        changes_balance = method.upper() == "POST" and bool(
+            re.fullmatch(r"/api/users/\d+/balance/(?:add|subtract)", endpoint)
+        )
+        if changes_balance:
+            retry_safe = False
+        balance_unknown = "Результат изменения баланса неизвестен. Проверьте баланс и историю операций перед повтором."
         started = time.monotonic()
         now_ts = time.time()
         self._prune_response_cache(now_ts)
@@ -471,7 +495,7 @@ class APIClient:
             if inflight_existing is not None:
                 self._inflight_get_waiters[cache_key] = self._inflight_get_waiters.get(cache_key, 0) + 1
                 try:
-                    return copy.deepcopy(await inflight_existing)
+                    return copy.deepcopy(await asyncio.shield(inflight_existing))
                 finally:
                     remaining_waiters = self._inflight_get_waiters.get(cache_key, 0) - 1
                     if remaining_waiters > 0:
@@ -510,6 +534,11 @@ class APIClient:
             else:
                 self._invalidate_response_cache_for_request(method, endpoint, request_headers)
             return result
+        except asyncio.CancelledError:
+            self._fail_inflight_request(
+                cache_key, inflight_future, RetryableRequestError("Первичный запрос отменён.")
+            )
+            raise
         except httpx.TimeoutException as exc:
             self._fail_inflight_request(cache_key, inflight_future, exc)
             timeout_used = timeout if timeout is not None else self.timeout
@@ -531,7 +560,7 @@ class APIClient:
                     f"Превышен таймаут ожидания ({timeout_used}s) при создании заказа. "
                     "Возможно, заказ уже создан. Проверьте список заказов перед повторной отправкой."
                 ) from exc
-            message = f"Превышен таймаут ожидания ({timeout_used}s). Сервер временно недоступен, попробуйте позже."
+            message = balance_unknown if changes_balance else f"Превышен таймаут ожидания ({timeout_used}s). Сервер временно недоступен, попробуйте позже."
             if retry_safe:
                 raise RetryableRequestError(message) from exc
             raise APIRequestError(message) from exc
@@ -558,16 +587,20 @@ class APIClient:
             # only creates log spam and makes the bot look broken. Retry 429 only
             # when the server explicitly says when to retry.
             if status_code == 429:
-                retry_after = e.response.headers.get("Retry-After")
-                if retry_after and retry_safe:
+                retry_after = _retry_after_seconds(e.response.headers.get("Retry-After", ""))
+                if retry_after is not None and retry_after <= 10 and retry_safe:
                     logger.warning(f"Rate limited HTTP 429, retrying after server hint: {endpoint}")
-                    raise RetryableRequestError(
+                    retry_error = RetryableRequestError(
                         f"Сервер временно ограничил запросы (429), повторяем позже."
-                    ) from e
+                    )
+                    retry_error.retry_after_seconds = retry_after
+                    raise retry_error from e
                 raise APIRequestError(error_detail) from e
 
             transient_statuses = {408, 425}
             if status_code >= 500 or status_code in transient_statuses:
+                if changes_balance:
+                    raise APIRequestError(balance_unknown) from e
                 if retry_safe:
                     logger.warning(f"Transient HTTP {status_code}, retrying: {endpoint}")
                     raise RetryableRequestError(f"Временная ошибка сервера ({status_code}), выполняется повтор.") from e
@@ -579,11 +612,15 @@ class APIClient:
         except Exception as e:
             self._fail_inflight_request(cache_key, inflight_future, e)
             logger.error(f"Request error: {method} {endpoint} to {url}: {e}")
+            if changes_balance:
+                raise APIRequestError(balance_unknown) from e
             if retry_safe:
                 raise RetryableRequestError("Сервер временно недоступен, попробуйте позже.") from e
             raise APIRequestError("Сервер временно недоступен, попробуйте позже.") from e
 
         finally:
+            if changes_balance:
+                self._invalidate_response_cache_for_request(method, endpoint, request_headers)
             if cache_key and inflight_future is not None:
                 existing_future = self._inflight_get_requests.get(cache_key)
                 if existing_future is inflight_future:

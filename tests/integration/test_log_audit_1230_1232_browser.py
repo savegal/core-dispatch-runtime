@@ -92,6 +92,7 @@ async def test_sdk_without_native_interceptor_cannot_presign_get_retries(page, m
 @pytest.mark.parametrize("mode", ["main", "reply"])
 async def test_publish_retains_wire_signatures_and_author_uid_when_response_url_is_stripped(page, mode, monkeypatch):
     from types import SimpleNamespace
+    monkeypatch.setenv("LIKE_PARENT_BEFORE_REPLY", "0")
     requests = await fixture(page, mode, strip_response_url=True)
     client = await PlaywrightHttpClient.from_page(page, retry_policy=RetryPolicy(max_retries=0))
     if mode == "main":

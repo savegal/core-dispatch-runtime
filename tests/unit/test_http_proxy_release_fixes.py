@@ -159,6 +159,29 @@ async def test_rotation_drains_users_and_blocks_new_users(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_proxy_lease_passes_redis_time_into_write_scripts(monkeypatch, isolated_proxy_leases):
+    now = 500
+    monkeypatch.setattr(isolated_proxy_leases, "time", lambda: (now, 0))
+    original_eval = isolated_proxy_leases.eval
+
+    def eval_without_nondeterministic_writes(script, *args):
+        assert "redis.call('TIME')" not in script
+        return original_eval(script, *args)
+
+    monkeypatch.setattr(isolated_proxy_leases, "eval", eval_without_nondeterministic_writes)
+    lease = await concurrency.acquire_proxy_usage("http://fixture.invalid:8080")
+    try:
+        assert isolated_proxy_leases.zscore(lease.keys[0], lease.token) == now + concurrency._LEASE_TTL
+        now = 520
+        assert concurrency._eval_lease_at_server_time(
+            concurrency._LEASE_RENEW, lease.keys, lease.token, lease.mode, concurrency._LEASE_TTL,
+        )
+        assert isolated_proxy_leases.zscore(lease.keys[0], lease.token) == now + concurrency._LEASE_TTL
+    finally:
+        await lease.release()
+
+
+@pytest.mark.asyncio
 async def test_late_usage_release_does_not_delete_new_lease(isolated_proxy_leases):
     first = await concurrency.acquire_proxy_usage("http://fixture.invalid:8080")
     isolated_proxy_leases.zrem(first.keys[0], first.token)  # Simulate expiration/crashed owner.

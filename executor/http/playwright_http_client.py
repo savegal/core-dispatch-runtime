@@ -20,7 +20,8 @@ from executor.http.page_runtime import document_generation, prepared_runtime_pro
 from executor.http.execution_policy import valid_comment_id
 from services.execution_attempts import track_publication_requests
 from executor.http.signature_runtime import resolve_request_signature, split_explicit_signature_params
-from executor.http.request_evidence import observe_request_security, resolve_security_evidence
+from executor.http.request_evidence import observe_request_security, resolve_security_evidence, same_http_endpoint
+from services.tiktok_urls import is_tiktok_shortlink, media_id_from_url
 from services.cookie_validator import normalize_cookie_records
 from executor.http.retry_policy import (
     RetryPolicy, HttpErrorType, classify_http_error,
@@ -30,7 +31,6 @@ from executor.http.retry_policy import (
 LIKE_FAST_POLICY = RetryPolicy(max_retries=0, base_delay=0.5, max_delay=1.0)
 
 logger = logging.getLogger("executor.http.playwright_client")
-_SHORTLINK_HOST_MARKERS = ("vt.tiktok.com", "vm.tiktok.com")
 _PAGE_FETCH_JS = """
 async ({url, method, headers, form_data, timeout_ms, referrer}) => {
     const controller = new AbortController();
@@ -44,6 +44,7 @@ async ({url, method, headers, form_data, timeout_ms, referrer}) => {
             method,
             headers,
             credentials: "include",
+            redirect: "error",
             signal: controller.signal,
         };
         if (referrer) {
@@ -64,7 +65,7 @@ async ({url, method, headers, form_data, timeout_ms, referrer}) => {
         const response = await window.fetch(url, options);
         return {
             status: response.status,
-            url: response.url,
+            url: typeof response.url === "string" ? response.url : "",
             headers: Object.fromEntries(response.headers.entries()),
             text: await response.text(),
         };
@@ -809,16 +810,10 @@ class PlaywrightHttpClient:
     def _canonical_referer_url(video_url: Optional[str], runtime_profile: Optional[Dict[str, Any]]) -> Optional[str]:
         if not video_url:
             return None
-        try:
-            from urllib.parse import urlparse
-
-            host = (urlparse(video_url).netloc or "").lower()
-            if any(marker in host for marker in _SHORTLINK_HOST_MARKERS):
-                current_url = str((runtime_profile or {}).get("current_url") or "").strip()
-                if current_url and ("/video/" in current_url or "/photo/" in current_url):
-                    return current_url
-        except Exception:
-            return video_url
+        if is_tiktok_shortlink(video_url):
+            current_url = str((runtime_profile or {}).get("current_url") or "").strip()
+            if media_id_from_url(current_url):
+                return current_url
         return video_url
 
     def _runtime_profile_for_request(self, proxy_country_code: Optional[str] = None) -> Dict[str, Any]:
@@ -1058,9 +1053,12 @@ class PlaywrightHttpClient:
                     }
                     if profile.method.upper() not in {"GET", "HEAD"}:
                         browser_headers["content-type"] = "application/x-www-form-urlencoded; charset=UTF-8"
-                    detach = track_publication_requests(self.page, self.last_request_meta, flag="request_attempted")
+                    detach = track_publication_requests(
+                        self.page, self.last_request_meta, flag="request_attempted", expected_url=url,
+                    )
                     try:
                         with observe_request_security(self.page, url, profile.method) as wire_evidence:
+                            self.last_request_meta["transport_invoked"] = True
                             browser_response = await self.page.evaluate(
                                 _PAGE_FETCH_JS,
                                 {
@@ -1092,9 +1090,15 @@ class PlaywrightHttpClient:
                         headers=headers,
                         form=form_data or None,
                         timeout=timeout_to_use,
+                        max_redirects=0,
                     )
                     response_headers = response.headers
                     status_code = response.status
+                    response_url = getattr(response, "url", None)
+                if response_url is not None and not same_http_endpoint(response_url, url):
+                    if is_publish:
+                        return unconfirmed("unexpected_response_url")
+                    return False, None, "unexpected_response_url", HttpErrorType.API_ERROR
                 
                 # ИСПРАВЛЕНО: Проверяем Content-Type ответа перед парсингом
                 # Если TikTok вернул HTML (капча/WAF/редирект) - сразу классифицируем как FORBIDDEN/CAPTCHA
@@ -1135,6 +1139,8 @@ class PlaywrightHttpClient:
                     
                     if is_publish and status_code == 200 and not (response_body or "").strip():
                         return unconfirmed("empty_body")
+                    if is_publish and 300 <= status_code < 400:
+                        return unconfirmed("upstream_redirect")
                     if is_publish and 500 <= status_code < 600:
                         return unconfirmed("upstream_5xx")
 

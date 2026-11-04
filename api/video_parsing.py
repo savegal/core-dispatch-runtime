@@ -1272,7 +1272,7 @@ async def create_creator(
     
     # КРИТИЧНО: Проверяем существование блогера в TikTok перед сохранением в БД (легковесный HTTP запрос)
     # Это предотвращает засорение БД несуществующими блогерами
-    if settings.VALIDATE_CREATOR_PROFILE_ON_ADD:
+    if settings.VALIDATE_CREATOR_PROFILE_ON_ADD and not settings.USE_PROXY:
         profile_url = f"https://www.tiktok.com/@{username}"
         try:
             async with aiohttp.ClientSession() as session:
@@ -1289,8 +1289,8 @@ async def create_creator(
             logger.debug(f"Timeout when checking @{username}, allowing creation")
     else:
         logger.debug(
-            "Creator profile validation on add is disabled; skipping direct TikTok profile request for @%s",
-            username,
+            "Skipped direct creator profile probe for @%s (proxy_required=%s)",
+            username, settings.USE_PROXY,
         )
 
     

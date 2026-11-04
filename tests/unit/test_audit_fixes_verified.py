@@ -9,6 +9,23 @@ from executor.device_profiles import build_device_profile, prepare_device_page, 
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("payload", [{}, {"ip": "invalid"}, {"ip": 123}, ValueError("HTML gateway")])
+async def test_proxy_ip_probes_reject_invalid_success_body(payload):
+    from services.mobile_proxy_service import get_current_ip
+
+    with patch("httpx.AsyncClient") as client_cls:
+        response = MagicMock(status_code=200)
+        if isinstance(payload, Exception):
+            response.json.side_effect = payload
+        else:
+            response.json.return_value = payload
+        client_cls.return_value.__aenter__.return_value.get = AsyncMock(return_value=response)
+        ok, status, _, _ = await check_proxy_health_async("http://1.2.3.4:8080")
+        assert (ok, status) == (False, "bad")
+        assert await get_current_ip("http://1.2.3.4:8080") is None
+
+
+@pytest.mark.asyncio
 async def test_proxy_service_httpx_client_receives_proxy():
     with patch("httpx.AsyncClient") as mock_client_cls:
         mock_client = AsyncMock()
