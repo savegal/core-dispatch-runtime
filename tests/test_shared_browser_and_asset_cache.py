@@ -649,7 +649,9 @@ async def test_existing_shared_page_reuse_bypasses_slow_unrelated_context_setup(
             account(2, "http://second.invalid:8080")
         ))
         await asyncio.wait_for(blocker_started.wait(), timeout=2.0)
-        assert pool._browser_id_lock("shared_proxied").locked()
+        # Once a shared Chromium owner exists, unrelated context setup is
+        # deliberately not serialized on the process lock.
+        assert not pool._browser_id_lock("shared_proxied").locked()
         context, page = await asyncio.wait_for(pool.get_page_for_account(first), timeout=0.2)
         assert context is first_context and page is first_page
         assert not page._pool_available
