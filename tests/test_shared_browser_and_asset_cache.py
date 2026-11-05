@@ -659,3 +659,39 @@ async def test_existing_shared_page_reuse_bypasses_slow_unrelated_context_setup(
         if second_task is not None:
             await asyncio.gather(second_task, return_exceptions=True)
         await pool.close_all()
+
+
+@pytest.mark.asyncio
+async def test_shared_existing_process_allows_parallel_new_account_contexts(shared_pool):
+    pool, launch = shared_pool
+    pool.max_browsers = 3
+    slow_task = None
+    entered = asyncio.Event()
+    release = asyncio.Event()
+    original_cleanup = pool._cleanup_old_contexts
+
+    try:
+        await pool.get_page_for_account(account(1, "http://owner.invalid:8080"))
+
+        async def slow_cleanup():
+            if asyncio.current_task() is slow_task:
+                entered.set()
+                await release.wait()
+            await original_cleanup()
+
+        pool._cleanup_old_contexts = slow_cleanup
+        slow_task = asyncio.create_task(pool.get_page_for_account(
+            account(2, "http://slow.invalid:8080")
+        ))
+        await asyncio.wait_for(entered.wait(), timeout=2.0)
+        context, page = await asyncio.wait_for(pool.get_page_for_account(
+            account(3, "http://fast.invalid:8080")
+        ), timeout=0.5)
+        assert context._pool_account_id == 3 and page is not None
+        assert launch.await_count == 1
+        assert not slow_task.done()
+    finally:
+        release.set()
+        if slow_task is not None:
+            await asyncio.gather(slow_task, return_exceptions=True)
+        await pool.close_all()
