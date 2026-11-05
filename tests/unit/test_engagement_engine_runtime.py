@@ -2092,6 +2092,8 @@ async def test_engagement_only_stops_after_four_empty_accounts_across_two_proxie
             parent_search_scroll_budget=120,
         )
 
+    # Visibility search may need more accounts than the default retry budget.
+    monkeypatch.setattr(engagement_engine.settings, "MAX_RETRY_ACCOUNTS", 6)
     monkeypatch.setattr(engagement_engine.settings, "PARALLEL_COMMENTING_TARGET_BROWSERS", 3, raising=False)
     monkeypatch.setattr(engagement_engine.settings, "PARALLEL_COMMENTING_MAX_BROWSERS", 3, raising=False)
     monkeypatch.setattr(db_database, "get_sync_db_context", _fake_db_context)
@@ -2201,6 +2203,8 @@ async def test_engagement_only_resets_empty_account_quorum_when_parent_was_found
             parent_search_scroll_container_scrollable=False,
         )
 
+    # Visibility search may need more accounts than the default retry budget.
+    monkeypatch.setattr(engagement_engine.settings, "MAX_RETRY_ACCOUNTS", 6)
     monkeypatch.setattr(engagement_engine.settings, "PARALLEL_COMMENTING_TARGET_BROWSERS", 2, raising=False)
     monkeypatch.setattr(engagement_engine.settings, "PARALLEL_COMMENTING_MAX_BROWSERS", 2, raising=False)
     monkeypatch.setattr(db_database, "get_sync_db_context", _fake_db_context)
