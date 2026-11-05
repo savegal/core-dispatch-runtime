@@ -1055,6 +1055,7 @@ class PlaywrightHttpClient:
                         browser_headers["content-type"] = "application/x-www-form-urlencoded; charset=UTF-8"
                     detach = track_publication_requests(
                         self.page, self.last_request_meta, flag="request_attempted", expected_url=url,
+                        track_failures=True,
                     )
                     try:
                         with observe_request_security(self.page, url, profile.method) as wire_evidence:

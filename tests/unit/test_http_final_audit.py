@@ -65,14 +65,14 @@ class EventPage:
         self.url, self.mode, self.body, self.content_type = URL, mode, body, content_type
         self.context = SimpleNamespace(cookies=AsyncMock(return_value=[]))
         self.listeners = []
+        self.events = {"request": self.listeners}
         self.arguments = None
 
     def on(self, event, callback):
-        assert event == "request"
-        self.listeners.append(callback)
+        self.events.setdefault(event, []).append(callback)
 
     def remove_listener(self, event, callback):
-        self.listeners.remove(callback)
+        self.events[event].remove(callback)
 
     async def evaluate(self, script, arguments, **kwargs):
         self.arguments = arguments
@@ -263,3 +263,60 @@ def test_legacy_engine_serialization_does_not_resurrect_ghost_receipts(bad):
     if bad == "local_main":
         assert not payload["engagement"]["main"]["success"]
         assert not payload["engagement"]["main"]["local_confirmed"]
+
+
+class FailedFetchPage(EventPage):
+    def __init__(self, network_failure, *, response_seen=False):
+        super().__init__("before")
+        self.network_failure = network_failure
+        self.response_seen = response_seen
+
+    async def evaluate(self, script, arguments, **kwargs):
+        request = SimpleNamespace(
+            url="https://www.tiktok.com/api/comment/publish/",
+            method="POST", failure=self.network_failure,
+        )
+        for listener in list(self.events.get("request", [])):
+            listener(request)
+        if self.response_seen:
+            for listener in list(self.events.get("response", [])):
+                listener(SimpleNamespace(request=request))
+        for listener in list(self.events.get("requestfailed", [])):
+            listener(request)
+        raise RuntimeError("TypeError: Failed to fetch")
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("failure,has_response,should_retry", [
+    ("net::ERR_PROXY_CONNECTION_FAILED", False, True),
+    ("net::ERR_SOCKS_CONNECTION_FAILED", False, True),
+    ("net::ERR_CONNECTION_REFUSED", False, True),
+    ("net::ERR_CONNECTION_RESET", False, False),
+    ("net::ERR_TIMED_OUT", False, False),
+    ("net::ERR_PROXY_CONNECTION_FAILED", True, False),
+])
+async def test_only_proven_pre_connect_failures_allow_another_publish(
+    client_factory, failure, has_response, should_retry,
+):
+    page = FailedFetchPage(failure, response_seen=has_response)
+    order_state = {}
+    detach = track_publication_requests(page, order_state, track_failures=True)
+    try:
+        client = client_factory(page)
+        result = await client._execute_request(
+            RequestProfile.publish_main_profile(), {"text": "fixture"},
+        )
+        from executor.http.retry_policy import HttpErrorType
+        if should_retry:
+            assert result[3] != HttpErrorType.SUBMITTED_UNCONFIRMED
+            assert client.last_request_meta["request_attempted"] is False
+            assert order_state["publication_attempted"] is False
+            assert page._publication_attempted is False
+        else:
+            assert result[3] == HttpErrorType.SUBMITTED_UNCONFIRMED
+            assert client.last_request_meta["request_attempted"] is True
+            assert order_state["publication_attempted"] is True
+            assert page._publication_attempted is True
+    finally:
+        detach()
+        assert all(not callbacks for callbacks in page.events.values())

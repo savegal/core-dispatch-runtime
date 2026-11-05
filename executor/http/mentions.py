@@ -486,12 +486,16 @@ async def resolve_mention_user(
             fb = _use_fallback(f"transient_error:{result.get('reason')}")
             if fb is not None:
                 return fb
-
-        else:
-            # transient_error: DO NOT put into negative cache!
             logger.warning(
                 "[MENTION] @%s transient error during resolve: %s; NOT negative caching",
-                username, result.get("reason")
+                username, result.get("reason"),
+            )
+            return None
+
+        else:
+            logger.warning(
+                "[MENTION] @%s unexpected resolve status %r; NOT negative caching",
+                username, status,
             )
             return None
 

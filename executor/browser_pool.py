@@ -1153,15 +1153,40 @@ class BrowserPool:
                     lease = await acquire_proxy_usage(resolved_route.url) if resolved_route else None
                     if settings.BROWSER_POOL_SHARED_PROCESS:
                         await self._reserve_browser_capacity(browser_id_for_lock, account_id=account.id)
-                    async with self._browser_id_lock(browser_id_for_lock):
-                        if (not settings.BROWSER_POOL_SHARED_PROCESS
-                                and browser_id_for_lock not in self._browsers and account.id not in self._contexts):
-                            await self._reserve_browser_capacity(browser_id_for_lock)
-                        context, page = await self.get_page_for_account(
-                            account,
-                            retry_count=retry_count,
-                            _browser_id_lock_held=True,
-                        )
+                    # Reuse of an account-isolated ready page needs only the
+                    # account lock already held, not the global process lock.
+                    reused = None
+                    if settings.BROWSER_POOL_SHARED_PROCESS:
+                        existing = self._contexts.get(account.id)
+                        owner_id = self._account_browser_ids.get(account.id)
+                        owner = self._browsers.get(owner_id)
+                        expected_proxy_key = self._make_browser_id(proxy_source_for_lock)
+                        if (existing is not None and owner_id == browser_id_for_lock
+                                and getattr(existing, "_account_proxy_key", None) == expected_proxy_key
+                                and not getattr(existing, "_pool_disposed", False)
+                                and owner is not None and owner.is_connected()):
+                            available_page = next(
+                                (candidate for candidate in list(existing.pages)
+                                 if self._is_page_available(candidate, account.id)),
+                                None,
+                            )
+                            if available_page is not None:
+                                self._context_last_used[account.id] = datetime.now(timezone.utc)
+                                self._mark_page_in_use(available_page, account.id)
+                                self._sync_pool_metrics()
+                                reused = (existing, available_page)
+                    if reused is not None:
+                        context, page = reused
+                    else:
+                        async with self._browser_id_lock(browser_id_for_lock):
+                            if (not settings.BROWSER_POOL_SHARED_PROCESS
+                                    and browser_id_for_lock not in self._browsers and account.id not in self._contexts):
+                                await self._reserve_browser_capacity(browser_id_for_lock)
+                            context, page = await self.get_page_for_account(
+                                account,
+                                retry_count=retry_count,
+                                _browser_id_lock_held=True,
+                            )
                     if callable(getattr(page, "on", None)) and not getattr(page, "_pool_capacity_callback", None):
                         page._pool_capacity_callback = lambda *_: self._capacity_changed.set()
                         page.on("close", page._pool_capacity_callback)

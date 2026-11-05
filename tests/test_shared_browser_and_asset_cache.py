@@ -622,3 +622,40 @@ def test_account_selection_prioritizes_hot_candidates_across_batches(db_session,
     finally:
         account_service._MAIN_ACCOUNT_RESERVED_UNTIL.clear()
         account_service._REPLY_ACCOUNT_RESERVED_UNTIL.clear()
+
+
+@pytest.mark.asyncio
+async def test_existing_shared_page_reuse_bypasses_slow_unrelated_context_setup(shared_pool):
+    pool, _ = shared_pool
+    first = account(1, "http://first.invalid:8080")
+    blocker_started = asyncio.Event()
+    unblock = asyncio.Event()
+    second_task = None
+    original_cleanup = pool._cleanup_old_contexts
+
+    try:
+        first_context, first_page = await pool.get_page_for_account(first)
+        # Simulate an already returned, idle page.
+        first_page._pool_available = True
+
+        async def stalled_cleanup():
+            if asyncio.current_task() is second_task:
+                blocker_started.set()
+                await unblock.wait()
+            await original_cleanup()
+
+        pool._cleanup_old_contexts = stalled_cleanup
+        second_task = asyncio.create_task(pool.get_page_for_account(
+            account(2, "http://second.invalid:8080")
+        ))
+        await asyncio.wait_for(blocker_started.wait(), timeout=2.0)
+        assert pool._browser_id_lock("shared_proxied").locked()
+        context, page = await asyncio.wait_for(pool.get_page_for_account(first), timeout=0.2)
+        assert context is first_context and page is first_page
+        assert not page._pool_available
+        assert not second_task.done()
+    finally:
+        unblock.set()
+        if second_task is not None:
+            await asyncio.gather(second_task, return_exceptions=True)
+        await pool.close_all()

@@ -2405,7 +2405,9 @@ async def _attempt_publish_on_account(
 
         context, page = await create_page_for_account(account)
         page._publication_attempted = False
-        detach_publication_tracker = track_publication_requests(page, outcome_dict if outcome_dict is not None else {})
+        detach_publication_tracker = track_publication_requests(
+            page, outcome_dict if outcome_dict is not None else {}, track_failures=True,
+        )
 
         if eligible_for_http:
             skip_reason = _should_skip_http_for_account(account.id)
@@ -2567,6 +2569,12 @@ async def _attempt_publish_on_account(
 
                     if outcome_dict is not None:
                         outcome_dict["publication_attempted"] = request_attempted
+                        if isinstance(request_meta, dict):
+                            attempted_text = request_meta.get("published_text")
+                            if isinstance(attempted_text, str):
+                                outcome_dict["published_text"] = attempted_text
+                                if attempted_text != text:
+                                    outcome_dict["text_template"] = text
                     if getattr(error_type, "value", error_type) == "submitted_unconfirmed":
                         if outcome_dict is not None:
                             outcome_dict.update(submitted_unconfirmed=True, method="http", posted=True)
@@ -3369,7 +3377,10 @@ async def execute_replies_http(
             )
 
             if stage == "submitted_unconfirmed":
-                results.append({"variant_index": reply_idx + 1, "text": reply_text,
+                results.append({"variant_index": reply_idx + 1,
+                                "text": reply_outcome.get("published_text") or reply_text,
+                                "text_template": reply_outcome.get("text_template"),
+                                "published_text": reply_outcome.get("published_text"),
                                 "success": False, "submitted_unconfirmed": True,
                                 "visibility_status": "submitted_unconfirmed", "error": err,
                                 "account_id": reply_account.id, "method": "http"})
@@ -3402,7 +3413,9 @@ async def execute_replies_http(
                 elif parent_unconfirmed_after_submit:
                     verify_mode = "http_parent_unconfirmed"
                 results.append({
-                    "text": reply_text,
+                    "text": reply_outcome.get("published_text") or reply_text,
+                    "text_template": reply_outcome.get("text_template"),
+                    "published_text": reply_outcome.get("published_text"),
                     "success": not reply_submitted_unconfirmed,
                     "method": result_method,
                     "error": (

@@ -10050,7 +10050,10 @@ async def _reply_with_variant_on_all_mains(
     try:
         context, page = await create_page_for_account(account)
         page._publication_attempted = False
-        detach_publication_tracker = track_publication_requests(page, parent_search_progress_sink if parent_search_progress_sink is not None else {})
+        detach_publication_tracker = track_publication_requests(
+            page, parent_search_progress_sink if parent_search_progress_sink is not None else {},
+            track_failures=True,
+        )
         _log_user_trace(
             "reply_browser_created",
             page=page,
