@@ -1118,6 +1118,7 @@ class BrowserPool:
         account: Account,
         retry_count: int = 0,
         _browser_id_lock_held: bool = False,
+        _parallel_shared_owner: bool = False,
     ) -> Tuple[BrowserContext, Page]:
         """
         Получает или создаёт страницу для аккаунта.
@@ -1196,6 +1197,7 @@ class BrowserPool:
                                 account,
                                 retry_count=retry_count,
                                 _browser_id_lock_held=True,
+                                _parallel_shared_owner=True,
                             )
                         else:
                             async with self._browser_id_lock(browser_id_for_lock):
@@ -1407,6 +1409,14 @@ class BrowserPool:
                         browser = None
                 
                 if browser is None:
+                    # This path deliberately skipped the shared process lock
+                    # because an owner was alive at entry. If it disappeared,
+                    # do not race another account to launch a replacement.
+                    # The next independent acquire will enter via the lock.
+                    if _parallel_shared_owner:
+                        raise TikTokClientError(
+                            "Shared browser owner lost during parallel context setup"
+                        )
                     await self._reserve_browser_capacity(browser_id)
                     # Создаём новый браузер.
                     # patchright требует полный Chromium (не headless-shell) — headless-shell
