@@ -320,3 +320,40 @@ async def test_only_proven_pre_connect_failures_allow_another_publish(
     finally:
         detach()
         assert all(not callbacks for callbacks in page.events.values())
+
+
+@pytest.mark.asyncio
+async def test_safe_proxy_handshake_failure_can_retry_before_next_receipt(client_factory):
+    from executor.http.retry_policy import HttpErrorType
+    import asyncio
+
+    page = FailedFetchPage("net::ERR_PROXY_CONNECTION_FAILED")
+    attempts = {"count": 0}
+
+    async def first_connection_fails_then_receipt(script, arguments, **kwargs):
+        attempts["count"] += 1
+        request = SimpleNamespace(
+            url="https://www.tiktok.com/api/comment/publish/",
+            method="POST", failure="net::ERR_PROXY_CONNECTION_FAILED",
+        )
+        for listener in list(page.events.get("request", [])):
+            listener(request)
+        if attempts["count"] == 1:
+            for listener in list(page.events.get("requestfailed", [])):
+                listener(request)
+            raise RuntimeError("TypeError: Failed to fetch")
+        return {
+            "status": 200, "url": "https://www.tiktok.com/api/comment/publish/",
+            "headers": {"content-type": "application/json"},
+            "text": json.dumps({"status_code": 0, "comment": {"cid": CID}}),
+        }
+
+    page.evaluate = first_connection_fails_then_receipt
+    client = client_factory(page)
+    client.retry_policy = RetryPolicy(max_retries=1, base_delay=0, max_delay=0, jitter=False)
+    success, response_data, error, error_type = await client._execute_request(
+        RequestProfile.publish_main_profile(), {"text": "fixture"},
+    )
+    assert success is True and error is None and error_type is None
+    assert response_data is not None and attempts["count"] == 2
+    assert client.last_request_meta["request_attempted"] is True

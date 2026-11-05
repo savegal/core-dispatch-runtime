@@ -308,3 +308,32 @@ async def test_legacy_reply_unknown_result_is_terminal_once(monkeypatch):
     rows = await engine.execute_replies_http(None, URL, CID, ["fixture"], main_comment_text="fixture")
     assert len(rows) == 1 and rows[0]["submitted_unconfirmed"]
     mock.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_legacy_reply_result_preserves_actual_spintax_and_mentions(monkeypatch):
+    from executor import engagement_engine as engine
+    monkeypatch.setattr(engine.settings, "USE_PROXY", False)
+    monkeypatch.setattr(engine.settings, "MAX_RETRY_ACCOUNTS", 1)
+    account = SimpleNamespace(id=1, proxy=None, label="fixture")
+    monkeypatch.setattr(engine, "get_free_account_for_reply", lambda *_, **kwargs: account)
+    monkeypatch.setattr(engine, "get_http_execution_strategy", lambda *_: {"strategy": "http_first"})
+    monkeypatch.setattr(engine, "_should_skip_http_for_account", lambda *_: None)
+    template = "{Hello|Hi} @MiXeD"
+    published = "Hello @mixed"
+
+    async def attempt(*_, outcome_dict, **kwargs):
+        outcome_dict.update(
+            publication_attempted=True, posted=True, network_confirmed=True,
+            parent_confirmed=True, parent_confirmation_level="http_parent_id",
+            published_text=published, text_template=template,
+        )
+        return CID, None, "http"
+
+    monkeypatch.setattr(engine, "attempt_reply_on_account", attempt)
+    results = await engine.execute_replies_http(None, URL, CID, [template], main_comment_text="main")
+    assert len(results) == 1
+    assert results[0]["success"] is True
+    assert results[0]["text"] == published
+    assert results[0]["published_text"] == published
+    assert results[0]["text_template"] == template
