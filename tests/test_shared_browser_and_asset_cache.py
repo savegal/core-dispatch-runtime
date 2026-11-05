@@ -697,3 +697,35 @@ async def test_shared_existing_process_allows_parallel_new_account_contexts(shar
         if slow_task is not None:
             await asyncio.gather(slow_task, return_exceptions=True)
         await pool.close_all()
+
+
+@pytest.mark.asyncio
+async def test_parallel_shared_owner_loss_never_relaunches_without_process_lock(shared_pool):
+    from executor.tiktok_client import TikTokClientError
+
+    pool, launch = shared_pool
+    owner = None
+    original_cleanup = pool._cleanup_old_contexts
+    try:
+        await pool.get_page_for_account(account(1, "http://owner.invalid:8080"))
+        owner = pool._browsers["shared_proxied"]
+        owner_lost = False
+
+        async def lose_owner_before_context_setup():
+            nonlocal owner_lost
+            if not owner_lost:
+                owner_lost = True
+                pool._browsers.pop("shared_proxied", None)
+            await original_cleanup()
+
+        pool._cleanup_old_contexts = lose_owner_before_context_setup
+        with pytest.raises(TikTokClientError, match="Shared browser owner lost"):
+            await pool.get_page_for_account(account(2, "http://new.invalid:8080"))
+        # Retrying under an unlocked process would race another account's
+        # recovery and could overwrite the shared Chromium owner.
+        assert launch.await_count == 1
+    finally:
+        pool._cleanup_old_contexts = original_cleanup
+        if owner is not None:
+            pool._browsers["shared_proxied"] = owner
+        await pool.close_all()
