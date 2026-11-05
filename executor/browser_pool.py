@@ -1178,15 +1178,35 @@ class BrowserPool:
                     if reused is not None:
                         context, page = reused
                     else:
-                        async with self._browser_id_lock(browser_id_for_lock):
-                            if (not settings.BROWSER_POOL_SHARED_PROCESS
-                                    and browser_id_for_lock not in self._browsers and account.id not in self._contexts):
-                                await self._reserve_browser_capacity(browser_id_for_lock)
+                        # A live shared process can open independent account
+                        # contexts concurrently. The process lock is needed
+                        # only when its Chromium owner may need creation or
+                        # recovery; keeping it during slow per-proxy setup
+                        # serializes otherwise unrelated accounts.
+                        shared_owner_ready = False
+                        if settings.BROWSER_POOL_SHARED_PROCESS:
+                            existing_owner = self._browsers.get(browser_id_for_lock)
+                            if existing_owner is not None:
+                                try:
+                                    shared_owner_ready = bool(existing_owner.is_connected())
+                                except Exception:
+                                    shared_owner_ready = False
+                        if shared_owner_ready:
                             context, page = await self.get_page_for_account(
                                 account,
                                 retry_count=retry_count,
                                 _browser_id_lock_held=True,
                             )
+                        else:
+                            async with self._browser_id_lock(browser_id_for_lock):
+                                if (not settings.BROWSER_POOL_SHARED_PROCESS
+                                        and browser_id_for_lock not in self._browsers and account.id not in self._contexts):
+                                    await self._reserve_browser_capacity(browser_id_for_lock)
+                                context, page = await self.get_page_for_account(
+                                    account,
+                                    retry_count=retry_count,
+                                    _browser_id_lock_held=True,
+                                )
                     if callable(getattr(page, "on", None)) and not getattr(page, "_pool_capacity_callback", None):
                         page._pool_capacity_callback = lambda *_: self._capacity_changed.set()
                         page.on("close", page._pool_capacity_callback)
