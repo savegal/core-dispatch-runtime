@@ -2,7 +2,7 @@
 from collections import OrderedDict
 from dataclasses import dataclass
 from threading import RLock
-from urllib.parse import urlsplit
+from urllib.parse import unquote, urlsplit
 
 from config.settings import get_settings
 
@@ -13,7 +13,7 @@ _CDN_DOMAINS = (
 )
 _DYNAMIC_MARKERS = (
     "/api/", "/passport/", "/aweme/", "mcs", "mon.", "log.", "mstoken",
-    "x-bogus", "x-gnarly", "ttwid", "sessionid",
+    "x-bogus", "x-gnarly", "a_bogus", "ttwid", "sessionid", "verifyfp", "device_id",
 )
 
 
@@ -27,7 +27,7 @@ def is_cacheable_static_asset(method: str, resource_type: str, url: str) -> bool
             parsed.scheme in ("http", "https")
             and any(host == domain or host.endswith("." + domain) for domain in _CDN_DOMAINS)
             and parsed.path.lower().endswith((".js", ".css"))
-            and not any(marker in url.lower() for marker in _DYNAMIC_MARKERS)
+            and not any(marker in unquote(url).lower() for marker in _DYNAMIC_MARKERS)
         )
     except ValueError:
         return False
@@ -76,10 +76,22 @@ class StaticAssetCache:
                 or not 64 <= len(body) <= min(self.max_item_bytes, self.max_total_bytes)):
             return False
         normalized = {str(key).lower(): str(value) for key, value in headers.items()}
-        # response.body() is decoded. Never replay compression, lengths, or
-        # account cookies from the original network response into another context.
-        for key in ("content-encoding", "content-length", "transfer-encoding", "set-cookie", "connection"):
+        directives = {value.partition("=")[0].strip() for value in normalized.get("cache-control", "").lower().split(",")}
+        vary = {name.strip() for name in normalized.get("vary", "").lower().split(",") if name.strip()}
+        content_type = normalized.get("content-type", "").lower()
+        if ("set-cookie" in normalized or directives & {"private", "no-store", "no-cache"}
+                or vary - {"accept-encoding"} or content_type.startswith("text/html")):
+            return False
+        # response.body() is decoded. Never replay compression, lengths,
+        # account cookies, or CDN POP/trace/timing metadata into another context.
+        for key in (
+            "content-encoding", "content-length", "transfer-encoding", "set-cookie", "connection",
+            "server-timing", "date", "age", "via", "etag", "last-modified", "expires", "alt-svc",
+        ):
             normalized.pop(key, None)
+        for key in list(normalized):
+            if key.startswith(("x-tt-", "x-cache", "cf-", "x-amz-", "x-bd-")):
+                normalized.pop(key, None)
         normalized.setdefault("content-type", "text/css; charset=utf-8" if resource_type == "stylesheet"
                               else "application/javascript; charset=utf-8")
         normalized.update({

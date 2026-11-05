@@ -450,6 +450,7 @@ async def create_new_template(callback: CallbackQuery, state: FSMContext):
             reply_markup=InlineKeyboardMarkup(inline_keyboard=[
                 [InlineKeyboardButton(text='💬 Полный шаблон', callback_data='template:create_full')],
                 [InlineKeyboardButton(text='↩️ Только ответы', callback_data='template:create_replies')],
+                [InlineKeyboardButton(text='🔑 Ключевые слова', callback_data='template:create_keywords')],
                 [InlineKeyboardButton(text='❌ Отмена', callback_data='quicktpl:cancel')],
             ]),
             parse_mode='Markdown',
@@ -487,6 +488,78 @@ async def create_full_template(callback: CallbackQuery, state: FSMContext):
     except Exception as e:
         logger.error(f'Error starting new template creation: {e}', exc_info=True)
         await callback.answer('Ошибка', show_alert=True)
+
+
+@router.callback_query(F.data == 'template:create_keywords')
+async def create_keywords_template(callback: CallbackQuery, state: FSMContext):
+    """Начинает создание шаблона ключевых слов."""
+    try:
+        has_access, user_data = await ensure_access(callback)
+        if not has_access:
+            await callback.answer('Доступ запрещён', show_alert=True)
+            return
+        await callback.answer()
+        await state.update_data(
+            creating_template_via_quick_order=True,
+            main_comment='',
+            new_template_text_variants=[],
+            new_template_keywords=[],
+            new_template_variant_index=1,
+            replies={},
+            reply_count=0,
+            template_type='keywords',
+        )
+        await callback.message.edit_text(
+            '*Шаблон ключевых слов*\n\n'
+            'Отправьте слова или фразы через запятую либо с новой строки (до 50 ключей).\n'
+            'Например: `где купить, цена, доставка`',
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                [InlineKeyboardButton(text='❌ Отмена', callback_data='quicktpl:cancel')],
+            ]),
+            parse_mode='Markdown',
+        )
+        await state.set_state(OrderStates.NEW_TEMPLATE_KEYWORDS)
+    except Exception as e:
+        logger.error(f'Error starting keywords template creation: {e}', exc_info=True)
+        await callback.answer('Ошибка', show_alert=True)
+
+
+@router.message(StateFilter(OrderStates.NEW_TEMPLATE_KEYWORDS))
+async def save_new_template_keywords(message: Message, state: FSMContext):
+    """Сохраняет ключевые слова для нового шаблона."""
+    try:
+        from services.keyword_replies import normalize_keywords
+        try:
+            keywords = normalize_keywords(message.text or '')
+        except ValueError as exc:
+            await message.answer(
+                f'❌ {exc}',
+                reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                    [InlineKeyboardButton(text=f'{Emoji.CANCEL} Отмена', callback_data='quicktpl:cancel')],
+                ]),
+            )
+            return
+        await state.update_data(
+            new_template_keywords=keywords,
+            main_comment='\n'.join(keywords),
+            template_type='keywords',
+        )
+        max_replies = settings.MAX_REPLIES
+        await message.answer(
+            f'✅ Сохранено ключевых слов: *{len(keywords)}*.\n\n'
+            f'*Ответ 1 из {max_replies} (необязательно)*\n\n'
+            'Вы можете сразу прикрепить ответы к шаблону ключей или нажать «⏭ Без ответов», '
+            'чтобы сохранить только список ключевых слов.',
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                [InlineKeyboardButton(text='⏭ Без ответов (только ключи)', callback_data='new_template:skip_replies')],
+                [InlineKeyboardButton(text=f'{Emoji.CANCEL} Отмена', callback_data='quicktpl:cancel')],
+            ]),
+            parse_mode='Markdown',
+        )
+        await state.set_state(OrderStates.NEW_TEMPLATE_REPLIES_ALL)
+    except Exception as e:
+        logger.error(f'Error saving template keywords: {e}', exc_info=True)
+        await message.answer('Ошибка сохранения ключевых слов. Попробуйте снова.')
 
 
 @router.callback_query(F.data == 'template:create_replies')
@@ -680,19 +753,31 @@ def _build_new_template_preview_text_and_keyboard(
     template_type: str = "full",
     verify_main_visibility: bool = False,
     verify_reply_visibility: bool = False,
+    keywords: list | None = None,
 ) -> tuple[str, InlineKeyboardMarkup]:
     """Общий строитель preview-текста и клавиатуры для нового шаблона/заказа."""
     replies_only = template_type == "replies_only"
-    has_videos = bool(links) and not replies_only
+    keywords_only = template_type == "keywords"
+    has_videos = bool(links) and not replies_only and not keywords_only
 
     if has_videos:
         preview_text = f'*Проверьте заказ*\n\n🔗 Видео: *{len(links)}*\n'
+    elif keywords_only:
+        preview_text = '*Проверьте шаблон ключевых слов*\n\n'
     elif replies_only:
         preview_text = '*Проверьте шаблон ответов*\n\n'
     else:
         preview_text = '*Проверьте шаблон*\n\n'
 
-    if not replies_only:
+    if keywords_only:
+        kw_list = list(keywords or [])
+        preview_text += f'🔑 Ключевых слов: *{len(kw_list)}*\n'
+        for idx, kw in enumerate(kw_list[:8], start=1):
+            preview_text += f'{idx}. {_mono_preview(kw, 80)}\n'
+        if len(kw_list) > 8:
+            preview_text += f'... и ещё {len(kw_list) - 8}\n'
+        preview_text += '\n'
+    elif not replies_only:
         preview_text += f'💬 Комментарий: *{len(text_variants) if text_variants else 1} вариант(а)*\n\n*Комментарий*\n'
         for idx, variant in enumerate(text_variants[:3], start=1):
             preview_text += f'{idx}. {_mono_preview(variant, 100)}\n'
@@ -718,9 +803,11 @@ def _build_new_template_preview_text_and_keyboard(
             [InlineKeyboardButton(text=f'{Emoji.CANCEL} Отмена', callback_data='quicktpl:cancel')]
         ])
     else:
+        edit_label = 'Изменить ключи' if keywords_only else ('Изменить ответы' if replies_only else 'Изменить текст')
+        edit_cb = 'template:create_keywords' if keywords_only else ('new_template:edit_replies' if replies_only else 'new_template:edit')
         keyboard = InlineKeyboardMarkup(inline_keyboard=[
             [InlineKeyboardButton(text='💾 Сохранить шаблон', callback_data='new_template:save_as_template')],
-            [InlineKeyboardButton(text='Изменить ответы' if replies_only else 'Изменить текст', callback_data='new_template:edit_replies' if replies_only else 'new_template:edit')],
+            [InlineKeyboardButton(text=edit_label, callback_data=edit_cb)],
             [InlineKeyboardButton(text=f'{Emoji.CANCEL} Отмена', callback_data='quicktpl:cancel')]
         ])
 
@@ -752,6 +839,7 @@ async def show_new_template_preview_from_callback(callback: CallbackQuery, state
             template_type=template_type,
             verify_main_visibility=bool(state_data.get('verify_main_visibility', False)),
             verify_reply_visibility=bool(state_data.get('verify_reply_visibility', False)),
+            keywords=state_data.get('new_template_keywords') or [],
         )
         await callback.message.edit_text(preview_text, reply_markup=keyboard, parse_mode='Markdown')
         await state.set_state(None)
@@ -779,6 +867,7 @@ async def show_new_template_preview(message: Message, state: FSMContext):
             template_type=template_type,
             verify_main_visibility=bool(state_data.get('verify_main_visibility', False)),
             verify_reply_visibility=bool(state_data.get('verify_reply_visibility', False)),
+            keywords=state_data.get('new_template_keywords') or [],
         )
         await message.answer(preview_text, reply_markup=keyboard, parse_mode='Markdown')
         await state.set_state(None)
@@ -852,6 +941,7 @@ async def save_as_template_only(callback: CallbackQuery, state: FSMContext):
         replies = state_data.get('replies', {})
         reply_count = state_data.get('reply_count', 0)
         template_type = state_data.get('template_type') or 'full'
+        keywords_list = list(state_data.get('new_template_keywords') or [])
         replies_list = replies_dict_to_list(replies)
         if template_type == 'replies_only':
             if not replies_list:
@@ -859,6 +949,17 @@ async def save_as_template_only(callback: CallbackQuery, state: FSMContext):
                     '❌ *Ошибка*\n\nДля шаблона ответов нужен хотя бы один ответ.',
                     reply_markup=InlineKeyboardMarkup(inline_keyboard=[
                         [InlineKeyboardButton(text='✏️ Ввести ответы', callback_data='new_template:edit_replies')],
+                        [InlineKeyboardButton(text=f'{Emoji.HOME} Меню', callback_data='menu:main')],
+                    ]),
+                    parse_mode='Markdown',
+                )
+                return
+        elif template_type == 'keywords':
+            if not keywords_list:
+                await callback.message.edit_text(
+                    '❌ *Ошибка*\n\nДля шаблона ключевых слов укажите хотя бы один ключ.',
+                    reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                        [InlineKeyboardButton(text='✏️ Ввести ключи', callback_data='template:create_keywords')],
                         [InlineKeyboardButton(text=f'{Emoji.HOME} Меню', callback_data='menu:main')],
                     ]),
                     parse_mode='Markdown',
@@ -872,17 +973,24 @@ async def save_as_template_only(callback: CallbackQuery, state: FSMContext):
         else:
             reply_mode = 'A'
         task_settings = {'reply_mode': reply_mode, 'reply_count': reply_count, 'template_type': template_type}
-        task_settings['text_variants'] = [] if template_type == 'replies_only' else text_variants
+        task_settings['text_variants'] = [] if template_type in ('replies_only', 'keywords') else text_variants
         task_settings['replies'] = replies_list
+        if template_type == 'keywords':
+            task_settings['keywords'] = keywords_list
         try:
             import datetime
             date_str = datetime.datetime.now().strftime('%d.%m %H:%M')
-            template_name = f'Ответы {date_str}' if template_type == 'replies_only' else f'Шаблон {date_str}'
+            if template_type == 'keywords':
+                template_name = f'Ключи {date_str}'
+            elif template_type == 'replies_only':
+                template_name = f'Ответы {date_str}'
+            else:
+                template_name = f'Шаблон {date_str}'
             template = await api_client.create_task_template(
                 user_id=user_backend_id,
                 name=template_name,
                 main_comment=main_comment or '',
-                text_variants=[] if template_type == 'replies_only' else text_variants,
+                text_variants=[] if template_type in ('replies_only', 'keywords') else text_variants,
                 replies=replies_list,
                 likes=0,
                 settings=task_settings,
@@ -1387,6 +1495,8 @@ async def confirm_template(callback: CallbackQuery, state: FSMContext):
             'delays': template.get('settings', {}).get('delays', True),
             'shuffle': template.get('settings', {}).get('shuffle', False),
             'rotate_accounts': template.get('settings', {}).get('rotate_accounts', True),
+            'reply_like_target': str(template.get('settings', {}).get('reply_like_target') or state_data.get('reply_like_target') or '1'),
+            'reply_like_count': int(template.get('settings', {}).get('reply_like_count') or state_data.get('reply_like_count') or 0),
             'origin': 'quick_order',
             'account_pool_mode': account_pool_mode,
             'verify_main_visibility': bool(state_data.get('verify_main_visibility', False)),

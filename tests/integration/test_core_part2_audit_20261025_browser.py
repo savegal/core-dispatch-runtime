@@ -47,7 +47,7 @@ async def test_referrer_requires_exact_origin_not_a_string_prefix(browser_page, 
     await check_referrer(browser_page, source)
 
 
-@pytest.mark.parametrize("body,expected", [("",HttpErrorType.FORBIDDEN), ("{}",HttpErrorType.SUBMITTED_UNCONFIRMED),
+@pytest.mark.parametrize("body,expected", [("",HttpErrorType.SUBMITTED_UNCONFIRMED), ("{}",HttpErrorType.SUBMITTED_UNCONFIRMED),
                                            ('{"data":{}}',HttpErrorType.SUBMITTED_UNCONFIRMED),
                                            (" ",HttpErrorType.SUBMITTED_UNCONFIRMED)])
 async def test_empty_vs_nonempty_publish_receipts_do_not_gain_an_extra_post(browser_page, body, expected):

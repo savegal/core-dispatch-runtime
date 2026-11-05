@@ -1,8 +1,45 @@
 from types import SimpleNamespace
 
+import httpx
 import pytest
 
 from services import boost_project_client
+
+
+@pytest.mark.asyncio
+async def test_boost_order_timeout_does_not_create_a_second_order(monkeypatch):
+    original_client = httpx.AsyncClient
+    orders = []
+
+    def handler(request):
+        assert request.url.params["action"] == "add"
+        orders.append(request)
+        raise httpx.ReadTimeout("receipt lost", request=request)
+
+    monkeypatch.setattr(boost_project_client, "get_settings", lambda: SimpleNamespace(
+        BOOST_PROJECT_API_KEY="fixture", BOOST_PROJECT_BASE_URL="https://provider.invalid/api",
+        BOOST_PROJECT_TIKTOK_LIKES_SERVICE_ID=5, BOOST_PROJECT_LIKES_QUANTITY=50,
+    ))
+    monkeypatch.setattr(httpx, "AsyncClient", lambda **kwargs: original_client(
+        transport=httpx.MockTransport(handler), **kwargs,
+    ))
+    result = await boost_project_client.order_tiktok_comment_likes(
+        "https://www.tiktok.com/@demo/video/1234567890123456789", "demo", 50,
+    )
+    assert result == (False, None, boost_project_client.ORDER_OUTCOME_UNKNOWN)
+    assert len(orders) == 1
+
+
+@pytest.mark.asyncio
+async def test_boost_balance_distinguishes_provider_error_from_zero(monkeypatch):
+    original_client = httpx.AsyncClient
+    responses = iter(({"error": "invalid key"}, {"balance": "0.00"}))
+    monkeypatch.setattr(boost_project_client, "_api_key", lambda: "fixture")
+    monkeypatch.setattr(httpx, "AsyncClient", lambda **kwargs: original_client(
+        transport=httpx.MockTransport(lambda request: httpx.Response(200, json=next(responses))), **kwargs,
+    ))
+    assert await boost_project_client.get_balance() == (False, None, "invalid key")
+    assert await boost_project_client.get_balance() == (True, 0.0, None)
 
 
 @pytest.mark.unit

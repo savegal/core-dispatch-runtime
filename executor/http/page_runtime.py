@@ -2,9 +2,8 @@
 import asyncio
 from copy import deepcopy
 import time
-import re
-from urllib.parse import urlparse
 from executor.browser_reads import await_browser_read
+from services.tiktok_urls import media_id_from_url, parse_tiktok_url
 
 
 def target_page_matches(page, aweme_id):
@@ -14,21 +13,15 @@ def target_page_matches(page, aweme_id):
 
 
 def target_url_matches(url, aweme_id):
-    current = urlparse(str(url or ""))
-    media = re.search(r"/(?:video|photo)/(\d+)(?:/|$)", current.path)
-    return bool(
-        current.scheme in {"http", "https"}
-        and (current.hostname == "tiktok.com" or (current.hostname or "").endswith(".tiktok.com"))
-        and media and media.group(1) == str(aweme_id)
-        and not any(marker in current.path.lower() for marker in ("/login", "/signup", "/verify", "/auth"))
-    )
+    return media_id_from_url(url) == str(aweme_id)
 
 
 def _media_document_key(url):
-    parsed = urlparse(str(url or ""))
-    media = re.search(r"/(?:video|photo)/(\d+)(?:/|$)", parsed.path)
-    return ((parsed.scheme, parsed.hostname, media.group(1))
-            if media and target_url_matches(url, media.group(1)) else None)
+    media_id = media_id_from_url(url)
+    if media_id:
+        parsed = parse_tiktok_url(url)
+        return parsed.scheme, parsed.hostname, media_id
+    return None
 
 
 def page_document_key(page):

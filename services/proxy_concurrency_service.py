@@ -21,11 +21,11 @@ _PROXY_USAGE_TTL = 3600  # 1 hour TTL for usage counters (safety cleanup)
 _PROXY_FAIL_PREFIX = "proxy_fail:"
 _PROXY_FAIL_TTL = 7200  # 2 hours TTL for fail counters
 
-# Token-owned leases are separate from legacy task counters. Redis TIME makes
-# expiration independent of worker clocks; pending rotation blocks new users.
+# Read Redis TIME before the write scripts so Redis 3.0 can replicate them.
+# Pending rotation still blocks new users, independent of worker clocks.
 _LEASE_TTL = 60
 _LEASE_ACQUIRE = """
-local now = redis.call('TIME')[1]
+local now = tonumber(ARGV[5])
 redis.call('ZREMRANGEBYSCORE', KEYS[1], '-inf', now)
 if ARGV[2] == 'rotate' then
   local owner = redis.call('GET', KEYS[2])
@@ -50,7 +50,7 @@ if ARGV[2] == 'rotate' then
   if redis.call('GET', KEYS[2]) ~= ARGV[1] then return 0 end
   redis.call('EXPIRE', KEYS[2], ARGV[3])
 else
-  local now = redis.call('TIME')[1]
+  local now = tonumber(ARGV[4])
   local expiry = redis.call('ZSCORE', KEYS[1], ARGV[1])
   if not expiry or tonumber(expiry) <= tonumber(now) then return 0 end
   redis.call('ZADD', KEYS[1], now + tonumber(ARGV[3]), ARGV[1])
@@ -63,6 +63,12 @@ return 1
 def _lease_client():
     from services.proxy_health_service import _get_proxy_health_client
     return _get_proxy_health_client()
+
+
+def _eval_lease_at_server_time(script, keys, *args):
+    client = _lease_client()
+    now, _ = client.time()
+    return client.eval(script, len(keys), *keys, *args, now)
 
 
 @dataclass
@@ -93,7 +99,7 @@ async def acquire_proxy_usage(proxy_str: str, *, rotation: bool = False, timeout
     try:
         while True:
             granted = await asyncio.to_thread(
-                _lease_client().eval, _LEASE_ACQUIRE, 2, *lease.keys,
+                _eval_lease_at_server_time, _LEASE_ACQUIRE, lease.keys,
                 lease.token, lease.mode, _LEASE_TTL, max(1, settings.MAX_TASKS_PER_PROXY),
             )
             if granted:
@@ -112,8 +118,9 @@ async def acquire_proxy_usage(proxy_str: str, *, rotation: bool = False, timeout
         try:
             while True:
                 await asyncio.sleep(_LEASE_TTL / 3)
-                ok = await asyncio.to_thread(_lease_client().eval, _LEASE_RENEW, 2, *lease.keys,
-                                             lease.token, lease.mode, _LEASE_TTL)
+                ok = await asyncio.to_thread(
+                    _eval_lease_at_server_time, _LEASE_RENEW, lease.keys, lease.token, lease.mode, _LEASE_TTL,
+                )
                 if not ok:
                     raise ProxyRouteError("proxy_lease_lost")
         except asyncio.CancelledError:

@@ -2,12 +2,14 @@
 import asyncio
 import logging
 import time
+from ipaddress import ip_address
 from typing import Tuple, Optional
 from urllib.parse import urlparse
 import httpx
 from services.log_sanitizer import sanitize_url
 
 logger = logging.getLogger("services.proxy_service")
+PROXY_IP_CHECK_URL = "https://api.ipify.org?format=json"
 
 
 def normalize_proxy_url(proxy_str: str) -> str:
@@ -33,7 +35,7 @@ def normalize_proxy_url(proxy_str: str) -> str:
 
 async def check_proxy_health_async(
     proxy_str: str, 
-    test_url: str = "https://api.ipify.org?format=json",
+    test_url: str = PROXY_IP_CHECK_URL,
     timeout: float = 10.0,
     measure_speed: bool = True
 ) -> Tuple[bool, str, Optional[str], Optional[int]]:
@@ -85,7 +87,7 @@ async def check_proxy_health_async(
             # ИСПРАВЛЕНО: httpx настраивает прокси в конструкторе AsyncClient
             async with httpx.AsyncClient(
                 timeout=timeout,
-                follow_redirects=True,
+                follow_redirects=test_url != PROXY_IP_CHECK_URL,
                 proxy=proxy_url,
                 trust_env=False,
             ) as client:
@@ -97,31 +99,17 @@ async def check_proxy_health_async(
                     response_time_ms = int(elapsed * 1000)
                 
                 if response.status_code == 200:
-                    # Пробуем получить IP из ответа
-                    try:
-                        data = response.json()
-                        ip = data.get("ip", "unknown")
-                        
-                        # ИСПРАВЛЕНО: Определяем статус на основе скорости
-                        # Если прокси медленный (>60 секунд), помечаем как "slow", но не как "bad"
-                        # Медленные прокси всё равно работают, просто медленнее
-                        status = "active"
-                        if response_time_ms and response_time_ms > 60000:  # Увеличено с 30 до 60 секунд
-                            status = "slow"
-                            logger.info(f"Proxy {safe_proxy} is slow but working: {response_time_ms}ms")
-                        
-                        logger.debug(f"Proxy {safe_proxy} is {status}, IP: {ip}, time: {response_time_ms}ms")
-                        return True, status, None, response_time_ms
-                    except Exception:
-                        # Если не JSON, просто проверяем статус
-                        if response.status_code == 200:
-                            status = "active"
-                            if response_time_ms and response_time_ms > 60000:  # Увеличено с 30 до 60 секунд
-                                status = "slow"
-                            logger.debug(f"Proxy {safe_proxy} is {status} (status 200), time: {response_time_ms}ms")
-                            return True, status, None, response_time_ms
-                        else:
-                            return False, "bad", f"HTTP {response.status_code}", response_time_ms
+                    if test_url == PROXY_IP_CHECK_URL:
+                        try:
+                            raw_ip = response.json()["ip"]
+                            if not isinstance(raw_ip, str):
+                                raise ValueError("Expected a textual IP address")
+                            ip_address(raw_ip)
+                        except (KeyError, TypeError, ValueError):
+                            return False, "bad", "Invalid IP probe response", response_time_ms
+                    status = "slow" if response_time_ms is not None and response_time_ms > 60000 else "active"
+                    logger.debug("Proxy %s is %s, time=%sms", safe_proxy, status, response_time_ms)
+                    return True, status, None, response_time_ms
                 else:
                     return False, "bad", f"HTTP {response.status_code}", response_time_ms
                     
@@ -199,7 +187,7 @@ async def quick_check_proxy(proxy_str: str, timeout: float = 30.0, max_response_
     try:
         is_active, status, _, response_time_ms = await check_proxy_health_async(
             proxy_str, 
-            "https://api.ipify.org?format=json",  # Быстрый endpoint
+            PROXY_IP_CHECK_URL,
             timeout=timeout,
             measure_speed=True  # ИСПРАВЛЕНО: Измеряем скорость для проверки
         )

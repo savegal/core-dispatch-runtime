@@ -24,13 +24,16 @@ class Settings(BaseSettings):
 
     # Ограничения
     MAX_ACTIONS_PER_ACCOUNT: int = 999999  # ИСПРАВЛЕНО: Убран лимит на комментирование (было 50)
+    SOFT_DAILY_MAIN_ACTIONS_TARGET: int = 3  # Мягкий ориентир дневной нагрузки для скоринга ротации (main)
+    SOFT_DAILY_REPLY_ACTIONS_TARGET: int = 6  # Мягкий ориентир дневной нагрузки для скоринга ротации (reply)
+    RESIDENTIAL_DEFAULT_COUNTRY: str = "DE"  # Дефолтная страна для sticky-шаблонов резидентских прокси
     MAX_THREADS: int = 2  # КРИТИЧНО: Снижено до 2 для работы на ноутбуке
-    MAX_CONCURRENT_BROWSERS: int = 1  # КРИТИЧНО: Снижено до 1 для работы на ноутбуке (минимум нагрузки)
+    MAX_CONCURRENT_BROWSERS: int = 4  # ОПТИМИЗИРОВАНО: 4 контекста внутри 1 процесса Chromium (BROWSER_POOL_SHARED_PROCESS=True)
     BROWSER_POOL_CAPACITY_WAIT_SECONDS: float = 15.0
     BROWSER_POOL_SHARED_PROCESS: bool = True
     STATIC_ASSET_CACHE_ENABLED: bool = True
     STATIC_ASSET_CACHE_MAX_MB: int = 128
-    KEYWORD_REPLY_MAX_SCAN_PAGES: int = 100
+    KEYWORD_REPLY_MAX_SCAN_PAGES: int = Field(default=10, ge=1, le=100)
     # NEW: Лимит задач на один прокси (1-2 для мобильных, 2-3 для серверных)
     # 1 - самый безопасный режим (стабильная ротация, макс. скорость)
     MAX_TASKS_PER_PROXY: int = 1
@@ -41,6 +44,7 @@ class Settings(BaseSettings):
     # - 32GB RAM: MAX_CONCURRENT_BROWSERS = 30-40
     RANDOM_DELAY: bool = True
     ACCOUNT_COOLDOWN_SECONDS: int = 60  # Для ноутбука: 60. Для сервера (стабильные аккаунты): 30-20
+    REPLY_ACCOUNT_COOLDOWN_SECONDS: int = 0  # Мягкий кулдаун между ответами одного reply-аккаунта (в .env: 300)
     # Prefer real browser auth (sessionid/sid_tt), but allow sid_guard-only
     # accounts as a last resort. They still must pass browser action-ready and
     # enrichment gates before any DOM publish/search is attempted.
@@ -140,8 +144,9 @@ class Settings(BaseSettings):
     GLOBAL_NETWORK_PROBE_TIMEOUT_SECONDS: float = 3.0
     
     # Задержки для обработки URL
-    URL_PROCESSING_DELAY_MIN: float = 0.5  # Минимальный множитель для задержки между URL
-    URL_PROCESSING_DELAY_MAX: float = 1.5  # Максимальный множитель для задержки между URL
+    URL_PROCESSING_DELAY_BASE_SECONDS: float = Field(default=60.0, ge=0)
+    URL_PROCESSING_DELAY_MIN: float = 0.5  # Минимальный множитель базовой задержки между URL
+    URL_PROCESSING_DELAY_MAX: float = 1.5  # Максимальный множитель базовой задержки между URL
 
     # Compatibility defaults for settings referenced across API/bot/worker code.
     ADMIN_IDS: str = ""
@@ -215,14 +220,14 @@ class Settings(BaseSettings):
     # ИСПРАВЛЕНО: Настройки для надёжной верификации комментариев (рекомендации ChatGPT)
     COMMENT_APPEARANCE_TIMEOUT: int = 90  # Максимальное время ожидания появления комментария (секунды, 90 секунд)
     MAIN_VISIBILITY_REPAIR_ROUNDS: int = Field(default=2, ge=0, le=3)
-    MAIN_VISIBILITY_OBSERVER_ATTEMPTS: int = Field(default=6, ge=2, le=12)
-    MAIN_VISIBILITY_MAX_PAGES: int = Field(default=20, ge=1, le=100)
+    MAIN_VISIBILITY_OBSERVER_ATTEMPTS: int = Field(default=2, ge=2, le=12)
+    MAIN_VISIBILITY_MAX_PAGES: int = Field(default=5, ge=1, le=100)
     MAIN_VISIBILITY_INITIAL_DELAY_SECONDS: float = Field(default=10.0, ge=0, le=60)
     MAIN_VISIBILITY_RECHECK_DELAY_SECONDS: float = Field(default=10.0, ge=0, le=60)
     MAIN_VISIBILITY_MAX_SECONDS: float = Field(default=300.0, ge=1, le=900)
     REPLY_PUBLICATION_VISIBILITY_REPAIR_ROUNDS: int = Field(default=2, ge=0, le=3)
-    REPLY_PUBLICATION_VISIBILITY_OBSERVER_ATTEMPTS: int = Field(default=6, ge=2, le=12)
-    REPLY_PUBLICATION_VISIBILITY_MAX_PAGES: int = Field(default=20, ge=1, le=100)
+    REPLY_PUBLICATION_VISIBILITY_OBSERVER_ATTEMPTS: int = Field(default=2, ge=2, le=12)
+    REPLY_PUBLICATION_VISIBILITY_MAX_PAGES: int = Field(default=5, ge=1, le=100)
     REPLY_PUBLICATION_VISIBILITY_INITIAL_DELAY_SECONDS: float = Field(default=10.0, ge=0, le=60)
     REPLY_PUBLICATION_VISIBILITY_RECHECK_DELAY_SECONDS: float = Field(default=10.0, ge=0, le=60)
     REPLY_PUBLICATION_VISIBILITY_MAX_SECONDS: float = Field(default=300.0, ge=1, le=900)
@@ -384,25 +389,25 @@ class Settings(BaseSettings):
     MIN_DELAY_BETWEEN_ACTIONS_MS: int = 500  # Минимальная задержка между действиями (мс)
     MAX_DELAY_BETWEEN_ACTIONS_MS: int = 2000  # Максимальная задержка между действиями (мс)
     
-    # Настройки парсинга видео (для снижения риска капчи)
-    VIDEO_PARSING_WARMUP_ENABLED: bool = True  # Включить warm-up перед парсингом профиля
-    VIDEO_PARSING_WARMUP_SCROLLS_MIN: int = 2  # Минимальное количество скроллов на FYP
-    VIDEO_PARSING_WARMUP_SCROLLS_MAX: int = 3  # Максимальное количество скроллов на FYP
-    VIDEO_PARSING_WARMUP_WATCH_TIME_MIN_MS: int = 2000  # Минимальное время просмотра видео на FYP (мс)
-    VIDEO_PARSING_WARMUP_WATCH_TIME_MAX_MS: int = 5000  # Максимальное время просмотра видео на FYP (мс)
-    VIDEO_PARSING_SCROLL_ITERATIONS_MIN: int = 5  # Минимальное количество скроллов при парсинге
-    VIDEO_PARSING_SCROLL_ITERATIONS_MAX: int = 10  # Максимальное количество скроллов при парсинге
+    # Настройки парсинга видео (HTTP-first мониторинг без лишнего прогрева /foryou и DOM-скролла)
+    VIDEO_PARSING_WARMUP_ENABLED: bool = False  # Отключён прогрев /foryou перед парсингом профиля (экономия трафика и времени)
+    VIDEO_PARSING_WARMUP_SCROLLS_MIN: int = 1  # Минимальное количество скроллов на FYP
+    VIDEO_PARSING_WARMUP_SCROLLS_MAX: int = 2  # Максимальное количество скроллов на FYP
+    VIDEO_PARSING_WARMUP_WATCH_TIME_MIN_MS: int = 1000  # Минимальное время просмотра видео на FYP (мс)
+    VIDEO_PARSING_WARMUP_WATCH_TIME_MAX_MS: int = 2000  # Максимальное время просмотра видео на FYP (мс)
+    VIDEO_PARSING_SCROLL_ITERATIONS_MIN: int = 2  # Минимальное количество скроллов при парсинге
+    VIDEO_PARSING_SCROLL_ITERATIONS_MAX: int = 4  # Максимальное количество скроллов при парсинге
     VIDEO_PARSING_SCROLL_AMOUNT_MIN: int = 300  # Минимальная величина скролла (px)
     VIDEO_PARSING_SCROLL_AMOUNT_MAX: int = 800  # Максимальная величина скролла (px)
-    VIDEO_PARSING_SCROLL_DELAY_MIN_MS: int = 1200  # Минимальная задержка между скроллами (мс)
-    VIDEO_PARSING_SCROLL_DELAY_MAX_MS: int = 2500  # Максимальная задержка между скроллами (мс)
-    VIDEO_PARSING_READ_SIMULATION_CHANCE: float = 0.7  # Вероятность имитации чтения после скролла (0.0-1.0)
-    VIDEO_PARSING_READ_TIME_MIN_MS: int = 1000  # Минимальное время имитации чтения (мс)
-    VIDEO_PARSING_READ_TIME_MAX_MS: int = 3000  # Максимальное время имитации чтения (мс)
-    VIDEO_PARSING_INITIAL_LOAD_DELAY_MIN_MS: int = 2000  # Минимальная задержка после загрузки страницы (мс)
-    VIDEO_PARSING_INITIAL_LOAD_DELAY_MAX_MS: int = 5000  # Максимальная задержка после загрузки страницы (мс)
-    VIDEO_PARSING_MOUSE_MOVEMENT_CHANCE: float = 0.5  # Вероятность случайных движений мыши (0.0-1.0)
-    VIDEO_PARSING_HOVER_CHANCE: float = 0.3  # Вероятность hover на элементы (0.0-1.0)
+    VIDEO_PARSING_SCROLL_DELAY_MIN_MS: int = 600  # Минимальная задержка между скроллами (мс)
+    VIDEO_PARSING_SCROLL_DELAY_MAX_MS: int = 1200  # Максимальная задержка между скроллами (мс)
+    VIDEO_PARSING_READ_SIMULATION_CHANCE: float = 0.2  # Вероятность имитации чтения после скролла (0.0-1.0)
+    VIDEO_PARSING_READ_TIME_MIN_MS: int = 500  # Минимальное время имитации чтения (мс)
+    VIDEO_PARSING_READ_TIME_MAX_MS: int = 1000  # Максимальное время имитации чтения (мс)
+    VIDEO_PARSING_INITIAL_LOAD_DELAY_MIN_MS: int = 400  # Минимальная задержка после загрузки страницы (мс)
+    VIDEO_PARSING_INITIAL_LOAD_DELAY_MAX_MS: int = 900  # Максимальная задержка после загрузки страницы (мс)
+    VIDEO_PARSING_MOUSE_MOVEMENT_CHANCE: float = 0.1  # Вероятность случайных движений мыши (0.0-1.0)
+    VIDEO_PARSING_HOVER_CHANCE: float = 0.0  # Вероятность hover на элементы (0.0-1.0)
     
     # Валидация аккаунтов и прокси
     VALIDATE_BEFORE_TASK: bool = True  # Быстрая проверка куков перед использованием аккаунта

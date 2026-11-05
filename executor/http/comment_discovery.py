@@ -14,7 +14,9 @@ from services.cookie_validator import normalize_cookie_records
 from executor.http.request_profile import RequestProfile
 from executor.http.playwright_http_client import _extract_runtime_profile
 from executor.http.page_runtime import activate_page_input, prepared_runtime_profile
-from executor.http.request_evidence import observe_request_security, resolve_security_evidence, has_request_signature
+from executor.http.request_evidence import (
+    has_request_signature, observe_request_security, resolve_security_evidence, same_http_endpoint,
+)
 
 
 logger = logging.getLogger(__name__)
@@ -74,7 +76,7 @@ async url => {
     const controller = new AbortController();
     const timer = setTimeout(() => controller.abort(), 5000);
     try {
-        const response = await window.fetch(url, {credentials: "include", signal: controller.signal});
+        const response = await window.fetch(url, {credentials: "include", redirect: "error", signal: controller.signal});
         return {status: response.status, text: await response.text(), url: response.url,
                 headers: Object.fromEntries(response.headers.entries())};
     } finally { clearTimeout(timer); }
@@ -128,7 +130,7 @@ async def _fetch_with_native_activation(page, script, url, meta, *, native_only=
     def matches(raw_url):
         parsed = urlparse(str(raw_url or ""))
         values = parse_qs(parsed.query)
-        return ((parsed.scheme, parsed.hostname, parsed.path) == (expected.scheme, expected.hostname, expected.path)
+        return (same_http_endpoint(raw_url, url)
                 and values.get("aweme_id") == query.get("aweme_id") and values.get("cursor") == ["0"])
 
     def on_request(request):
@@ -258,11 +260,11 @@ async def _fetch_comment_list(page, aweme_id, cursor, count, *, fresh, parent_co
                 security["security_params_source"] == "request_event"
                 and not has_request_signature(meta["security_params"])
             )
-            actual, expected = urlparse(str(response.get("url") or "")), urlparse(url)
-            same_endpoint = (actual.scheme, actual.hostname, actual.path) == (expected.scheme, expected.hostname, expected.path)
+            if not same_http_endpoint(response.get("url"), url):
+                return unavailable("unexpected_response_url")
             headers = {str(key).lower(): value for key, value in (response.get("headers") or {}).items()}
             token = headers.get("x-ms-token")
-            if meta["http_status"] == 200 and same_endpoint and isinstance(token, str) and token.strip():
+            if meta["http_status"] == 200 and isinstance(token, str) and token.strip():
                 try:
                     records = await page.context.cookies()
                     updates = [{**record, "value": token.strip()} for record in records
@@ -292,29 +294,24 @@ async def _fetch_comment_list(page, aweme_id, cursor, count, *, fresh, parent_co
             return unavailable("empty_body")
         if not has_request_signature(meta["security_params"]):
             return unavailable("unsigned_response")
-        if fresh:
-            actual = urlparse(str(response.get("url") or ""))
-            expected = urlparse(url)
-            if actual.scheme != "https" or actual.hostname != expected.hostname or actual.path != expected.path:
-                return unavailable("unexpected_response_url")
         try:
             data = json.loads(response["text"])
         except (ValueError, TypeError):
             return unavailable("invalid_json")
-        if fresh and (not isinstance(data, dict) or type(data.get("status_code")) is not int):
+        if not isinstance(data, dict):
+            return unavailable("invalid_payload")
+        if type(data.get("status_code")) is not int:
             return unavailable("missing_api_status")
-        if not isinstance(data, dict) or data.get("status_code", 0) != 0:
-            meta["api_status"] = data.get("status_code") if isinstance(data, dict) else None
-            return unavailable("api_status" if isinstance(data, dict) else "invalid_payload")
+        if data["status_code"] != 0:
+            meta["api_status"] = data["status_code"]
+            return unavailable("api_status")
         payload = data.get("data") if isinstance(data.get("data"), dict) else data
-        if fresh and "status_code" in payload and (type(payload["status_code"]) is not int or payload["status_code"] != 0):
+        if "status_code" in payload and (type(payload["status_code"]) is not int or payload["status_code"] != 0):
             return unavailable("api_status")
         explicit_empty = (type(payload.get("total")) is int and payload["total"] == 0
                           and type(payload.get("has_more")) in (bool, int, str)
                           and payload.get("has_more") in (False, 0, "0"))
-        if fresh and "comments" in payload and payload["comments"] is None and explicit_empty:
-            payload["comments"] = []
-        if not fresh and "comments" in payload and payload["comments"] is None:
+        if "comments" in payload and payload["comments"] is None and explicit_empty:
             payload["comments"] = []
         if not isinstance(payload.get("comments"), list):
             return unavailable("missing_comments")
@@ -336,9 +333,12 @@ async def find_parent_comments(page, aweme_id: str, mains, *, phrase_match=False
     Valid JSON with no match is distinct from an unavailable API. A cursor loop
     or a page limit is inconclusive, rather than proof a parent does not exist.
     """
+    from executor.http.comment_scanner import _cursor, _more, reports_unseen_comments
+
     matches = {}
     cursor = 0
     seen_cursors = set()
+    seen_comments = set()
     scanned = 0
     available = False
     exhausted = False
@@ -369,10 +369,13 @@ async def find_parent_comments(page, aweme_id: str, mains, *, phrase_match=False
         for row in payload["comments"]:
             if not isinstance(row, dict):
                 continue
+            if row.get("aweme_id") is not None and str(row["aweme_id"]) != str(aweme_id):
+                continue
             scanned += 1
             cid = str(row.get("cid") or "").strip()
             if not cid.isascii() or not cid.isdigit() or not 10 <= len(cid) <= 30:
                 continue
+            seen_comments.add(cid)
             if cid in {hit["cid"] for hit in matches.values()}:
                 continue
             # Only top-level parents belong to this endpoint's discovery flow.
@@ -393,13 +396,12 @@ async def find_parent_comments(page, aweme_id: str, mains, *, phrase_match=False
                 if text_matches:
                     matches[index] = {"cid": cid, "text": text, "author": str(user.get("unique_id") or user.get("nickname") or "")}
                     break
-        has_more = payload.get("has_more") in (True, 1, "1")
-        if not has_more:
-            exhausted = True
-        if len(matches) == len(mains) or not has_more:
+        has_more = _more(payload.get("has_more"))
+        exhausted = has_more is False and not reports_unseen_comments(payload, len(seen_comments))
+        if len(matches) == len(mains) or has_more is not True:
             break
-        next_cursor = payload.get("cursor")
-        if next_cursor is None or str(next_cursor) == str(cursor):
+        next_cursor = _cursor(payload.get("cursor"))
+        if next_cursor is None or next_cursor <= cursor:
             break
         cursor = next_cursor
     return matches, {"available": available, "scanned": scanned, "exhausted": exhausted}

@@ -1,4 +1,4 @@
-"""Discover matching parents and send one durably fenced reply per comment."""
+"""Discover matching parents and durably fence reply dispatch per branch."""
 import asyncio
 from collections import Counter
 from copy import deepcopy
@@ -14,7 +14,8 @@ from db.models import KeywordReplyTarget
 from executor.engagement_engine import EngagementResult, extract_video_id
 from executor.http.execution_policy import http_first_enabled, valid_comment_id
 from executor.http.page_runtime import target_page_matches
-from services.keyword_replies import KEYWORD_ORDER_KIND, matches_keywords, normalize_keywords
+from services.keyword_replies import KEYWORD_ORDER_KIND, matches_keywords, normalize_keywords, replies_per_keyword_target
+from services.likes_config import coerce_bool
 from services.visibility_checkpoint import run_visibility_checkpoint
 
 
@@ -84,15 +85,16 @@ def _bound_video(task_settings, source_url, media_id=None):
     return None
 
 
-def _valid_comment_row(row):
+def _valid_comment_row(row, aweme_id=None):
     return bool(isinstance(row, dict) and valid_comment_id(row.get("cid"))
-                and (row.get("text") is None or isinstance(row["text"], str)))
+                and (row.get("text") is None or isinstance(row["text"], str))
+                and (aweme_id is None or row.get("aweme_id") is None or str(row["aweme_id"]) == str(aweme_id)))
 
 
-def select_targets(rows, keywords, seen):
+def select_targets(rows, keywords, seen, *, aweme_id=None):
     selected = []
     for row in rows:
-        if not _valid_comment_row(row):
+        if not _valid_comment_row(row, aweme_id):
             continue
         cid = str(row["cid"]).strip()
         if cid in seen:
@@ -103,8 +105,13 @@ def select_targets(rows, keywords, seen):
         if not matches_keywords(str(row.get("text") or ""), keywords):
             continue
         user = row.get("user") if isinstance(row.get("user"), dict) else {}
+        try:
+            digg_count = max(0, int(row.get("digg_count") or 0))
+        except (TypeError, ValueError):
+            digg_count = 0
         selected.append({"cid": cid, "text": str(row.get("text") or ""),
-                         "author": str(user.get("unique_id") or "").strip() or None})
+                         "author": str(user.get("unique_id") or "").strip() or None,
+                         "digg_count": digg_count})
     return selected
 
 
@@ -118,6 +125,7 @@ def has_more(value):
 
 async def collect_http_targets(page, aweme_id, keywords, *, stop_requested=None):
     from executor.http.comment_discovery import comment_read_batch, fetch_comment_page
+    from executor.http.comment_scanner import reports_unseen_comments
     seen, cursors, targets = set(), set(), []
     cursor = 0
     complete, error = False, None
@@ -130,15 +138,17 @@ async def collect_http_targets(page, aweme_id, keywords, *, stop_requested=None)
             if not isinstance(payload, dict) or not isinstance(payload.get("comments"), list):
                 error = "keyword_comment_list_unavailable"
                 break
-            targets.extend(select_targets(payload["comments"], keywords, seen))
-            if not all(_valid_comment_row(row) for row in payload["comments"]):
+            targets.extend(select_targets(payload["comments"], keywords, seen, aweme_id=aweme_id))
+            if not all(_valid_comment_row(row, aweme_id) for row in payload["comments"]):
                 # Keep the valid matches, but malformed rows cannot prove that
                 # every accessible comment was examined successfully.
                 error = "keyword_comment_list_unavailable"
                 break
             try:
                 if not has_more(payload.get("has_more")):
-                    complete = True
+                    complete = not reports_unseen_comments(payload, len(seen))
+                    if not complete:
+                        error = "keyword_comment_list_unavailable"
                     break
                 next_cursor = int(payload["cursor"])
                 if next_cursor <= int(cursor) or next_cursor in cursors:
@@ -228,6 +238,50 @@ def target_dict(row):
     return result
 
 
+def _validate_receipt(outcome, parent_id):
+    observed_parents = [
+        str(outcome[field]).strip()
+        for field in ("parent_comment_id", "response_parent_id", "response_root_comment_id")
+        if valid_comment_id(outcome.get(field))
+    ]
+    if any(parent != parent_id for parent in observed_parents):
+        observed_reply = outcome.pop("reply_id", None) or outcome.get("reply_comment_id")
+        outcome.pop("reply_comment_id", None)
+        outcome.update(
+            success=False, submitted_unconfirmed=True, network_confirmed=False,
+            error="keyword_parent_mismatch", observed_parent_comment_ids=observed_parents,
+            observed_reply_id=observed_reply,
+        )
+    elif outcome.get("success") and not (
+        valid_comment_id(outcome.get("reply_id")) and outcome.get("network_confirmed")
+        and str(outcome.get("method") or "").startswith("http")
+    ):
+        outcome.update(success=False, submitted_unconfirmed=True, error="keyword_delivery_unconfirmed")
+    return outcome
+
+
+def _target_slots(row, replies_per_target):
+    if replies_per_target == 1:
+        return [target_dict(row)]
+    aggregate = target_dict(row)
+    outcomes = aggregate.get("branch_outcomes") or []
+    slots = []
+    for index in range(replies_per_target):
+        if index < len(outcomes) and isinstance(outcomes[index], dict):
+            item = _validate_receipt(dict(outcomes[index]), row.comment_id)
+        elif index == 0 and not outcomes:
+            item = dict(aggregate)
+        else:
+            item = {"success": False, "error": aggregate.get("error") or "not_attempted"}
+            if row.status in {"dispatching", "unconfirmed"}:
+                item.update(submitted_unconfirmed=True, visibility_status="submitted_unconfirmed")
+        item.update(parent_comment_id=row.comment_id, matched_main_text=row.parent_text,
+                    variant_index=(row.position - 1) * replies_per_target + index + 1)
+        item.setdefault("matched_parent_author", row.parent_author)
+        slots.append(item)
+    return slots
+
+
 def _targets(db, task_id, key):
     return db.query(KeywordReplyTarget).filter_by(task_id=task_id, video_key=key).order_by(
         KeywordReplyTarget.position).populate_existing().all()
@@ -306,12 +360,13 @@ class KeywordReplyResult(EngagementResult):
     def __init__(self, scan):
         super().__init__()
         self.scan = scan
+        self.matched_targets = 0
         self.boost_enabled, self.boost_quantity = False, 0
 
     def to_dict(self, **kwargs):
         kwargs["mode"] = KEYWORD_ORDER_KIND
         result = super().to_dict(**kwargs)
-        result["keyword_replies"] = {**self.scan, "matched": self.expected_reply_variants,
+        result["keyword_replies"] = {**self.scan, "matched": self.matched_targets,
                                      "replied": result["engagement"]["replies"]["ok"],
                                      "unconfirmed": result["engagement"]["replies"]["submitted_unconfirmed"]}
         if not self.scan.get("complete"):
@@ -392,11 +447,25 @@ async def _execute_keyword_replies(db, task, video_url, *, task_id, pool_owner_u
             "resolved_video_url": resolved_url, "aweme_id": str(media_id)}, video_url)
     if not media_id:
         scan = {**scan, "complete": False, "error": scan.get("error") or "keyword_discovery_unavailable"}
+    if targets:
+        current_settings = getattr(task, "settings", None) or {}
+        if coerce_bool(current_settings.get("sort_targets_by_likes"), current_settings.get("target_sort") == "likes"):
+            targets = sorted(targets, key=lambda item: int(item.get("digg_count") or 0), reverse=True)
+        try:
+            max_targets = max(0, int(current_settings.get("max_targets") or 0))
+        except (TypeError, ValueError, OverflowError):
+            max_targets = 0
+        if max_targets > 0:
+            existing_cids = {row.comment_id for row in _targets(db, task.id, key)}
+            targets = [item for item in targets if item["cid"] not in existing_cids][
+                :max(0, max_targets - len(existing_cids))
+            ]
     if targets is not None or (binding and _bound_video(task.settings or {}, video_url) is None):
         await checkpoint(db, task, video_url, "plan", targets=targets or [], scan=scan,
                          replies=replies, storage_key=key, binding=binding)
     rows = _targets(db, task.id, key)
     prepublish_failed_account_ids = set()
+    replies_per_target = replies_per_keyword_target(task_settings.get("replies_per_target"))
     for row in rows:
         if not media_id:
             break
@@ -407,31 +476,49 @@ async def _execute_keyword_replies(db, task, video_url, *, task_id, pool_owner_u
             continue
         logger.info("[KEYWORD_REPLY] task=%s parent=%s position=%s/%s dispatch_claimed", task_id, row.comment_id, row.position, len(rows))
         try:
+            if replies_per_target > 1:
+                target_replies = [
+                    replies[(max(1, int(row.position or 1)) - 1 + idx) % len(replies)]
+                    for idx in range(replies_per_target)
+                ]
+            else:
+                target_replies = [row.reply_text]
             outcomes, _, _ = await engine.execute_engagement_only_replies_via_full_flow(
                 db, resolved_url, comment_text=row.parent_text, comment_id=row.comment_id,
-                comment_author=row.parent_author, replies=[row.reply_text], task_id=task_id,
+                comment_author=row.parent_author, replies=target_replies, task_id=task_id,
                 pool_owner_user_id=pool_owner_user_id, stop_requested=stop_requested, parent_phrase_match=False,
-                close_pool_after_phase=False, prepublish_failed_account_ids=prepublish_failed_account_ids)
-            outcome = dict(outcomes[0]) if len(outcomes) == 1 else {"error": "keyword_delivery_unconfirmed", "submitted_unconfirmed": True}
-            observed_parents = [str(outcome[field]) for field in ("parent_comment_id", "response_parent_id", "response_root_comment_id")
-                                if valid_comment_id(outcome.get(field))]
-            if any(parent != row.comment_id for parent in observed_parents):
-                outcome.update(success=False, submitted_unconfirmed=True, error="keyword_parent_mismatch",
-                               observed_parent_comment_ids=observed_parents)
-            if outcome.get("success") and http_first_enabled(settings) and not (
-                valid_comment_id(outcome.get("reply_id")) and outcome.get("network_confirmed")
-                and str(outcome.get("method") or "").startswith("http")
-            ):
-                outcome.update(success=False, submitted_unconfirmed=True, error="keyword_delivery_unconfirmed")
-            if _can_defer_without_delivery_risk(outcome):
+                close_pool_after_phase=False, prepublish_failed_account_ids=prepublish_failed_account_ids,
+                task_settings=getattr(task, "settings", None) if task is not None else None)
+            by_index = {
+                receipt.get("variant_index", index): _validate_receipt(dict(receipt), row.comment_id)
+                for index, receipt in enumerate(outcomes, 1) if isinstance(receipt, dict)
+            }
+            uncertain_receipt = {"success": False, "error": "keyword_delivery_unconfirmed",
+                                 "submitted_unconfirmed": True}
+            if replies_per_target == 1 and len(outcomes) != 1:
+                by_index.clear()
+            receipts = [
+                by_index.get(index, uncertain_receipt).copy()
+                for index in range(1, replies_per_target + 1)
+            ]
+            can_defer = all(_can_defer_without_delivery_risk(receipt) for receipt in receipts)
+            for receipt in receipts:
+                if not can_defer and receipt.get("error") in _RESOURCE_DEFERRAL_ERRORS:
+                    receipt.update(success=False, submitted_unconfirmed=True)
+            outcome = dict(next((receipt for receipt in receipts if receipt.get("error")), receipts[0]))
+            outcome["success"] = all(receipt.get("success") for receipt in receipts)
+            uncertain = any(receipt.get("submitted_unconfirmed")
+                            or receipt.get("visibility_status") == "submitted_unconfirmed" for receipt in receipts)
+            if replies_per_target > 1:
+                outcome["branch_outcomes"] = receipts
+                outcome["branch_replies_ok"] = sum(bool(receipt.get("success")) for receipt in receipts)
+            if can_defer:
                 outcome["deferred_reason"] = outcome["error"]
                 status = "pending"
                 scan = {**scan, "error": outcome["error"]}
             else:
-                if outcome.get("error") in _RESOURCE_DEFERRAL_ERRORS:
-                    outcome.update(success=False, submitted_unconfirmed=True)
-                uncertain = outcome.get("submitted_unconfirmed") or outcome.get("visibility_status") == "submitted_unconfirmed"
-                status = "unconfirmed" if uncertain else "success" if outcome.get("success") else "failed"
+                partially_sent = not outcome["success"] and any(receipt.get("success") for receipt in receipts)
+                status = "unconfirmed" if uncertain or partially_sent else "success" if outcome["success"] else "failed"
         except asyncio.CancelledError:
             raise  # The durable dispatch marker prevents a blind retry.
         except Exception:
@@ -443,8 +530,9 @@ async def _execute_keyword_replies(db, task, video_url, *, task_id, pool_owner_u
     result = KeywordReplyResult(scan)
     rows = _targets(db, task.id, key)
     result.comment_found = bool(rows)
-    result.expected_reply_variants = len(rows)
-    result.replies = [target_dict(row) for row in rows]
+    result.matched_targets = len(rows)
+    result.expected_reply_variants = len(rows) * replies_per_target
+    result.replies = [slot for row in rows for slot in _target_slots(row, replies_per_target)]
     result.resolved_video_url, result.aweme_id = resolved_url, media_id
     if not rows:
         result.main_comment["error"] = scan.get("error") or "keyword_no_matches"

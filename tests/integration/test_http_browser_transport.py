@@ -19,10 +19,47 @@ pytestmark = [pytest.mark.integration, pytest.mark.asyncio]
 CLOCK_TOLERANCE_MS = int(time.get_clock_info("monotonic").resolution * 1000) + 1
 
 
-@pytest.mark.parametrize("mode,expected_calls,success", [
-    ("signed_empty", 2, True), ("unsigned_first", 2, True), ("invalid_json", 1, False),
-])
-async def test_publish_empty_body_has_one_bounded_retry_without_replaying_invalid_json(browser_page, mode, expected_calls, success):
+async def test_profile_probe_uses_page_fetch_and_the_requested_owner(browser_page):
+    from services.video_parser import _probe_profile_videos_http_first
+
+    requested = []
+    detail = {"userInfo": {"user": {"uniqueId": "fixture", "secUid": "right-owner"}}}
+    item_list = {"itemList": [{"id": "7641761192486194454", "author": "fixture"}]}
+
+    async def serve(route):
+        url = urlparse(route.request.url)
+        if url.path.startswith("/api/"):
+            requested.append((url.path, parse_qs(url.query)))
+            await route.fulfill(json=detail if url.path == "/api/user/detail/" else item_list)
+            return
+        await route.fulfill(content_type="text/html", body="""<script id="SIGI_STATE" type="application/json">
+            {"UserModule":{"users":{"other":{"uniqueId":"other","secUid":"MS4wLjABAAAA-wrong"}}}}
+        </script>""")
+
+    await browser_page.route("**/*", serve)
+    await browser_page.goto("https://www.tiktok.com/@fixture")
+    await browser_page.evaluate("""() => {
+        const nativeFetch = window.fetch;
+        window.fetch = (input, options) => {
+            const url = new URL(input, location.href);
+            url.searchParams.set("fixture-signature", "page");
+            return nativeFetch(url.href, options);
+        };
+    }""", isolated_context=False)
+
+    result = await _probe_profile_videos_http_first(browser_page, "fixture")
+
+    assert result["itemListPayload"] == item_list
+    assert [path for path, _ in requested] == ["/api/user/detail/", "/api/post/item_list/"]
+    assert requested[1][1]["secUid"] == ["right-owner"]
+    assert all(query["fixture-signature"] == ["page"] for _, query in requested)
+    runtime = await browser_page.evaluate("() => [navigator.language, String(screen.width)]", isolated_context=False)
+    assert requested[1][1]["browser_language"] == [runtime[0]]
+    assert requested[1][1]["screen_width"] == [runtime[1]]
+
+
+@pytest.mark.parametrize("mode", ["signed_empty", "unsigned_first", "invalid_json"])
+async def test_publish_empty_or_invalid_body_is_not_replayed(browser_page, mode):
     requests = []
     async def serve(route):
         if urlparse(route.request.url).path != "/api/comment/publish/":
@@ -50,11 +87,10 @@ async def test_publish_empty_body_has_one_bounded_retry_without_replaying_invali
                                   retry_policy=RetryPolicy(max_retries=3))
     result = await client._execute_request(RequestProfile.publish_main_profile(),
                                            {"aweme_id": "7635267329407913230", "text": "fixture"})
-    assert result[0] is success
-    assert len(requests) == expected_calls
+    assert result[0] is False
+    assert len(requests) == 1
     assert client.last_request_meta["security_params_source"] == "request_event"
-    if not success:
-        assert client.last_request_meta["publication_status"] == "submitted_unconfirmed"
+    assert client.last_request_meta["publication_status"] == "submitted_unconfirmed"
 
 
 async def test_mention_resolution_aborts_a_stalled_response_body(browser_page, monkeypatch):
@@ -169,6 +205,44 @@ async def test_cancel_after_real_post_preserves_dispatch_evidence(browser_page):
         release.set()
         if not request.done():
             request.cancel()
+
+
+async def test_lost_like_response_keeps_dispatch_evidence(browser_page):
+    posts = []
+
+    async def serve(route):
+        if route.request.method == "POST":
+            posts.append(urlparse(route.request.url).path)
+            await route.abort("failed")
+        else:
+            await route.fulfill(content_type="text/html", body="<html>Local</html>")
+
+    await browser_page.route("**/*", serve)
+    await browser_page.goto("https://www.tiktok.com/@fixture/video/7635267329407913230")
+    client = await PlaywrightHttpClient.from_page(browser_page)
+    success, _, _ = await client.like_comment("7635267329407913230", "7641761192486194454")
+    assert not success and posts == ["/api/comment/digg/"]
+    assert client.last_request_meta["request_attempted"] is True
+    assert not getattr(browser_page, "_publication_attempted", False)
+
+
+async def test_publish_rejects_receipt_and_token_from_another_endpoint(browser_page, monkeypatch):
+    await browser_page.route("**/*", lambda route: route.fulfill(content_type="text/html", body="<html>Local</html>"))
+    await browser_page.goto("https://www.tiktok.com/@fixture/video/7635267329407913230")
+    client = await PlaywrightHttpClient.from_page(browser_page)
+    original = browser_page.evaluate
+
+    async def evaluate(script, *args, **kwargs):
+        if script == _PAGE_FETCH_JS:
+            return {"status": 200, "url": "https://www.tiktok.com/unrelated",
+                    "headers": {"content-type": "application/json", "x-ms-token": "wrong-token"},
+                    "text": '{"status_code":0,"comment":{"cid":"7641761192486194454"}}'}
+        return await original(script, *args, **kwargs)
+
+    monkeypatch.setattr(browser_page, "evaluate", evaluate)
+    success, cid, error, _ = await client.publish_main_comment("7635267329407913230", "fixture")
+    assert not success and cid is None and error == "submitted_unconfirmed:unexpected_response_url"
+    assert not any(cookie["name"] == "msToken" for cookie in await browser_page.context.cookies())
 
 
 async def test_warmup_waits_for_subresource_set_cookie_after_commit(browser_page, monkeypatch):
@@ -314,7 +388,7 @@ async def test_browser_cookie_updates_are_used_on_retry_and_next_publish(browser
         captured.append({"url": route.request.url, "headers": await route.request.all_headers(), "body": route.request.post_data})
         if len(captured) == 1:
             await browser_page.context.add_cookies(cookies(2)[:2])
-            await route.fulfill(content_type="application/json", body="", headers={
+            await route.fulfill(content_type="application/json", body='{"status_code":123}', headers={
                 "set-cookie": "tt_csrf_token=tt_csrf_token-2; Domain=.tiktok.com; Path=/; Secure",
             })
         else:
@@ -589,7 +663,7 @@ async def test_comment_list_retry_recovers_when_interceptor_arrives_after_empty_
             query=parse_qs(url.query)
             signed=all(query.get(key) for key in ('X-Bogus','X-Gnarly'))
             requests.append((signed,time.monotonic()))
-            await route.fulfill(content_type='application/json',body='{"comments":[]}' if signed else '')
+            await route.fulfill(content_type='application/json',body='{"status_code":0,"comments":[]}' if signed else '')
             if len(requests) == 1:
                 await browser_page.evaluate(_COMMENT_INTERCEPTOR_JS, isolated_context=False)
         else:
@@ -597,7 +671,7 @@ async def test_comment_list_retry_recovers_when_interceptor_arrives_after_empty_
 
     await browser_page.route('**/*',serve)
     await browser_page.goto('https://www.tiktok.com/@demo/video/123')
-    assert await fetch_comment_page(browser_page,'123')=={'comments':[]}
+    assert await fetch_comment_page(browser_page,'123')=={'status_code':0,'comments':[]}
     assert [signed for signed,_ in requests]==[False,True]
     assert requests[1][1]-requests[0][1]>=1.4
     assert browser_page._comment_list_http_meta['retry_count']==1

@@ -371,3 +371,20 @@ def test_mention_cache_bounded_size():
     assert hit is True
     assert val["user_id"] == str(_MAX_CACHE_SIZE + 49)
     _MENTION_CACHE.clear()
+
+
+@pytest.mark.unit
+@pytest.mark.asyncio
+async def test_transient_mention_resolve_without_fallback_is_logged(caplog):
+    from unittest.mock import AsyncMock
+    username = "cold_no_cache_42"
+    _MENTION_CACHE.pop(username, None)
+    page = AsyncMock()
+    page.is_closed = lambda: False
+    page.evaluate.return_value = {"status": "transient_error", "reason": "api_connection_failed"}
+    with caplog.at_level("WARNING", logger="executor.http.mentions"):
+        info = await resolve_mention_user(page, username)
+    assert info is None
+    assert "transient error during resolve" in caplog.text
+    assert "api_connection_failed" in caplog.text
+    assert _cache_get(username)[0] is False

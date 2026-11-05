@@ -102,6 +102,7 @@ async def test_http_discovery_visits_all_pages_deduplicates_and_filters(monkeypa
 
 @pytest.mark.parametrize("second,reason", [
     (None, "keyword_comment_list_unavailable"),
+    ({"comments": [], "has_more": 0, "total": 9}, "keyword_comment_list_unavailable"),
     ({"comments": [], "cursor": 20, "has_more": 1}, "keyword_pagination_stalled"),
 ])
 async def test_partial_discovery_does_not_claim_complete_coverage(monkeypatch, second, reason):
@@ -338,7 +339,7 @@ async def test_wizard_creates_a_distinct_http_keyword_order(monkeypatch):
     await state.update_data(replies=["Подробности в профиле"], account_pool_mode="shared")
     await wizard.show_engagement_preview(callback, state)
     preview = message.edit_text.await_args.args[0]
-    assert "HTTP" in preview and "каждый найденный комментарий" in preview
+    assert "HTTP" in preview and "Ответов на комментарий: 1" in preview
     assert "по действующему тарифу за видео" in preview
     await wizard.confirm_engagement_order(callback, state)
     payload = create.await_args.kwargs

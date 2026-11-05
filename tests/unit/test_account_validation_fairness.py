@@ -26,6 +26,9 @@ class Response:
     (200,None,'inconclusive'),
 ])
 async def test_validation_distinguishes_auth_rejection_from_transport_or_generic_error(monkeypatch,http,payload,expected):
+    from config.settings import get_settings
+    monkeypatch.setattr(get_settings(), "USE_PROXY", False)
+
     class Client:
         def __init__(self,*args,**kwargs):pass
         async def __aenter__(self):return self

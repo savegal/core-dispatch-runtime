@@ -247,7 +247,8 @@ def _build_recreated_order_settings(orig_settings: dict | None, *, origin: str) 
     if isinstance(source.get("keywords"), list):
         clean["keywords"] = list(source["keywords"])
     for key in ("verify_main_visibility", "verify_reply_visibility", "boost_likes_enabled",
-                "reply_like_target", "reply_like_count"):
+                "reply_like_target", "reply_like_count", "sort_targets_by_likes",
+                "max_targets", "replies_per_target"):
         if key in source:
             clean[key] = source[key]
     return clean
@@ -727,7 +728,7 @@ def _order_likes_detail_lines(task: dict) -> list[str]:
         if len(targets) > 5:
             lines.append(_html(f"Ещё целей: {len(targets) - 5}"))
     elif requested:
-        line = "Boost: включён, но заказов лайков в результате нет"
+        line = "Платные лайки включены. Сервис не подтвердил заказ лайков."
         error = str(likes.get("error") or "").strip()
         if error:
             line += f" — {error}"
@@ -1689,7 +1690,7 @@ def _overview_content_items(task: dict) -> list[str]:
 
     likes_lines = _order_likes_detail_lines(task)
     if likes_lines:
-        items.append(_html_block("Лайки Boost", likes_lines))
+        items.append(_html_block("Платные лайки", likes_lines))
 
     first_video = (task.get("video_urls") or [None])[0]
     if first_video:
@@ -1965,6 +1966,19 @@ def _render_order_settings(task: dict) -> str:
         expected = sum(int(row.get("expected", 0)) for row in reply_reports)
         replacements = sum(int(row.get("replacements", 0)) for row in reply_reports)
         lines.append(f"Ответы найдены при проверке: {confirmed}/{expected}; замен: {replacements}")
+    likes_delivered = likes_requested = 0
+    has_reply_likes = False
+    for row in (settings_dict.get("url_results") or {}).values():
+        report = row.get("reply_likes") if isinstance(row, dict) else None
+        if isinstance(report, dict):
+            has_reply_likes = True
+            by_comment_id = report.get("by_comment_id") or {}
+            likes_delivered += sum(_safe_int(count) for count in by_comment_id.values())
+            likes_requested += len(by_comment_id) * _safe_int(report.get("requested_per_reply"))
+    if likes_requested:
+        lines.append(f"Лайки на подтверждённые ответы: {likes_delivered}/{likes_requested}")
+    elif has_reply_likes:
+        lines.append("Лайки на ответы: выбранные ответы не подтверждены")
     return _html_screen(f"Заказ #{task_id} · Детали", _html_block("Параметры", lines))
 
 
@@ -2559,6 +2573,17 @@ async def copy_order(callback: CallbackQuery, state: FSMContext):
                 template_usage="replies_only" if source_settings.get("template_id") else None,
                 reply_source="template" if source_settings.get("template_id") else "manual",
                 boost_likes_enabled=False,
+                **{
+                    k: source_settings[k]
+                    for k in (
+                        "reply_like_target",
+                        "reply_like_count",
+                        "sort_targets_by_likes",
+                        "max_targets",
+                        "replies_per_target",
+                    )
+                    if k in source_settings
+                },
             )
             await show_engagement_preview(callback, state)
             return

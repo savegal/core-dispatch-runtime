@@ -13,6 +13,7 @@ from patchright.async_api import Page
 from config.settings import get_settings
 from db.models import Account
 from services.account_service import MONITOR_SCOPE, get_http_execution_strategy
+from services.tiktok_urls import media_id_from_url, parse_tiktok_url
 from executor.dom_actions import dismiss_cookie_banners
 
 logger = logging.getLogger("services.video_parser")
@@ -20,7 +21,6 @@ settings = get_settings()
 _EMPTY_DIAGNOSTIC_LAST_SAVED: dict[str, float] = {}
 _WARMUP_CACHE: dict[str, tuple[float, bool]] = {}
 
-VIDEO_ID_RE = re.compile(r"/video/(\d+)")
 PINNED_DOM_VERIFY_LIMIT = 6
 TIKTOK_API_RATE_LIMIT_STATUS_CODES = {8, 20012, 2190}
 _ITEM_LIST_KEYS = (
@@ -118,7 +118,7 @@ def _author_matches_item(item: dict, username_lower: str, *, allow_missing_autho
     return allow_missing_author
 
 
-def _get_aweme_id_from_item(item: dict) -> Optional[str]:
+def _get_aweme_id_from_item(item: dict, *, allow_generic_id: bool = True) -> Optional[str]:
     if not isinstance(item, dict):
         return None
     strong_keys = ("aweme_id", "awemeId", "awemeID", "video_id", "videoId", "item_id", "itemId")
@@ -129,6 +129,8 @@ def _get_aweme_id_from_item(item: dict) -> Optional[str]:
         s = str(val)
         if s.isdigit() and 16 <= len(s) <= 22:
             return s
+    if not allow_generic_id:
+        return None
     val = item.get("id")
     s = str(val) if val is not None else ""
     if s.isdigit() and 16 <= len(s) <= 22:
@@ -148,7 +150,7 @@ def _truthy_tiktok_flag(value: object) -> bool:
 def _item_is_pinned(item: dict) -> bool:
     return any(
         _truthy_tiktok_flag(item.get(key))
-        for key in ("is_pinned", "pinned", "isPinned", "isTop", "top", "is_top")
+        for key in ("is_pinned", "pinned", "isPinned", "isPinnedItem", "is_pinned_item", "isTop", "top", "is_top")
     )
 
 
@@ -168,6 +170,191 @@ def _get_create_time_from_item(item: dict) -> Optional[int]:
         if 1_000_000_000 < n < 4_000_000_000:
             return n
     return None
+
+
+def _extract_aweme_ids_ordered_from_payload(
+    payload: object,
+    username_lower: str,
+    found_list: List[Tuple[str, bool, Optional[int]]],
+    found_set: Set[str],
+) -> int:
+    if not isinstance(payload, (dict, list)):
+        return 0
+    allow_missing_author = _payload_mentions_username(payload, username_lower) if isinstance(payload, dict) else False
+    before = len(found_list)
+
+    def _walk(obj: object, depth: int = 0) -> None:
+        if depth > 10:
+            return
+        if isinstance(obj, dict):
+            for list_key in _ITEM_LIST_KEYS:
+                if list_key not in obj:
+                    continue
+                items = obj[list_key]
+                if isinstance(items, dict):
+                    items = [items]
+                if not isinstance(items, list):
+                    continue
+                for item in items:
+                    if not isinstance(item, dict):
+                        continue
+                    if not _author_matches_item(item, username_lower, allow_missing_author=allow_missing_author):
+                        continue
+                    aweme_id = _get_aweme_id_from_item(item)
+                    if not aweme_id or aweme_id in found_set:
+                        continue
+                    found_list.append((aweme_id, _item_is_pinned(item), _get_create_time_from_item(item)))
+                    found_set.add(aweme_id)
+            if not any(k in obj for k in _ITEM_LIST_KEYS):
+                aweme_id = _get_aweme_id_from_item(obj, allow_generic_id="video" in obj)
+                if aweme_id and _author_matches_item(obj, username_lower, allow_missing_author=allow_missing_author):
+                    if aweme_id not in found_set:
+                        found_list.append((aweme_id, _item_is_pinned(obj), _get_create_time_from_item(obj)))
+                        found_set.add(aweme_id)
+                for key, value in obj.items():
+                    if key not in ("log_pb", "extra", "status_code", "status_msg"):
+                        _walk(value, depth + 1)
+            else:
+                for wrapper_key in ("data", "body", "result", "userPost", "user_post", "__DEFAULT_SCOPE__", "webapp.user-detail"):
+                    if wrapper_key in obj:
+                        _walk(obj[wrapper_key], depth + 1)
+        elif isinstance(obj, list):
+            for item in obj:
+                _walk(item, depth + 1)
+
+    _walk(payload, 0)
+    return len(found_list) - before
+
+
+async def _probe_profile_videos_http_first(
+    page: Page,
+    username: str,
+    *,
+    limit: int = 12,
+    need_item_list: bool = True,
+) -> dict:
+    username_clean = str(username or "").strip().lstrip("@").lower()
+    fetch_count = max(15, min(35, int(limit or 12) * 2))
+    try:
+        result = await asyncio.wait_for(page.evaluate(
+            r"""async ({ username, count, needItemList }) => {
+                const out = {
+                    secUid: null,
+                    profileReason: null,
+                    statusCode: null,
+                    videoCount: null,
+                    ssrItemsPayload: null,
+                    userDetailPayload: null,
+                    itemListPayload: null,
+                };
+                const inspectUserInfo = (userDetail) => {
+                    if (!userDetail || typeof userDetail !== "object") return;
+                    const sc = Number(userDetail.statusCode ?? userDetail.status_code ?? 0);
+                    if (sc && !out.statusCode) out.statusCode = sc;
+                    if ([10202, 10221, 10222, 10223, 10204].includes(sc)) {
+                        out.profileReason = "profile_not_found";
+                    }
+                    const ui = userDetail.userInfo || userDetail.user_info || userDetail;
+                    if (sc !== 0) return;
+                    const u = ui.user || ui.author || {};
+                    const owner = String(u.uniqueId || u.unique_id || "").toLowerCase();
+                    if (owner !== username) return;
+                    const st = ui.stats || ui.statsV2 || {};
+                    if (typeof u.secUid === "string" && u.secUid) {
+                        out.secUid = u.secUid;
+                    }
+                    if (u && (u.privateAccount === true || u.secret === 1 || u.secret === true)) {
+                        out.profileReason = "private_profile";
+                    }
+                    if (st && st.videoCount !== undefined && st.videoCount !== null) {
+                        const vc = Number(st.videoCount);
+                        if (!Number.isNaN(vc)) {
+                            out.videoCount = vc;
+                            if (vc === 0 && !out.profileReason) {
+                                out.profileReason = "empty_profile";
+                            }
+                        }
+                    }
+                };
+                try {
+                    const el = document.getElementById("__UNIVERSAL_DATA_FOR_REHYDRATION__");
+                    if (el && el.textContent) {
+                        const data = JSON.parse(el.textContent);
+                        const scope = (data && data.__DEFAULT_SCOPE__) || {};
+                        const ud = scope["webapp.user-detail"];
+                        if (ud) {
+                            inspectUserInfo(ud);
+                            if (ud.itemList || ud.userPost) {
+                                out.ssrItemsPayload = ud;
+                            }
+                        }
+                    }
+                } catch (e) {}
+                try {
+                    if (!out.secUid) {
+                        const sigi = document.getElementById("SIGI_STATE");
+                        if (sigi && sigi.textContent) {
+                            const data = JSON.parse(sigi.textContent);
+                            if (data && data.ItemModule) {
+                                out.ssrItemsPayload = { itemList: Object.values(data.ItemModule) };
+                            }
+                            const module = data?.UserModule;
+                            const user = Object.values(module?.users || {}).find(u =>
+                                String(u?.uniqueId || u?.unique_id || "").toLowerCase() === username);
+                            if (user) inspectUserInfo({ user, stats: module.stats?.[user.uniqueId] });
+                        }
+                    }
+                } catch (e) {}
+                const language = navigator.language || "en";
+                const region = language.match(/-([a-z]{2})$/i)?.[1]?.toUpperCase() || "";
+                const common = {
+                    WebIdLastTime: Math.floor(Date.now() / 1000), aid: 1988,
+                    app_language: language.split("-")[0], app_name: "tiktok_web",
+                    browser_language: language, browser_name: "Mozilla",
+                    browser_online: navigator.onLine, browser_platform: navigator.platform,
+                    browser_version: navigator.userAgent.replace(/^Mozilla\//, ""),
+                    channel: "tiktok_web", cookie_enabled: navigator.cookieEnabled,
+                    device_platform: "web_pc", focus_state: document.hasFocus(), from_page: "user",
+                    history_len: history.length, is_fullscreen: Boolean(document.fullscreenElement),
+                    is_page_visible: !document.hidden, os: "windows", priority_region: region,
+                    referer: document.referrer, region, screen_height: screen.height, screen_width: screen.width,
+                    tz_name: Intl.DateTimeFormat().resolvedOptions().timeZone || "Etc/UTC",
+                };
+                const apiUrl = (path, extra) => `${path}?${new URLSearchParams({ ...common, ...extra })}`;
+                if (!out.secUid && !out.profileReason) {
+                    try {
+                        const detailUrl = apiUrl("/api/user/detail/", { uniqueId: username });
+                        const r = await fetch(detailUrl, { credentials: "include", signal: AbortSignal.timeout(4000) });
+                        if (r.status === 429) {
+                            out.userDetailPayload = { status_code: 8, status_msg: "HTTP 429 rate limit" };
+                        } else if (r.ok) {
+                            const j = await r.json();
+                            out.userDetailPayload = j;
+                            inspectUserInfo(j);
+                        }
+                    } catch (e) {}
+                }
+                if (needItemList && out.secUid && !out.profileReason) {
+                    try {
+                        const listUrl = apiUrl("/api/post/item_list/", { count, coverFormat: 2, cursor: 0, secUid: out.secUid });
+                        const r2 = await fetch(listUrl, { credentials: "include", signal: AbortSignal.timeout(4000) });
+                        if (r2.status === 429) {
+                            out.itemListPayload = { status_code: 8, status_msg: "HTTP 429 rate limit" };
+                        } else if (r2.ok) {
+                            const j2 = await r2.json();
+                            out.itemListPayload = j2;
+                        }
+                    } catch (e) {}
+                }
+                return out;
+            }""",
+            {"username": username_clean, "count": fetch_count, "needItemList": bool(need_item_list)},
+            isolated_context=False,
+        ), timeout=9.0)
+        return result if isinstance(result, dict) else {}
+    except Exception as exc:
+        logger.debug("[VIDEO_PARSER] HTTP profile probe failed for @%s: %s", username_clean, exc)
+        return {}
 
 
 def _should_save_empty_diagnostic(username: str) -> bool:
@@ -304,11 +491,7 @@ def extract_video_id(url: str) -> str | None:
     Returns:
         str | None: video_id или None если не найден
     """
-    if not url:
-        return None
-    
-    m = VIDEO_ID_RE.search(url)
-    return m.group(1) if m else None
+    return media_id_from_url(url, allow_relative=True)
 
 
 def is_valid_video_url(url: str, username: str) -> bool:
@@ -322,19 +505,9 @@ def is_valid_video_url(url: str, username: str) -> bool:
     Returns:
         bool: True если URL валиден
     """
-    if not url or not isinstance(url, str):
-        return False
-    
     username_lower = username.lower().lstrip("@")
-    url_lower = url.lower()
-    
-    if "tiktok.com" not in url_lower:
-        return False
-    
-    if f"/@{username_lower}/" not in url_lower:
-        return False
-    
-    return bool(re.search(rf"/@{re.escape(username_lower)}/video/\d+", url_lower))
+    parsed = parse_tiktok_url(url)
+    return bool(parsed and parsed.path.lower().startswith(f"/@{username_lower}/") and media_id_from_url(url))
 
 
 async def warmup_before_parsing(page: Page, account: Account) -> dict[str, str | bool]:
@@ -619,7 +792,7 @@ async def quick_detect_dead_account_for_parsing(page: Page, username: str) -> tu
         except Exception as cleanup_exc:
             logger.debug("[VIDEO_PARSER] Cookie banner cleanup before account detection failed: %s", cleanup_exc)
 
-        dead_account_check = await page.evaluate("""
+        dead_account_check = await page.evaluate(r"""
             () => {
                 const checks = {
                     hasLoginButton: false,
@@ -1226,13 +1399,14 @@ async def fetch_latest_videos_from_profile(
         RateLimited: Если TikTok вернул rate limit (HTTP 429)
     """
     profile_url = f"https://www.tiktok.com/@{username}"
-    
+    network_mode = settings.TIKTOK_NETWORK_FIRST and settings.TIKTOK_NETWORK_IMPL_READY
+
     try:
         logger.debug(f"[VIDEO_PARSER] Fetching videos from profile: {username} (stop_at={stop_at_video_id})")
         
         # ИСПРАВЛЕНО: Warm-up перед парсингом профиля
         warmup_state = {"performed": False, "mode": "disabled"}
-        if account and settings.VIDEO_PARSING_WARMUP_ENABLED:
+        if account and settings.VIDEO_PARSING_WARMUP_ENABLED and not network_mode:
             try:
                 warmup_state = await warmup_before_parsing(page, account)
             except PageBlocked:
@@ -1314,168 +1488,9 @@ async def fetch_latest_videos_from_profile(
                                         str(status_msg)[:120],
                                     )
                                     return
-                                # P0: Извлекаем aweme_id с сохранением порядка и pinned статуса
-                                def _extract_author_username(item: dict) -> Optional[str]:
-                                    try:
-                                        # Try multiple author container keys; TikTok rotates between them.
-                                        for author_key in ("author", "authorInfo", "author_info", "userInfo", "user"):
-                                            author = item.get(author_key)
-                                            if isinstance(author, dict):
-                                                for uid_key in ("unique_id", "uniqueId", "uniqueID", "username", "user_unique_id", "userUniqueId"):
-                                                    uid = author.get(uid_key)
-                                                    if uid:
-                                                        return str(uid).lower().lstrip("@")
-                                                # Sometimes nested as author.userInfo.uniqueId
-                                                nested = author.get("userInfo") or author.get("user")
-                                                if isinstance(nested, dict):
-                                                    for uid_key in ("unique_id", "uniqueId", "username"):
-                                                        uid = nested.get(uid_key)
-                                                        if uid:
-                                                            return str(uid).lower().lstrip("@")
-                                            if isinstance(author, str):
-                                                return author.lower().lstrip("@")
-                                        # Top-level fallbacks (some endpoints flatten)
-                                        for direct_key in ("author_name", "authorName", "unique_id", "uniqueId",
-                                                           "username", "nickname", "uniqueID"):
-                                            direct = item.get(direct_key)
-                                            if direct:
-                                                return str(direct).lower().lstrip("@")
-                                    except Exception:
-                                        return None
-                                    return None
-
-                                def _author_matches(item: dict, allow_missing_author: bool) -> bool:
-                                    return _author_matches_item(
-                                        item,
-                                        username_lower,
-                                        allow_missing_author=allow_missing_author,
-                                    )
-
-                                def _response_matches_username(payload: dict) -> bool:
-                                    return _payload_mentions_username(payload, username_lower)
-
-                                allow_missing_author = False
-                                if _response_matches_username(response_json):
-                                    allow_missing_author = True
-                                else:
-                                    allow_missing_author = False
-
-                                def _get_aweme_id(item: dict) -> Optional[str]:
-                                    return _get_aweme_id_from_item(item)
-
-                                def _get_create_time(item: dict) -> Optional[int]:
-                                    return _get_create_time_from_item(item)
-
-                                # Список ключей-обёрток вокруг которых TikTok прячет items
-                                # data.itemList / body.itemList / result.itemList / userPost.itemList и т.д.
-                                def extract_aweme_ids_ordered(obj, found_list, found_set, depth=0):
-                                    """Извлекает aweme_id с сохранением порядка из API ответа."""
-                                    if depth > 10:
-                                        return
-                                    if isinstance(obj, dict):
-                                        # Сначала пробуем найти любой из известных ключей-списков на текущем уровне
-                                        for list_key in _ITEM_LIST_KEYS:
-                                            if list_key not in obj:
-                                                continue
-                                            items = obj[list_key]
-                                            if isinstance(items, dict):
-                                                items = [items]
-                                            if not isinstance(items, list):
-                                                continue
-                                            for item in items:
-                                                if not isinstance(item, dict):
-                                                    continue
-                                                if not _author_matches(item, allow_missing_author):
-                                                    continue
-                                                aweme_id = _get_aweme_id(item)
-                                                if not aweme_id:
-                                                    continue
-                                                is_pinned = _item_is_pinned(item)
-                                                create_time = _get_create_time(item)
-                                                if aweme_id not in found_set:
-                                                    found_list.append((aweme_id, is_pinned, create_time))
-                                                    found_set.add(aweme_id)
-                                                    logger.debug(f"[VIDEO_PARSER] Found aweme_id in {list_key}: {aweme_id} (pinned: {is_pinned})")
-
-                                        # Legacy explicit branches (оставлены для совместимости диагностических логов)
-                                        if "itemList" in obj:
-                                            items = obj["itemList"]
-                                            if isinstance(items, list):
-                                                for item in items:
-                                                    if not isinstance(item, dict):
-                                                        continue
-                                                    if not _author_matches(item, allow_missing_author):
-                                                        continue
-                                                    aweme_id = _get_aweme_id(item)
-                                                    if not aweme_id:
-                                                        continue
-                                                    is_pinned = _item_is_pinned(item)
-                                                    create_time = _get_create_time(item)
-                                                    if aweme_id not in found_set:
-                                                        found_list.append((aweme_id, is_pinned, create_time))
-                                                        found_set.add(aweme_id)
-                                                        logger.debug(f"[VIDEO_PARSER] Found aweme_id in itemList: {aweme_id} (pinned: {is_pinned})")
-                                        if "item_list" in obj:
-                                            items = obj["item_list"]
-                                            if isinstance(items, list):
-                                                for item in items:
-                                                    if not isinstance(item, dict):
-                                                        continue
-                                                    if not _author_matches(item, allow_missing_author):
-                                                        continue
-                                                    aweme_id = _get_aweme_id(item)
-                                                    if not aweme_id:
-                                                        continue
-                                                    is_pinned = _item_is_pinned(item)
-                                                    create_time = _get_create_time(item)
-                                                    if aweme_id not in found_set:
-                                                        found_list.append((aweme_id, is_pinned, create_time))
-                                                        found_set.add(aweme_id)
-                                                        logger.debug(f"[VIDEO_PARSER] Found aweme_id in item_list: {aweme_id} (pinned: {is_pinned})")
-                                        if "aweme_list" in obj:
-                                            items = obj["aweme_list"]
-                                            if isinstance(items, list):
-                                                for item in items:
-                                                    if not isinstance(item, dict):
-                                                        continue
-                                                    if not _author_matches(item, allow_missing_author):
-                                                        continue
-                                                    aweme_id = _get_aweme_id(item)
-                                                    if not aweme_id:
-                                                        continue
-                                                    is_pinned = _item_is_pinned(item)
-                                                    create_time = _get_create_time(item)
-                                                    if aweme_id not in found_set:
-                                                        found_list.append((aweme_id, is_pinned, create_time))
-                                                        found_set.add(aweme_id)
-                                                        logger.debug(f"[VIDEO_PARSER] Found aweme_id in aweme_list: {aweme_id} (pinned: {is_pinned})")
-                                        # Если на этом уровне ничего из известных ключей-списков нет,
-                                        # пробуем item-как-объект и рекурсивно спускаемся в детей.
-                                        if not any(k in obj for k in _ITEM_LIST_KEYS):
-                                            aweme_id = _get_aweme_id(obj)
-                                            if aweme_id and _author_matches(obj, allow_missing_author):
-                                                is_pinned = _item_is_pinned(obj)
-                                                create_time = _get_create_time(obj)
-                                                if aweme_id not in found_set:
-                                                    found_list.append((aweme_id, is_pinned, create_time))
-                                                    found_set.add(aweme_id)
-                                                    logger.debug(f"[VIDEO_PARSER] Found aweme_id: {aweme_id} (pinned: {is_pinned})")
-                                            for key, value in obj.items():
-                                                if key not in ["log_pb", "extra", "status_code", "status_msg"]:
-                                                    extract_aweme_ids_ordered(value, found_list, found_set, depth + 1)
-                                        else:
-                                            # Уже нашли список(и) на этом уровне — спускаемся только в типичные обёртки,
-                                            # чтобы не разогнать рекурсию по statistic-полям items.
-                                            for wrapper_key in ("data", "body", "result", "userPost", "user_post"):
-                                                if wrapper_key in obj:
-                                                    extract_aweme_ids_ordered(obj[wrapper_key], found_list, found_set, depth + 1)
-                                    elif isinstance(obj, list):
-                                        for item in obj:
-                                            extract_aweme_ids_ordered(item, found_list, found_set, depth + 1)
-                                
-                                before_count = len(video_ids_from_api_ordered)
-                                extract_aweme_ids_ordered(response_json, video_ids_from_api_ordered, video_ids_from_api_set)
-                                added = len(video_ids_from_api_ordered) - before_count
+                                added = _extract_aweme_ids_ordered_from_payload(
+                                    response_json, username_lower, video_ids_from_api_ordered, video_ids_from_api_set,
+                                )
                                 if added > 0:
                                     logger.info(f"[VIDEO_PARSER] Extracted {added} new video IDs from API response (ordered)")
                                 else:
@@ -1558,11 +1573,17 @@ async def fetch_latest_videos_from_profile(
                     logger.warning(f"[VIDEO_PARSER] Rate limited for @{username} (HTTP 429)")
                     raise RateLimited(f"Rate limited for @{username}")
                 elif response.status >= 500:
-                    logger.warning(f"[VIDEO_PARSER] Server error for @{username}: {response.status}")
-                    raise PageBlocked(f"Server error for @{username}: HTTP {response.status}")
+                    return ScanResult(
+                        status="FAIL", new_videos=[], newest_normal_video_id=None, anchor_found=False,
+                        canonical_source="API" if network_mode else "DOM", pages_loaded=1,
+                        diagnostics=_build_api_diagnostics({
+                            "reason": "profile_server_error", "error_type": "upstream_http",
+                            "error": f"HTTP {response.status} from profile page",
+                        }),
+                    )
         
-            # КРИТИЧНО: Минимальная задержка для загрузки базового DOM (1-2 секунды)
-            await asyncio.sleep(random.uniform(1.0, 2.0))
+            if not network_mode:
+                await asyncio.sleep(random.uniform(1.0, 2.0))
             
             # КРИТИЧНО: БЫСТРАЯ проверка мертвого аккаунта СРАЗУ после загрузки
             account_status, reason = await quick_detect_dead_account_for_parsing(page, username)
@@ -1583,13 +1604,57 @@ async def fetch_latest_videos_from_profile(
                 )
             await asyncio.sleep(delay)
             
-            # ИСПРАВЛЕНО: Ждем загрузки данных через API (увеличено время ожидания)
+            # HTTP-First: Активный запрос данных профиля через SSR JSON + подписанный fetch(/api/post/item_list/)
+            http_profile_reason: Optional[str] = None
             try:
-                # Ждем появления video_ids в API ответах
+                if network_mode and not api_rate_limited and not _has_sufficient_api_ids(video_ids_from_api_ordered, limit, stop_at_video_id):
+                    http_probe = await _probe_profile_videos_http_first(
+                        page,
+                        username_lower,
+                        limit=limit,
+                        need_item_list=True,
+                    )
+                    for payload_key in ("ssrItemsPayload", "userDetailPayload", "itemListPayload"):
+                        payload_obj = http_probe.get(payload_key)
+                        if isinstance(payload_obj, dict):
+                            if _is_tiktok_api_rate_limited_payload(payload_obj):
+                                api_rate_limited = True
+                            else:
+                                added_http = _extract_aweme_ids_ordered_from_payload(
+                                    payload_obj,
+                                    username_lower,
+                                    video_ids_from_api_ordered,
+                                    video_ids_from_api_set,
+                                )
+                                if added_http > 0:
+                                    api_responses_received.append(f"http_probe:{payload_key}")
+                    if http_probe.get("profileReason") in {"profile_not_found", "private_profile", "empty_profile"}:
+                        http_profile_reason = str(http_probe["profileReason"])
+            except Exception as probe_exc:
+                logger.debug(f"[VIDEO_PARSER] HTTP probe error for @{username}: {probe_exc}")
+
+            # ИСПРАВЛЕНО: Ждем загрузки данных через API (ускоренный цикл если HTTP-probe уже отработал)
+            try:
+                if api_rate_limited:
+                    raise RateLimited(f"Rate limited for @{username} (TikTok API throttle)")
+                if http_profile_reason and not video_ids_from_api_ordered:
+                    logger.info(f"[VIDEO_PARSER] HTTP probe confirmed {http_profile_reason} for @{username}")
+                    return ScanResult(
+                        status="EMPTY",
+                        new_videos=[],
+                        newest_normal_video_id=None,
+                        anchor_found=False,
+                        canonical_source="API",
+                        pages_loaded=1,
+                        diagnostics=_build_api_diagnostics({"reason": http_profile_reason, "http_probe": True}),
+                    )
                 logger.debug(f"[VIDEO_PARSER] Waiting for API responses for @{username}...")
                 previous_count = 0
                 stagnant_polls = 0
-                for i in range(30):  # Проверяем каждые 0.5 секунды в течение 15 секунд
+                max_wait_polls = 6 if network_mode else 30
+                for i in range(max_wait_polls):
+                    if api_rate_limited or _has_sufficient_api_ids(video_ids_from_api_ordered, limit, stop_at_video_id):
+                        break
                     await asyncio.sleep(0.5)
                     current_count = len(video_ids_from_api_ordered)
                     if current_count == previous_count:
@@ -1643,7 +1708,17 @@ async def fetch_latest_videos_from_profile(
         await ensure_page_ok(page, username)
         
         # ИСПРАВЛЕНО: Имитация человеческого взаимодействия
-        await simulate_human_interaction(page, username, light=warmup_state.get("mode") == "light")
+        if network_mode and not video_ids_from_api_ordered:
+            return ScanResult(
+                status="FAIL", new_videos=[], newest_normal_video_id=None, anchor_found=False,
+                canonical_source="API", pages_loaded=1,
+                diagnostics=_build_api_diagnostics({
+                    "reason": "profile_api_unavailable", "error_type": "upstream_http",
+                    "error": "Profile API returned no usable videos",
+                }),
+            )
+        if not network_mode:
+            await simulate_human_interaction(page, username, light=warmup_state.get("mode") == "light")
         
         # P0: API - канонический источник, используем его как основной
         canonical_videos: List[Tuple[str, str, bool, Optional[int]]] = []  # (video_id, url, is_pinned, create_time)
@@ -1662,7 +1737,7 @@ async def fetch_latest_videos_from_profile(
             suspicious_api_fallback_added = 0
 
             # Optional DOM check for pinned in top items (anchor safety)
-            if stop_at_video_id:
+            if stop_at_video_id and not network_mode:
                 try:
                     dom_meta = await extract_videos_with_metadata(page, username)
                     if dom_meta:
@@ -1679,7 +1754,7 @@ async def fetch_latest_videos_from_profile(
             
             # P1: УЛУЧШЕНО: Более реалистичный скролл даже при API (маскировка)
             # Даже если API дал данные, нужно имитировать просмотр профиля
-            if settings.HUMAN_LIKE_BEHAVIOR:
+            if settings.HUMAN_LIKE_BEHAVIOR and not network_mode:
                 try:
                     from executor.human_behavior import scroll_wheel_natural, simulate_reading, random_mouse_movement
                     # Имитируем просмотр профиля: скроллим с настраиваемым количеством
@@ -1718,7 +1793,8 @@ async def fetch_latest_videos_from_profile(
 
             suspicious_min_videos = int(getattr(settings, "MONITOR_API_SUSPICIOUS_MIN_VIDEOS", 3))
             if (
-                getattr(settings, "MONITOR_API_SUSPICIOUS_FALLBACK_ENABLED", True)
+                not network_mode
+                and getattr(settings, "MONITOR_API_SUSPICIOUS_FALLBACK_ENABLED", True)
                 and stop_at_video_id
                 and 0 < api_canonical_count < suspicious_min_videos
             ):
@@ -1818,6 +1894,15 @@ async def fetch_latest_videos_from_profile(
                     if video_id and is_valid_video_url(href, username):
                         canonical_videos.append((video_id, href, False, None))
         
+        if network_mode and not canonical_videos:
+            return ScanResult(
+                status="FAIL", new_videos=[], newest_normal_video_id=None, anchor_found=False,
+                canonical_source="API", pages_loaded=1,
+                diagnostics=_build_api_diagnostics({
+                    "reason": "profile_api_invalid_videos", "error_type": "upstream_http",
+                    "error": "Profile API returned invalid video IDs",
+                }),
+            )
         if not canonical_videos:
             # Fallback: Пробуем найти видео через JSON данные страницы (последняя попытка)
             try:
@@ -2180,7 +2265,7 @@ async def fetch_latest_videos_from_profile(
         
         # УЛУЧШЕНО: Имитация "возврата назад" после просмотра профиля (маскировка)
         exit_chance = getattr(settings, "VIDEO_PARSING_EXIT_BEHAVIOR_CHANCE", 0.4)
-        if settings.HUMAN_LIKE_BEHAVIOR and random.random() < exit_chance:
+        if settings.HUMAN_LIKE_BEHAVIOR and not network_mode and random.random() < exit_chance:
             try:
                 from executor.human_behavior import scroll_wheel_natural, random_mouse_movement
                 # Небольшой скролл вверх (как будто пересматриваешь начало)

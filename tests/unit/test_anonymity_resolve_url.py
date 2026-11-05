@@ -41,6 +41,30 @@ def use_proxy(monkeypatch):
 
 @pytest.mark.unit
 @pytest.mark.asyncio
+async def test_shortlink_rejects_external_location_before_following_it(monkeypatch, use_proxy):
+    import httpx
+    from executor import engagement_engine
+
+    use_proxy(False)
+    original_client = httpx.AsyncClient
+    get_pool = _install_pool(monkeypatch, {}, forbid=True)
+    requested = []
+    short = "https://www.tiktok.com/t/ZFixture/"
+
+    def handler(request):
+        requested.append(str(request.url))
+        return httpx.Response(302, headers={"Location": "http://127.0.0.1:4443/private"})
+
+    monkeypatch.setattr(httpx, "AsyncClient", lambda **kwargs: original_client(
+        transport=httpx.MockTransport(handler), **kwargs,
+    ))
+    assert await engagement_engine.resolve_video_url(short) == (short, None)
+    assert requested == [short]
+    get_pool.assert_not_awaited()
+
+
+@pytest.mark.unit
+@pytest.mark.asyncio
 async def test_resolve_returns_existing_id_unchanged():
     """Canonical URL с aweme_id — возвращаем как есть, без HTTP."""
     from executor.engagement_engine import resolve_video_url

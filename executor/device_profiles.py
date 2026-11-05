@@ -309,7 +309,8 @@ async def prepare_device_page(page):
             # Apply the same geometry used by the viewport and identity script.
             geometry = profile["identity"].get("geometry")
             from config.settings import get_settings
-            if geometry and get_settings().PLAYWRIGHT_SYNC_WINDOW_WITH_VIEWPORT:
+            shared_proc = bool(getattr(getattr(page, "context", None), "_shared_browser_process", False))
+            if geometry and get_settings().PLAYWRIGHT_SYNC_WINDOW_WITH_VIEWPORT and not shared_proc:
                 window = await session.send("Browser.getWindowForTarget")
                 if isinstance(window, dict) and type(window.get("windowId")) is int:
                     await session.send("Browser.setWindowBounds", {

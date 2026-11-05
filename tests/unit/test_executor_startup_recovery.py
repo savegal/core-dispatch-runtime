@@ -1,8 +1,14 @@
-import pytest
+import asyncio
 import os
+import threading
+from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
+from unittest.mock import AsyncMock, Mock
 
-from db.models import Task, User
+import pytest
+from sqlalchemy.orm import Session
+
+from db.models import PendingEnqueue, Task, User
 
 
 class _FakeRedis:
@@ -155,3 +161,65 @@ def test_mark_task_settings_dirty_persists_in_place_json_update(db_session):
 
     saved = db_session.query(Task).filter(Task.id == task.id).one()
     assert saved.settings["url_results"]["https://www.tiktok.com/@demo/video/1"]["status"] == "success"
+
+
+@pytest.mark.unit
+def test_stale_reply_likes_are_requeued_and_resumed_without_republishing(db_session, monkeypatch):
+    from executor import engagement_engine, executor, reply_visibility, user_schema
+    from services import task_service, task_stop_signal
+
+    user = User(telegram_id=981002, role="user", balance=100, is_blocked=False)
+    db_session.add(user)
+    db_session.flush()
+    media_id = "1234567890123456789"
+    url = f"https://www.tiktok.com/@demo/video/{media_id}"
+    parent, cid = "7641761192486194454", "7641761192486194455"
+    plan = {
+        "state": "pending", "requested_per_reply": 2, "targets": [{"cid": cid, "parent_id": parent}],
+        "attempts": {cid: {"8": "confirmed"}}, "exclude_account_ids": [1], "by_comment_id": {cid: 1},
+    }
+    task = Task(user_id=user.id, kind="full", status="in_progress", main_comment="main", video_urls=[url],
+                updated_at=datetime.now(timezone.utc) - timedelta(hours=1), total_cost=10,
+                settings={"account_pool_mode": "personal", "url_results": {url: {
+                    "status": "success", "publication_complete": True, "reply_likes": plan,
+                }}})
+    db_session.add(task)
+    db_session.commit()
+    task_id = task.id
+
+    enqueue = Mock(side_effect=ConnectionError("Redis unavailable"))
+    monkeypatch.setattr(task_service, "enqueue_task_once", enqueue)
+    assert task_service.recover_stuck_tasks(db_session, timeout_seconds=60) == 1
+    db_session.refresh(task)
+    assert task.status == "pending" and not task.refunded_cost
+    assert db_session.query(PendingEnqueue).filter_by(task_id=task_id).one()
+    enqueue.side_effect = None
+    assert task_service.recover_pending_enqueues(db_session) == 1
+
+    publish = AsyncMock(side_effect=AssertionError("publication was already completed"))
+    verify = AsyncMock(side_effect=AssertionError("visibility was already checked"))
+    boost = AsyncMock(return_value={cid: 2})
+    monkeypatch.setattr(engagement_engine, "execute_hybrid_full", publish)
+    monkeypatch.setattr(user_schema, "execute_user_schema_full", publish)
+    monkeypatch.setattr(reply_visibility, "verify_order_reply_visibility", verify)
+    monkeypatch.setattr(user_schema, "boost_target_replies_via_http_pool", boost)
+    monkeypatch.setattr(task_stop_signal, "is_task_stop_requested", lambda _: False)
+    monkeypatch.setattr(executor, "get_sync_db", lambda: iter([Session(db_session.get_bind())]))
+    monkeypatch.setattr(executor, "_shutdown_event", threading.Event())
+    monkeypatch.setattr(executor.settings, "TIKTOK_NETWORK_FIRST", True)
+    monkeypatch.setattr(executor.settings, "TIKTOK_NETWORK_IMPL_READY", True)
+    monkeypatch.setenv("AUTO_BOOST_LIKES", "1")
+    loop = asyncio.new_event_loop()
+    monkeypatch.setattr(executor, "get_event_loop", lambda: loop)
+    try:
+        executor.process_task(task_id)
+    finally:
+        loop.close()
+
+    db_session.refresh(task)
+    assert task.status == "done"
+    assert task.settings["url_results"][url]["reply_likes"]["state"] == "completed"
+    assert task.settings["url_results"][url]["reply_likes"]["by_comment_id"] == {cid: 2}
+    assert boost.await_args.kwargs["attempts"] == {cid: {"8": "confirmed"}}
+    publish.assert_not_awaited()
+    verify.assert_not_awaited()

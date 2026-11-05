@@ -2,6 +2,7 @@ from datetime import datetime, timezone, timedelta
 from sqlalchemy.orm import Session
 from db.models import CreatorSource, CreatorVideo, MonitorOutbox, Task, PendingEnqueue
 from config.settings import get_settings
+from services.likes_config import pending_reply_likes
 from services.redis_service import get_redis_client
 import logging
 import time
@@ -773,8 +774,8 @@ def recover_stuck_tasks(db: Session, timeout_seconds: int = TASK_TIMEOUT_SECONDS
     """
     ИСПРАВЛЕНО: Восстанавливает зависшие задачи (в статусе "in_progress" дольше timeout_seconds).
     
-    Если задача зависла без прогресса (progress=0) - переводит в error с refund.
-    Если есть прогресс - переводит в partial/error с refund за неуспешные видео.
+    Незавершённую фазу лайков с сохранёнными целями можно возобновить один раз.
+    Для остальных задач применяется возврат с учётом прогресса.
     
     Args:
         db: SQLAlchemy сессия
@@ -810,6 +811,28 @@ def recover_stuck_tasks(db: Session, timeout_seconds: int = TASK_TIMEOUT_SECONDS
         )
         
         try:
+            task_settings = dict(task.settings or {})
+            url_results = task_settings.get("url_results")
+            has_pending_likes = isinstance(url_results, dict) and any(map(pending_reply_likes, url_results.values()))
+            if has_pending_likes and not task_settings.get("stopped_by_user") and not task_settings.get("_reply_likes_requeued"):
+                task_id = task.id
+                task_settings["_reply_likes_requeued"] = True
+                changed = db.query(Task).filter(
+                    Task.id == task_id, Task.status == "in_progress", Task.updated_at < timeout_threshold,
+                ).update(
+                    {Task.status: "pending", Task.settings: task_settings, Task.updated_at: now},
+                    synchronize_session=False,
+                )
+                if not changed:
+                    db.rollback()
+                    continue
+                reserve_task_for_enqueue(db, task_id)
+                db.commit()
+                recovered_count += 1
+                finalize_reserved_enqueue(db, task_id)
+                logger.info("Task %s returned to the queue to resume reply likes", task_id)
+                continue
+
             # Определяем финальный статус
             if progress == 0:
                 # Нет прогресса - полный fail с refund

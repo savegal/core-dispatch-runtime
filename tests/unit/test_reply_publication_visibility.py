@@ -97,6 +97,18 @@ async def test_same_text_different_id_is_missing_only_after_complete_read(monkey
     assert report["absent_ids"] == [CID] and report["complete"]
 
 
+@pytest.mark.parametrize("parent_visible", [False, True])
+async def test_empty_reply_branch_proves_absence_only_if_parent_is_visible(monkeypatch, parent_visible):
+    monkeypatch.setattr(visibility, "fetch_reply_page", AsyncMock(return_value={"comments": [], "has_more": 0, "total": 0}))
+    parent = AsyncMock(return_value={"found_ids": [PARENT] if parent_visible else []})
+    monkeypatch.setattr(visibility, "scan_main_comment_ids", parent)
+    evidence = await visibility.scan_reply_comment_ids(None, VIDEO, PARENT, [CID], max_pages=2)
+    parent.assert_awaited_once_with(None, VIDEO, [PARENT], max_pages=2)
+    assert evidence["complete"] is parent_visible
+    assert evidence["absent_ids"] == ([CID] if parent_visible else [])
+    assert evidence["reason"] == ("exhausted" if parent_visible else "reply_parent_visibility_unconfirmed")
+
+
 async def test_positive_survives_later_api_failure(monkeypatch):
     monkeypatch.setattr(visibility, "fetch_reply_page", AsyncMock(side_effect=[branch(CID, more=1), None]))
     page = SimpleNamespace(_reply_list_http_meta={"reason": "empty_body"})
@@ -112,6 +124,115 @@ async def test_disabled_reply_mode_does_not_allocate_accounts(adapter, key, valu
     await visibility.verify_order_reply_visibility(adapter.db, adapter.task, URL, row)
     assert row == before and not adapter.snapshots
     adapter.selector.assert_not_called()
+
+
+@pytest.mark.parametrize("kind", ["full", "engagement_only", "keyword_replies"])
+async def test_reply_likes_only_send_to_selected_public_cid(adapter, monkeypatch, kind):
+    monkeypatch.setenv("AUTO_BOOST_LIKES", "1")
+    boost = AsyncMock(return_value={NEW: 15})
+    monkeypatch.setattr(adapter.schema, "boost_target_replies_via_http_pool", boost)
+    adapter.task.kind = kind
+    adapter.task.settings.update(verify_reply_visibility=False, reply_like_target="2", reply_like_count=15)
+    row = result(item(), item(NEW, variant=2))
+    row.update(mode=kind, resolved_video_url=URL, aweme_id=VIDEO)
+    if kind == "full":
+        row["engagement"]["main"] = {"comment_id": PARENT, "account_id": 2}
+    if kind == "keyword_replies":
+        adapter.task.settings["verify_reply_visibility"] = True
+        adapter.task.settings["keyword_repair_rounds"] = 3
+        adapter.scan.return_value = {"found_ids": [NEW], "absent_ids": [CID], "complete": True}
+    else:
+        adapter.scan.return_value = {"found_ids": [NEW], "absent_ids": [], "complete": False}
+
+    await visibility.verify_order_reply_visibility(adapter.db, adapter.task, URL, row)
+
+    adapter.publish.assert_not_awaited()
+    if kind == "keyword_replies":
+        boost.assert_not_awaited()
+        assert "reply_likes" not in row
+    else:
+        assert adapter.scan.await_args.args[3] == [NEW]
+        assert boost.await_args.kwargs["targets"] == [{"cid": NEW, "parent_id": PARENT}]
+        assert boost.await_args.kwargs["max_likes"] == 15
+        assert row["reply_likes"]["by_comment_id"] == {NEW: 15}
+        assert any(snapshot.get("reply_likes", {}).get("state") == "pending" for snapshot in adapter.snapshots)
+        assert adapter.snapshots[-1]["reply_likes"]["by_comment_id"] == {NEW: 15}
+        assert row["status"] == "success" and row["engagement"]["replies"]["ok"] == 2
+
+
+async def test_reply_like_resume_does_not_redispatch_an_unconfirmed_attempt(adapter, monkeypatch):
+    from executor.http.playwright_http_client import PlaywrightHttpClient
+
+    monkeypatch.setenv("AUTO_BOOST_LIKES", "1")
+    row = result(item())
+    row["reply_likes"] = {
+        "state": "pending", "requested_per_reply": 3, "targets": [{"cid": CID, "parent_id": PARENT}],
+        "by_comment_id": {CID: 0}, "attempts": {}, "exclude_account_ids": [1],
+    }
+    sent = []
+
+    def select(*args, exclude_ids, **kwargs):
+        return next((adapter.accounts[key] for key in (8, 9, 10, 20) if key not in exclude_ids), None)
+
+    async def like(*, correlation_id, **kwargs):
+        account_id = correlation_id.split("_acc")[1].split("_")[0]
+        assert adapter.snapshots[-1]["reply_likes"]["attempts"][CID][account_id] == "unconfirmed"
+        sent.append(account_id)
+        if account_id == "9":
+            raise asyncio.CancelledError
+        return True, None, None
+
+    monkeypatch.setattr(adapter.schema, "get_free_account_for_reply", select)
+    monkeypatch.setattr(PlaywrightHttpClient, "from_page", AsyncMock(return_value=SimpleNamespace(like_comment=like)))
+    with pytest.raises(asyncio.CancelledError):
+        await visibility.resume_reply_likes(adapter.db, adapter.task, URL, row)
+
+    saved = copy.deepcopy(adapter.snapshots[-1])
+    assert saved["reply_likes"]["attempts"] == {CID: {"8": "confirmed", "9": "unconfirmed"}}
+    await visibility.resume_reply_likes(adapter.db, adapter.task, URL, saved)
+
+    assert sent == ["8", "9", "10"]
+    assert adapter.snapshots[-1]["reply_likes"]["by_comment_id"] == {CID: 2}
+    assert adapter.snapshots[-1]["reply_likes"]["state"] == "completed"
+    adapter.publish.assert_not_awaited()
+    adapter.scan.assert_not_awaited()
+
+
+async def test_reply_like_keeps_attempt_if_transport_loses_dispatch_event(adapter, monkeypatch):
+    from executor.http.playwright_http_client import PlaywrightHttpClient
+
+    monkeypatch.setenv("AUTO_BOOST_LIKES", "1")
+    row = result(item())
+    row["reply_likes"] = {
+        "state": "pending", "requested_per_reply": 1, "targets": [{"cid": CID, "parent_id": PARENT}],
+        "by_comment_id": {CID: 0}, "attempts": {}, "exclude_account_ids": [1],
+    }
+    client = SimpleNamespace(
+        like_comment=AsyncMock(return_value=(False, "transport failed", None)),
+        last_request_meta={"request_attempted": False, "transport_invoked": True},
+    )
+    monkeypatch.setattr(PlaywrightHttpClient, "from_page", AsyncMock(return_value=client))
+
+    await visibility.resume_reply_likes(adapter.db, adapter.task, URL, row)
+
+    client.like_comment.assert_awaited_once()
+    assert row["reply_likes"]["attempts"] == {CID: {"8": "unconfirmed"}}
+    assert row["reply_likes"]["by_comment_id"] == {CID: 0}
+
+
+async def test_unconfirmed_priority_does_not_fall_back_to_another_reply(adapter, monkeypatch):
+    monkeypatch.setenv("AUTO_BOOST_LIKES", "1")
+    boost = AsyncMock()
+    monkeypatch.setattr(adapter.schema, "boost_target_replies_via_http_pool", boost)
+    adapter.task.settings.update(reply_like_target="2", reply_like_count=1)
+    adapter.scan.return_value = {"found_ids": [CID], "absent_ids": [], "complete": False}
+    row = result(item(), item(NEW, variant=2))
+
+    await visibility.verify_order_reply_visibility(adapter.db, adapter.task, URL, row)
+
+    boost.assert_not_awaited()
+    assert row["reply_likes"]["by_comment_id"] == {}
+    assert row[visibility.REPORT_KEY]["confirmed"] == 1
 
 
 @pytest.mark.parametrize("format", ["full", "engagement_only"])

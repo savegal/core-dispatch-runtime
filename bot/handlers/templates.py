@@ -11,13 +11,16 @@ from bot.services.formatting import markdown_inline_code
 from bot.services.likes_ui import LIKES_DISABLED_LABEL, format_reply_likes_label
 from bot.services.template_utils import (
     has_meaningful_text,
+    is_keywords_template,
     is_replies_only_template,
     normalize_text_variants_list,
     normalize_user_text,
     preserve_nonempty_lines,
+    template_keywords,
     template_replies,
     template_text_variants,
 )
+from services.keyword_replies import normalize_keywords
 from bot.services.user_utils import get_user_backend_id
 from bot.services.order_creation_ui import current_order_transport_label
 from bot.state.order_states import OrderStates
@@ -79,12 +82,13 @@ def _replies_lines(replies: list[str]) -> list[str]:
     return lines
 
 
-def _template_detail_keyboard(template_id: int, *, replies_only: bool = False) -> InlineKeyboardMarkup:
-    use_button = (
-        InlineKeyboardButton(text="🚀 Создать заказ с ответами", callback_data=f"engagement:from_template:{template_id}")
-        if replies_only
-        else InlineKeyboardButton(text="✅ Использовать", callback_data=f"template:apply:{template_id}")
-    )
+def _template_detail_keyboard(template_id: int, *, replies_only: bool = False, keywords_only: bool = False) -> InlineKeyboardMarkup:
+    if keywords_only:
+        use_button = InlineKeyboardButton(text="🔎 Заказ по ключевым словам", callback_data=f"engagement:from_keyword_template:{template_id}")
+    elif replies_only:
+        use_button = InlineKeyboardButton(text="🚀 Создать заказ с ответами", callback_data=f"engagement:from_template:{template_id}")
+    else:
+        use_button = InlineKeyboardButton(text="✅ Использовать", callback_data=f"template:apply:{template_id}")
     return InlineKeyboardMarkup(
         inline_keyboard=[
             [use_button],
@@ -97,28 +101,66 @@ def _template_detail_keyboard(template_id: int, *, replies_only: bool = False) -
     )
 
 
-def _template_edit_keyboard(template_id: int, *, replies_only: bool = False) -> InlineKeyboardMarkup:
+def _template_edit_keyboard(template_id: int, *, replies_only: bool = False, keywords_only: bool = False) -> InlineKeyboardMarkup:
     rows = [[InlineKeyboardButton(text="✏️ Название", callback_data=f"template:edit_name:{template_id}")]]
-    if not replies_only:
-        rows.append([InlineKeyboardButton(text="💬 Комментарии", callback_data=f"template:edit_comment:{template_id}")])
-    rows.append([InlineKeyboardButton(text="↩️ Ответы", callback_data=f"template:edit_replies:{template_id}")])
-    rows.append([InlineKeyboardButton(text="❤️ Лайки на ответ", callback_data=f"template:edit_likes:{template_id}")])
+    if keywords_only:
+        rows.append([InlineKeyboardButton(text="🔑 Ключевые слова", callback_data=f"template:edit_keywords:{template_id}")])
+        rows.append([InlineKeyboardButton(text="↩️ Ответы", callback_data=f"template:edit_replies:{template_id}")])
+    else:
+        if not replies_only:
+            rows.append([InlineKeyboardButton(text="💬 Комментарии", callback_data=f"template:edit_comment:{template_id}")])
+        rows.append([InlineKeyboardButton(text="↩️ Ответы", callback_data=f"template:edit_replies:{template_id}")])
+        rows.append([InlineKeyboardButton(text="❤️ Лайки на ответ", callback_data=f"template:edit_likes:{template_id}")])
     rows.append([InlineKeyboardButton(text="◀️ Назад", callback_data=f"template:detail:{template_id}")])
     return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+def _keywords_lines(keywords: list[str]) -> list[str]:
+    if not keywords:
+        return ["Ключевые слова не заданы."]
+    lines = [f"{idx}. {_preview(item, 100)}" for idx, item in enumerate(keywords[:12], start=1)]
+    if len(keywords) > 12:
+        lines.append(f"… и ещё {len(keywords) - 12} ключ(ей).")
+    return lines
 
 
 def _build_template_detail_text(template: dict) -> str:
     name = _md(str(template.get("name") or "Без названия")[:100])
     variants = template_text_variants(template)
     replies = _template_reply_list(template)
+    keywords_only = is_keywords_template(template)
     replies_only = is_replies_only_template(template)
-    type_label = "только ответы" if replies_only else "полный"
+    keywords = template_keywords(template)
+    if keywords_only:
+        type_label = "ключевые слова"
+    elif replies_only:
+        type_label = "только ответы"
+    else:
+        type_label = "полный"
     t_settings = _template_settings(template)
     target = t_settings.get("reply_like_target", "1")
     count = int(t_settings.get("reply_like_count", 0) or 0)
     reply_likes_str = format_reply_likes_label(target, count)
 
     parts = []
+    if keywords_only:
+        parts.append(block("Ключевые слова", _keywords_lines(keywords)))
+        if replies:
+            parts.append(block("Ответы", _replies_lines(replies)))
+        parts.append(
+            block(
+                "Параметры",
+                kv_rows(
+                    [
+                        ("Тип", f"*{type_label}*"),
+                        ("🔑 Ключей", f"*{len(keywords)}*"),
+                        ("↩️ Ответов", f"*{len(replies)}*"),
+                    ]
+                ),
+            )
+        )
+        return screen(f"Шаблон · {name}", *parts)
+
     if not replies_only:
         parts.append(block("Комментарии", _variants_lines(variants)))
     parts.extend([
@@ -142,24 +184,33 @@ def _build_template_edit_text(template: dict) -> str:
     name = _md(template.get("name") or "Без названия")
     variants = template_text_variants(template)
     replies = _template_reply_list(template)
+    keywords_only = is_keywords_template(template)
     replies_only = is_replies_only_template(template)
+    keywords = template_keywords(template)
     t_settings = _template_settings(template)
     target = t_settings.get("reply_like_target", "1")
     count = int(t_settings.get("reply_like_count", 0) or 0)
     reply_likes_str = format_reply_likes_label(target, count)
 
+    if keywords_only:
+        summary_lines = [
+            f"Название: *{name}*",
+            "Тип: *ключевые слова*",
+            f"Ключевых слов: *{len(keywords)}*",
+            f"Ответов: *{len(replies)}*",
+        ]
+    else:
+        summary_lines = [
+            f"Название: *{name}*",
+            f"Тип: *{'только ответы' if replies_only else 'полный'}*",
+            f"Комментариев: *{len(variants)}*" if not replies_only else "Комментариев: *не используется*",
+            f"Ответов: *{len(replies)}*",
+            f"Лайки на ответ: *{reply_likes_str}*",
+        ]
+
     return screen(
         f"Редактирование · {name}",
-        block(
-            "Сейчас в шаблоне",
-            [
-                f"Название: *{name}*",
-                f"Тип: *{'только ответы' if replies_only else 'полный'}*",
-                f"Комментариев: *{len(variants)}*" if not replies_only else "Комментариев: *не используется*",
-                f"Ответов: *{len(replies)}*",
-                f"Лайки на ответ: *{reply_likes_str}*",
-            ],
-        ),
+        block("Сейчас в шаблоне", summary_lines),
         "Выберите, что хотите изменить.",
     )
 
@@ -227,6 +278,7 @@ async def _show_template_detail(message, template: dict) -> None:
         reply_markup=_template_detail_keyboard(
             template["id"],
             replies_only=is_replies_only_template(template),
+            keywords_only=is_keywords_template(template),
         ),
         parse_mode="Markdown",
     )
@@ -263,6 +315,9 @@ async def apply_task_template(callback: CallbackQuery):
         _, template = await _load_template_for_user(callback.from_user.id, template_id)
         if not template:
             await callback.answer("Шаблон не найден", show_alert=True)
+            return
+        if is_keywords_template(template):
+            await callback.answer("Этот шаблон предназначен для заказов по ключевым словам", show_alert=True)
             return
         if is_replies_only_template(template):
             await callback.answer("Этот шаблон подходит только для заказов на ответы", show_alert=True)
@@ -400,6 +455,7 @@ async def edit_template(callback: CallbackQuery, state: FSMContext):
             reply_markup=_template_edit_keyboard(
                 template_id,
                 replies_only=is_replies_only_template(template),
+                keywords_only=is_keywords_template(template),
             ),
             parse_mode="Markdown",
         )
@@ -752,18 +808,28 @@ def _build_template_likes_keyboard(template_id: int, current_target: str, curren
     target_str = str(current_target or "1").strip().lower()
     is_active = current_count > 0 and target_str not in {"none", "0", "off", "disabled"}
     
-    # Row 1: Target reply
+    # Row 1: Target reply (1..3, 4..6, Все)
     r1 = []
     targets = [("1", "1-й"), ("2", "2-й"), ("3", "3-й"), ("all", "Все")]
     for val, lbl in targets:
         checked = "✅ " if (is_active and target_str == val) else ""
         r1.append(InlineKeyboardButton(text=f"{checked}{lbl}", callback_data=f"template:set_like_target:{template_id}:{val}"))
+    r1b = []
+    for val, lbl in [("4", "4-й"), ("5", "5-й"), ("6", "6-й")]:
+        checked = "✅ " if (is_active and target_str == val) else ""
+        r1b.append(InlineKeyboardButton(text=f"{checked}{lbl}", callback_data=f"template:set_like_target:{template_id}:{val}"))
 
-    # Row 2: Count of likes
+    # Row 2: Count of likes (1..5)
     r2 = []
     for c in [1, 2, 3, 5]:
         checked = "✅ " if (is_active and current_count == c) else ""
         r2.append(InlineKeyboardButton(text=f"{checked}{c} шт", callback_data=f"template:set_like_count:{template_id}:{c}"))
+
+    # Row 2b: High boost counts (10..25)
+    r2b = []
+    for c in [10, 15, 25]:
+        checked = "✅ " if (is_active and current_count == c) else ""
+        r2b.append(InlineKeyboardButton(text=f"{checked}{c} шт", callback_data=f"template:set_like_count:{template_id}:{c}"))
 
     # Row 3: Off
     off_checked = "✅ " if not is_active else ""
@@ -772,7 +838,7 @@ def _build_template_likes_keyboard(template_id: int, current_target: str, curren
     # Row 4: Back
     r4 = [InlineKeyboardButton(text="◀️ Сохранить и вернуться", callback_data=f"template:edit:{template_id}")]
 
-    return InlineKeyboardMarkup(inline_keyboard=[r1, r2, r3, r4])
+    return InlineKeyboardMarkup(inline_keyboard=[r1, r1b, r2, r2b, r3, r4])
 
 
 def _build_template_likes_prompt_text(template_name: str, target: str, count: int) -> str:

@@ -11,6 +11,7 @@ import json
 import asyncio
 import time
 from urllib.parse import parse_qs, urlparse
+from types import SimpleNamespace
 from typing import Optional, Dict, Any, Tuple
 from datetime import datetime, timezone
 from patchright.async_api import APIRequestContext, Page, BrowserContext
@@ -19,7 +20,8 @@ from executor.http.page_runtime import document_generation, prepared_runtime_pro
 from executor.http.execution_policy import valid_comment_id
 from services.execution_attempts import track_publication_requests
 from executor.http.signature_runtime import resolve_request_signature, split_explicit_signature_params
-from executor.http.request_evidence import observe_request_security, resolve_security_evidence
+from executor.http.request_evidence import observe_request_security, resolve_security_evidence, same_http_endpoint
+from services.tiktok_urls import is_tiktok_shortlink, media_id_from_url
 from services.cookie_validator import normalize_cookie_records
 from executor.http.retry_policy import (
     RetryPolicy, HttpErrorType, classify_http_error,
@@ -29,7 +31,6 @@ from executor.http.retry_policy import (
 LIKE_FAST_POLICY = RetryPolicy(max_retries=0, base_delay=0.5, max_delay=1.0)
 
 logger = logging.getLogger("executor.http.playwright_client")
-_SHORTLINK_HOST_MARKERS = ("vt.tiktok.com", "vm.tiktok.com")
 _PAGE_FETCH_JS = """
 async ({url, method, headers, form_data, timeout_ms, referrer}) => {
     const controller = new AbortController();
@@ -43,6 +44,7 @@ async ({url, method, headers, form_data, timeout_ms, referrer}) => {
             method,
             headers,
             credentials: "include",
+            redirect: "error",
             signal: controller.signal,
         };
         if (referrer) {
@@ -63,7 +65,7 @@ async ({url, method, headers, form_data, timeout_ms, referrer}) => {
         const response = await window.fetch(url, options);
         return {
             status: response.status,
-            url: response.url,
+            url: typeof response.url === "string" ? response.url : "",
             headers: Object.fromEntries(response.headers.entries()),
             text: await response.text(),
         };
@@ -693,6 +695,27 @@ async def _extract_runtime_profile(page: Page) -> Dict[str, Any]:
         profile = {}
     ssr_identity_observed = bool(profile.get("device_id"))
     context = getattr(page, "context", None)
+    device_profile = getattr(context, "_account_device_profile", None) if context is not None else None
+    if isinstance(device_profile, dict):
+        hw = (device_profile.get("identity") or {}).get("hardware") or {}
+        opts = device_profile.get("options") or {}
+        vp = opts.get("viewport") or {}
+        if not profile.get("screen_width") and hw.get("width"):
+            profile["screen_width"] = int(hw["width"])
+        if not profile.get("screen_height") and hw.get("height"):
+            profile["screen_height"] = int(hw["height"])
+        if not profile.get("viewport_width") and vp.get("width"):
+            profile["viewport_width"] = int(vp["width"])
+        if not profile.get("viewport_height") and vp.get("height"):
+            profile["viewport_height"] = int(vp["height"])
+        if not profile.get("user_agent") and opts.get("user_agent"):
+            profile["user_agent"] = str(opts["user_agent"])
+        if not profile.get("platform") and (device_profile.get("identity") or {}).get("platform"):
+            profile["platform"] = str(device_profile["identity"]["platform"])
+    if context is not None and not profile.get("browser_language"):
+        ctx_locale = getattr(context, "_account_locale", None)
+        if ctx_locale:
+            profile["browser_language"] = str(ctx_locale)
     account_obj = getattr(page, "_pool_account_obj", None) or getattr(context, "_pool_account_obj", None)
     account_id = (
         getattr(page, "_pool_account_id", None)
@@ -726,6 +749,14 @@ async def _extract_runtime_profile(page: Page) -> Dict[str, Any]:
             try:
                 setattr(context, "_account_ssr_region", ssr_region)
             except Exception:
+                pass
+        if account_obj is not None:
+            # Keep verified page SSR evidence available to the country resolver.
+            # The extraction is read-only for the ORM; persistence is handled
+            # by the normal account service rather than a browser callback.
+            try:
+                setattr(account_obj, "_account_ssr_region", ssr_region)
+            except (AttributeError, TypeError):
                 pass
     else:
         profile.pop("ssr_region", None)
@@ -779,16 +810,10 @@ class PlaywrightHttpClient:
     def _canonical_referer_url(video_url: Optional[str], runtime_profile: Optional[Dict[str, Any]]) -> Optional[str]:
         if not video_url:
             return None
-        try:
-            from urllib.parse import urlparse
-
-            host = (urlparse(video_url).netloc or "").lower()
-            if any(marker in host for marker in _SHORTLINK_HOST_MARKERS):
-                current_url = str((runtime_profile or {}).get("current_url") or "").strip()
-                if current_url and ("/video/" in current_url or "/photo/" in current_url):
-                    return current_url
-        except Exception:
-            return video_url
+        if is_tiktok_shortlink(video_url):
+            current_url = str((runtime_profile or {}).get("current_url") or "").strip()
+            if media_id_from_url(current_url):
+                return current_url
         return video_url
 
     def _runtime_profile_for_request(self, proxy_country_code: Optional[str] = None) -> Dict[str, Any]:
@@ -882,7 +907,17 @@ class PlaywrightHttpClient:
             PlaywrightHttpClient: Экземпляр клиента
         """
         request_context = browser_context.request
-        runtime_profile = await _extract_runtime_profile(page) if page is not None else {}
+        if page is not None:
+            runtime_profile = await _extract_runtime_profile(page)
+        else:
+            dummy_page = SimpleNamespace(
+                url=None,
+                context=browser_context,
+                _pool_account_id=getattr(browser_context, "_pool_account_id", None),
+                _pool_account_obj=getattr(browser_context, "_pool_account_obj", None),
+                evaluate=None,
+            )
+            runtime_profile = await _extract_runtime_profile(dummy_page)
         return cls(request_context, retry_policy, runtime_profile=runtime_profile, page=page)
     
     async def _execute_request(
@@ -921,6 +956,8 @@ class PlaywrightHttpClient:
         if prepared_mentions is not None:
             self.last_request_meta["mentions"] = prepared_mentions
         is_publish = profile.method.upper() == "POST" and profile.endpoint.rstrip("/") == "/api/comment/publish"
+        if is_publish and isinstance(dynamic_params.get("text"), str):
+            self.last_request_meta["published_text"] = dynamic_params["text"]
 
         def unconfirmed(reason):
             self.last_request_meta["publication_status"] = "submitted_unconfirmed"
@@ -1016,9 +1053,13 @@ class PlaywrightHttpClient:
                     }
                     if profile.method.upper() not in {"GET", "HEAD"}:
                         browser_headers["content-type"] = "application/x-www-form-urlencoded; charset=UTF-8"
-                    detach = track_publication_requests(self.page, self.last_request_meta, flag="request_attempted")
+                    detach = track_publication_requests(
+                        self.page, self.last_request_meta, flag="request_attempted", expected_url=url,
+                        track_failures=True,
+                    )
                     try:
                         with observe_request_security(self.page, url, profile.method) as wire_evidence:
+                            self.last_request_meta["transport_invoked"] = True
                             browser_response = await self.page.evaluate(
                                 _PAGE_FETCH_JS,
                                 {
@@ -1050,9 +1091,15 @@ class PlaywrightHttpClient:
                         headers=headers,
                         form=form_data or None,
                         timeout=timeout_to_use,
+                        max_redirects=0,
                     )
                     response_headers = response.headers
                     status_code = response.status
+                    response_url = getattr(response, "url", None)
+                if response_url is not None and not same_http_endpoint(response_url, url):
+                    if is_publish:
+                        return unconfirmed("unexpected_response_url")
+                    return False, None, "unexpected_response_url", HttpErrorType.API_ERROR
                 
                 # ИСПРАВЛЕНО: Проверяем Content-Type ответа перед парсингом
                 # Если TikTok вернул HTML (капча/WAF/редирект) - сразу классифицируем как FORBIDDEN/CAPTCHA
@@ -1091,21 +1138,12 @@ class PlaywrightHttpClient:
                         self.last_request_meta.get("security_params_source", "unavailable"),
                     )
                     
-                    if status_code == 200 and len(response_body or "") == 0 and is_publish:
-                        error_type = HttpErrorType.FORBIDDEN
-                        error_msg = "TikTok stealth-reject: empty JSON response (body_len=0). Publication was not confirmed."
-                        redirected = any(marker in str(self._page_url_hint(self.page) or "").lower() for marker in ("/login", "/signup", "/verify", "/auth", "/messages", "/inbox"))
-                        if self.page is not None and attempt == 0 and effective_retry_policy.max_retries > 0 and not redirected:
-                            from executor.http.page_runtime import activate_page_input
-                            self.last_request_meta["empty_body_retry_count"] = 1
-                            self.last_request_meta["empty_body_retry_unconfirmed"] = True
-                            await activate_page_input(self.page)
-                            await asyncio.sleep(2.0)
-                            continue
-                        self.last_request_meta.update(publication_status="rejected", failure_reason="stealth_reject_empty_body")
-                        # A blank response is not a receipt. Preserve the failure
-                        # classification so orchestration charges this account.
-                        return False, None, error_msg, error_type
+                    if is_publish and status_code == 200 and not (response_body or "").strip():
+                        return unconfirmed("empty_body")
+                    if is_publish and 300 <= status_code < 400:
+                        return unconfirmed("upstream_redirect")
+                    if is_publish and 500 <= status_code < 600:
+                        return unconfirmed("upstream_5xx")
 
                     # ИСПРАВЛЕНО: Если Content-Type не JSON - это капча/WAF/редирект
                     if "application/json" not in content_type and status_code == 200:
@@ -1224,6 +1262,8 @@ class PlaywrightHttpClient:
                             return False, None, error_msg, error_type
                         continue
                     elif type(status_code_in_body) is not int or status_code_in_body != 0:
+                        if is_publish and type(status_code_in_body) is not int:
+                            return unconfirmed("invalid_api_status")
                         error_type, error_msg = _classify_api_response_error(response_data)
                         logger.warning(
                             f"[HTTP] API error in response | "
@@ -1485,6 +1525,9 @@ class PlaywrightHttpClient:
         Returns:
             tuple: (success, comment_id, error_message, error_type, meta)
         """
+        from services.spintax import expand_spintax, has_spintax
+        if has_spintax(text):
+            text = expand_spintax(text)
         profile = RequestProfile.publish_reply_profile()
         extra_params = dict(extra_params or {})
         proxy_country_code = extra_params.pop("proxy_country_code", None)
@@ -1653,6 +1696,9 @@ class PlaywrightHttpClient:
         Returns:
             tuple: (success, comment_id, error_message, error_type)
         """
+        from services.spintax import expand_spintax, has_spintax
+        if has_spintax(text):
+            text = expand_spintax(text)
         profile = RequestProfile.publish_main_profile()
         extra_params = dict(extra_params or {})
         proxy_country_code = extra_params.pop("proxy_country_code", None)

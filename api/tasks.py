@@ -307,7 +307,11 @@ class TaskCreate(BaseModel):
                 raise ValueError("Для ответов по ключевым словам нужен хотя бы один текст ответа")
             if self.engagement_comment_id or self.engagement_username or self.engagement_comment_text:
                 raise ValueError("В заказе по ключевым словам нельзя задавать один целевой комментарий")
-            for key in ("keyword_scans", "keyword_video_bindings", "url_results", "execution_ledger", "engagement_target_mode"):
+            for key in (
+                "keyword_scans", "keyword_video_bindings", "url_results", "execution_ledger",
+                "engagement_target_mode", "reply_like_target", "reply_like_count",
+                "repair_keyword_replies", "keyword_repair_rounds",
+            ):
                 task_settings.pop(key, None)
             task_settings.update(keywords=self.keywords, reply_count=len(replies), boost_likes_enabled=False)
             self.settings = task_settings

@@ -58,19 +58,16 @@ def test_entry_referrer_is_independent_of_current_media(referrer):
     assert query["root_referer"] == referrer
 
 
-async def test_empty_publish_failure_reaches_account_penalty_and_replacement_path():
+async def test_empty_publish_is_an_unconfirmed_receipt():
     from tests.unit.test_http_final_audit import EventPage
     page = EventPage("response", "")
     client = PlaywrightHttpClient(SimpleNamespace(fetch=AsyncMock()), page=page,
                                   retry_policy=RetryPolicy(max_retries=0))
     success, _, message, error = await client._execute_request(RequestProfile.publish_main_profile(), {"text": "fixture"})
-    assert not success and error == HttpErrorType.FORBIDDEN
-    assert schema._http_attempt_failure_reason(message, error, publish_kind="main") == "stealth_reject_empty_body"
-    account_id = -320002
-    engine._HTTP_ACCOUNT_HEALTH.pop(account_id, None)
-    engine._record_http_account_failure_result(account_id, error)
-    assert engine._HTTP_ACCOUNT_HEALTH[account_id]["fatal"] == 1
-    assert client.last_request_meta["publication_status"] == "rejected"
+    assert not success and error == HttpErrorType.SUBMITTED_UNCONFIRMED
+    assert message == "submitted_unconfirmed:empty_body"
+    assert client.last_request_meta["request_attempted"] is True
+    assert client.last_request_meta["publication_status"] == "submitted_unconfirmed"
 
 
 def test_cross_thread_health_increments_and_branch_reads_are_atomic():

@@ -40,6 +40,8 @@ async def open_fixture(browser, state):
             state["reads"] += 1
             state["cursors"].append(query["cursor"][0])
             body = {"status_code": 0, "comments": state["rows"], "has_more": state.get("has_more", 0), "cursor": 20}
+        elif path == "/api/comment/list/":
+            body = {"status_code": 0, "comments": [{"cid": PARENT, "reply_id": "0"}], "has_more": 0, "total": 1}
         elif path == "/api/comment/publish/":
             assert route.request.method == "POST"
             form = parse_qs(route.request.post_data or "")

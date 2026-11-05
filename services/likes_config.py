@@ -16,6 +16,24 @@ BOOST_LIKES_TARGET_MODES = {
 BOOST_LIKES_DEFAULT = 100
 BOOST_LIKES_MIN = 50
 BOOST_LIKES_MAX = 5000
+REPLY_LIKES_MAX = 25
+
+
+def pending_reply_likes(result: dict | None) -> bool:
+    plan = result.get("reply_likes") if isinstance(result, dict) else None
+    return isinstance(plan, dict) and plan.get("state") == "pending" and bool(plan.get("targets"))
+
+
+def reply_like_preferences(settings: dict) -> tuple[str, int]:
+    """Read the saved reply index (or 'all') and its per-reply budget."""
+    target = str(settings.get("reply_like_target", "1")).strip().lower()
+    if target not in {"1", "2", "3", "4", "5", "6", "all"}:
+        return "none", 0
+    try:
+        count = int(settings.get("reply_like_count") or 0)
+    except (TypeError, ValueError, OverflowError):
+        count = 0
+    return target, max(0, min(REPLY_LIKES_MAX, count))
 
 
 def coerce_bool(value: Any, default: bool) -> bool:

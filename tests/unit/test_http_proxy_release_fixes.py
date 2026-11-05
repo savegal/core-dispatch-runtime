@@ -159,6 +159,29 @@ async def test_rotation_drains_users_and_blocks_new_users(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_proxy_lease_passes_redis_time_into_write_scripts(monkeypatch, isolated_proxy_leases):
+    now = 500
+    monkeypatch.setattr(isolated_proxy_leases, "time", lambda: (now, 0))
+    original_eval = isolated_proxy_leases.eval
+
+    def eval_without_nondeterministic_writes(script, *args):
+        assert "redis.call('TIME')" not in script
+        return original_eval(script, *args)
+
+    monkeypatch.setattr(isolated_proxy_leases, "eval", eval_without_nondeterministic_writes)
+    lease = await concurrency.acquire_proxy_usage("http://fixture.invalid:8080")
+    try:
+        assert isolated_proxy_leases.zscore(lease.keys[0], lease.token) == now + concurrency._LEASE_TTL
+        now = 520
+        assert concurrency._eval_lease_at_server_time(
+            concurrency._LEASE_RENEW, lease.keys, lease.token, lease.mode, concurrency._LEASE_TTL,
+        )
+        assert isolated_proxy_leases.zscore(lease.keys[0], lease.token) == now + concurrency._LEASE_TTL
+    finally:
+        await lease.release()
+
+
+@pytest.mark.asyncio
 async def test_late_usage_release_does_not_delete_new_lease(isolated_proxy_leases):
     first = await concurrency.acquire_proxy_usage("http://fixture.invalid:8080")
     isolated_proxy_leases.zrem(first.keys[0], first.token)  # Simulate expiration/crashed owner.
@@ -182,7 +205,7 @@ async def test_late_mobile_release_preserves_second_handle(monkeypatch, isolated
 @pytest.mark.asyncio
 @pytest.mark.parametrize("body", ["", "invalid", '{"status_code":0}'])
 @pytest.mark.parametrize("observed_signed", [True, None])
-async def test_ambiguous_publish_only_allows_one_empty_body_retry(body, observed_signed):
+async def test_ambiguous_publish_never_replays(body, observed_signed):
     from tests.unit.test_http_final_audit import EventPage
     page = EventPage("response", body)
     listeners = {}
@@ -204,10 +227,8 @@ async def test_ambiguous_publish_only_allows_one_empty_body_retry(body, observed
     client = PlaywrightHttpClient(SimpleNamespace(fetch=AsyncMock()), page=page,
                                   retry_policy=RetryPolicy(max_retries=3))
     result = await client._execute_request(RequestProfile.publish_main_profile(), {"aweme_id": "7635267329407913230", "text": "fixture"})
-    assert result[3] == (HttpErrorType.FORBIDDEN if body == "" else HttpErrorType.SUBMITTED_UNCONFIRMED)
-    assert page.evaluate.await_count == (2 if body == "" else 1)
-    if body == "":
-        assert client.last_request_meta["empty_body_retry_count"] == 1
+    assert result[3] == HttpErrorType.SUBMITTED_UNCONFIRMED
+    page.evaluate.assert_awaited_once()
     from executor import user_schema
     from executor.publish_action import PublishResult
     classified = PublishResult(status="submitted_unconfirmed", network_request_attempted=True)
@@ -287,3 +308,32 @@ async def test_legacy_reply_unknown_result_is_terminal_once(monkeypatch):
     rows = await engine.execute_replies_http(None, URL, CID, ["fixture"], main_comment_text="fixture")
     assert len(rows) == 1 and rows[0]["submitted_unconfirmed"]
     mock.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_legacy_reply_result_preserves_actual_spintax_and_mentions(monkeypatch):
+    from executor import engagement_engine as engine
+    monkeypatch.setattr(engine.settings, "USE_PROXY", False)
+    monkeypatch.setattr(engine.settings, "MAX_RETRY_ACCOUNTS", 1)
+    account = SimpleNamespace(id=1, proxy=None, label="fixture")
+    monkeypatch.setattr(engine, "get_free_account_for_reply", lambda *_, **kwargs: account)
+    monkeypatch.setattr(engine, "get_http_execution_strategy", lambda *_: {"strategy": "http_first"})
+    monkeypatch.setattr(engine, "_should_skip_http_for_account", lambda *_: None)
+    template = "{Hello|Hi} @MiXeD"
+    published = "Hello @mixed"
+
+    async def attempt(*_, outcome_dict, **kwargs):
+        outcome_dict.update(
+            publication_attempted=True, posted=True, network_confirmed=True,
+            parent_confirmed=True, parent_confirmation_level="http_parent_id",
+            published_text=published, text_template=template,
+        )
+        return CID, None, "http"
+
+    monkeypatch.setattr(engine, "attempt_reply_on_account", attempt)
+    results = await engine.execute_replies_http(None, URL, CID, [template], main_comment_text="main")
+    assert len(results) == 1
+    assert results[0]["success"] is True
+    assert results[0]["text"] == published
+    assert results[0]["published_text"] == published
+    assert results[0]["text_template"] == template

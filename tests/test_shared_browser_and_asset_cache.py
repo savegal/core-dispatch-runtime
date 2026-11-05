@@ -327,6 +327,7 @@ async def test_shared_direct_accounts_use_separate_proxyless_process(shared_pool
     ASSET.replace("sf16.", "log."), ASSET.replace("tiktokcdn.com", "eviltiktokcdn.com"),
     ASSET.replace("tiktokcdn.com", "tiktokcdn.com.evil.invalid"),
     ASSET.replace("/assets/", "/passport/"), ASSET.replace("/assets/", "/aweme/"),
+    ASSET + "?verifyFp=secret", ASSET + "?%64evice_id=secret",
 ])
 def test_cache_rejects_dynamic_and_untrusted_urls(url):
     assert not is_cacheable_static_asset("GET", "script", url)
@@ -335,7 +336,7 @@ def test_cache_rejects_dynamic_and_untrusted_urls(url):
 
 def test_cache_lru_limits_and_response_headers():
     cache = StaticAssetCache(max_total_bytes=200, max_item_bytes=150)
-    assert cache.put(ASSET, 200, {"Content-Encoding": "gzip", "Set-Cookie": "secret=1"}, b"a" * 100)
+    assert cache.put(ASSET, 200, {"Content-Encoding": "gzip"}, b"a" * 100)
     second, third = ASSET + "?v=2", ASSET + "?v=3"
     assert cache.put(second, 200, {}, b"b" * 100)
     cache.get(ASSET)
@@ -351,6 +352,15 @@ def test_cache_lru_limits_and_response_headers():
         assert not cache.put(ASSET, status, {}, body)
     assert not is_cacheable_static_asset("POST", "script", ASSET)
     assert not is_cacheable_static_asset("GET", "fetch", ASSET)
+
+
+@pytest.mark.parametrize("headers", [
+    {"Set-Cookie": "secret=1"}, {"Cache-Control": "private, max-age=60"},
+    {"Cache-Control": "no-store"}, {"Vary": "Accept-Encoding, Cookie"},
+    {"Content-Type": "text/html"},
+])
+def test_cache_rejects_personalized_or_non_asset_responses(headers):
+    assert not StaticAssetCache().put(ASSET, 200, headers, b"x" * 100)
 
 
 @pytest.mark.asyncio
@@ -612,3 +622,110 @@ def test_account_selection_prioritizes_hot_candidates_across_batches(db_session,
     finally:
         account_service._MAIN_ACCOUNT_RESERVED_UNTIL.clear()
         account_service._REPLY_ACCOUNT_RESERVED_UNTIL.clear()
+
+
+@pytest.mark.asyncio
+async def test_existing_shared_page_reuse_bypasses_slow_unrelated_context_setup(shared_pool):
+    pool, _ = shared_pool
+    first = account(1, "http://first.invalid:8080")
+    blocker_started = asyncio.Event()
+    unblock = asyncio.Event()
+    second_task = None
+    original_cleanup = pool._cleanup_old_contexts
+
+    try:
+        first_context, first_page = await pool.get_page_for_account(first)
+        # Simulate an already returned, idle page.
+        first_page._pool_available = True
+
+        async def stalled_cleanup():
+            if asyncio.current_task() is second_task:
+                blocker_started.set()
+                await unblock.wait()
+            await original_cleanup()
+
+        pool._cleanup_old_contexts = stalled_cleanup
+        second_task = asyncio.create_task(pool.get_page_for_account(
+            account(2, "http://second.invalid:8080")
+        ))
+        await asyncio.wait_for(blocker_started.wait(), timeout=2.0)
+        # Once a shared Chromium owner exists, unrelated context setup is
+        # deliberately not serialized on the process lock.
+        assert not pool._browser_id_lock("shared_proxied").locked()
+        context, page = await asyncio.wait_for(pool.get_page_for_account(first), timeout=0.2)
+        assert context is first_context and page is first_page
+        assert not page._pool_available
+        assert not second_task.done()
+    finally:
+        unblock.set()
+        if second_task is not None:
+            await asyncio.gather(second_task, return_exceptions=True)
+        await pool.close_all()
+
+
+@pytest.mark.asyncio
+async def test_shared_existing_process_allows_parallel_new_account_contexts(shared_pool):
+    pool, launch = shared_pool
+    pool.max_browsers = 3
+    slow_task = None
+    entered = asyncio.Event()
+    release = asyncio.Event()
+    original_cleanup = pool._cleanup_old_contexts
+
+    try:
+        await pool.get_page_for_account(account(1, "http://owner.invalid:8080"))
+
+        async def slow_cleanup():
+            if asyncio.current_task() is slow_task:
+                entered.set()
+                await release.wait()
+            await original_cleanup()
+
+        pool._cleanup_old_contexts = slow_cleanup
+        slow_task = asyncio.create_task(pool.get_page_for_account(
+            account(2, "http://slow.invalid:8080")
+        ))
+        await asyncio.wait_for(entered.wait(), timeout=2.0)
+        context, page = await asyncio.wait_for(pool.get_page_for_account(
+            account(3, "http://fast.invalid:8080")
+        ), timeout=0.5)
+        assert context._pool_account_id == 3 and page is not None
+        assert launch.await_count == 1
+        assert not slow_task.done()
+    finally:
+        release.set()
+        if slow_task is not None:
+            await asyncio.gather(slow_task, return_exceptions=True)
+        await pool.close_all()
+
+
+@pytest.mark.asyncio
+async def test_parallel_shared_owner_loss_never_relaunches_without_process_lock(shared_pool):
+    from executor.tiktok_client import TikTokClientError
+
+    pool, launch = shared_pool
+    owner = None
+    original_cleanup = pool._cleanup_old_contexts
+    try:
+        await pool.get_page_for_account(account(1, "http://owner.invalid:8080"))
+        owner = pool._browsers["shared_proxied"]
+        owner_lost = False
+
+        async def lose_owner_before_context_setup():
+            nonlocal owner_lost
+            if not owner_lost:
+                owner_lost = True
+                pool._browsers.pop("shared_proxied", None)
+            await original_cleanup()
+
+        pool._cleanup_old_contexts = lose_owner_before_context_setup
+        with pytest.raises(TikTokClientError, match="Shared browser owner lost"):
+            await pool.get_page_for_account(account(2, "http://new.invalid:8080"))
+        # Retrying under an unlocked process would race another account's
+        # recovery and could overwrite the shared Chromium owner.
+        assert launch.await_count == 1
+    finally:
+        pool._cleanup_old_contexts = original_cleanup
+        if owner is not None:
+            pool._browsers["shared_proxied"] = owner
+        await pool.close_all()

@@ -1093,6 +1093,7 @@ async def test_execute_hybrid_full_resolves_shortlink_before_attempts(db_session
     """HYBRID FULL should pass the canonical URL through the whole flow once
     resolve_video_url can expand a shortlink.
     """
+    monkeypatch.setattr(engagement_engine.settings, "USE_PROXY", False)
     account = Account(id=21, label="main", status="active", cookies='{"sessionid":"x"}', proxy="http://proxy-main")
     task = SimpleNamespace(reply1="reply one", reply2=None, reply3=None, settings={"reply_count": 1})
     resolved_url = "https://www.tiktok.com/@demo/video/7635267329407913230"
@@ -1149,6 +1150,45 @@ async def test_execute_hybrid_full_resolves_shortlink_before_attempts(db_session
     assert captured["verify_video_url"] == resolved_url
     assert captured["reply_video_url"] == resolved_url
     assert captured["boost_video_url"] == resolved_url
+
+
+@pytest.mark.unit
+@pytest.mark.asyncio
+async def test_execute_hybrid_full_stops_after_main_receipt(db_session, monkeypatch):
+    from config.settings import get_settings
+
+    monkeypatch.setattr(get_settings(), "TIKTOK_NETWORK_FIRST", True)
+    monkeypatch.setattr(get_settings(), "TIKTOK_NETWORK_IMPL_READY", True)
+    account = SimpleNamespace(id=24, label="main")
+    task = SimpleNamespace(reply1="reply one", reply2=None, reply3=None, settings={})
+    url = "https://www.tiktok.com/@demo/video/1234567890123456789"
+    cid = "7641761192486194454"
+    stopped = False
+    released = []
+
+    async def publish(*args, outcome_dict, **kwargs):
+        nonlocal stopped
+        stopped = True
+        outcome_dict.update(network_confirmed=True, method="http", publication_attempted=True)
+        return cid, None, "http"
+
+    replies = AsyncMock()
+    boost = AsyncMock()
+    monkeypatch.setattr(engagement_engine, "resolve_order_video_url", AsyncMock(return_value=(url, "1234567890123456789")))
+    monkeypatch.setattr(engagement_engine, "get_free_account_for_main_comment", lambda *args, **kwargs: account)
+    monkeypatch.setattr(engagement_engine, "attempt_main_comment_on_account", publish)
+    monkeypatch.setattr(engagement_engine, "execute_replies_http", replies)
+    monkeypatch.setattr(engagement_engine, "_order_boost_likes", boost)
+    monkeypatch.setattr(engagement_engine, "release_main_account_reservation", released.append)
+
+    result = await engagement_engine.execute_hybrid_full(
+        db_session, task, url, "hello", 180, stop_requested=lambda: stopped,
+    )
+
+    assert result.comment_id == cid and result.main_comment["network_confirmed"]
+    assert released == [account.id]
+    replies.assert_not_awaited()
+    boost.assert_not_awaited()
 
 
 @pytest.mark.unit
@@ -2052,6 +2092,8 @@ async def test_engagement_only_stops_after_four_empty_accounts_across_two_proxie
             parent_search_scroll_budget=120,
         )
 
+    # Visibility search may need more accounts than the default retry budget.
+    monkeypatch.setattr(engagement_engine.settings, "MAX_RETRY_ACCOUNTS", 6)
     monkeypatch.setattr(engagement_engine.settings, "PARALLEL_COMMENTING_TARGET_BROWSERS", 3, raising=False)
     monkeypatch.setattr(engagement_engine.settings, "PARALLEL_COMMENTING_MAX_BROWSERS", 3, raising=False)
     monkeypatch.setattr(db_database, "get_sync_db_context", _fake_db_context)
@@ -2161,6 +2203,8 @@ async def test_engagement_only_resets_empty_account_quorum_when_parent_was_found
             parent_search_scroll_container_scrollable=False,
         )
 
+    # Visibility search may need more accounts than the default retry budget.
+    monkeypatch.setattr(engagement_engine.settings, "MAX_RETRY_ACCOUNTS", 6)
     monkeypatch.setattr(engagement_engine.settings, "PARALLEL_COMMENTING_TARGET_BROWSERS", 2, raising=False)
     monkeypatch.setattr(engagement_engine.settings, "PARALLEL_COMMENTING_MAX_BROWSERS", 2, raising=False)
     monkeypatch.setattr(db_database, "get_sync_db_context", _fake_db_context)

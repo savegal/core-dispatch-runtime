@@ -224,9 +224,11 @@ async def _install_resource_blocking_routes(context: BrowserContext, account_id:
 
     async def populate(response):
         try:
+            all_headers = getattr(response, "all_headers", None)
+            headers = await await_browser_read(all_headers) if callable(all_headers) else response.headers
             body = await await_browser_read(response.body)
             if settings.STATIC_ASSET_CACHE_ENABLED:
-                static_asset_cache.put(response.url, response.status, response.headers, body)
+                static_asset_cache.put(response.url, response.status, headers, body)
         except Exception:
             pass  # Closing a tab must never affect other contexts' downloads.
         finally:
@@ -1116,6 +1118,7 @@ class BrowserPool:
         account: Account,
         retry_count: int = 0,
         _browser_id_lock_held: bool = False,
+        _parallel_shared_owner: bool = False,
     ) -> Tuple[BrowserContext, Page]:
         """
         Получает или создаёт страницу для аккаунта.
@@ -1151,15 +1154,61 @@ class BrowserPool:
                     lease = await acquire_proxy_usage(resolved_route.url) if resolved_route else None
                     if settings.BROWSER_POOL_SHARED_PROCESS:
                         await self._reserve_browser_capacity(browser_id_for_lock, account_id=account.id)
-                    async with self._browser_id_lock(browser_id_for_lock):
-                        if (not settings.BROWSER_POOL_SHARED_PROCESS
-                                and browser_id_for_lock not in self._browsers and account.id not in self._contexts):
-                            await self._reserve_browser_capacity(browser_id_for_lock)
-                        context, page = await self.get_page_for_account(
-                            account,
-                            retry_count=retry_count,
-                            _browser_id_lock_held=True,
-                        )
+                    # Reuse of an account-isolated ready page needs only the
+                    # account lock already held, not the global process lock.
+                    reused = None
+                    if settings.BROWSER_POOL_SHARED_PROCESS:
+                        existing = self._contexts.get(account.id)
+                        owner_id = self._account_browser_ids.get(account.id)
+                        owner = self._browsers.get(owner_id)
+                        expected_proxy_key = self._make_browser_id(proxy_source_for_lock)
+                        if (existing is not None and owner_id == browser_id_for_lock
+                                and getattr(existing, "_account_proxy_key", None) == expected_proxy_key
+                                and not getattr(existing, "_pool_disposed", False)
+                                and owner is not None and owner.is_connected()):
+                            available_page = next(
+                                (candidate for candidate in list(existing.pages)
+                                 if self._is_page_available(candidate, account.id)),
+                                None,
+                            )
+                            if available_page is not None:
+                                self._context_last_used[account.id] = datetime.now(timezone.utc)
+                                self._mark_page_in_use(available_page, account.id)
+                                self._sync_pool_metrics()
+                                reused = (existing, available_page)
+                    if reused is not None:
+                        context, page = reused
+                    else:
+                        # A live shared process can open independent account
+                        # contexts concurrently. The process lock is needed
+                        # only when its Chromium owner may need creation or
+                        # recovery; keeping it during slow per-proxy setup
+                        # serializes otherwise unrelated accounts.
+                        shared_owner_ready = False
+                        if settings.BROWSER_POOL_SHARED_PROCESS:
+                            existing_owner = self._browsers.get(browser_id_for_lock)
+                            if existing_owner is not None:
+                                try:
+                                    shared_owner_ready = bool(existing_owner.is_connected())
+                                except Exception:
+                                    shared_owner_ready = False
+                        if shared_owner_ready:
+                            context, page = await self.get_page_for_account(
+                                account,
+                                retry_count=retry_count,
+                                _browser_id_lock_held=True,
+                                _parallel_shared_owner=True,
+                            )
+                        else:
+                            async with self._browser_id_lock(browser_id_for_lock):
+                                if (not settings.BROWSER_POOL_SHARED_PROCESS
+                                        and browser_id_for_lock not in self._browsers and account.id not in self._contexts):
+                                    await self._reserve_browser_capacity(browser_id_for_lock)
+                                context, page = await self.get_page_for_account(
+                                    account,
+                                    retry_count=retry_count,
+                                    _browser_id_lock_held=True,
+                                )
                     if callable(getattr(page, "on", None)) and not getattr(page, "_pool_capacity_callback", None):
                         page._pool_capacity_callback = lambda *_: self._capacity_changed.set()
                         page.on("close", page._pool_capacity_callback)
@@ -1360,6 +1409,14 @@ class BrowserPool:
                         browser = None
                 
                 if browser is None:
+                    # This path deliberately skipped the shared process lock
+                    # because an owner was alive at entry. If it disappeared,
+                    # do not race another account to launch a replacement.
+                    # The next independent acquire will enter via the lock.
+                    if _parallel_shared_owner:
+                        raise TikTokClientError(
+                            "Shared browser owner lost during parallel context setup"
+                        )
                     await self._reserve_browser_capacity(browser_id)
                     # Создаём новый браузер.
                     # patchright требует полный Chromium (не headless-shell) — headless-shell
@@ -1743,6 +1800,7 @@ class BrowserPool:
                 context._account_proxy_source = proxy_source
                 context._account_proxy_key = self._make_browser_id(proxy_source)
                 context._account_proxy_in_use = bool(proxy_source)
+                context._shared_browser_process = bool(settings.BROWSER_POOL_SHARED_PROCESS and proxy_source)
                 context._account_proxy_route = resolved_route
                 context._account_locale = context_options.get("locale")
                 context._account_accept_language = accept_language if proxy_source else None

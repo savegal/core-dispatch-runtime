@@ -85,10 +85,10 @@ async def test_empty_post_with_one_signature_is_never_duplicated(browser_page, s
     }""", signature, isolated_context=False)
     client = PlaywrightHttpClient(browser_page.context.request, page=browser_page, retry_policy=RetryPolicy(max_retries=3))
     success, _, _, error = await client._execute_request(RequestProfile.publish_main_profile(), {"aweme_id": VIDEO, "text": "fixture"})
-    assert not success and error == HttpErrorType.FORBIDDEN and len(posts) == 1
+    assert not success and error == HttpErrorType.SUBMITTED_UNCONFIRMED and len(posts) == 1
 
 
-async def test_dom_and_callable_sdk_skip_mandatory_warmup_age(browser_page):
+async def test_callable_sdk_without_wire_evidence_respects_warmup_age(browser_page):
     async def serve(route):
         if urlparse(route.request.url).path == "/api/comment/list/":
             await route.fulfill(content_type="application/json", body='{"status_code":0,"comments":[]}')
@@ -109,8 +109,7 @@ async def test_dom_and_callable_sdk_skip_mandatory_warmup_age(browser_page):
     ])
     await browser_page.goto(URL)
     browser_page._http_auth_verified_at = time.monotonic()
-    start = time.monotonic()
     _, valid, info = await engagement_engine.warmup_page_for_http(browser_page, URL, max_retries=1)
     assert valid and info["signer_ready"] and info["sdk_present"]
-    assert info["signed_dispatch_seen"] and info["minimum_age_wait_ms"] == 0
-    assert time.monotonic() - start < 2.0
+    assert not info["signed_dispatch_seen"] and info["comment_api_skipped"]
+    assert info["target_page_age_ms"] >= info["required_nav_age_ms"]

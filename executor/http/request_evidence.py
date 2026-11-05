@@ -16,6 +16,22 @@ def signature_presence(url):
     return {key: bool(query.get(key)) for key in SECURITY_KEYS}
 
 
+def same_http_endpoint(actual_url, expected_url):
+    """Match origin and path independently of signatures and query order."""
+    def endpoint(url):
+        parsed = urlparse(str(url or ""))
+        if parsed.scheme not in {"http", "https"} or not parsed.hostname or parsed.username is not None:
+            return None
+        default_port = 443 if parsed.scheme == "https" else 80
+        return parsed.scheme, parsed.hostname, parsed.port if parsed.port is not None else default_port, parsed.path
+
+    try:
+        expected = endpoint(expected_url)
+        return expected is not None and endpoint(actual_url) == expected
+    except ValueError:
+        return False
+
+
 @contextmanager
 def observe_request_security(page, expected_url, method="GET"):
     expected = urlparse(expected_url)
@@ -26,7 +42,7 @@ def observe_request_security(page, expected_url, method="GET"):
         try:
             actual = urlparse(str(getattr(request, "url", "")))
             if (str(getattr(request, "method", "")).upper() != method.upper()
-                    or (actual.scheme, actual.hostname, actual.path) != (expected.scheme, expected.hostname, expected.path)):
+                    or not same_http_endpoint(request.url, expected_url)):
                 return
             query = parse_qs(actual.query)
             if any(wanted.get(key) != query.get(key) for key in ("aweme_id", "item_id", "comment_id", "cursor") if key in wanted):

@@ -13,7 +13,6 @@ logger = logging.getLogger("services.geo_service")
 # Бесплатные API для определения гео (без ключей)
 GEO_API_URLS = [
     "https://ipapi.co/{ip}/json/",  # Бесплатный, до 1000 запросов/день
-    "https://ip-api.com/json/{ip}?fields=status,message,countryCode",  # Бесплатный, 45 req/min
 ]
 PROXY_PUBLIC_IP_URL = "https://api.ipify.org?format=json"
 

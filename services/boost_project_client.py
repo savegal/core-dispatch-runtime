@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import math
 from typing import Any, Optional, Tuple
 
 import httpx
@@ -19,6 +20,7 @@ from services.likes_config import coerce_likes_quantity
 logger = logging.getLogger("services.boost_project")
 
 RETRY_STATUS_CODES = {429, 500, 502, 503, 504}
+ORDER_OUTCOME_UNKNOWN = "Boost Project order outcome unknown. Check provider order history before retrying."
 
 
 def _base_url() -> str:
@@ -59,7 +61,9 @@ def _extract_order_id(data: dict[str, Any]) -> Optional[int]:
         if value is None:
             continue
         try:
-            return int(value)
+            order_id = int(value)
+            if type(value) is not bool and order_id > 0:
+                return order_id
         except (TypeError, ValueError):
             continue
     return None
@@ -90,6 +94,7 @@ async def _request_json_with_retries(
             if last_status not in RETRY_STATUS_CODES or attempt == attempts:
                 return last_status, last_data, last_raw
         except Exception as exc:
+            last_status, last_data = 0, {}
             last_raw = repr(exc)
             if attempt == attempts:
                 return last_status, last_data, last_raw
@@ -115,7 +120,14 @@ async def get_balance() -> Tuple[bool, Optional[float], Optional[str]]:
             return False, None, "Invalid API key"
         if status != 200:
             return False, None, _api_error(data, raw) or f"HTTP {status}"
-        balance = float(data.get("balance", 0))
+        if "error" in data and data["error"]:
+            return False, None, _api_error(data, "")
+        try:
+            balance = float(data["balance"])
+        except (KeyError, TypeError, ValueError, OverflowError):
+            return False, None, _api_error(data, "") or "Response missing a valid balance"
+        if isinstance(data["balance"], bool) or not math.isfinite(balance):
+            return False, None, "Response missing a valid balance"
         return True, balance, None
     except Exception as e:
         logger.warning("Likes API balance check failed: %s", e)
@@ -160,28 +172,31 @@ async def order_tiktok_comment_likes(
                 "GET",
                 _base_url(),
                 params=payload,
+                attempts=1,
             )
-            if status in {404, 405}:
+            if status == 405:
                 status, data, raw = await _request_json_with_retries(
                     client,
                     "POST",
                     _base_url(),
                     data=payload,
+                    attempts=1,
                 )
 
+        if status == 0 or status == 408 or status >= 500:
+            return False, None, ORDER_OUTCOME_UNKNOWN
         if status == 401:
             return False, None, "Invalid API key"
         if status != 200:
             detail = _api_error(data, raw)
             return False, None, f"HTTP {status}: {detail}" if detail else f"HTTP {status}"
 
-        api_error = _api_error(data, "")
-        if api_error:
-            return False, None, api_error
+        if data.get("error"):
+            return False, None, _api_error(data, "")
 
         order_id = _extract_order_id(data)
         if order_id is None:
-            return False, None, f"Response missing order: {data}"
+            return False, None, ORDER_OUTCOME_UNKNOWN
 
         logger.info(
             "Comment likes order created: order_id=%s, video_url=%s, username=%s, quantity=%s",

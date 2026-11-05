@@ -25,10 +25,15 @@ def _cursor(value):
     return None
 
 
+def reports_unseen_comments(payload, seen_count):
+    total = payload.get("total")
+    return type(total) is int and total > seen_count
+
+
 async def scan_comment_ids(page, aweme_id, comment_ids, *, read_page, parent_comment_id=None,
                            max_pages=20, meta_attr="_comment_list_http_meta"):
     wanted = {comment_id_key(cid) for cid in comment_ids if valid_comment_id(cid)}
-    found, cursors, pages = set(), set(), set()
+    found, seen, cursors, pages = set(), set(), set(), set()
     cursor, scanned, complete, reason = 0, 0, False, "page_limit"
     reply = parent_comment_id is not None
     if not wanted or (reply and not valid_comment_id(parent_comment_id)):
@@ -77,9 +82,13 @@ async def scan_comment_ids(page, aweme_id, comment_ids, *, read_page, parent_com
                     reason = "repeated_page"
                     break
                 pages.add(fingerprint)
+                seen.update(page_ids)
                 more = _more(payload.get("has_more"))
                 if more is False:
-                    complete, reason = True, "exhausted"
+                    if reports_unseen_comments(payload, len(seen)):
+                        reason = "comment_list_total_mismatch"
+                    else:
+                        complete, reason = True, "exhausted"
                     break
                 if more is None:
                     reason = "missing_has_more"

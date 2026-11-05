@@ -505,7 +505,7 @@ def test_order_overview_shows_publication_and_boost_like_targets():
 
     assert "main_a" in overview
     assert "main_b" in overview
-    assert "Boost" in overview
+    assert "Платные лайки" in overview
     assert "Лайки: 50 частично" in overview
     assert "2, ожидалось 3" in overview
     assert "1/2" in overview

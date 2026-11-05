@@ -12,7 +12,7 @@ from bot.services.drafts import get_draft
 from bot.state.order_states import OrderStates
 from bot.services.formatting import Emoji
 from bot.services.likes_ui import get_likes_display_label
-from bot.services.template_utils import is_replies_only_template, template_replies
+from bot.services.template_utils import is_keywords_template, is_replies_only_template, template_keywords, template_replies
 from bot.services.telegram_utils import safe_callback_answer
 from bot.services.software_mode import (
     get_software_mode_for_user,
@@ -356,20 +356,29 @@ async def show_templates(callback: CallbackQuery):
         for template in shown_templates:
             name = template.get("name", "Без имени")
             template_id = template.get("id")
-            kind_icon = "↩️" if is_replies_only_template(template) else "💬"
-            replies_count = len(template_replies(template))
+            if is_keywords_template(template):
+                kind_icon = "🔑"
+                kw_count = len(template_keywords(template))
+                replies_count = len(template_replies(template))
+                badge = f"{kw_count} ключ." + (f" · {replies_count} отв." if replies_count else "")
+            elif is_replies_only_template(template):
+                kind_icon = "↩️"
+                badge = f"{len(template_replies(template))} отв."
+            else:
+                kind_icon = "💬"
+                badge = f"{len(template_replies(template))} отв."
             if len(name) > 28:
                 name = name[:25] + "..."
             keyboard.append([
                 InlineKeyboardButton(
-                    text=f"{kind_icon} {name} · {replies_count} отв.",
+                    text=f"{kind_icon} {name} · {badge}",
                     callback_data=f"template:detail:{template_id}"
                 )
             ])
         
         text = (
             "*📑 Шаблоны*\n\n"
-            "💬 полный шаблон · ↩️ только ответы\n\n"
+            "💬 полный · ↩️ только ответы · 🔑 ключевые слова\n\n"
             f"Страница *{page + 1}*/{total_pages} · всего: *{len(templates)}*"
         )
 

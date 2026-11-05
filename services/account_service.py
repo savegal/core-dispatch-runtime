@@ -816,7 +816,7 @@ def _read_account_session_quality(
         elif has_verify_fp and (has_ms_token or has_csrf or has_browser_linkage or has_device_linkage):
             bucket = SESSION_BUCKET_WORKABLE
             quality_reason = "http_ready"
-        elif supporting_signals >= 1:
+        elif supporting_signals >= 1 or has_strong_pair:
             bucket = SESSION_BUCKET_DEGRADED
             quality_reason = "weak_http_context"
         else:
@@ -862,7 +862,7 @@ def _read_account_session_quality(
         "has_sessionid": has_sessionid,
         "has_sid_guard": has_sid_guard,
         "has_ms_token": has_ms_token,
-        "can_warmup_http": has_sid_guard and has_ms_token and has_browser_auth,
+        "can_warmup_http": has_sid_guard and has_browser_auth,
         "has_verify_fp": has_verify_fp,
         "has_browser_linkage": has_browser_linkage,
         "has_device_linkage": has_device_linkage,
@@ -1482,8 +1482,12 @@ def _calculate_scope_quality_score(
     # Per-account override: если у аккаунта свой лимит (личные пулы),
     # «нагрузка» считается относительно него — иначе аккаунт с лимитом 5 будет
     # выглядеть «свободным» по сравнению с MAX_ACTIONS_PER_ACCOUNT.
-    main_cap = max(1, int(account.daily_main_limit or settings.MAX_ACTIONS_PER_ACCOUNT))
-    reply_cap = max(1, int(account.daily_reply_limit or settings.MAX_ACTIONS_PER_ACCOUNT))
+    raw_main_limit = int(account.daily_main_limit or settings.MAX_ACTIONS_PER_ACCOUNT)
+    raw_reply_limit = int(account.daily_reply_limit or settings.MAX_ACTIONS_PER_ACCOUNT)
+    soft_main_target = int(getattr(settings, "SOFT_DAILY_MAIN_ACTIONS_TARGET", 3) or 3)
+    soft_reply_target = int(getattr(settings, "SOFT_DAILY_REPLY_ACTIONS_TARGET", 6) or 6)
+    main_cap = max(1, soft_main_target if (not account.daily_main_limit and raw_main_limit > 50) else raw_main_limit)
+    reply_cap = max(1, soft_reply_target if (not account.daily_reply_limit and raw_reply_limit > 50) else raw_reply_limit)
     if scope == MAIN_SCOPE:
         load_ratio = min(1.0, float(account.today_main_comments or 0) / main_cap)
     elif scope == REPLY_SCOPE:
@@ -2197,7 +2201,8 @@ def get_free_account_for_main_comment(
     if account and settings.PROXY_GEO_MATCHING and (logger.isEnabledFor(logging.DEBUG) or logger.isEnabledFor(logging.WARNING)):
         try:
             if account.proxy:
-                proxy_obj = db.query(Proxy).filter(Proxy.proxy == account.proxy).first()
+                from services.proxy_normalizer import find_account_proxy_record
+                proxy_obj = find_account_proxy_record(db, account)
                 if proxy_obj:
                     if account.country_code and proxy_obj.country_code:
                         if account.country_code == proxy_obj.country_code:
@@ -2222,7 +2227,8 @@ def get_free_account_for_main_comment(
         selection_proxy_obj = None
         if account.proxy:
             try:
-                selection_proxy_obj = db.query(Proxy).filter(Proxy.proxy == account.proxy).first()
+                from services.proxy_normalizer import find_account_proxy_record
+                selection_proxy_obj = find_account_proxy_record(db, account)
             except Exception as proxy_diag_err:
                 logger.debug(
                     "[ACCOUNT_SERVICE] Could not load proxy diagnostics for main account %s: %s",
@@ -2544,8 +2550,28 @@ def get_free_account_for_reply(
                     if acc.proxy
                 })
                 if proxy_values:
-                    proxies = db.query(Proxy).filter(Proxy.proxy.in_(proxy_values)).all()
-                    proxy_map = {p.proxy: p for p in proxies}
+                    # Stored account URLs may have expanded session placeholders;
+                    # include the source Proxy template rows when building the map.
+                    proxies = db.query(Proxy).filter(or_(
+                        Proxy.proxy.in_(proxy_values),
+                        Proxy.proxy.contains("{"),
+                        func.lower(Proxy.proxy).contains("session-auto"),
+                        func.lower(Proxy.proxy).contains("sessid-auto"),
+                        func.lower(Proxy.proxy).contains("sid-auto"),
+                    )).all()
+                    from services.proxy_normalizer import (
+                        account_sticky_proxy_matches_template,
+                        resolve_account_sticky_proxy,
+                    )
+                    for pool in (available_accounts, runtime_last_resort_accounts, last_resort_accounts):
+                        for candidate, _, _ in pool:
+                            if candidate.proxy and candidate.proxy not in proxy_map:
+                                proxy_map[candidate.proxy] = next((
+                                    proxy for proxy in proxies if
+                                    resolve_account_sticky_proxy(proxy.proxy, candidate, default_country=proxy.country_code)
+                                    == candidate.proxy
+                                    or account_sticky_proxy_matches_template(proxy.proxy, candidate, candidate.proxy)
+                                ), None)
             except Exception as proxy_err:
                 logger.debug(f"[REPLY] Proxy map build failed: {proxy_err}")
 
@@ -2554,16 +2580,18 @@ def get_free_account_for_reply(
                 return True
             proxy_obj = proxy_map.get(acc.proxy)
             if not proxy_obj:
-                return True
+                # Without a matched Proxy row the type cannot be verified.
+                return False
+            is_mobile = str(proxy_obj.is_mobile or "").strip().upper() == "Y"
             if proxy_type_filter.lower() == "mobile":
-                return proxy_obj.is_mobile == "Y"
+                return is_mobile
             if proxy_type_filter.lower() == "residential":
-                return proxy_obj.is_mobile != "Y"
+                return not is_mobile
             return True
 
         def _proxy_is_mobile(acc: Account) -> bool:
             proxy_obj = proxy_map.get(acc.proxy)
-            return bool(proxy_obj and proxy_obj.is_mobile == "Y")
+            return bool(proxy_obj and str(proxy_obj.is_mobile or "").strip().upper() == "Y")
 
         if proxy_type_filter:
             filtered_accounts = [
@@ -2603,13 +2631,21 @@ def get_free_account_for_reply(
 
         if available_accounts:
             ranked_available = []
+            reply_cooldown_seconds = max(0, int(getattr(settings, "REPLY_ACCOUNT_COOLDOWN_SECONDS", 0) or 0))
             for acc, state, index in available_accounts:
                 lifecycle = _read_account_lifecycle(acc, now)
                 spend_lane = _read_account_spend_lane(acc, REPLY_SCOPE, now)
                 score = _calculate_scope_quality_score(acc, state, REPLY_SCOPE, now)
+                in_reply_cooldown = 0
+                if reply_cooldown_seconds > 0 and getattr(acc, "last_used_at", None) is not None:
+                    raw_used = acc.last_used_at
+                    last_used_dt = raw_used if getattr(raw_used, "tzinfo", None) else raw_used.replace(tzinfo=timezone.utc)
+                    if (now - last_used_dt).total_seconds() < reply_cooldown_seconds:
+                        in_reply_cooldown = 1
                 ranked_available.append(
                     (
                         (
+                            in_reply_cooldown,
                             -classify_account_web_readiness(acc.cookies),
                             assignment_rank(acc),
                             RUNTIME_BUCKET_ORDER.get(state["bucket"], 5),

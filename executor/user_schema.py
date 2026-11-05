@@ -58,7 +58,7 @@ import threading
 import time
 import uuid
 from dataclasses import dataclass, field
-from typing import Any, Callable, Dict, List, Optional, Tuple, Set
+from typing import Any, Awaitable, Callable, Dict, List, Optional, Tuple, Set
 from urllib.parse import urlparse
 
 from patchright.async_api import Page
@@ -1454,6 +1454,158 @@ def record_reply_boost(cid: Optional[str], account_id: Optional[str], parent_id:
     return likes_given
 
 
+async def boost_target_replies_via_http_pool(
+    db: Session,
+    video_url: str,
+    aweme_id: str,
+    *,
+    targets: List[Dict[str, Any]],
+    max_likes: int,
+    exclude_account_ids: Optional[Set[int]] = None,
+    pool_owner_user_id: Optional[int] = None,
+    task_id: Optional[int] = None,
+    stop_requested: Optional[Callable[[], bool]] = None,
+    attempts: Optional[Dict[str, Dict[str, str]]] = None,
+    persist_progress: Optional[Callable[[], Awaitable[bool]]] = None,
+) -> Dict[str, int]:
+    """Boost confirmed reply comments up to max_likes using additional free accounts from the pool."""
+    if attempts is not None and persist_progress is None:
+        raise ValueError("Persisted reply like attempts require a checkpoint callback")
+    clean_aweme = str(aweme_id or "").strip()
+    if not clean_aweme or max_likes <= 0 or not targets:
+        return {}
+    pending_targets = [
+        {"cid": str(t.get("cid") or "").strip(), "parent_id": str(t.get("parent_id") or "").strip()}
+        for t in targets
+        if isinstance(t, dict)
+        and _looks_like_tiktok_comment_id(str(t.get("cid") or "").strip())
+        and _looks_like_tiktok_comment_id(str(t.get("parent_id") or "").strip())
+    ]
+    if not pending_targets:
+        return {}
+    likes_by_cid: Dict[str, int] = {}
+    for item in pending_targets:
+        cid = item["cid"]
+        if attempts is not None:
+            likes_by_cid[cid] = sum(status == "confirmed" for status in attempts.get(cid, {}).values())
+            continue
+        _record_branch_published_reply(item["parent_id"], 1, item["cid"])
+        likes_by_cid[item["cid"]] = next(
+            (row["likes_given"] for row in _get_branch_published_replies(item["parent_id"])
+             if row["cid"] == item["cid"]),
+            0,
+        )
+    excluded: Set[int] = set(exclude_account_ids or set())
+    max_pool_attempts = min(max(max_likes * 2, 6), 60)
+    from executor.engagement_engine import warmup_page_for_http
+    from executor.http.playwright_http_client import PlaywrightHttpClient
+
+    def has_budget(cid: str, account_id: Optional[int] = None) -> bool:
+        if attempts is None:
+            return can_boost_reply(cid, account_id, max_likes=max_likes)
+        attempted = attempts.get(cid, {})
+        return len(attempted) < max_likes and str(account_id) not in attempted
+
+    for attempt_idx in range(max_pool_attempts):
+        if stop_requested and stop_requested():
+            break
+        pending_targets = [
+            t for t in pending_targets
+            if has_budget(t["cid"])
+        ]
+        if not pending_targets:
+            break
+        if attempts is not None:
+            already_used = set.intersection(*(set(attempts.get(item["cid"], {})) for item in pending_targets))
+            excluded.update(int(account_id) for account_id in already_used)
+        account = get_free_account_for_reply(
+            db,
+            exclude_ids=list(excluded),
+            reserve=True,
+            exclude_degraded_categories={"captcha", "page_blocked"},
+            pool_owner_user_id=pool_owner_user_id,
+        )
+        if account is None:
+            break
+        excluded.add(account.id)
+        context = page = None
+        corr = f"task_{task_id or 0}_reply_like_pool_a{attempt_idx + 1}_acc{account.id}"
+        try:
+            deny = await _preflight_cookie_http_gate(db, account, correlation_id=corr, phase="reply_like_pool_pre_browser")
+            if deny:
+                continue
+            context, page = await create_page_for_account(account)
+            ready, _ = await _ensure_account_login_ready(
+                db, page, account, video_url,
+                timeout_ms=int(_settings.PLAYWRIGHT_TIMEOUT * (2 if getattr(account, "proxy", None) else 1)),
+                correlation_id=corr,
+            )
+            if not ready:
+                continue
+            _, valid, _ = await warmup_page_for_http(page, video_url, correlation_id=corr, account=account, db=db)
+            if not valid or not is_on_expected_media_url(getattr(page, "url", None), video_url):
+                continue
+            client = await PlaywrightHttpClient.from_page(page)
+            for item in list(pending_targets):
+                if stop_requested and stop_requested():
+                    break
+                cid = item["cid"]
+                parent_id = item.get("parent_id") or None
+                if not has_budget(cid, account.id):
+                    continue
+                account_key = str(account.id)
+                if attempts is not None:
+                    # A worker can die after dispatch and before receiving its receipt.
+                    attempts.setdefault(cid, {})[account_key] = "unconfirmed"
+                    if not await persist_progress():
+                        del attempts[cid][account_key]
+                        return likes_by_cid
+                    if stop_requested and stop_requested():
+                        del attempts[cid][account_key]
+                        await persist_progress()
+                        return likes_by_cid
+                try:
+                    ok, _, _ = await client.like_comment(
+                        aweme_id=clean_aweme,
+                        cid=cid,
+                        correlation_id=f"{corr}_reply_{cid[:12]}",
+                        video_url=video_url,
+                    )
+                    if attempts is not None:
+                        request_meta = getattr(client, "last_request_meta", {})
+                        not_sent = (
+                            not ok and request_meta.get("request_attempted") is False
+                            and not request_meta.get("transport_invoked")
+                        )
+                        if ok:
+                            attempts[cid][account_key] = "confirmed"
+                            likes_by_cid[cid] += 1
+                        elif not_sent:
+                            del attempts[cid][account_key]
+                        if (ok or not_sent) and not await persist_progress():
+                            return likes_by_cid
+                    elif ok:
+                        given = record_reply_boost(cid, account.id, parent_id=parent_id)
+                        likes_by_cid[cid] = given
+                        logger.info(
+                            "[HTTP_POOL_BOOST] Account %s liked reply %s [%s/%s likes]",
+                            account.id, cid[:20], given, max_likes,
+                        )
+                    await asyncio.sleep(random.uniform(0.35, 0.75))
+                except Exception as exc:
+                    logger.debug("[HTTP_POOL_BOOST] Account %s like reply %s error: %s", account.id, cid[:20], exc)
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            logger.debug("[HTTP_POOL_BOOST] Pool account %s failed: %s", account.id, exc)
+        finally:
+            try:
+                await _safe_close(context, page, reason="reply_like_pool_done", correlation_id=corr)
+            finally:
+                release_reply_account_reservation(account.id)
+    return likes_by_cid
+
+
 async def _publish_reply_http_first_if_eligible(
     session: Optional[_UserSchemaHttpSession],
     reply_text: str,
@@ -1482,8 +1634,6 @@ async def _publish_reply_http_first_if_eligible(
             correlation_id=correlation_id,
             video_url=session.video_url,
         )
-        if success and comment_id:
-            _record_branch_published_reply(parent_id, variant_index, comment_id)
     except Exception as exc:
         session.disabled_reason = f"http_exception:{str(exc)[:80]}"
         request_attempted = _http_session_request_attempted(session, error_msg=str(exc))
@@ -1513,12 +1663,21 @@ async def _publish_reply_http_first_if_eligible(
             post_was_enabled_at_click=True,
         )
 
+    reply_request_meta = _http_session_request_meta(session)
+    published_reply_text = str(reply_request_meta.get("published_text") or "") or reply_text
     if success and comment_id:
-        await record_publication("reply", {"text": reply_text, "variant_index": variant_index,
+        parent_confirmed = bool((meta or {}).get("parent_confirmed"))
+        parent_level = str((meta or {}).get("parent_confirmation_level") or "unconfirmed")
+        if parent_confirmed:
+            _record_branch_published_reply(parent_id, variant_index, comment_id)
+        await record_publication("reply", {"text": published_reply_text, "variant_index": variant_index,
             "parent_comment_id": parent_id, "reply_id": str(comment_id), "account_id": session.account_id,
-            "network_confirmed": True, "success": True, "publication_attempted": True, "method": "http_user_schema"})
+            "network_confirmed": parent_confirmed, "success": parent_confirmed, "publication_attempted": True,
+            "submitted_unconfirmed": not parent_confirmed, "parent_confirmed": parent_confirmed,
+            "response_parent_id": (meta or {}).get("response_parent_id"),
+            "parent_confirmation_level": parent_level, "method": "http_user_schema"})
         # Free HTTP auto-boost: like parent comment AFTER reply succeeds so digg never blocks reply publish
-        if _like_parent_before_reply_enabled() and parent_id and can_boost_parent(parent_id, session.account_id):
+        if parent_confirmed and _like_parent_before_reply_enabled() and can_boost_parent(parent_id, session.account_id):
             try:
                 await asyncio.sleep(random.uniform(0.4, 0.9))
                 like_ok, like_err, _ = await session.client.like_comment(
@@ -1539,49 +1698,6 @@ async def _publish_reply_http_first_if_eligible(
             except Exception as exc:
                 logger.debug("[HTTP_AUTO_BOOST] Like parent comment %s failed (non-blocking): %s", parent_id[:20], exc)
 
-        # Targeted reply like boost (configured in order or template)
-        settings_dict = task_settings or {}
-        raw_target = str(settings_dict.get("reply_like_target") or "").strip().lower()
-        raw_count = int(settings_dict.get("reply_like_count") or 0)
-        if raw_count > 0 and raw_target not in {"0", "none", "off", "false", ""}:
-            known_replies = _get_branch_published_replies(parent_id)
-            target_items = []
-            digits = re.findall(r"\d+", raw_target)
-            if digits:
-                target_idx = int(digits[0])
-                target_items = [
-                    item for item in known_replies
-                    if item.get("index") == target_idx
-                    and can_boost_reply(item.get("cid"), session.account_id, max_likes=raw_count)
-                ]
-            elif raw_target == "all":
-                target_items = [
-                    item for item in known_replies
-                    if can_boost_reply(item.get("cid"), session.account_id, max_likes=raw_count)
-                ]
-
-            for item in target_items:
-                try:
-                    await asyncio.sleep(random.uniform(0.4, 0.9))
-                    reply_like_ok, reply_like_err, _ = await session.client.like_comment(
-                        aweme_id=session.aweme_id,
-                        cid=item["cid"],
-                        cookies=session.cookies,
-                        correlation_id=f"{correlation_id}_target_reply_like_{item['cid'][:12]}",
-                        video_url=session.video_url,
-                    )
-                    if reply_like_ok:
-                        likes_given = record_reply_boost(item["cid"], session.account_id, parent_id=parent_id)
-                        logger.info(
-                            "[HTTP_AUTO_BOOST] Reply bot %s liked target reply #%s (%s) [%s/%s likes] in branch %s",
-                            session.account_id, item.get("index"), item["cid"][:20], likes_given, raw_count, parent_id[:20]
-                        )
-                    else:
-                        logger.debug("[HTTP_AUTO_BOOST] Reply bot %s like target reply non-ok: %s", session.account_id, reply_like_err)
-                except Exception as exc:
-                    logger.debug("[HTTP_AUTO_BOOST] Target reply like error (non-blocking): %s", exc)
-        parent_confirmed = bool((meta or {}).get("parent_confirmed"))
-        parent_level = str((meta or {}).get("parent_confirmation_level") or "unconfirmed")
         try:
             from executor.engagement_engine import _record_http_account_result as record_http_account_result
             record_http_account_result(session.account_id, "success")
@@ -1609,7 +1725,8 @@ async def _publish_reply_http_first_if_eligible(
                 "response_root_comment_id": (meta or {}).get("response_root_comment_id"),
                 "parent_mismatch": bool((meta or {}).get("parent_mismatch")),
                 "parent_mismatch_reason": (meta or {}).get("parent_mismatch_reason"),
-                "request_meta": _http_session_request_meta(session),
+                "published_text": published_reply_text,
+                "request_meta": reply_request_meta,
             },
             post_was_enabled_at_click=True,
         )
@@ -3868,6 +3985,11 @@ async def _ensure_account_login_ready(
         try:
             if not _on_target_media():
                 try:
+                    from executor.engagement_engine import install_early_comment_list_interceptor
+                    install_early_comment_list_interceptor(page, video_url)
+                except Exception:
+                    pass
+                try:
                     await page.goto(video_url, wait_until="commit", timeout=timeout_ms)
                 except Exception as nav_exc:
                     if "ERR_ABORTED" not in str(nav_exc):
@@ -5228,10 +5350,15 @@ async def _publish_all_variants_on_account(
 
         if getattr(result, "network_request_attempted", False) or getattr(result, "network_captured", False) or getattr(result, "post_was_enabled_at_click", False):
             page._publication_attempted = True
-        if not tiktok_username and http_session is not None and result.status == "success":
+        published_text = text
+        if http_session is not None and result.status == "success":
             request_meta = getattr(getattr(http_session, "client", None), "last_request_meta", {})
             if isinstance(request_meta, dict):
-                tiktok_username = str(request_meta.get("comment_author") or "").strip() or None
+                if not tiktok_username:
+                    tiktok_username = str(request_meta.get("comment_author") or "").strip() or None
+                expanded_text = request_meta.get("published_text")
+                if isinstance(expanded_text, str) and expanded_text and result.dom_strategy == _USER_SCHEMA_HTTP_METHOD:
+                    published_text = expanded_text
         if _is_comment_composer_publish_failure(result):
             comments_already_open = await _recover_page_before_input_retry(
                 page,
@@ -5267,7 +5394,7 @@ async def _publish_all_variants_on_account(
         success = success_status and bool(result.comment_id)
         network_confirmed = success and bool(getattr(result, "network_captured", False))
         if network_confirmed:
-            await record_publication("main", {"text": text, "variant_index": idx,
+            await record_publication("main", {"text": published_text, "variant_index": idx,
                 "comment_id": str(result.comment_id), "account_id": account.id,
                 "tiktok_username": tiktok_username, "network_confirmed": True,
                 "publication_attempted": True, "method": result.dom_strategy})
@@ -5320,7 +5447,7 @@ async def _publish_all_variants_on_account(
                     local_ok, local_info = await asyncio.wait_for(
                         find_comment_in_list(
                             page=page,
-                            expected_text=text,
+                            expected_text=published_text,
                             max_scrolls=2,
                             scroll_delay_ms=300,
                             expected_author=tiktok_username,
@@ -5479,7 +5606,7 @@ async def _publish_all_variants_on_account(
         )
 
         published_main = PublishedMain(
-            text=text,
+            text=published_text,
             comment_id=published_comment_id,
             network_confirmed=network_confirmed,
             local_confirmed=local_confirmed,
@@ -9923,7 +10050,10 @@ async def _reply_with_variant_on_all_mains(
     try:
         context, page = await create_page_for_account(account)
         page._publication_attempted = False
-        detach_publication_tracker = track_publication_requests(page, parent_search_progress_sink if parent_search_progress_sink is not None else {})
+        detach_publication_tracker = track_publication_requests(
+            page, parent_search_progress_sink if parent_search_progress_sink is not None else {},
+            track_failures=True,
+        )
         _log_user_trace(
             "reply_browser_created",
             page=page,
@@ -10470,8 +10600,12 @@ async def _reply_with_variant_on_all_mains(
                     elif unconfirmed and reply_attempt_key:
                         soft_submitted_reply_keys.add(reply_attempt_key)
                         soft_submitted_keys_this_attempt.add(reply_attempt_key)
+                    published_reply_text = (
+                        str(((publish_result.network_response_json or {}).get("published_text") if isinstance(publish_result.network_response_json, dict) else "") or "")
+                        or reply_text
+                    )
                     outcome = ReplyOutcome(
-                        text=reply_text, variant_index=variant_index, matched_main_text=main.text,
+                        text=published_reply_text, variant_index=variant_index, matched_main_text=main.text,
                         parent_comment_id=parent_id, success=bool(success),
                         method=publish_result.dom_strategy or _USER_SCHEMA_HTTP_METHOD,
                         error=None if success else publish_result.error_reason,
@@ -11858,8 +11992,12 @@ async def _reply_with_variant_on_all_mains(
                     active_soft_submitted_reply_keys.add(reply_attempt_key)
                     soft_submitted_keys_this_attempt.add(reply_attempt_key)
 
+                published_reply_text = (
+                    str(((publish_result.network_response_json or {}).get("published_text") if isinstance(publish_result.network_response_json, dict) else "") or "")
+                    or reply_text
+                )
                 outcome = ReplyOutcome(
-                    text=reply_text,
+                    text=published_reply_text,
                     variant_index=variant_index,
                     matched_main_text=anchor_text,
                     parent_comment_id=parent_id,
