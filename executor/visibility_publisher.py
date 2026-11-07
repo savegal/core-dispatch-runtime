@@ -71,6 +71,8 @@ async def publish_visibility_http(db, account, video_url, text, *, correlation_i
             return None, "http_session_media_mismatch"
         if db is not None and db.in_transaction():
             db.commit()  # No checked-out SQL connection while the browser waits/posts.
+        if stop_requested():
+            return None, "stopped_by_user"
         if not await _ensure_signed_dispatch_ready(page, str(expected_id), correlation_id=correlation_id):
             return None, "runtime_signer_not_ready"
         # A POST with a lost/empty response may already exist on the platform.
