@@ -106,3 +106,38 @@ async def test_probe_classifies_http_status(monkeypatch, isolated_proxy_leases, 
             SimpleNamespace(id=9001), ProxyRoute.parse("http://gateway.example:8080")
         )
     assert str(exc.value) == "proxy_route:" + reason
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("reason,started,attempted,expected_state", [
+    ("proxy_route:residential_ip_probe_timeout", False, False, "not_sent"),
+    ("submitted_unconfirmed:empty_body", True, True, "uncertain"),
+])
+async def test_quantity_publisher_maps_proxy_failures_without_replaying_ambiguous_post(
+    db_session, sample_task, sample_account, monkeypatch, reason, started, attempted, expected_state
+):
+    from db.models import Account
+    from services import account_service
+    from executor import visibility_publisher
+    from executor.quantity_engine import publish_action
+
+    configure_task(db_session, sample_task, mains=1)
+    ensure_actions(db_session, sample_task, sample_task.video_urls[0], "main", 1, ["main"])
+    row = db_session.query(QuantityAction).one()
+    account_id = sample_account.id
+    monkeypatch.setattr(account_service, "get_free_account_for_main_comment",
+                        lambda db, **kwargs: db.get(Account, account_id))
+
+    async def fake_publisher(*args, **kwargs):
+        kwargs["progress"]["publication_call_started"] = started
+        kwargs["progress"]["publication_attempted"] = attempted
+        return None, reason
+
+    monkeypatch.setattr(visibility_publisher, "publish_visibility_http", fake_publisher)
+    outcome = await publish_action(db_session.get_bind(), sample_task.id, row.id,
+                                   stop_requested=lambda: False)
+    assert outcome == ("proxy_preflight_unavailable" if not started else "uncertain")
+    db_session.refresh(row)
+    assert row.state == expected_state and row.candidate_count == 1
+    assert row.dispatches == (1 if attempted else 0)
+    assert (claim_action(db_session, row.id) is not None) is (not attempted)
