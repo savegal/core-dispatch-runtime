@@ -21,6 +21,31 @@ logger = logging.getLogger(__name__)
 INCONCLUSIVE_RECHECK_DELAYS = (2.0, 5.0, 10.0)
 TASK_CONTROL_POLL_SECONDS = 1.0
 
+# A gateway/IP-verification outage is not evidence that an account is dead.
+# Keep the per-slot candidate ceiling as a hard bound, while limiting how fast
+# a quantity order can consume new candidates during repeated route failures.
+_PROXY_PREFLIGHT_ERRORS = frozenset({
+    "proxy_authentication_required",
+    "proxy_capacity_timeout",
+    "proxy_coordination_unavailable",
+    "residential_coordination_unavailable",
+    "residential_route_already_assigned",
+    "residential_exit_ip_in_use",
+})
+
+
+def _proxy_preflight_failure(reason, progress):
+    return (not progress.get("publication_call_started")
+            and isinstance(reason, str)
+            and (reason in _PROXY_PREFLIGHT_ERRORS
+                 or reason.startswith("residential_ip_probe_")))
+
+
+def _proxy_preflight_backoff_seconds(streak):
+    if streak < 3:
+        return 0.0
+    return min(30.0, float(2 ** min(5, streak - 2)))
+
 
 async def _owned_db_call(function, *args, **kwargs):
     operation = asyncio.create_task(asyncio.to_thread(function, *args, **kwargs))
@@ -330,6 +355,10 @@ async def publish_action(engine, task_id, identity, *, stop_requested, pool_owne
             finally:
                 release = release_main_account_reservation if action_kind == "main" else release_reply_account_reservation
                 release(reserved_id)
+        # Expose a non-publishing infrastructure failure to the scheduler.
+        # Durable state still remains "not_sent" with its original error_code.
+        if final_state == "not_sent" and _proxy_preflight_failure(reason, progress):
+            return "proxy_preflight_unavailable"
         return final_state
 
 
@@ -482,6 +511,7 @@ async def _execute_quantity_publications(db, task, video_url, text_variants, tas
     checked_rounds, ready_for_check = {}, {}
     seeded_parents = set()
     next_send, selection_blocked, preparation_failed = 0.0, False, False
+    proxy_preflight_fail_streak = 0
     reason = None
     try:
         while not stop_requested() and time.monotonic() - started < plan.max_seconds:
@@ -496,6 +526,18 @@ async def _execute_quantity_publications(db, task, video_url, text_variants, tas
             if outcomes:
                 selection_blocked = all(value == "no_accounts_available" for value in outcomes)
                 preparation_failed = all(value == "account_preparation_failed" for value in outcomes)
+                if all(value == "proxy_preflight_unavailable" for value in outcomes):
+                    proxy_preflight_fail_streak += len(outcomes)
+                    pause = _proxy_preflight_backoff_seconds(proxy_preflight_fail_streak)
+                    if pause:
+                        next_send = max(next_send, time.monotonic() + pause)
+                        logger.warning(
+                            "Quantity task %s: %s consecutive proxy preflight failures; "
+                            "deferring new candidates %.1fs without retiring accounts",
+                            task_id, proxy_preflight_fail_streak, pause,
+                        )
+                else:
+                    proxy_preflight_fail_streak = 0
             for job in [job for job in checks if job.done()]:
                 identities = checks.pop(job)
                 selection_blocked = False
