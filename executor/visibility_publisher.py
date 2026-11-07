@@ -1,7 +1,29 @@
 """One HTTP replacement receipt, without composer/search/behavioral UI paths."""
+import asyncio
+import logging
+
 from executor.http.execution_policy import http_first_enabled, valid_comment_id
 from executor.http.retry_policy import RetryPolicy
 from executor.http.signature_runtime import wait_for_runtime_signer_ready
+
+logger = logging.getLogger(__name__)
+
+
+async def _ensure_signed_dispatch_ready(page, aweme_id: str, *, correlation_id: str) -> bool:
+    """Prime one read-only signed GET when warmup saw an SDK but no signed request.
+
+    The publisher must never mistake SDK presence for signed-dispatch evidence.
+    Do not retry POST or manufacture signature evidence to satisfy this guard.
+    """
+    if await wait_for_runtime_signer_ready(page, timeout_ms=200, require_signed_dispatch=True):
+        return True
+    from executor.http.comment_discovery import fetch_comment_page
+    try:
+        await asyncio.wait_for(fetch_comment_page(page, str(aweme_id), count=20), timeout=5.0)
+    except Exception as exc:
+        logger.info("[VISIBILITY_HTTP] %s: signed GET bootstrap unavailable (%s)",
+                    correlation_id, type(exc).__name__)
+    return bool(await wait_for_runtime_signer_ready(page, timeout_ms=700, require_signed_dispatch=True))
 
 
 async def publish_visibility_http(db, account, video_url, text, *, correlation_id,
@@ -49,7 +71,7 @@ async def publish_visibility_http(db, account, video_url, text, *, correlation_i
             return None, "http_session_media_mismatch"
         if db is not None and db.in_transaction():
             db.commit()  # No checked-out SQL connection while the browser waits/posts.
-        if not await wait_for_runtime_signer_ready(page, timeout_ms=1200, require_signed_dispatch=True):
+        if not await _ensure_signed_dispatch_ready(page, str(expected_id), correlation_id=correlation_id):
             return None, "runtime_signer_not_ready"
         # A POST with a lost/empty response may already exist on the platform.
         # Only the visibility controller may authorize another publication.
