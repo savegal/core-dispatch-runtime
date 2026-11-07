@@ -35,10 +35,12 @@ _PROXY_PREFLIGHT_ERRORS = frozenset({
 
 
 def _proxy_preflight_failure(reason, progress):
-    return (not progress.get("publication_call_started")
-            and isinstance(reason, str)
-            and (reason in _PROXY_PREFLIGHT_ERRORS
-                 or reason.startswith("residential_ip_probe_")))
+    if progress.get("publication_call_started") or not isinstance(reason, str):
+        return False
+    # ProxyRouteError stringifies with a "proxy_route:" prefix; the cookie gate
+    # passes that string verbatim. Never require a bare error code here.
+    code = reason.removeprefix("proxy_route:")
+    return code in _PROXY_PREFLIGHT_ERRORS or code.startswith("residential_ip_probe_")
 
 
 def _proxy_preflight_backoff_seconds(streak):
