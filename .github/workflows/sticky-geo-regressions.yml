@@ -8,7 +8,12 @@ on:
       - "services/proxy_normalizer.py"
       - "services/geo_detection_service.py"
       - "services/cookie_validator.py"
+      - "services/residential_proxy_service.py"
       - "executor/http/playwright_http_client.py"
+      - "executor/visibility_publisher.py"
+      - "executor/quantity_engine.py"
+      - "tests/unit/test_quantity_signed_bootstrap.py"
+      - "tests/unit/test_quantity_proxy_failure_backoff.py"
       - "tests/test_request_budget_defaults.py"
       - "tests/test_sticky_proxy_patch.py"
       - "tests/test_sticky_rebalance_policy.py"
@@ -40,7 +45,7 @@ jobs:
           python -m pip install -r requirements.txt fakeredis
       - name: Compile changed modules
         run: |
-          python -m compileall -q services/geo_detection_service.py services/proxy_normalizer.py services/proxy_assignment_service.py services/cookie_validator.py executor/http/playwright_http_client.py
+          python -m compileall -q services/geo_detection_service.py services/proxy_normalizer.py services/proxy_assignment_service.py services/cookie_validator.py services/residential_proxy_service.py executor/http/playwright_http_client.py executor/visibility_publisher.py executor/quantity_engine.py tests/unit/test_quantity_signed_bootstrap.py tests/unit/test_quantity_proxy_failure_backoff.py
       - name: Run focused regression tests without live network or browsers
         run: |
-          python -m pytest -q tests/test_sticky_proxy_patch.py tests/test_sticky_rebalance_policy.py tests/test_trusted_country_sources.py tests/test_cookie_curl_fallback_patch.py tests/test_request_budget_defaults.py
+          python -m pytest -q tests/test_sticky_proxy_patch.py tests/test_sticky_rebalance_policy.py tests/test_trusted_country_sources.py tests/test_cookie_curl_fallback_patch.py tests/test_request_budget_defaults.py tests/unit/test_quantity_signed_bootstrap.py tests/unit/test_quantity_proxy_failure_backoff.py
