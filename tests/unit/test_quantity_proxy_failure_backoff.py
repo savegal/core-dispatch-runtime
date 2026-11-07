@@ -1,5 +1,5 @@
 """Quantity-route failures should be bounded without corrupting publication receipts."""
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, Mock
 
 import httpx
 import pytest
@@ -17,6 +17,16 @@ from tests.unit.test_quantity_redesign_recovery import configure_task
 pytestmark = pytest.mark.unit
 
 
+def mock_successful_redis_claims(monkeypatch):
+    # These cases exercise HTTP error mapping, not the Redis lease Lua scripts.
+    # A real FakeRedis lease is already covered by test_residential_proxy_policy.
+    from types import SimpleNamespace
+    monkeypatch.setattr(
+        "services.proxy_concurrency_service._lease_client",
+        lambda: SimpleNamespace(eval=Mock(return_value=1), get=Mock(return_value=None)),
+    )
+
+
 @pytest.mark.parametrize("reason", [
     "residential_ip_probe_timeout",
     "residential_ip_probe_connect_error",
@@ -26,6 +36,7 @@ pytestmark = pytest.mark.unit
 ])
 def test_classifies_only_pre_post_proxy_failures(reason):
     assert _proxy_preflight_failure(reason, {"publication_call_started": False})
+    assert _proxy_preflight_failure("proxy_route:" + reason, {"publication_call_started": False})
     assert not _proxy_preflight_failure(reason, {"publication_call_started": True})
     assert not _proxy_preflight_failure("submitted_unconfirmed:empty_body",
                                         {"publication_call_started": False})
@@ -65,13 +76,14 @@ def test_pre_post_network_failure_remains_retryable_and_does_not_consume_dispatc
 async def test_probe_classifies_network_errors_without_leaking_proxy_url(
     monkeypatch, isolated_proxy_leases, error, reason
 ):
+    mock_successful_redis_claims(monkeypatch)
     probe = AsyncMock(side_effect=error)
     monkeypatch.setattr(residential, "_probe_exit_ip", probe)
     route = ProxyRoute.parse("http://secret-login:secret-password@gateway.example:8080")
     from types import SimpleNamespace
     with pytest.raises(ProxyRouteError) as exc:
         await residential.ensure_residential_exit_ip(SimpleNamespace(id=9001), route)
-    assert str(exc.value) == reason
+    assert str(exc.value) == "proxy_route:" + reason
     assert "secret" not in str(exc.value)
     probe.assert_awaited_once()
 
@@ -83,6 +95,7 @@ async def test_probe_classifies_network_errors_without_leaking_proxy_url(
     (503, "residential_ip_probe_service_error"),
 ])
 async def test_probe_classifies_http_status(monkeypatch, isolated_proxy_leases, code, reason):
+    mock_successful_redis_claims(monkeypatch)
     request = httpx.Request("GET", "https://api.ipify.org")
     response = httpx.Response(code, request=request)
     probe = AsyncMock(side_effect=httpx.HTTPStatusError("status", request=request, response=response))
@@ -92,4 +105,4 @@ async def test_probe_classifies_http_status(monkeypatch, isolated_proxy_leases, 
         await residential.ensure_residential_exit_ip(
             SimpleNamespace(id=9001), ProxyRoute.parse("http://gateway.example:8080")
         )
-    assert str(exc.value) == reason
+    assert str(exc.value) == "proxy_route:" + reason
