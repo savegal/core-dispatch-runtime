@@ -87,13 +87,24 @@ async def ensure_residential_exit_ip(account, route, *, lease=None) -> str | Non
     except httpx.ProxyError as exc:
         if "407" in str(exc):
             raise ProxyRouteError("proxy_authentication_required") from None
-        raise ProxyRouteError("residential_ip_probe_failed") from None
+        raise ProxyRouteError("residential_ip_probe_proxy_error") from None
     except httpx.HTTPStatusError as exc:
-        if exc.response.status_code == 407:
+        code = exc.response.status_code
+        if code == 407:
             raise ProxyRouteError("proxy_authentication_required") from None
-        raise ProxyRouteError("residential_ip_probe_failed") from None
-    except (httpx.HTTPError, TimeoutError, ValueError, TypeError):
-        raise ProxyRouteError("residential_ip_probe_failed") from None
+        if code == 429:
+            raise ProxyRouteError("residential_ip_probe_rate_limited") from None
+        if 500 <= code <= 599:
+            raise ProxyRouteError("residential_ip_probe_service_error") from None
+        raise ProxyRouteError("residential_ip_probe_http_error") from None
+    except (httpx.TimeoutException, TimeoutError):
+        raise ProxyRouteError("residential_ip_probe_timeout") from None
+    except httpx.ConnectError:
+        raise ProxyRouteError("residential_ip_probe_connect_error") from None
+    except httpx.HTTPError:
+        raise ProxyRouteError("residential_ip_probe_transport_error") from None
+    except (ValueError, TypeError):
+        raise ProxyRouteError("residential_ip_probe_invalid") from None
     except Exception:
         raise ProxyRouteError("residential_coordination_unavailable") from None
     account.proxy_exit_ip = observed
