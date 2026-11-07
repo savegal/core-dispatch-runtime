@@ -1,4 +1,4 @@
-"""A persisted sticky session is immutable in ordinary weighted rebalancing."""
+"""Rebalancing fills missing routes and preserves existing account bindings."""
 import pytest
 from sqlalchemy import create_engine
 from sqlalchemy.orm import Session
@@ -33,13 +33,13 @@ def make_case(monkeypatch):
         )
         mobile = Proxy(
             id=2, proxy=RAW_MOBILE, status="active",
-            is_mobile="Y", country_code="DE",
+            is_mobile="Y", country_code="DE", rotation_url="https://other.example/rotate",
         )
         account = Account(
             id=42, label="sticky-42", cookies="sessionid=abc",
             status="active", error_count_recent=0,
             country_code=account_country,
-            proxy=resolve_account_sticky_proxy(RAW_STICKY, 
+            proxy=resolve_account_sticky_proxy(RAW_STICKY,
                 type("AccountIdentity", (), {"id": 42, "country_code": "UA"})()),
         )
         db.add(mobile)
@@ -76,7 +76,8 @@ def test_redis_bad_does_not_release_sticky_pin(make_case, monkeypatch):
     monkeypatch.setattr(rebalance, "get_bad_proxy_set", lambda *_: {RAW_STICKY})
     result = _rebalance(db)
     assert account.proxy == original
-    assert result["pinned_outside_active_pool"] == 1
+    assert result["pinned_accounts"] == 1
+    assert result["ignored_temporarily_bad_proxies"] == 1
 
 
 @pytest.mark.parametrize("status", ["disabled", "slow", "unknown"])
@@ -95,19 +96,14 @@ def test_country_change_does_not_release_sticky_pin(make_case):
     assert account.proxy == original
 
 
-def test_database_bad_source_allows_reassignment(make_case):
-    db, account = make_case(gateway_status="bad")
+@pytest.mark.parametrize("source", ["bad", "deleted"])
+def test_rebalancing_keeps_binding_when_source_is_unavailable(make_case, source):
+    db, account = make_case(gateway_status="bad", gateway_present=source != "deleted")
+    original = account.proxy
     result = _rebalance(db)
-    assert account.proxy == RAW_MOBILE
-    assert result["changed"] == 1
-    assert result["pinned_sticky_accounts"] == 0
-
-
-def test_deleted_source_allows_reassignment(make_case):
-    db, account = make_case(gateway_present=False)
-    result = _rebalance(db)
-    assert account.proxy == RAW_MOBILE
-    assert result["changed"] == 1
+    assert account.proxy == original
+    assert result["changed"] == 0
+    assert result["pinned_accounts"] == 1
 
 
 def test_type_filter_does_not_release_an_active_residential_pin(make_case):
@@ -115,11 +111,16 @@ def test_type_filter_does_not_release_an_active_residential_pin(make_case):
     original = account.proxy
     result = _rebalance(db, force_proxy_type_filter="mobile")
     assert account.proxy == original
-    assert result["pinned_outside_active_pool"] == 1
+    assert result["pinned_accounts"] == 1
+    assert result["force_proxy_type_filter"] == "mobile"
+    assert result["mobile_proxies"] == 1
 
 
 def test_rebalancing_does_not_infer_account_country_from_proxy(make_case):
     db, account = make_case(gateway_status="bad", account_country=None)
-    _rebalance(db)
+    assert rebalance.clear_proxy_bindings(db, {1}) == 1
+    db.commit()
+    result = _rebalance(db)
     assert account.proxy == RAW_MOBILE
     assert account.country_code is None
+    assert result["changed"] == 1

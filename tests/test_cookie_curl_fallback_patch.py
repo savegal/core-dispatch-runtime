@@ -3,6 +3,8 @@ import asyncio
 from types import SimpleNamespace
 
 import pytest
+from curl_cffi.requests import impersonate
+from executor import browser_identity
 from services import cookie_validator as validator
 from services import proxy_normalizer
 from executor.http import request_profile
@@ -11,6 +13,7 @@ from executor.http import request_profile
 @pytest.mark.parametrize("curl_raises", [False, True])
 def test_curl_passport_and_aiohttp_backup(monkeypatch, curl_raises):
     calls = {"curl": 0, "aiohttp": 0}
+    profiles = []
 
     class CurlResponse:
         status_code = 200
@@ -21,7 +24,7 @@ def test_curl_passport_and_aiohttp_backup(monkeypatch, curl_raises):
 
     class CurlSession:
         def __init__(self, **kwargs):
-            assert kwargs["impersonate"] == "chrome131"
+            profiles.append(kwargs["impersonate"])
 
         async def __aenter__(self):
             calls["curl"] += 1
@@ -63,6 +66,9 @@ def test_curl_passport_and_aiohttp_backup(monkeypatch, curl_raises):
             return AioResponse()
 
     monkeypatch.setenv("VALIDATOR_TEST_CURL_CFFI", "1")
+    monkeypatch.setattr(browser_identity, "_running_version", "144.0.0.0")
+    available_profiles = [SimpleNamespace(value=name) for name in ("chrome131", "chrome142", "chrome145")]
+    monkeypatch.setattr(impersonate, "BrowserType", available_profiles)
     monkeypatch.setattr(validator, "_CurlAsyncSession", CurlSession)
     monkeypatch.setattr(validator.aiohttp, "ClientSession", AioSession)
     monkeypatch.setattr(validator, "_ORIGINAL_AIOHTTP_CLIENT_SESSION", AioSession)
@@ -74,5 +80,6 @@ def test_curl_passport_and_aiohttp_backup(monkeypatch, curl_raises):
 
     result = asyncio.run(validator._validate_account_http_tri_state(SimpleNamespace(country_code="US")))
     assert result["valid"] is True
+    assert profiles == ["chrome142"]
     assert calls["curl"] == 1
     assert calls["aiohttp"] == int(curl_raises)
