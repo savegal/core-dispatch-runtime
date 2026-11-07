@@ -771,180 +771,62 @@ def recover_tasks_lost_in_redis(db: Session) -> int:
 
 
 def recover_stuck_tasks(db: Session, timeout_seconds: int = TASK_TIMEOUT_SECONDS) -> int:
-    """
-    ИСПРАВЛЕНО: Восстанавливает зависшие задачи (в статусе "in_progress" дольше timeout_seconds).
-    
-    Незавершённую фазу лайков с сохранёнными целями можно возобновить один раз.
-    Для остальных задач применяется возврат с учётом прогресса.
-    
-    Args:
-        db: SQLAlchemy сессия
-        timeout_seconds: Максимальное время в секундах для задачи в статусе "in_progress"
-        
-    Returns:
-        Количество восстановленных задач
-    """
-    from db.models import User
-    from services.balance_service import get_pricing, calculate_refund_amount, refund_balance, balance_is_admin
-    
+    """Resume pending reply likes or settle orders left by an interrupted worker."""
+    from sqlalchemy import and_, or_
+    from services.task_execution_ledger import has_submission_evidence, url_result_counts_as_success
+    from services.task_settlement import REFUND_PENDING_KEY, lock_task_for_settlement, settle_task_refund
+
     now = datetime.now(timezone.utc)
-    timeout_threshold = now - timedelta(seconds=timeout_seconds)
-    
-    # Находим задачи, которые зависли в статусе "in_progress"
-    stuck_tasks = db.query(Task).filter(
-        Task.status == "in_progress",
-        Task.updated_at < timeout_threshold
-    ).all()
-    
+    stale = (
+        Task.updated_at < now - timedelta(seconds=timeout_seconds),
+        or_(
+            Task.status == "in_progress",
+            and_(Task.status.in_(("stopped", "error", "partial")),
+                 Task.settings[REFUND_PENDING_KEY].as_boolean().is_(True)),
+        ),
+    )
+    stuck_ids = [row.id for row in db.query(Task.id).filter(*stale)]
     recovered_count = 0
-    for task in stuck_tasks:
-        # Сохраняем старое значение updated_at для сообщения об ошибке
-        old_updated_at = task.updated_at
-        progress = task.progress or 0
-        total_urls = len(task.video_urls or [])
-        
-        logger.warning(
-            f"Recovering stuck task {task.id}: "
-            f"in_progress since {old_updated_at}, "
-            f"progress={progress}/{total_urls}, "
-            f"timeout={timeout_seconds}s"
-        )
-        
+    for task_id in stuck_ids:
         try:
-            task_settings = dict(task.settings or {})
-            url_results = task_settings.get("url_results")
-            has_pending_likes = isinstance(url_results, dict) and any(map(pending_reply_likes, url_results.values()))
-            if has_pending_likes and not task_settings.get("stopped_by_user") and not task_settings.get("_reply_likes_requeued"):
-                task_id = task.id
-                task_settings["_reply_likes_requeued"] = True
-                changed = db.query(Task).filter(
-                    Task.id == task_id, Task.status == "in_progress", Task.updated_at < timeout_threshold,
-                ).update(
-                    {Task.status: "pending", Task.settings: task_settings, Task.updated_at: now},
-                    synchronize_session=False,
-                )
-                if not changed:
-                    db.rollback()
-                    continue
-                reserve_task_for_enqueue(db, task_id)
-                db.commit()
-                recovered_count += 1
-                finalize_reserved_enqueue(db, task_id)
-                logger.info("Task %s returned to the queue to resume reply likes", task_id)
+            task = lock_task_for_settlement(db, task_id, *stale)
+            if task is None:
+                db.rollback()
                 continue
 
-            # Определяем финальный статус
-            if progress == 0:
-                # Нет прогресса - полный fail с refund
-                task.status = "error"
+            task_settings = dict(task.settings or {})
+            url_results = task_settings.get("url_results") or {}
+            if task.status == "in_progress":
+                if (any(map(pending_reply_likes, url_results.values()))
+                        and not task_settings.get("stopped_by_user")
+                        and not task_settings.get("_reply_likes_requeued")):
+                    task.settings = {**task_settings, "_reply_likes_requeued": True}
+                    task.status = "pending"
+                    task.updated_at = now
+                    reserve_task_for_enqueue(db, task_id)
+                    db.commit()
+                    recovered_count += 1
+                    finalize_reserved_enqueue(db, task_id)
+                    logger.info("Task %s returned to the queue to resume reply likes", task_id)
+                    continue
+
+                completed = sum(map(url_result_counts_as_success, url_results.values()))
+                has_progress = completed or any(map(has_submission_evidence, url_results.values()))
+                task.status = "partial" if has_progress or (not url_results and task.progress) else "error"
                 task.error_reason = (
-                    f"Задача зависла в статусе 'in_progress' более {timeout_seconds // 60} минут "
-                    f"(с {old_updated_at}). Не завершена обработка ни одной ссылки; отдельные действия могли быть выполнены. "
-                    f"Возможные причины: нет активных аккаунтов, "
-                    f"воркер остановлен, ошибки подключения."
+                    f"Задача зависла более {timeout_seconds // 60} минут (с {task.updated_at}). "
+                    f"Успешно обработано {completed}/{len(task.video_urls or [])} видео по сохранённым результатам."
                 )
-                
-                # Возвращаем средства полностью (если были списаны)
-                user = db.query(User).filter(User.id == task.user_id).first()
-                if user and not balance_is_admin(user) and task.total_cost and task.total_cost > 0:
-                    try:
-                        already_refunded = Decimal(str(task.refunded_cost or 0))
-                        remaining_refund = max(Decimal(str(task.total_cost)) - already_refunded, Decimal("0.00"))
-                        if remaining_refund <= 0:
-                            logger.info(f"Task {task.id}: refund already applied earlier, skipping duplicate full refund")
-                        else:
-                            refund_success = refund_balance(
-                                db=db,
-                                user_id=task.user_id,
-                                amount=remaining_refund,
-                                task_id=task.id,
-                                description=f"Возврат за зависшую задачу #{task.id} (in_progress timeout, no progress)",
-                                commit=False,
-                            )
-                            
-                            if refund_success:
-                                task.refunded_cost = already_refunded + remaining_refund
-                                logger.info(
-                                    f"Task {task.id}: Full refund {remaining_refund} грн for stuck timeout "
-                                    f"(no progress, user {task.user_id})"
-                                )
-                            else:
-                                logger.error(f"Task {task.id}: Failed to refund balance for stuck timeout")
-                    except Exception as refund_error:
-                        logger.error(
-                            f"Task {task.id}: Error refunding balance for stuck timeout: {refund_error}",
-                            exc_info=True
-                        )
-            else:
-                # Есть прогресс - partial с refund за неуспешные
-                from services.task_state_machine import safe_transition
-                new_status = safe_transition(task.status, "partial")
-                if new_status:
-                    task.status = new_status
-                else:
-                    task.status = "error"
-                
-                task.error_reason = (
-                    f"Задача зависла в статусе 'in_progress' более {timeout_seconds // 60} минут "
-                    f"(с {old_updated_at}). Обработано {progress}/{total_urls} видео."
-                )
-                
-                # Возвращаем средства за неуспешные видео
-                user = db.query(User).filter(User.id == task.user_id).first()
-                if user and not balance_is_admin(user) and task.total_cost and task.total_cost > 0:
-                    failed_videos = total_urls - progress
-                    if failed_videos > 0:
-                        try:
-                            pricing = get_pricing(db)
-                            target_refund = calculate_refund_amount(failed_videos, pricing)
-                            already_refunded = Decimal(str(task.refunded_cost or 0))
-                            remaining_refund = max(Decimal(str(task.total_cost)) - already_refunded, Decimal("0.00"))
-                            refund_amount = min(Decimal(str(target_refund)), remaining_refund)
-                            if refund_amount <= 0:
-                                logger.info(f"Task {task.id}: refund already applied earlier, skipping duplicate partial refund")
-                            else:
-                                refund_success = refund_balance(
-                                    db=db,
-                                    user_id=task.user_id,
-                                    amount=refund_amount,
-                                    task_id=task.id,
-                                    description=f"Возврат за {failed_videos} неуспешных видео в зависшей задаче #{task.id}",
-                                    commit=False,
-                                )
-                                
-                                if refund_success:
-                                    task.refunded_cost = already_refunded + refund_amount
-                                    logger.info(
-                                        f"Task {task.id}: Refunded {refund_amount} грн for {failed_videos} failed videos "
-                                        f"(stuck timeout, user {task.user_id})"
-                                    )
-                                else:
-                                    logger.error(f"Task {task.id}: Failed to refund balance for stuck timeout")
-                        except Exception as refund_error:
-                            logger.error(
-                                f"Task {task.id}: Error refunding balance for stuck timeout: {refund_error}",
-                                exc_info=True
-                            )
-            
+
+            settle_task_refund(db, task, legacy_progress=True)
             task.updated_at = now
-            
-            try:
-                db.commit()
-                recovered_count += 1
-                logger.info(f"Task {task.id} recovered from stuck in_progress (status: {task.status})")
-            except Exception as e:
-                db.rollback()
-                logger.error(f"Error committing recovery for task {task.id}: {e}", exc_info=True)
-                continue  # Продолжаем обработку следующих задач
-            
-        except Exception as e:
+            db.commit()
+            recovered_count += 1
+            logger.info("Task %s settled by recovery (status: %s)", task_id, task.status)
+        except Exception:
             db.rollback()
-            logger.error(f"Error recovering stuck task {task.id}: {e}", exc_info=True)
-            # Продолжаем обработку следующих задач даже если одна не удалась
-    
-    if recovered_count > 0:
-        logger.info(f"Recovered {recovered_count} stuck in_progress task(s)")
-    
+            logger.exception("Error recovering stuck task %s", task_id)
+
     return recovered_count
 
 

@@ -6,6 +6,8 @@ from sqlalchemy import inspect
 from sqlalchemy.orm import Session
 from sqlalchemy.orm.attributes import set_committed_value
 
+from services.async_ownership import await_owned
+
 _TASK_LOCKS = [threading.RLock() for _ in range(64)]
 
 
@@ -27,14 +29,17 @@ async def run_visibility_checkpoint(db, task, checkpoint, *args):
                 checkpoint_db.connection().exec_driver_sql("BEGIN IMMEDIATE")
             row = checkpoint_db.query(Task).filter(Task.id == task_id).with_for_update().one()
             checkpoint(checkpoint_db, row, *args)
+            try:
+                from services.publication_journal import sync_public_evidence
+                sync_public_evidence(checkpoint_db, row)
+                checkpoint_db.commit()
+            except Exception:
+                # The publication receipt above has already committed.
+                checkpoint_db.rollback()
+                import logging
+                logging.getLogger(__name__).warning("Could not project publication evidence", exc_info=True)
             return row.settings
 
     pending = asyncio.create_task(asyncio.to_thread(persist))
-    try:
-        merged = await asyncio.shield(pending)
-    except asyncio.CancelledError:
-        # Cancellation cannot interrupt a thread's commit. Finish owning this
-        # receipt before publication cleanup runs and propagates cancellation.
-        await pending
-        raise
+    merged = await await_owned(pending)
     set_committed_value(task, "settings", merged)

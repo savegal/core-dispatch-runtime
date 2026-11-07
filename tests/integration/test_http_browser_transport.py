@@ -19,6 +19,126 @@ pytestmark = [pytest.mark.integration, pytest.mark.asyncio]
 CLOCK_TOLERANCE_MS = int(time.get_clock_info("monotonic").resolution * 1000) + 1
 
 
+@pytest.fixture
+def metered_origin():
+    from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+    import threading
+    seen = []
+    class Handler(BaseHTTPRequestHandler):
+        def log_message(self, *args):
+            pass
+
+        def do_GET(self):
+            if self.path.startswith("/meter/"):
+                seen.append(("GET", self.path))
+                body = self.server.meter_body
+            else:
+                body = b'<html><link rel="icon" href="data:,"></html>'
+            self.send_response(200)
+            self.send_header("Content-Type", "text/plain" if self.path.startswith("/meter/") else "text/html")
+            self.send_header("Content-Length", str(len(body)))
+            self.send_header("Cache-Control", "no-store")
+            self.end_headers()
+            self.wfile.write(body)
+
+        def do_POST(self):
+            seen.append(("POST", self.path))
+            body = self.rfile.read(int(self.headers.get("Content-Length", 0)))
+            self.send_response(200)
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+    server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+    server.meter_body = b"measured response"
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        yield f"http://127.0.0.1:{server.server_port}", server, seen
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=2)
+
+
+async def test_native_chromium_sizes_reach_sql_reads_and_writes(browser_page, metered_origin, db_session, sample_task):
+    from db.models import TaskTrafficBucket
+    from services.traffic_meter import TrafficMeter
+    origin, _server, _seen = metered_origin
+    await browser_page.goto(origin)
+    browser_page._pool_task_id = sample_task.id
+    meter, requests, finished = TrafficMeter(db_session.get_bind(), 42), [], asyncio.Event()
+    def started(request):
+        if "/meter/" in request.url:
+            meter.started(request)
+    def completed(request):
+        if "/meter/" in request.url:
+            requests.append(request)
+            meter.finished(request)
+            if len(requests) == 2:
+                finished.set()
+    context = browser_page.context
+    context.on("request", started)
+    context.on("requestfinished", completed)
+    try:
+        await browser_page.evaluate("""async () => {
+            await (await fetch('/meter/read')).text();
+            await (await fetch('/meter/write', {method:'POST', body:'metered body'})).text();
+        }""", isolated_context=False)
+        await asyncio.wait_for(finished.wait(), 2)
+        await meter.close()
+        rows = {row.category: row for row in db_session.query(TaskTrafficBucket)}
+        assert set(rows) == {"reads", "writes"}
+        for request in requests:
+            sizes = await request.sizes()
+            row = rows["writes" if request.method == "POST" else "reads"]
+            assert row.received_bytes == sizes["responseBodySize"] + sizes["responseHeadersSize"] > 0
+            assert row.sent_bytes == sizes["requestBodySize"] + sizes["requestHeadersSize"] > 0
+            assert row.requests == 1
+    finally:
+        context.remove_listener("request", started)
+        context.remove_listener("requestfinished", completed)
+        await meter.close()
+
+
+async def test_native_download_budget_blocks_the_next_order_navigation(
+        browser_page, metered_origin, db_session, sample_task, monkeypatch):
+    from executor import quantity_engine as quantity, engagement_engine
+    from services.quantity_plan import QuantityPlan
+    from services.traffic_meter import TrafficMeter
+    origin, server, seen = metered_origin
+    server.meter_body = b"x" * 1048576
+    sample_task.settings = {"publication_plan": QuantityPlan(main_count=1, traffic_limit_mb=1).model_dump()}
+    db_session.commit()
+    await browser_page.goto(origin)
+    browser_page._pool_task_id = sample_task.id
+    meter, finished = TrafficMeter(db_session.get_bind(), 42), asyncio.Event()
+    def started(request):
+        if "/meter/" in request.url:
+            meter.started(request)
+    def completed(request):
+        if "/meter/" in request.url:
+            meter.finished(request)
+            finished.set()
+    context = browser_page.context
+    context.on("request", started)
+    context.on("requestfinished", completed)
+    resolver = AsyncMock(side_effect=AssertionError("Exhausted quota cannot navigate to TikTok"))
+    monkeypatch.setattr(engagement_engine, "resolve_order_video_url", resolver)
+    try:
+        await browser_page.evaluate("async () => (await fetch('/meter/read')).text()", isolated_context=False)
+        await asyncio.wait_for(finished.wait(), 2)
+        await asyncio.gather(*list(meter.pending))
+        result = await quantity.execute_quantity_order(db_session, sample_task, sample_task.video_urls[0],
+            ["main"], sample_task.id, stop_requested=lambda: False)
+        assert result.error == "quantity_traffic_budget_exhausted"
+        resolver.assert_not_awaited()
+        assert seen == [("GET", "/meter/read")]
+    finally:
+        context.remove_listener("request", started)
+        context.remove_listener("requestfinished", completed)
+        await meter.close()
+
+
 async def test_profile_probe_uses_page_fetch_and_the_requested_owner(browser_page):
     from services.video_parser import _probe_profile_videos_http_first
 
@@ -58,7 +178,7 @@ async def test_profile_probe_uses_page_fetch_and_the_requested_owner(browser_pag
     assert requested[1][1]["screen_width"] == [runtime[1]]
 
 
-@pytest.mark.parametrize("mode", ["signed_empty", "unsigned_first", "invalid_json"])
+@pytest.mark.parametrize("mode", ["signed_empty", "unsigned_first", "invalid_json", "empty_json"])
 async def test_publish_empty_or_invalid_body_is_not_replayed(browser_page, mode):
     requests = []
     async def serve(route):
@@ -66,7 +186,7 @@ async def test_publish_empty_or_invalid_body_is_not_replayed(browser_page, mode)
             await route.fulfill(content_type="text/html", body="<html>Fixture</html>")
             return
         requests.append(route.request.url)
-        body = "invalid" if mode == "invalid_json" else ""
+        body = "invalid" if mode == "invalid_json" else "{}" if mode == "empty_json" else ""
         if len(requests) > 1:
             body = '{"status_code":0,"comment":{"cid":"7641761192486194454"}}'
         await route.fulfill(content_type="application/json", body=body)
@@ -138,6 +258,98 @@ async def test_mention_resolution_aborts_a_stalled_response_body(browser_page, m
         thread.join(timeout=2)
 
 
+async def test_mention_api_timeout_preserves_time_and_a_live_signal_for_ssr(browser_page, monkeypatch):
+    from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+    import threading
+    from executor.http import mentions
+    disconnected, ssr_seen = threading.Event(), threading.Event()
+    class Handler(BaseHTTPRequestHandler):
+        def log_message(self, *_):
+            pass
+        def do_GET(self):
+            if self.path.startswith("/api/user/detail/"):
+                self.send_response(200)
+                self.send_header("Content-Length", "999")
+                self.end_headers()
+                self.wfile.flush()
+                self.connection.settimeout(2)
+                try:
+                    if not self.connection.recv(1):
+                        disconnected.set()
+                except OSError:
+                    pass
+                return
+            html = "<html>Fixture</html>"
+            if self.path.startswith("/@audit_fixture"):
+                ssr_seen.set()
+                data = {"__DEFAULT_SCOPE__": {"webapp.user-detail": {"userInfo": {"user": {
+                    "id": "1234567890", "secUid": "MS4wLjABAAAA-audit-fixture", "uniqueId": "audit_fixture"}}}}}
+                html = '<script id="__UNIVERSAL_DATA_FOR_REHYDRATION__" type="application/json">' + json.dumps(data) + '</script>'
+            body = html.encode()
+            self.send_response(200)
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+    server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+    server.daemon_threads = True
+    thread = threading.Thread(target=server.serve_forever, kwargs={"poll_interval": .05}, daemon=True)
+    thread.start()
+    monkeypatch.setattr(mentions, "_MENTION_CACHE", {})
+    try:
+        await browser_page.goto(f"http://127.0.0.1:{server.server_port}/")
+        user = await mentions.resolve_mention_user(browser_page, "audit_fixture", timeout_ms=1600)
+        assert user and user["user_id"] == "1234567890"
+        assert ssr_seen.is_set() and await asyncio.to_thread(disconnected.wait, 1)
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=2)
+
+
+async def test_browser_publish_keeps_application_csrf_but_drops_caller_sdk_headers_and_ua(browser_page):
+    received = []
+    async def serve(route):
+        if urlparse(route.request.url).path == "/api/comment/publish/":
+            received.append(route.request.headers)
+            await route.fulfill(json={"status_code": 0, "comment": {"cid": "7704740811904828192"}})
+        else:
+            await route.fulfill(content_type="text/html", body="<html>Fixture</html>")
+    await browser_page.route("**/*", serve)
+    await browser_page.goto("https://www.tiktok.com/@fixture/video/123")
+    profile = RequestProfile.publish_main_profile()
+    profile.static_headers.update({"X-SecSDK-CSRF-Token": "application-csrf", "User-Agent": "wrong-static-ua"})
+    client = PlaywrightHttpClient(browser_page.context.request, page=browser_page, retry_policy=RetryPolicy(max_retries=0))
+    assert (await client._execute_request(profile, {"aweme_id": "123", "text": "fixture"}, cookies={"tt_csrf_token": "live-csrf"}))[0]
+    assert received[0]["tt-csrf-token"] == "live-csrf"
+    assert "x-secsdk-csrf-token" not in received[0]
+    assert received[0]["user-agent"] != "wrong-static-ua"
+
+
+@pytest.mark.parametrize("browser_page", [False], indirect=True)
+async def test_sdk_presence_cannot_send_a_post_until_a_signed_dispatch_exists(browser_page):
+    # A separate page has no fixture readiness GET or production SDK.
+    page = browser_page
+    posts = []
+    async def serve(route):
+        if route.request.method == "POST":
+            posts.append(route.request.url)
+            await route.fulfill(json={"status_code": 0, "comment": {"cid": "7704740811904828192"}})
+        else:
+            await route.fulfill(content_type="text/html", body="<script>window.byted_acrawler = {sign: () => ({})};</script>")
+    await page.route("**/*", serve)
+    try:
+        await page.goto("https://www.tiktok.com/@fixture/video/123")
+        client = PlaywrightHttpClient(page.context.request, page=page, retry_policy=RetryPolicy(max_retries=0))
+        result = await client._execute_request(RequestProfile.publish_main_profile(), {"aweme_id": "123", "text": "fixture"})
+        assert not result[0] and result[2] == "runtime_signer_not_ready"
+        assert not posts and not client.last_request_meta["request_attempted"]
+        await page.evaluate("fetch('/fixture-ready?X-Bogus=local-proof').then(r => r.text())", isolated_context=False)
+        assert (await client._execute_request(RequestProfile.publish_main_profile(), {"aweme_id": "123", "text": "fixture"}))[0]
+        assert len(posts) == 1
+    finally:
+        await page.close()
+
+
 _COMMENT_INTERCEPTOR_JS = """() => {
     const original=window.fetch;
     window.fetch=function fetch(input, options) {
@@ -152,13 +364,136 @@ _COMMENT_INTERCEPTOR_JS = """() => {
 
 
 @pytest.fixture
-async def browser_page():
+async def browser_page(request):
     async with async_playwright() as playwright:
         browser = await playwright.chromium.launch(headless=True)
         try:
-            yield await browser.new_page()
+            context = await browser.new_context()
+            page = await context.new_page()
+            # These transport fixtures replace TikTok's SDK with local routes.
+            # Seed its readiness prerequisite with a real completed GET.
+            if getattr(request, "param", True):
+                await page.add_init_script("""(() => {
+                if (location.hostname.endsWith('tiktok.com')) {
+                    addEventListener('DOMContentLoaded', () => {
+                        fetch('/__fixture_ready__?X-Bogus=local-fixture').then(r => r.text()).catch(() => {});
+                    }, {once: true});
+                }
+                })();""")
+            yield page
         finally:
             await browser.close()
+
+
+@pytest.mark.parametrize("accepted", [True, False])
+async def test_real_fetch_journal_counts_one_post_and_keeps_public_visibility_separate(
+        browser_page, db_session, sample_task, sample_account, accepted):
+    from db.models import PublicationAttempt
+    from services.publication_progress import publication_scope
+    posts = []
+    async def serve(route):
+        if route.request.method == "POST":
+            posts.append(route.request.url)
+            await route.fulfill(content_type="application/json",
+                body='{"status_code":0,"comment":{"cid":"7704740811904828192"}}' if accepted else "")
+        else:
+            await route.fulfill(content_type="text/html", body="<html>Local fixture</html>")
+    await browser_page.route("**/*", serve)
+    await browser_page.goto("https://www.tiktok.com/@fixture/video/7635267329407913230")
+    browser_page._pool_account_id = sample_account.id
+    client = await PlaywrightHttpClient.from_page(browser_page, retry_policy=RetryPolicy(max_retries=0))
+    with publication_scope(db_session, sample_task, sample_task.video_urls[0]):
+        result = await client.publish_main_comment("7635267329407913230", "journal fixture")
+    db_session.expire_all()
+    row = db_session.query(PublicationAttempt).one()
+    assert len(posts) == row.wire_count == 1
+    assert row.account_id == sample_account.id
+    assert row.status == ("accepted" if accepted else "unknown")
+    assert bool(result[0]) is accepted and row.visibility == "unchecked"
+
+
+@pytest.mark.parametrize("cleanup_fails", [False, True])
+@pytest.mark.parametrize("kind", ["main", "reply"])
+async def test_quantity_crosses_real_selector_transport_journal_and_checkpoint(
+        browser_page, db_session, sample_task, sample_account, monkeypatch, cleanup_fails, kind):
+    from executor import user_schema as schema, visibility_publisher, engagement_engine
+    from executor.quantity_engine import ensure_actions, publish_action
+    from services import account_service
+    from services.quantity_plan import QuantityPlan
+    from services.order_transport import set_task_order_transport, reset_task_order_transport
+    from db.models import Account, PublicationAttempt, QuantityAction
+    posts = []
+    url, cid = "https://www.tiktok.com/@fixture/video/7635267329407913230", "7704740811904828192"
+    async def serve(route):
+        if route.request.method == "POST" and urlparse(route.request.url).path == "/api/comment/publish/":
+            posts.append(route.request.url)
+            body = parse_qs(route.request.post_data)
+            assert body.get("reply_id", ["0"]) == (["7704740811904828100"] if kind == "reply" else ["0"])
+            await route.fulfill(json={"status_code": 0, "comment": {"cid": cid,
+                "reply_id": "7704740811904828100" if kind == "reply" else "0",
+                "user": {"uid": "12345", "unique_id": "fixture"}}})
+        elif route.request.method == "POST":
+            await route.fulfill(json={"status_code": 0})
+        else:
+            await route.fulfill(content_type="text/html", body="<html>Local fixture</html>")
+    await browser_page.route("**/*", serve)
+    await browser_page.goto(url)
+    browser_page._pool_account_id = sample_account.id
+    sample_account.cookies = json.dumps({"sessionid": "a" * 32, "uid_tt": "12345", "ttwid": "wid",
+                                        "msToken": "ms", "tt_csrf_token": "csrf"})
+    sample_task.status, sample_task.video_urls = "in_progress", [url]
+    sample_task.settings = {"publication_plan": QuantityPlan(main_count=1, replies_per_main=int(kind == "reply")).model_dump(), "replies": ["reply"]}
+    db_session.commit()
+    ensure_actions(db_session, sample_task, url, "main", 1, ["quantity boundary"])
+    parent = db_session.query(QuantityAction).one()
+    if kind == "reply":
+        parent.state, parent.comment_id = "visible", "7704740811904828100"
+        db_session.commit()
+        ensure_actions(db_session, sample_task, url, "reply", 1, ["reply boundary"], parent=parent)
+    identity = db_session.query(QuantityAction.id).filter_by(kind=kind).scalar()
+    monkeypatch.setattr(account_service.settings, "USE_PROXY", False)
+    account_service._MAIN_ACCOUNT_RESERVED_UNTIL.clear()
+    monkeypatch.setattr(schema, "_preflight_cookie_http_gate", AsyncMock(return_value=None))
+    monkeypatch.setattr(schema, "create_page_for_account", AsyncMock(return_value=(browser_page.context, browser_page)))
+    monkeypatch.setattr(schema, "_ensure_account_login_ready", AsyncMock(return_value=(True, None)))
+    client = await PlaywrightHttpClient.from_page(browser_page, retry_policy=RetryPolicy(max_retries=0))
+    async def prepare(*args, scope, **kwargs):
+        return schema._UserSchemaHttpSession(scope=scope, account_id=sample_account.id, client=client,
+                                             cookies={}, aweme_id="7635267329407913230", video_url=url)
+    monkeypatch.setattr(schema, "_prepare_user_schema_http_session", prepare)
+    monkeypatch.setattr(visibility_publisher, "wait_for_runtime_signer_ready", AsyncMock(return_value=True))
+    monkeypatch.setattr(engagement_engine, "_record_http_account_result", lambda *a: None)
+    monkeypatch.setattr(schema, "_safe_close", AsyncMock())
+    persist = AsyncMock(side_effect=RuntimeError("fixture cleanup failed") if cleanup_fails else None)
+    monkeypatch.setattr(schema, "_persist_cookies_after_success", persist)
+    token = set_task_order_transport("http", SimpleNamespace(TIKTOK_NETWORK_IMPL_READY=True))
+    try:
+        if cleanup_fails:
+            with pytest.raises(RuntimeError, match="cleanup failed"):
+                await publish_action(db_session.get_bind(), sample_task.id, identity, stop_requested=lambda: False, target_url=url)
+        else:
+            assert await publish_action(db_session.get_bind(), sample_task.id, identity,
+                stop_requested=lambda: False, target_url=url) == "accepted"
+        db_session.expire_all()
+        action = db_session.get(QuantityAction, identity)
+        journal = db_session.query(PublicationAttempt).one()
+        account = db_session.get(Account, sample_account.id)
+        assert action.state == "accepted" and action.comment_id == journal.comment_id == cid
+        assert len(posts) == journal.wire_count == 1 and action.dispatches == 1
+        saved = db_session.get(type(sample_task), sample_task.id).settings["url_results"][url]
+        if kind == "main":
+            assert saved["engagement"]["main"]["variants_published"][0]["comment_id"] == cid
+        else:
+            assert saved["engagement"]["replies"]["items"][0]["reply_comment_id"] == cid
+            assert journal.kind == "reply" and journal.parent_id == parent.comment_id
+        assert account.today_main_comments == int(kind == "main") and account.today_replies == int(kind == "reply")
+        assert account.assignment_lease_token is None
+        assert await publish_action(db_session.get_bind(), sample_task.id, identity,
+            stop_requested=lambda: False, target_url=url) == "not_claimed"
+        assert len(posts) == 1
+    finally:
+        reset_task_order_transport(token)
+        account_service.release_main_account_reservation(sample_account.id)
 
 
 async def test_transport_exception_before_fetch_does_not_consume_publish_attempt(browser_page, monkeypatch):
@@ -510,6 +845,7 @@ async def test_browser_pool_init_scripts_preserve_plugins_chrome_and_account_ren
 
 
 @pytest.mark.parametrize("signal", ["sdk", "delayed_sdk", "fetch_wrapper", "delayed_fetch_wrapper", "ms_token_resource", "signature_resource", "x_bogus_resource", "x_gnarly_resource", "both_signatures_resource", "empty_signatures_resource", "native", "foreign_resource"])
+@pytest.mark.parametrize("browser_page", [False], indirect=True)
 async def test_runtime_readiness_observes_main_world_signals(browser_page, signal):
     from executor.http.signature_runtime import wait_for_runtime_signer_ready
 
@@ -543,6 +879,7 @@ async def test_runtime_readiness_observes_main_world_signals(browser_page, signa
 
 
 @pytest.mark.parametrize("signed", [False, True])
+@pytest.mark.parametrize("browser_page", [False], indirect=True)
 async def test_signer_wait_activity_wakes_background_traffic_once_without_false_readiness(browser_page, signed):
     from executor.http.signature_runtime import wait_for_runtime_signer_ready
     requests = []
@@ -574,6 +911,7 @@ async def test_signer_wait_activity_wakes_background_traffic_once_without_false_
 
 
 @pytest.mark.parametrize("masked", [False, True])
+@pytest.mark.parametrize("browser_page", [False], indirect=True)
 async def test_warmup_uses_callable_sdk_and_read_retry_without_claiming_signed_dispatch(browser_page, masked):
     from executor import engagement_engine
     from executor.http.signature_runtime import wait_for_runtime_signer_ready
@@ -762,6 +1100,44 @@ async def test_comment_api_discovers_numeric_parent_without_dom(browser_page):
     assert matches[0]["cid"] == "7641761192486194454"
     assert seen_cursors == ["0", "50"]
     assert info["available"]
+
+
+async def test_author_only_visibility_is_confirmed_by_native_reads(browser_page):
+    from executor.main_visibility import scan_main_comment_ids
+    from services.publication_recheck import apply_observations
+
+    cid, video_id = "7704740811904828192", "7704740811904828100"
+    url = f"https://www.tiktok.com/@fixture/video/{video_id}"
+    visible_to = {1}
+    requests = []
+
+    async def read(reader_id, role):
+        context = await browser_page.context.browser.new_context()
+        page = await context.new_page()
+        async def fulfill(route):
+            if urlparse(route.request.url).path == "/api/comment/list/":
+                requests.append(reader_id)
+                comment_id = cid if reader_id in visible_to else "7704740811904828193"
+                await route.fulfill(json={"status_code": 0, "comments": [{"cid": comment_id,
+                    "text": "fixture", "user": {"unique_id": "fixture"}}], "has_more": 0, "cursor": 0})
+            else:
+                await route.fulfill(content_type="text/html", body="<html>Local reader</html>")
+        try:
+            await page.route("**/*", fulfill)
+            await page.goto(url)
+            await page.evaluate(_COMMENT_INTERCEPTOR_JS, isolated_context=False)
+            return dict(await scan_main_comment_ids(page, video_id, [cid]), observer_id=reader_id, role=role)
+        finally:
+            await context.close()
+
+    row = SimpleNamespace(account_id=1, comment_id=cid, visibility="unchecked", visible_at=None, check_count=0)
+    observations = [await read(2, "observer"), await read(3, "observer"), await read(1, "author")]
+    apply_observations([row], observations)
+    assert row.visibility == "author_only"
+    visible_to.add(2)
+    apply_observations([row], [await read(2, "observer")])
+    assert row.visibility == "visible" and row.visible_at is not None
+    assert requests == [2, 3, 1, 2]
 
 
 async def test_warmup_comment_get_obtains_missing_ms_token(browser_page, monkeypatch):

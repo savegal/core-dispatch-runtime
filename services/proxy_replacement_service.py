@@ -49,6 +49,11 @@ def replace_slow_proxy_for_account(
     if not account:
         logger.warning(f"Account {account_id} not found")
         return False
+    if account.proxy:
+        # Network failures pause this route. A residential identity changes only
+        # through an explicit administrator assignment.
+        logger.info("Keeping the saved proxy binding for account %s after a network failure", account_id)
+        return False
     
     # ОПТИМИЗАЦИЯ: Получаем только proxy строки вместо полных объектов Account
     proxy_results = db.query(Account.proxy).filter(
@@ -96,15 +101,8 @@ def replace_slow_proxy_for_account(
         return False
     
     old_proxy = account.proxy
-    account.proxy = new_proxy.proxy
-    
-    # УЛУЧШЕНИЕ: Если у аккаунта нет country_code, но у нового прокси есть - устанавливаем из прокси
-    if not account.country_code and new_proxy.country_code:
-        account.country_code = new_proxy.country_code
-        logger.info(
-            f"[GEO] Auto-set country_code {new_proxy.country_code} for account {account_id} "
-            f"({account.label[:20]}) from replacement proxy"
-        )
+    from services.proxy_assignment_service import bind_account_proxy
+    bind_account_proxy(db, account, new_proxy.proxy, proxy=new_proxy)
     
     try:
         db.commit()

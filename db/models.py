@@ -165,6 +165,100 @@ class Task(Base):
     )
 
 
+class PublicationAttempt(Base):
+    """A publication operation, with wire dispatch and public evidence kept apart."""
+    __tablename__ = "publication_attempts"
+    id = Column(String(32), primary_key=True)
+    task_id = Column(Integer, ForeignKey("tasks.id", ondelete="CASCADE"), nullable=False, index=True)
+    account_id = Column(Integer, ForeignKey("accounts.id", ondelete="SET NULL"), nullable=True, index=True)
+    video_url = Column(Text, nullable=False)
+    aweme_id = Column(String(32), nullable=True)
+    kind = Column(String(12), nullable=False)
+    parent_id = Column(String(32), nullable=True)
+    text = Column(Text, nullable=False)
+    text_hash = Column(String(64), nullable=False, index=True)
+    status = Column(String(20), nullable=False, default="preparing")
+    origin = Column(String(12), nullable=False, default="http")
+    action_id = Column(String(32), nullable=True, index=True)
+    wire_count = Column(Integer, nullable=False, default=0)
+    comment_id = Column(String(32), nullable=True, index=True)
+    error_code = Column(String(240), nullable=True)
+    visibility = Column(String(20), nullable=False, default="unchecked")
+    observers = Column(JSON, nullable=True)
+    identity_keys = Column(JSON, nullable=True)
+    started_at = Column(DateTime(timezone=True), nullable=False, server_default=func.now(), index=True)
+    dispatched_at = Column(DateTime(timezone=True), nullable=True)
+    finished_at = Column(DateTime(timezone=True), nullable=True)
+    checked_at = Column(DateTime(timezone=True), nullable=True)
+    visible_at = Column(DateTime(timezone=True), nullable=True)
+    next_check_at = Column(DateTime(timezone=True), nullable=True, index=True)
+    check_count = Column(Integer, nullable=False, default=0)
+
+
+class QuantityAction(Base):
+    __tablename__ = "quantity_actions"
+    id = Column(String(32), primary_key=True)
+    task_id = Column(Integer, ForeignKey("tasks.id", ondelete="CASCADE"), nullable=False, index=True)
+    video_url = Column(Text, nullable=False)
+    kind = Column(String(12), nullable=False)
+    slot = Column(Integer, nullable=False)
+    parent_action_id = Column(String(32), nullable=True)
+    parent_id = Column(String(32), nullable=True)
+    text = Column(Text, nullable=False)
+    state = Column(String(20), nullable=False, default="pending")
+    token = Column(String(32), nullable=True)
+    comment_id = Column(String(32), nullable=True)
+    account_id = Column(Integer, ForeignKey("accounts.id", ondelete="SET NULL"), nullable=True)
+    candidate_count = Column(Integer, nullable=False, default=0)
+    dispatches = Column(Integer, nullable=False, default=0)
+    error_code = Column(String(240), nullable=True)
+    updated_at = Column(DateTime(timezone=True), nullable=False, server_default=func.now())
+
+
+class TaskRuntime(Base):
+    __tablename__ = "task_runtime"
+    task_id = Column(Integer, ForeignKey("tasks.id", ondelete="CASCADE"), primary_key=True)
+    phase = Column(String(40), nullable=False, default="preparing")
+    updated_at = Column(DateTime(timezone=True), nullable=False, server_default=func.now())
+
+
+class TaskTrafficBucket(Base):
+    """Observed network sizes, never represented as provider-billed bytes."""
+    __tablename__ = "task_traffic_buckets"
+    task_id = Column(Integer, ForeignKey("tasks.id", ondelete="CASCADE"), primary_key=True)
+    account_key = Column(Integer, primary_key=True, default=0)
+    category = Column(String(24), primary_key=True)
+    hour = Column(DateTime(timezone=True), primary_key=True)
+    received_bytes = Column(BigInteger, nullable=False, default=0)
+    sent_bytes = Column(BigInteger, nullable=False, default=0)
+    requests = Column(Integer, nullable=False, default=0)
+
+
+class PublicationCheckJob(Base):
+    __tablename__ = "publication_check_jobs"
+    task_id = Column(Integer, ForeignKey("tasks.id", ondelete="CASCADE"), primary_key=True)
+    status = Column(String(20), nullable=False, default="pending", index=True)
+    available_at = Column(DateTime(timezone=True), nullable=False, server_default=func.now())
+    lease_token = Column(String(32), nullable=True)
+    lease_until = Column(DateTime(timezone=True), nullable=True)
+    result = Column(JSON, nullable=True)
+    updated_at = Column(DateTime(timezone=True), nullable=False, server_default=func.now())
+
+
+class AccountImportJob(Base):
+    __tablename__ = "account_import_jobs"
+    id = Column(String(32), primary_key=True)
+    status = Column(String(20), nullable=False, default="pending", index=True)
+    total = Column(Integer, nullable=False)
+    processed = Column(Integer, nullable=False, default=0)
+    counters = Column(JSON, nullable=True)
+    results = Column(JSON, nullable=True)
+    lease_token = Column(String(32), nullable=True)
+    lease_until = Column(DateTime(timezone=True), nullable=True)
+    error_code = Column(String(80), nullable=True)
+    updated_at = Column(DateTime(timezone=True), nullable=False, server_default=func.now())
+
+
 class KeywordReplyTarget(Base):
     """One durable reply decision per task, video and parent comment."""
     __tablename__ = "keyword_reply_targets"

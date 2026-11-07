@@ -19,7 +19,7 @@ from datetime import datetime, timezone
 from typing import Dict, List, Any, Optional, Tuple
 from dataclasses import dataclass
 from db.models import Account
-from executor.browser_identity import desktop_user_agent, sec_ch_ua
+from executor.browser_identity import desktop_user_agent, sec_ch_ua, curl_impersonation_profile
 
 logger = logging.getLogger("services.cookie_validator")
 
@@ -68,8 +68,8 @@ def _restore_session_cookies(cookies: Dict[str, str]) -> Dict[str, str]:
     return cookies
 
 
-def normalize_cookie_records(records: List[dict]) -> NormalizedCookies:
-    """Select web API values without discarding browser domains or attributes."""
+def normalize_cookie_records(records: List[dict], *, restore_guard_aliases: bool = True) -> NormalizedCookies:
+    """Select scoped values; disable aliases when measuring imported auth quality."""
     result = NormalizedCookies()
     best_rank = {}
     scoped_records = {}
@@ -110,7 +110,7 @@ def normalize_cookie_records(records: List[dict]) -> NormalizedCookies:
             result[name] = value
             best_rank[name] = rank
     result.records = list(scoped_records.values())
-    return _restore_session_cookies(result)
+    return _restore_session_cookies(result) if restore_guard_aliases else result
 
 
 def _ms_token_fingerprint(value: Any) -> str:
@@ -333,7 +333,7 @@ def prepare_cookies_for_context(
     )
 
 
-def parse_cookies_to_dict(raw: str) -> Dict[str, str]:
+def parse_cookies_to_dict(raw: str, *, restore_guard_aliases: bool = True) -> Dict[str, str]:
     """
     Парсит cookies из строки в словарь {name: value}.
     
@@ -344,6 +344,9 @@ def parse_cookies_to_dict(raw: str) -> Dict[str, str]:
        msToken выбирается для веб-домена, sid_guard — по timestamp внутри значения.
        Исходные домены и атрибуты доступны в NormalizedCookies.records.
     3. Inline: sessionid=xxx; sid_tt=yyy
+
+    restore_guard_aliases=False returns the explicit imported auth keys for
+    quality/format checks. Compatibility aliases never prove a live session.
     """
     if not raw or not raw.strip():
         return {}
@@ -355,19 +358,19 @@ def parse_cookies_to_dict(raw: str) -> Dict[str, str]:
         data = json.loads(raw)
         
         if isinstance(data, list):
-            return normalize_cookie_records(data)
+            return normalize_cookie_records(data, restore_guard_aliases=restore_guard_aliases)
         
         elif isinstance(data, dict):
             # Check for nested cookies key
             if "cookies" in data and isinstance(data["cookies"], list):
-                return parse_cookies_to_dict(json.dumps(data["cookies"]))
+                return parse_cookies_to_dict(json.dumps(data["cookies"]), restore_guard_aliases=restore_guard_aliases)
             
             # Simple key-value format
             for key, value in data.items():
                 if key and value is not None and not isinstance(value, (dict, list)):
                     result[str(key)] = str(value)
         
-        return _restore_session_cookies(result)
+        return _restore_session_cookies(result) if restore_guard_aliases else result
     
     except json.JSONDecodeError:
         pass
@@ -382,7 +385,7 @@ def parse_cookies_to_dict(raw: str) -> Dict[str, str]:
             if key:
                 result[key] = value
     
-    return _restore_session_cookies(result)
+    return _restore_session_cookies(result) if restore_guard_aliases else result
 
 
 HOT_WEB_READY = 2
@@ -545,6 +548,11 @@ def _inconclusive_result(error: str, *, country_code: Optional[str] = None) -> d
     return _result(status="inconclusive", valid=False, error=error, country_code=country_code, definitive=False)
 
 
+def _proxy_auth_result(country_code=None):
+    return {**_inconclusive_result("proxy_authentication_required:HTTP407", country_code=country_code),
+            "category": "proxy_route", "request_attempted": False}
+
+
 def _normalize_proxy_for_aiohttp(proxy_raw):
     from services.proxy_normalizer import ProxyRoute, ProxyRouteError
     if not str(proxy_raw or '').strip():
@@ -687,7 +695,7 @@ async def _validate_account_http_tri_state(account: Account, *, strict_passport:
         try:
             curl_proxy = route.url if route else None
             async with _CurlAsyncSession(
-                impersonate="chrome131",
+                impersonate=curl_impersonation_profile(headers["User-Agent"]),
                 proxies={"http": curl_proxy, "https": curl_proxy} if curl_proxy else None,
                 timeout=12 if curl_proxy else 8,
                 trust_env=False,
@@ -695,6 +703,8 @@ async def _validate_account_http_tri_state(account: Account, *, strict_passport:
                 resp = await curl_session.get(passport_url, headers=headers, allow_redirects=False)
                 location = (resp.headers.get("location") or "").lower()
                 status_code = int(getattr(resp, "status_code", 0) or 0)
+                if status_code == 407 and proxy_url:
+                    return _proxy_auth_result(country_code)
                 if status_code in (301, 302, 303, 307, 308) and ("login" in location or "signup" in location):
                     return _dead_result(f"Redirected to login (HTTP {status_code})", country_code=country_code)
                 if status_code == 401:
@@ -735,6 +745,8 @@ async def _validate_account_http_tri_state(account: Account, *, strict_passport:
                     return _inconclusive_result(f"HTTP challenge/rate-limit {status_code}", country_code=country_code)
                 return _inconclusive_result("Could not verify session (no definitive auth markers)", country_code=country_code)
         except Exception as curl_exc:
+            if proxy_url and re.search(r"\b407\b", str(curl_exc)):
+                return _proxy_auth_result(country_code)
             network_errors.append(f"curl_passport:{str(curl_exc)[:80]}")
             logger.warning("curl_cffi passport transport failed; attempting aiohttp backup: %s", type(curl_exc).__name__)
 
@@ -742,6 +754,8 @@ async def _validate_account_http_tri_state(account: Account, *, strict_passport:
         async with aiohttp.ClientSession(timeout=timeout, connector=connector) as session:
             try:
                 async with await _get(session, passport_url, allow_redirects=False) as resp:
+                    if resp.status == 407 and proxy_url:
+                        return _proxy_auth_result(country_code)
                     location = (resp.headers.get("location") or "").lower()
                     if resp.status in (301, 302, 303, 307, 308) and ("login" in location or "signup" in location):
                         return _dead_result(f"Redirected to login (HTTP {resp.status})", country_code=country_code)
@@ -785,6 +799,8 @@ async def _validate_account_http_tri_state(account: Account, *, strict_passport:
                     elif resp.status in (429, 503):
                         return _inconclusive_result(f"HTTP challenge/rate-limit {resp.status}", country_code=country_code)
             except (aiohttp.ClientError, asyncio.TimeoutError) as exc:
+                if proxy_url and (getattr(exc, "status", None) == 407 or re.search(r"\b407\b", str(exc))):
+                    return _proxy_auth_result(country_code)
                 network_errors.append(f"passport:{str(exc)[:80]}")
 
     except Exception as exc:
@@ -825,7 +841,9 @@ async def validate_account_http(account: Account, *, strict_passport: bool = Fal
     from services.proxy_concurrency_service import proxy_operation
     try:
         route = account_proxy_route(account)
-        async with proxy_operation(route.url if route else None):
+        async with proxy_operation(route.url if route else None) as lease:
+            from services.residential_proxy_service import ensure_residential_exit_ip
+            await ensure_residential_exit_ip(account, route, lease=lease)
             res = await _validate_account_http_tri_state(account, strict_passport=strict_passport)
     except ProxyRouteError as exc:
         return {**_inconclusive_result(str(exc)), "category": "proxy_route", "request_attempted": False}
@@ -972,7 +990,7 @@ def validate_cookies(cookies_raw: str) -> CookieValidationResult:
         )
     
     try:
-        cookies_dict = parse_cookies_to_dict(cookies_raw)
+        cookies_dict = parse_cookies_to_dict(cookies_raw, restore_guard_aliases=False)
         
         if not cookies_dict:
             return CookieValidationResult(

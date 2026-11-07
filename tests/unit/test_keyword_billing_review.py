@@ -1,5 +1,6 @@
 """Paid keyword orders use real worker/SQLite settlement, with no live services."""
 import asyncio
+from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 import inspect
 import threading
@@ -17,7 +18,7 @@ from api import tasks
 from db.database import Base
 from db.models import Pricing, Task, Transaction, User
 from executor import engagement_engine, executor, keyword_replies, reply_visibility
-from services import task_stop_signal
+from services import task_service, task_settlement, task_stop_signal
 from tests.unit.test_task_create_duplicates import order_db
 
 
@@ -165,7 +166,7 @@ def test_failed_refund_rollback_does_not_leave_keyword_order_in_progress(paid_ke
         db.rollback()
         return False
 
-    monkeypatch.setattr(executor, "refund_balance", failed_refund)
+    monkeypatch.setattr(task_settlement, "refund_balance", failed_refund)
     state = run()
     assert state["status"] == "error"
     assert state["balance"] == Decimal("5.00")
@@ -236,3 +237,140 @@ async def test_concurrent_keyword_orders_cannot_spend_the_same_balance_twice(ord
             assert len((await db.execute(select(Transaction))).scalars().all()) == 1
     finally:
         await engine.dispose()
+
+
+@pytest.mark.parametrize("exit_path", ["user_stop", "shutdown", "timeout", "critical_error"])
+def test_interrupted_worker_refunds_only_the_unused_video(paid_keyword_worker, monkeypatch, exit_path):
+    import time
+
+    engine, task_id, _, _, run = paid_keyword_worker
+    second = URL[:-1] + "8"
+    with Session(engine) as db:
+        task = db.get(Task, task_id)
+        task.video_urls = [URL, second]
+        task.total_cost = Decimal("10.00")
+        task.settings = {**task.settings, "url_results": {URL: {"status": "success"}}}
+        db.commit()
+
+    if exit_path == "user_stop":
+        policy = executor.ExecutionPolicy.from_settings
+
+        def stop_during_setup():
+            with Session(engine) as db:
+                task = db.get(Task, task_id)
+                task.status = "stopped"
+                task.error_reason = "stopped_by_user"
+                task.settings = {**task.settings, "stopped_by_user": True,
+                                 task_settlement.REFUND_PENDING_KEY: True}
+                db.commit()
+            return policy()
+
+        monkeypatch.setattr(executor.ExecutionPolicy, "from_settings", stop_during_setup)
+    elif exit_path == "shutdown":
+        executor._shutdown_event.set()
+    elif exit_path == "timeout":
+        policy = executor.ExecutionPolicy.from_settings
+
+        def slow_setup():
+            time.sleep(1.1)
+            return policy()
+
+        monkeypatch.setattr(executor.ExecutionPolicy, "from_settings", slow_setup)
+        monkeypatch.setattr(executor.settings, "TASK_PROCESSING_TIMEOUT", 1)
+        monkeypatch.setattr(executor.settings, "TASK_TIMEOUT_COOLDOWN_SECONDS", 0)
+    else:
+        def broken_setup(*args):
+            raise RuntimeError("fixture worker setup failed")
+
+        monkeypatch.setattr(executor, "activate_dedicated_proxy_for_user", broken_setup)
+
+    state = run()
+    assert state["status"] == ("error" if exit_path == "critical_error" else "stopped")
+    assert state["refunded"] == Decimal("5.00")
+    assert state["refunds"] == [Decimal("5.00")]
+    if exit_path != "critical_error":
+        with Session(engine) as db:
+            assert db.get(Task, task_id).error_reason == {
+                "timeout": "task_timeout", "shutdown": "worker_shutdown", "user_stop": "stopped_by_user",
+            }[exit_path]
+
+
+def test_early_failure_charges_failure_rate_only_for_the_visited_video(paid_keyword_worker, monkeypatch):
+    engine, task_id, discovery, _, run = paid_keyword_worker
+    urls = [URL[:-1] + str(index) for index in range(10)]
+    with Session(engine) as db:
+        task = db.get(Task, task_id)
+        task.video_urls = urls
+        task.total_cost = Decimal("50.00")
+        db.commit()
+
+    monkeypatch.setattr(executor, "_reply_visibility_exhausted", lambda row: True)
+    assert run()["refunds"] == [Decimal("48.00")]
+    assert discovery.await_count == 1
+
+
+async def test_api_stop_is_recoverable_if_worker_exits_and_refund_is_idempotent(paid_keyword_worker, monkeypatch):
+    engine, task_id, _, _, _ = paid_keyword_worker
+    second = URL[:-1] + "8"
+    with Session(engine) as db:
+        task = db.get(Task, task_id)
+        task.status = "in_progress"
+        task.video_urls = [URL, second]
+        task.total_cost = Decimal("10.00")
+        task.settings = {**task.settings, "url_results": {URL: {"status": "success"}}}
+        db.commit()
+
+    async_engine = create_async_engine(f"sqlite+aiosqlite:///{engine.url.database}")
+    monkeypatch.setattr(tasks, "request_task_stop", lambda _: True)
+    try:
+        async with async_sessionmaker(async_engine, expire_on_commit=False)() as db:
+            response = await inspect.unwrap(tasks.stop_task)(
+                request=Request({"type": "http", "headers": []}),
+                task_id=task_id, user_id=1, db=db, auth_user_id=1,
+            )
+            assert response["status"] == "stopped"
+    finally:
+        await async_engine.dispose()
+
+    with Session(engine) as db:
+        task = db.get(Task, task_id)
+        assert task.settings[task_settlement.REFUND_PENDING_KEY]
+        task.updated_at = datetime.now(timezone.utc) - timedelta(minutes=2)
+        db.commit()
+        with monkeypatch.context() as patch:
+            patch.setattr(task_settlement, "refund_balance", lambda *args, **kwargs: False)
+            assert task_service.recover_stuck_tasks(db, timeout_seconds=60) == 0
+            assert task.settings[task_settlement.REFUND_PENDING_KEY]
+        assert task_service.recover_stuck_tasks(db, timeout_seconds=60) == 1
+        assert task_service.recover_stuck_tasks(db, timeout_seconds=60) == 0
+        assert task.status == "stopped"
+        assert task_settlement.REFUND_PENDING_KEY not in task.settings
+        assert task.refunded_cost == Decimal("5.00")
+        assert db.get(User, 1).balance == Decimal("10.00")
+
+
+def test_account_shortage_without_a_submission_refunds_the_whole_video(paid_keyword_worker, monkeypatch):
+    _, _, _, _, run = paid_keyword_worker
+    outcome = SimpleNamespace(to_dict=lambda **kwargs: {"status": "fail", "error": "no_free_reply_accounts"})
+    monkeypatch.setattr(keyword_replies, "execute_keyword_replies", AsyncMock(return_value=outcome))
+    assert run()["refunds"] == [Decimal("5.00")]
+
+
+def test_stale_task_uses_saved_outcomes_instead_of_treating_cursor_as_success(paid_keyword_worker):
+    engine, task_id, _, _, _ = paid_keyword_worker
+    urls = [URL[:-1] + str(index) for index in range(3)]
+    with Session(engine) as db:
+        task = db.get(Task, task_id)
+        task.status = "in_progress"
+        task.updated_at = datetime.now(timezone.utc) - timedelta(minutes=2)
+        task.video_urls = urls
+        task.total_cost = Decimal("15.00")
+        task.progress = 2
+        task.settings = {**task.settings, "url_results": {
+            urls[0]: {"status": "success"}, urls[1]: {"status": "fail", "error": "keyword_no_matches"},
+        }}
+        db.commit()
+
+        assert task_service.recover_stuck_tasks(db, timeout_seconds=60) == 1
+        assert task.status == "partial"
+        assert task.refunded_cost == Decimal("8.00")

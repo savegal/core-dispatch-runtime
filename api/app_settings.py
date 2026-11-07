@@ -60,6 +60,25 @@ router = APIRouter(prefix="/api/settings", tags=["settings"])
 app_cfg = get_settings()
 
 
+@router.get("/publication_runtime")
+def get_publication_runtime_settings(_: None = Depends(verify_admin_header)):
+    from services.publication_runtime import load_publication_runtime, runtime_payload
+    with get_sync_db_context() as db:
+        return runtime_payload(load_publication_runtime(db))
+
+
+@router.post("/publication_runtime")
+def update_publication_runtime_settings(changes: dict, _: None = Depends(verify_admin_header)):
+    from pydantic import ValidationError
+    from services.publication_runtime import update_publication_runtime, runtime_payload
+    with get_sync_db_context() as db:
+        try:
+            return runtime_payload(update_publication_runtime(db, changes))
+        except ValidationError as exc:
+            db.rollback()
+            raise HTTPException(422, detail=exc.errors(include_url=False, include_context=False)) from exc
+
+
 class ProxySettingsResponse(BaseModel):
     proxy_type_filter: str | None
     proxy_prefer_mobile: bool
@@ -387,10 +406,8 @@ async def update_commenting_mode_settings(
 
 @router.get("/order_transport", response_model=OrderTransportSettings)
 async def get_order_transport_settings(_: None = Depends(verify_admin_header)):
-    with get_sync_db_context() as db:
-        return OrderTransportSettings(order_transport_mode=get_order_transport(db),
-                                      available_modes=["dom", "http"] if http_transport_available() else ["dom"],
-                                      http_available=http_transport_available())
+    return OrderTransportSettings(order_transport_mode="http",
+        available_modes=["http"] if http_transport_available() else [], http_available=http_transport_available())
 
 
 @router.post("/order_transport", response_model=OrderTransportSettings)
@@ -399,14 +416,16 @@ async def update_order_transport_settings(
 ):
     mode = str(settings.order_transport_mode or "").strip().lower()
     if mode not in ORDER_TRANSPORT_MODES:
-        raise HTTPException(status_code=400, detail="Выберите режим DOM или HTTP")
+        raise HTTPException(status_code=400, detail="Для новых заказов доступен HTTP-режим")
+    if mode != "http":
+        raise HTTPException(status_code=409, detail="Новые заказы выполняются только HTTP-запросами")
     if mode == "http" and not http_transport_available():
         raise HTTPException(status_code=409, detail="HTTP-транспорт недоступен в конфигурации сервера")
     with get_sync_db_context() as db:
         if not set_order_transport(db, mode):
             raise HTTPException(status_code=500, detail="Не удалось сохранить режим заказов")
-        return OrderTransportSettings(order_transport_mode=get_order_transport(db),
-                                      available_modes=["dom", "http"] if http_transport_available() else ["dom"],
+        return OrderTransportSettings(order_transport_mode="http",
+                                      available_modes=["http"] if http_transport_available() else [],
                                       http_available=http_transport_available())
 
 

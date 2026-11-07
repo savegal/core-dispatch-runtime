@@ -53,8 +53,8 @@ def _ensure_pricing_consistency(pricing: Pricing) -> Pricing:
         pricing.price_success,
         pricing.price_failure,
     )
-    pricing.price_success = price_success or DEFAULT_PRICE_SUCCESS
-    pricing.price_failure = price_failure or DEFAULT_PRICE_FAILURE
+    pricing.price_success = DEFAULT_PRICE_SUCCESS if price_success is None else price_success
+    pricing.price_failure = DEFAULT_PRICE_FAILURE if price_failure is None else price_failure
     return pricing
 
 
@@ -92,7 +92,7 @@ async def _select_singleton_pricing_async(db: AsyncSession) -> Pricing | None:
             await db.delete(duplicate)
     return pricing
 
-def get_pricing(db: Session) -> Pricing:
+def get_pricing(db: Session, *, commit: bool = True) -> Pricing:
     """[Sync] Получает текущие цены."""
     rows = db.query(Pricing).order_by(Pricing.id.asc()).all()
     needs_commit = False
@@ -116,7 +116,7 @@ def get_pricing(db: Session) -> Pricing:
                 db.delete(duplicate)
             needs_commit = True
     pricing = _ensure_pricing_consistency(pricing)
-    if needs_commit:
+    if needs_commit and commit:
         db.commit()
         db.refresh(pricing)
     return pricing

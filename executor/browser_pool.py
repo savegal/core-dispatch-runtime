@@ -173,6 +173,8 @@ settings = get_settings()
 
 
 async def _install_resource_blocking_routes(context: BrowserContext, account_id: int | None = None) -> None:
+    from services.traffic_meter import install_traffic_meter
+    install_traffic_meter(context, account_id)
     if (
         settings.BLOCK_IMAGES
         or settings.BLOCK_MEDIA
@@ -195,12 +197,14 @@ async def _install_resource_blocking_routes(context: BrowserContext, account_id:
             resource_type = request.resource_type
             request_url = request.url
             if _should_abort_resource(resource_type, request_url):
+                request._traffic_local = True
                 await route.abort()
                 return
             if (settings.STATIC_ASSET_CACHE_ENABLED
                     and is_cacheable_static_asset(request.method, resource_type, request_url)):
                 cached = static_asset_cache.get(request_url)
                 if cached is not None:
+                    request._traffic_local = True
                     await route.fulfill(status=cached.status, headers=cached.headers, body=cached.body)
                     return
             try:
@@ -394,6 +398,7 @@ class BrowserPool:
         self._context_socks5_leases: dict[str, tuple[int, int]] = {}
         self._closing_browser_ids: set[str] = set()
         self._account_locks = weakref.WeakValueDictionary()
+        self._pending_task_acquisitions = {}
         self._closing = False
         self._browser_idle_since: Dict[str, float] = {}
         configured_max = max_browsers or settings.MAX_CONCURRENT_BROWSERS
@@ -609,6 +614,13 @@ class BrowserPool:
         page._pool_task_id = _current_task_id.get()
 
     async def return_page_to_pool(self, page: Page | None) -> None:
+        try:
+            await self._return_page_to_pool(page)
+        finally:
+            if page is not None:
+                await self._release_page_lease(page)
+
+    async def _return_page_to_pool(self, page: Page | None) -> None:
         if page is None:
             return
         account_id = getattr(page, "_pool_account_id", None)
@@ -632,13 +644,17 @@ class BrowserPool:
                         page._pool_task_id = None
                 except Exception:
                     await page.close()
-            await self._release_page_lease(page)
             self._context_last_used[account_id] = datetime.now(timezone.utc)
             self._sync_pool_metrics()
         self._capacity_changed.set()
         await self._cleanup_unused_browsers()
 
     async def close_pages_for_task(self, task_id: int, *, reason: str | None = None) -> int:
+        pending = list(self._pending_task_acquisitions.get(int(task_id), set()))
+        for operation in pending:
+            operation.cancel()
+        if pending:
+            await asyncio.gather(*pending, return_exceptions=True)
         targets = []
         # No await during the snapshot. Page closing uses the account lock and
         # checks ownership again, so a replacement context cannot be removed.
@@ -652,6 +668,13 @@ class BrowserPool:
         return sum(bool(result) for result in results)
 
     async def close_page_from_pool(self, page: Page | None, *, reason: str | None = None) -> bool:
+        try:
+            return await self._close_page_from_pool(page, reason=reason)
+        finally:
+            if page is not None:
+                await self._release_page_lease(page)
+
+    async def _close_page_from_pool(self, page: Page | None, *, reason: str | None = None) -> bool:
         if page is None:
             return False
         account_id = getattr(page, "_pool_account_id", None)
@@ -660,7 +683,14 @@ class BrowserPool:
                 return False
             await page.close()
             return True
-        async with self._account_lock(account_id):
+        lock = self._account_lock(account_id)
+        if lock.locked():
+            # A page close must be able to interrupt an RPC held by the owner
+            # of this account lock. Registry disposal remains with that owner.
+            if not page.is_closed():
+                await page.close()
+            return True
+        async with lock:
             context = self._contexts.get(account_id)
             if not page.is_closed():
                 try:
@@ -669,7 +699,6 @@ class BrowserPool:
                     logger.debug("Page close failed account=%s: %s", account_id, exc)
                 if not page.is_closed():
                     return False
-            await self._release_page_lease(page)
             if context is None or getattr(page, "context", context) is not context:
                 return True
             if any(not other.is_closed() for other in context.pages):
@@ -755,6 +784,10 @@ class BrowserPool:
         try:
             if cache_tasks:
                 await asyncio.gather(*cache_tasks, return_exceptions=True)
+            from services.traffic_meter import TrafficMeter
+            meter = getattr(context, "_traffic_meter", None)
+            if isinstance(meter, TrafficMeter):
+                await meter.close()
             await self._persist_context_cookies_before_close(context, account_id)
         finally:
             try:
@@ -1114,6 +1147,26 @@ class BrowserPool:
             await self.close_page_from_pool(page, reason="shortlink_resolved")
 
     async def get_page_for_account(
+        self, account: Account, retry_count: int = 0, _browser_id_lock_held: bool = False,
+    ) -> Tuple[BrowserContext, Page]:
+        task_id = _current_task_id.get()
+        if task_id is None or _browser_id_lock_held:
+            return await self._get_page_for_account(account, retry_count, _browser_id_lock_held)
+        operation = asyncio.create_task(self._get_page_for_account(account, retry_count, False))
+        pending = self._pending_task_acquisitions.setdefault(task_id, set())
+        pending.add(operation)
+        try:
+            return await operation
+        except asyncio.CancelledError:
+            if asyncio.current_task().cancelling():
+                raise
+            raise TikTokClientError("Task browser acquisition interrupted") from None
+        finally:
+            pending.discard(operation)
+            if not pending:
+                self._pending_task_acquisitions.pop(task_id, None)
+
+    async def _get_page_for_account(
         self,
         account: Account,
         retry_count: int = 0,
@@ -1151,6 +1204,8 @@ class BrowserPool:
                     # Waiting for an account slot or proxy lease must not hold
                     # the shared process lock and stall every other account.
                     lease = await acquire_proxy_usage(resolved_route.url) if resolved_route else None
+                    from services.residential_proxy_service import ensure_residential_exit_ip
+                    await ensure_residential_exit_ip(account, resolved_route, lease=lease)
                     if settings.BROWSER_POOL_SHARED_PROCESS:
                         await self._reserve_browser_capacity(browser_id_for_lock, account_id=account.id)
                     async with self._browser_id_lock(browser_id_for_lock):
@@ -1781,30 +1836,12 @@ class BrowserPool:
                 from services.cookie_validator import remember_imported_ms_token
                 remember_imported_ms_token(context, cookies_list or [])
                 if cookies_list:
-                    domain = cookies_list[0].get("domain", ".tiktok.com")
                     try:
                         await context.add_cookies(cookies_list)
                     except Exception as cookie_error:
-                        if not domain.startswith("."):
-                            raise TikTokClientError(f"Failed to add cookies: {cookie_error}")
-
-                        temp_page = await context.new_page()
-                        await prepare_device_page(temp_page)
-                        try:
-                            wait_until_mode = "domcontentloaded"
-                            timeout_for_proxy = settings.PLAYWRIGHT_TIMEOUT * 1.5
-                            await temp_page.goto(
-                                settings.TIKTOK_BASE_URL,
-                                wait_until=wait_until_mode,
-                                timeout=timeout_for_proxy
-                            )
-                            await context.add_cookies(cookies_list)
-                        except Exception as warmup_error:
-                            raise TikTokClientError(
-                                f"Failed to add cookies after domain warmup: {warmup_error}"
-                            )
-                        finally:
-                            await temp_page.close()
+                        # Domain cookies do not require visiting that domain.
+                        # Repeating an invalid payload spends proxy traffic.
+                        raise TikTokClientError(f"Failed to add cookies: {type(cookie_error).__name__}") from None
 
                 # Сохраняем контекст
                 if self._closing or self._playwright is not playwright_instance:

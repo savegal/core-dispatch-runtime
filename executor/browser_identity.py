@@ -40,6 +40,24 @@ def desktop_user_agent(version: str | None = None) -> str:
             f"(KHTML, like Gecko) Chrome/{major}.0.0.0 Safari/537.36")
 
 
+def curl_impersonation_profile(user_agent: str | None = None, *, available=None) -> str:
+    """Use the installed curl build's closest desktop Chrome TLS profile."""
+    if available is None:
+        try:
+            from curl_cffi.requests.impersonate import BrowserType
+            available = [item.value for item in BrowserType]
+        except ImportError:
+            return "chrome"
+    match = re.search(r"Chrome/(\d+)", user_agent or desktop_user_agent())
+    major = int(match.group(1)) if match else int(chromium_version().split(".")[0])
+    profiles = [(int(found.group(1)), str(name)) for name in available
+                if (found := re.fullmatch(r"chrome(\d+)[a-z]?", str(name)))]
+    if not profiles:
+        return "chrome"
+    compatible = [item for item in profiles if item[0] <= major]
+    return max(compatible)[1] if compatible else min(profiles)[1]
+
+
 def chromium_brands(version: str | None = None, *, full: bool = False) -> list[dict[str, str]]:
     """Chromium's GetGreasedUserAgentBrandVersion + ShuffleBrandList."""
     # https://chromium.googlesource.com/chromium/src/+/main/components/embedder_support/user_agent_utils.cc

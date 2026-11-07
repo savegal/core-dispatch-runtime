@@ -85,10 +85,10 @@ async def test_real_reply_scheduler_keeps_pool_for_the_keyword_batch(keyword_db,
     finally:
         reset_task_order_transport(token)
     assert result.to_dict()["engagement"]["replies"]["ok"] == 3
-    assert close.await_count == 1
+    assert close.await_count == 0  # The executor owns shutdown after visibility and later URLs.
 
 
-async def test_keyword_batch_closes_pool_on_cancellation_after_durable_claim(keyword_db, execution, monkeypatch):
+async def test_keyword_cancellation_keeps_durable_claim_and_executor_pool_ownership(keyword_db, execution, monkeypatch):
     from executor import browser_pool
     db, task, _ = keyword_db
     _, sender = execution
@@ -97,7 +97,7 @@ async def test_keyword_batch_closes_pool_on_cancellation_after_durable_claim(key
     monkeypatch.setattr(browser_pool, "close_browser_pool", close)
     with pytest.raises(asyncio.CancelledError):
         await keyword.execute_keyword_replies(db, task, URL, task_id=task.id)
-    assert close.await_count == 1
+    assert close.await_count == 0  # The executor owns shutdown after visibility and later URLs.
     assert keyword._targets(db, task.id, keyword.video_key(URL))[0].status == "dispatching"
 
 
@@ -118,7 +118,7 @@ async def test_discovery_binds_comments_to_the_final_warmed_target(monkeypatch, 
         page.url = final_url
         return {}, True, {}
     monkeypatch.setattr(engagement, "warmup_page_for_http", warmup)
-    collect = AsyncMock(return_value=([], {"complete": True, "scanned": 0}))
+    collect = AsyncMock(return_value=([{"cid": CIDS[0], "text": "цена"}], {"complete": True, "scanned": 1}))
     monkeypatch.setattr(keyword, "collect_http_targets", collect)
     close, release = AsyncMock(), Mock()
     monkeypatch.setattr(schema, "_safe_close", close)

@@ -1003,6 +1003,7 @@ class TestAccountService:
         selected = get_free_account_for_main_comment(
             db_session,
             exclude_proxies={first_proxy},
+            exclude_proxy_source_hosts=True,
         )
 
         assert selected is not None
@@ -1081,6 +1082,7 @@ class TestAccountService:
         selected = get_free_account_for_main_comment(
             db_session,
             exclude_proxies={excluded_proxy},
+            exclude_proxy_source_hosts=True,
         )
 
         assert selected is not None
@@ -1173,6 +1175,7 @@ class TestAccountService:
         selected = get_free_account_for_reply(
             db_session,
             exclude_proxies={first_proxy},
+            exclude_proxy_source_hosts=True,
         )
 
         assert selected is not None

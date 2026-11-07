@@ -1,6 +1,7 @@
 from services.order_transport import order_transport_label
 import asyncio
 import json
+import time
 
 from aiogram import Router, F
 from aiogram.types import CallbackQuery, Message, InlineKeyboardMarkup, InlineKeyboardButton
@@ -529,8 +530,8 @@ def _format_proxy_mode_label(proxy_type_filter: str | None, prefer_mobile: bool)
         base = "только mobile"
     elif proxy_type_filter == "residential":
         base = "только residential"
-    if prefer_mobile and proxy_type_filter != "mobile":
-        return f"{base} + prefer mobile"
+    if proxy_type_filter is None:
+        return f"{base}, приоритет residential"
     return base
 
 
@@ -654,12 +655,8 @@ async def admin_menu(callback: CallbackQuery):
         )
         current_software_mode = software_mode_data.get("software_mode", "full")
         software_mode_label = "🟢 Полный" if current_software_mode == "full" else "🟡 Парсинг"
-        current_commenting_mode = commenting_mode_data.get("commenting_mode", "old")
-        order_strategy_label = order_transport_label(order_strategy_data.get("order_transport_mode"))
-        commenting_mode_label = {
-            "parallel": "🟢 Новая параллельная",
-            "parallel_6x1": "🟣 Параллельная 6×1",
-        }.get(current_commenting_mode, "⚪ Старая")
+        order_strategy_label = "HTTP — быстрый" if order_strategy_data.get("http_available", True) else "HTTP недоступен"
+        commenting_mode_label = "Количество главных × ответы под каждым"
 
         attention_lines = _build_attention_lines(
             health_summary=health_summary,
@@ -1349,7 +1346,18 @@ async def confirm_import(callback: CallbackQuery, state: FSMContext):
             for acc in parsed_accounts
         ]
         
-        result = await api_client.bulk_import_accounts(accounts_data)
+        last_update = 0.0
+        async def progress_view(progress):
+            nonlocal last_update
+            if time.monotonic() - last_update < 3 and progress["status"] != "done":
+                return
+            last_update = time.monotonic()
+            await callback.message.edit_text(
+                f"⏳ Импорт аккаунтов · {progress['job_id'][:8]}\n"
+                f"Обработано: {progress['processed']}/{progress['total']}\n"
+                f"Добавлено: {progress.get('added', 0)} · обновлено: {progress.get('updated', 0)}\n"
+                f"Пропущено: {progress.get('skipped', 0)}", parse_mode=None)
+        result = await api_client.import_accounts_job(accounts_data, on_progress=progress_view)
         imported = result.get("added", 0)  # API возвращает "added", а не "imported"
         updated = result.get("updated", 0)
         skipped = result.get("skipped", 0)
@@ -1366,7 +1374,7 @@ async def confirm_import(callback: CallbackQuery, state: FSMContext):
             text += f"⏭️ Пропущено: `{skipped}`\n"
         if duplicates_by_cookies > 0:
             text += f"🔁 Дубликаты (одинаковые cookies): `{duplicates_by_cookies}`\n"
-        text += f"📦 Всего обработано: `{imported + updated}`\n"
+        text += f"📦 Всего обработано: `{imported + updated + skipped}`\n"
         if assigned_proxies > 0:
             text += f"\n🔗 Автоназначено прокси: `{assigned_proxies}`\n"
         if without_proxies > 0:
@@ -1381,6 +1389,7 @@ async def confirm_import(callback: CallbackQuery, state: FSMContext):
         await callback.message.edit_text(
             text,
             reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                [InlineKeyboardButton(text="📄 Результаты импорта", callback_data=f"admin:import:report:{result['job_id']}")],
                 [InlineKeyboardButton(text="🔄 Проверить аккаунты", callback_data="admin:accounts:validate")],
                 [InlineKeyboardButton(text="◀️ Назад", callback_data="admin:accounts")]
             ]),
@@ -1437,26 +1446,20 @@ async def confirm_import_and_assign(callback: CallbackQuery, state: FSMContext):
         import time
         
         start_time = time.time()
-        import_task = asyncio.create_task(api_client.bulk_import_accounts(accounts_data))
-        
-        # Показываем прогресс каждые 5 секунд
-        while not import_task.done():
-            await asyncio.sleep(5)
-            elapsed = int(time.time() - start_time)
-            try:
-                if callback.message:
-                    await callback.message.edit_text(
-                        f"⏳ *Импорт аккаунтов*\n\n"
-                        f"📥 Обрабатываю {len(accounts_data)} аккаунтов...\n"
-                        f"⏱ Прошло: {elapsed} сек\n\n"
-                        f"💡 Это может занять несколько минут",
-                        parse_mode="Markdown"
-                    )
-            except Exception:
-                pass  # Игнорируем ошибки обновления
-        
-        # Импортируем аккаунты
-        result = await import_task
+        last_import_view_at = 0.0
+        async def show_import_progress(progress):
+            nonlocal last_import_view_at
+            if time.monotonic() - last_import_view_at < 3 and progress["status"] != "done":
+                return
+            last_import_view_at = time.monotonic()
+            await callback.message.edit_text(
+                f"⏳ Импорт аккаунтов · {progress['job_id'][:8]}\n\n"
+                f"Обработано: {progress['processed']}/{progress['total']}\n"
+                f"Добавлено: {progress.get('added', 0)} · обновлено: {progress.get('updated', 0)}\n"
+                f"Пропущено: {progress.get('skipped', 0)}\n"
+                f"Прокси назначено: {progress.get('assigned_proxies', 0)}\n"
+                f"Прошло: {int(time.time() - start_time)} сек", parse_mode=None)
+        result = await api_client.import_accounts_job(accounts_data, on_progress=show_import_progress)
         imported = result.get("added", 0)
         updated = result.get("updated", 0)
         skipped = result.get("skipped", 0)
@@ -1483,7 +1486,7 @@ async def confirm_import_and_assign(callback: CallbackQuery, state: FSMContext):
             text += f"⏭️ Пропущено: `{skipped}`\n"
         if duplicates_by_cookies > 0:
             text += f"🔁 Дубликаты (одинаковые cookies): `{duplicates_by_cookies}`\n"
-        text += f"📦 Всего обработано: `{imported + updated + skipped + duplicates_by_cookies}`\n"
+        text += f"📦 Всего обработано: `{imported + updated + skipped}`\n"
         if assigned_proxies > 0:
             text += f"\n🔗 Прокси назначено при импорте: `{assigned_proxies}`\n"
         if additional_assigned > 0:
@@ -1501,6 +1504,7 @@ async def confirm_import_and_assign(callback: CallbackQuery, state: FSMContext):
         await callback.message.edit_text(
             text,
             reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                [InlineKeyboardButton(text="📄 Результаты импорта", callback_data=f"admin:import:report:{result['job_id']}")],
                 [InlineKeyboardButton(text="🔄 Проверить аккаунты", callback_data="admin:accounts:validate")],
                 [InlineKeyboardButton(text="◀️ Назад", callback_data="admin:accounts")]
             ]),
@@ -1517,6 +1521,22 @@ async def confirm_import_and_assign(callback: CallbackQuery, state: FSMContext):
                 )
         except Exception as e2:
             logger.error(f"Error editing message: {e2}", exc_info=True)
+
+
+@router.callback_query(F.data.startswith("admin:import:report:"))
+async def account_import_report(callback: CallbackQuery):
+    from aiogram.types import BufferedInputFile
+    await callback.answer()
+    job_id = callback.data.rsplit(":", 1)[1]
+    job = await api_client.get_account_import_job(job_id)
+    lines = [f"Импорт {job_id}", f"Обработано: {job['processed']}/{job['total']}",
+             "Формат: номер · имя · результат · ID аккаунта · ошибка", ""]
+    labels = {"added": "добавлен", "updated": "обновлён", "skipped": "пропущен"}
+    for row in job.get("results") or []:
+        lines.append(f"{row['index'] + 1} · {row.get('label', '')} · {labels.get(row['status'], row['status'])}"
+                     f" · {row.get('account_id') or '—'} · {row.get('error') or '—'}")
+    await callback.message.answer_document(BufferedInputFile("\n".join(lines).encode("utf-8"),
+        filename=f"import-{job_id[:8]}.txt"))
 
 
 @router.callback_query(F.data == "admin:accounts:list")
@@ -1879,7 +1899,7 @@ async def account_test_mode_menu(callback: CallbackQuery):
             "• выключает жёсткий proxy_type_filter\n"
             "• выключает prefer_mobile\n"
             "• назначает residential proxy аккаунтам без proxy\n"
-            "• временно разрешает один residential proxy на несколько аккаунтов\n\n"
+            "• сохраняет отдельную residential-сессию для каждого аккаунта\n\n"
             "Это режим диагностики, не продакшен. После теста лучше выключить."
         )
 
@@ -4591,6 +4611,105 @@ async def show_queue(callback: CallbackQuery):
             pass
 
 
+def _publication_runtime_card(values):
+    from html import escape
+    intervals = ", ".join(str(delay) for delay in values["late_delays"])
+    text = (
+        "<b>Потоки и видимость</b>\n\n"
+        f"Одновременные заказы · <b>{values['order_workers']}</b>\n"
+        f"Отправки на заказ · {values['send_workers']} запрошено, {values['effective_senders']} доступно\n"
+        f"Проверки на заказ · {values['check_workers']} запрошено, {values['effective_readers']} доступно\n"
+        f"Браузерные слоты на воркер · {values['browser_slots']}\n"
+        f"Интервал запуска операций отправки · {values['send_interval']:g} с\n"
+        f"Первая проверка после публикации · {values['check_delay']:g} с\n"
+        f"CID в группе проверки · {values['check_batch_size']}\n"
+        f"До {values['observer_attempts']} читателей и {values['author_checks']} проверок автором на группу\n"
+        f"Глубина чтения · {values['main_pages']} страниц комментариев, {values['reply_pages']} страниц ответов\n"
+        f"Фоновые проверки · {values['late_workers']} воркеров, опрос каждые {values['late_poll']:g} с\n"
+        f"Паузы поздних проверок · {escape(intervals)} с\n"
+        f"Обновление карточки · каждые {values['live_interval']:g} с\n\n"
+        "Число одновременных заказов применяется при запуске исполнителя. "
+        "Параметры отправки и проверки задают профиль по умолчанию. "
+        "В форме заказа можно выбрать свой профиль в пределах браузерных слотов."
+    )
+    keyboard = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="Изменить настройки", callback_data="admin:publication_runtime:edit")],
+        [InlineKeyboardButton(text="Назад", callback_data="admin:main")],
+    ])
+    return text, keyboard
+
+
+@router.callback_query(F.data == "admin:publication_runtime")
+async def publication_runtime_menu(callback: CallbackQuery, state: FSMContext):
+    access = await get_user_data(callback.from_user.id)
+    if not access or not access[2]:
+        await callback.answer("Настройки доступны администратору", show_alert=True)
+        return
+    await state.clear()
+    try:
+        text, keyboard = _publication_runtime_card(await api_client.get_publication_runtime())
+    except Exception:
+        await callback.answer("Не удалось загрузить настройки", show_alert=True)
+        return
+    await callback.answer()
+    await safe_edit_callback_text(callback, text, reply_markup=keyboard, parse_mode="HTML")
+
+
+@router.callback_query(F.data == "admin:publication_runtime:edit")
+async def publication_runtime_edit(callback: CallbackQuery, state: FSMContext):
+    from services.publication_runtime import PublicationRuntime
+    access = await get_user_data(callback.from_user.id)
+    if not access or not access[2]:
+        await callback.answer("Настройки доступны администратору", show_alert=True)
+        return
+    try:
+        values = await api_client.get_publication_runtime()
+    except Exception:
+        await callback.answer("Не удалось загрузить настройки", show_alert=True)
+        return
+    lines = [f"{field}={json.dumps(values[field])}" for field in PublicationRuntime.model_fields]
+    await state.set_state(OrderStates.ADMIN_EDIT_PUBLICATION_RUNTIME)
+    await callback.answer()
+    await safe_edit_callback_text(callback,
+        "<b>Изменение скорости и проверок</b>\n\n"
+        "Отправьте только нужные строки. Ниже показаны текущие значения.\n\n"
+        "<pre>" + "\n".join(lines) + "</pre>", parse_mode="HTML",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[[
+            InlineKeyboardButton(text="Отмена", callback_data="admin:publication_runtime")]]))
+
+
+@router.message(StateFilter(OrderStates.ADMIN_EDIT_PUBLICATION_RUNTIME), F.text)
+async def publication_runtime_save(message: Message, state: FSMContext):
+    from services.publication_runtime import PublicationRuntime
+    access = await get_user_data(message.from_user.id)
+    if not access or not access[2]:
+        await state.clear()
+        return
+    try:
+        changes = {}
+        for line in message.text.splitlines():
+            if not line.strip():
+                continue
+            key, value = map(str.strip, line.split("=", 1))
+            if key not in PublicationRuntime.model_fields or key in changes:
+                raise ValueError("unknown or repeated field")
+            changes[key] = json.loads(value)
+        if not changes:
+            raise ValueError("empty settings")
+        PublicationRuntime.model_validate(changes)
+    except ValueError:
+        await message.answer("Проверьте названия полей и значения. Используйте одну строку «поле=значение» на настройку.")
+        return
+    try:
+        values = await api_client.update_publication_runtime(changes)
+        text, keyboard = _publication_runtime_card(values)
+    except Exception:
+        await message.answer("Настройки не сохранились. Проверьте значения и повторите отправку.")
+        return
+    await state.clear()
+    await message.answer(text, reply_markup=keyboard, parse_mode="HTML")
+
+
 @router.callback_query(F.data == "admin:proxy_settings")
 async def proxy_settings_menu(callback: CallbackQuery, *, skip_answer: bool = False):
     """Показывает настройки прокси вместе с реальным инвентарём и рисками выбранного режима."""
@@ -4640,7 +4759,7 @@ async def proxy_settings_menu(callback: CallbackQuery, *, skip_answer: bool = Fa
             "━━━━━━━━━━━━━━━━━━━━\n\n"
             "🎛 *Текущая логика выбора*\n"
             f"Режим: `{filter_text}`\n"
-            f"Предпочитать мобильные: `{'да' if proxy_prefer_mobile else 'нет'}`\n\n"
+            "Основной пул — residential с отдельной сессией на аккаунт.\n\n"
             "🌐 *Инвентарь*\n"
             f"Всего: `{int(proxy_stats.get('total', 0) or 0)}`\n"
             f"Active `{int(proxy_stats.get('active', 0) or 0)}` | slow `{int(proxy_stats.get('slow', 0) or 0)}` | bad `{int(proxy_stats.get('bad', 0) or 0)}` | unknown `{int(proxy_stats.get('unknown', 0) or 0)}`\n"
@@ -4648,8 +4767,8 @@ async def proxy_settings_menu(callback: CallbackQuery, *, skip_answer: bool = Fa
             "💡 *Что это меняет*\n"
             "• mobile only — жёстко режет пул до мобильных прокси\n"
             "• residential only — исключает mobile-пул\n"
-            "• prefer mobile — сначала берём mobile, но не блокируем весь пул\n"
-            "• validate/list proxies — лучший быстрый путь перед массовой работой"
+            "• residential — один адрес или sticky-сессия на аккаунт\n"
+            "• мобильный IP меняется через кнопку в списке прокси"
         )
 
         if warnings:
@@ -4673,12 +4792,6 @@ async def proxy_settings_menu(callback: CallbackQuery, *, skip_answer: bool = Fa
                 InlineKeyboardButton(
                     text=f"{'✅ ' if proxy_type_filter == 'residential' else ''}Только резидентские",
                     callback_data="admin:proxy_settings:type:residential",
-                )
-            ],
-            [
-                InlineKeyboardButton(
-                    text=f"{'✅' if proxy_prefer_mobile else '❌'} Предпочитать мобильные",
-                    callback_data="admin:proxy_settings:prefer_mobile:toggle",
                 )
             ],
             [
@@ -4722,25 +4835,10 @@ async def set_proxy_type_filter(callback: CallbackQuery):
 
 @router.callback_query(F.data == "admin:proxy_settings:prefer_mobile:toggle")
 async def toggle_proxy_prefer_mobile(callback: CallbackQuery):
-    """Переключает предпочтение мобильных прокси."""
-    try:
-        # Получаем текущие настройки
-        settings = await api_client.get_proxy_settings()
-        current_value = settings.get("proxy_prefer_mobile", False)
-        
-        # Переключаем
-        new_value = not current_value
-        
-        # Обновляем настройки
-        await api_client.update_proxy_settings(proxy_prefer_mobile=new_value)
-        
-        # Обновляем меню
-        await proxy_settings_menu(callback, skip_answer=True)
-        
-        await callback.answer("✅ Настройка обновлена", show_alert=False)
-    except Exception as e:
-        logger.error(f"Error toggling proxy prefer mobile: {e}", exc_info=True)
-        await callback.answer("Ошибка обновления настройки", show_alert=True)
+    """Old menu buttons resolve to the current residential-first policy."""
+    await api_client.update_proxy_settings(proxy_prefer_mobile=False)
+    await proxy_settings_menu(callback, skip_answer=True)
+    await callback.answer("В HTTP-режиме основной пул — residential")
 
 
 def _build_software_mode_text(mode: str) -> tuple[str, InlineKeyboardMarkup]:
@@ -4835,45 +4933,18 @@ async def set_software_mode_handler(callback: CallbackQuery):
 
 
 def _build_commenting_mode_text(mode: str) -> tuple[str, InlineKeyboardMarkup]:
-    """Returns (text, keyboard) for the commenting mode panel."""
-    is_old = mode == "old"
-    is_parallel = mode == "parallel"
-    is_parallel_6x1 = mode == "parallel_6x1"
-    active_label = {
-        "parallel": "🟢 Новая параллельная",
-        "parallel_6x1": "🟣 Параллельная 6×1",
-    }.get(mode, "⚪ Старая")
-
+    """Explain the current engine without exposing obsolete creation switches."""
     text = (
         "💬 *Режим комментинга*\n"
         "━━━━━━━━━━━━━━━━━━━━\n\n"
-        f"Активный режим: *{active_label}*\n\n"
-        "*⚪ Старая логика*\n"
-        "Текущий рабочий user-schema сценарий без изменения поведения.\n\n"
-        "*🟢 Новая параллельная*\n"
-        "Главные комментарии публикуются максимум тремя аккаунтами одновременно. "
-        "Ответы идут батчами до трёх аккаунтов, без публикации fallback-главных "
-        "со стороны ответчиков.\n\n"
-        "*🟣 Параллельная 6×1*\n"
-        "Две строгие волны по три аккаунта. Каждый аккаунт публикует только один "
-        "из трёх вариантов. Между волнами обязательно меняется IP мобильного "
-        "прокси; ответы запускаются только после успешных 6/6 главных комментариев.\n\n"
-        "_Переключение применяется к новым заказам._"
+        "Новые полные заказы: заданное количество главных комментариев на видео "
+        "и ответов под каждым подтверждённым главным.\n\n"
+        "Тексты берутся из библиотеки шаблона. Публикация и проверка идут через HTTP. "
+        "Лимиты отправок, времени и трафика задаются в заказе.\n\n"
+        "Параллелизм определяется MAX_CONCURRENT_BROWSERS и доступными аккаунтами/прокси. "
+        "Старые сохранённые заказы сохраняют совместимость со своим движком."
     )
-    old_btn = f"{'✅ ' if is_old else ''}⚪ Старая"
-    parallel_btn = f"{'✅ ' if is_parallel else ''}🟢 Новая"
-    parallel_6x1_btn = f"{'✅ ' if is_parallel_6x1 else ''}🟣 6×1"
     keyboard = InlineKeyboardMarkup(inline_keyboard=[
-        [
-            InlineKeyboardButton(text=old_btn, callback_data="admin:commenting_mode:set:old"),
-            InlineKeyboardButton(text=parallel_btn, callback_data="admin:commenting_mode:set:parallel"),
-        ],
-        [
-            InlineKeyboardButton(
-                text=parallel_6x1_btn,
-                callback_data="admin:commenting_mode:set:parallel_6x1",
-            ),
-        ],
         [InlineKeyboardButton(text="◀️ Назад", callback_data="admin:main")],
     ])
     return text, keyboard
@@ -4940,22 +5011,19 @@ async def set_commenting_mode_handler(callback: CallbackQuery):
 
 
 def _build_order_strategy_text(strategy: str, available: list[str] | None = None) -> tuple[str, InlineKeyboardMarkup]:
-    active = strategy if strategy in {"dom", "http"} else None
-    available_set = set(available if available is not None else ["dom", "http"])
+    active = "http"
+    available_set = set(available if available is not None else ["http"])
     text = (
         "*Режим заказов*\n\n"
         f"Сейчас: *{order_transport_label(active)}*\n\n"
-        "*DOM — через браузер*\nПубликация через интерфейс TikTok.\n\n"
         "*HTTP — быстрый*\nПубликация HTTP-запросами с браузерной сессией и подписью.\n\n"
-        "Общая настройка для полных заказов и «Только ответы», включая шаблоны и мониторинг. "
-        "«Ответы по ключевым словам» всегда выполняются через HTTP. "
-        "Уже созданные заказы сохраняют свой режим.\n\n"
-        "Проверки видимости, лайки и схема комментариев настраиваются отдельно."
+        "Все новые заказы выполняются HTTP-запросами, включая полные заказы, ответы, ключевые слова и мониторинг.\n\n"
+        "Количество главных комментариев и ответов под каждым задаётся в заказе или шаблоне."
     )
     rows = [[InlineKeyboardButton(
         text=("✓ " if item == active else "") + order_transport_label(item),
         callback_data=f"admin:order_strategy:set:{item}",
-    )] for item in ("dom", "http") if item in available_set]
+    )] for item in ("http",) if item in available_set]
     if "http" not in available_set:
         text += "\n\nHTTP недоступен в конфигурации сервера."
     rows.append([InlineKeyboardButton(text="◀️ Админ-панель", callback_data="admin:main")])
@@ -7768,6 +7836,13 @@ async def proxies_list(callback: CallbackQuery):
 
         text = "\n".join(lines)
         kb = get_proxy_list_keyboard(page, has_prev=page > 0, has_next=has_next)
+        mobile_buttons = [
+            [InlineKeyboardButton(text=f"📱 Сменить IP прокси #{proxy['id']}",
+                                  callback_data=f"admin:proxies:rotate:{proxy['id']}")]
+            for proxy in page_items
+            if proxy.get("is_mobile") == "Y" and proxy.get("rotation_url")
+        ]
+        kb.inline_keyboard = mobile_buttons + kb.inline_keyboard
         await _safe_edit_callback_text(callback, text, reply_markup=kb, parse_mode="Markdown")
     except Exception as e:
         logger.error("proxies_list error: %s", e, exc_info=True)
@@ -7775,6 +7850,22 @@ async def proxies_list(callback: CallbackQuery):
             await callback.answer(f"Ошибка: {str(e)[:100]}", show_alert=True)
         except Exception:
             pass
+
+
+@router.callback_query(F.data.startswith("admin:proxies:rotate:"))
+async def rotate_mobile_proxy(callback: CallbackQuery):
+    await callback.answer("Запрошена смена IP")
+    await _safe_edit_callback_text(callback, "📱 Ожидаю завершения активных запросов и смены IP…")
+    try:
+        proxy_id = int(callback.data.rsplit(":", 1)[-1])
+        result = await api_client.rotate_mobile_proxy(proxy_id)
+        text = f"📱 Прокси #{proxy_id}. Новый IP подтверждён — {result['ip']}"
+    except Exception:
+        logger.exception("Mobile proxy rotation request failed")
+        text = "Не удалось подтвердить смену IP мобильного прокси."
+    await _safe_edit_callback_text(callback, text, reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="◀️ К списку", callback_data="admin:proxies:list")],
+    ]))
 
 
 @router.callback_query(F.data == "admin:proxies:validate")

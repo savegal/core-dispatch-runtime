@@ -50,7 +50,8 @@ async def test_real_settings_api_persists_switch_and_protects_admin(transport_ap
     for method in (client.get, client.post):
         kwargs = {"json": {"order_transport_mode": "dom"}} if method == client.post else {}
         assert (await method("/api/settings/order_transport", **kwargs)).status_code == 403
-    for mode in ("http", "dom", "http"):
+    assert (await switch(client, "dom")).status_code == 409
+    for mode in ("http", "http"):
         response = await switch(client, mode)
         assert response.status_code == 200, response.text
         assert response.json()["order_transport_mode"] == mode
@@ -66,7 +67,8 @@ async def test_real_settings_api_persists_switch_and_protects_admin(transport_ap
 async def test_switch_does_not_report_success_on_failed_commit(transport_api, monkeypatch):
     from api import app_settings
     client, sessions = transport_api
-    assert (await switch(client, "dom")).status_code == 200
+    with sessions() as db:
+        transport.set_order_transport(db, "dom")
     monkeypatch.setattr(app_settings, "set_order_transport", lambda *a, **k: False)
     assert (await switch(client, "http")).status_code == 500
     with sessions() as db:
@@ -78,14 +80,16 @@ async def test_unavailable_http_is_disabled_in_api(transport_api, monkeypatch):
     client, _ = transport_api
     monkeypatch.setattr(get_settings(), "TIKTOK_NETWORK_IMPL_READY", False)
     assert (await switch(client, "http")).status_code == 409
-    response = (await switch(client, "dom")).json()
-    assert response["available_modes"] == ["dom"]
+    assert (await switch(client, "dom")).status_code == 409
+    response = (await client.get("/api/settings/order_transport", headers={"X-Admin-Token": "local-test-admin"})).json()
+    assert response["available_modes"] == []
     assert response["http_available"] is False
 
 
 async def test_fresh_read_refreshes_existing_session_identity_map(transport_api):
     client, sessions = transport_api
-    await switch(client, "dom")
+    with sessions() as db:
+        transport.set_order_transport(db, "dom")
     with sessions() as db:
         old = db.execute(select(AppSettings).where(AppSettings.key == transport.ORDER_TRANSPORT_KEY)).scalar_one()
         assert old.value == "dom"
@@ -153,9 +157,11 @@ async def test_real_creation_snapshots_server_policy_and_idempotency_keeps_origi
             return await inspect.unwrap(tasks.create_task)(request=request, task_data=payload, db=db, auth_user_id=1)
         first = await create("same-request")
         original = await db.get(Task, first["task_id"])
-        assert first[transport.ORDER_TRANSPORT_KEY] == original.settings[transport.ORDER_TRANSPORT_KEY] == "dom"
+        assert first[transport.ORDER_TRANSPORT_KEY] == original.settings[transport.ORDER_TRANSPORT_KEY] == "http"
         assert original.settings["verify_reply_visibility"] is True
         assert original.settings["replies"] == ["Ответ 👨‍👩‍👧", "Ещё ответ"]
+        # An idempotent retry of a pre-upgrade order retains its saved policy.
+        original.settings = {**original.settings, transport.ORDER_TRANSPORT_KEY: "dom"}
         setting.value = "http"
         await db.commit()
         repeat = await create("same-request")
@@ -196,7 +202,12 @@ async def test_http_api_switch_then_create_full_and_reply_orders(transport_api, 
     monkeypatch.setattr(tasks, "finalize_reserved_enqueue_async", finalize)
     monkeypatch.setattr(tasks, "claim_dedup_key", lambda *a, **k: True)
     for mode in ("dom", "http"):
-        assert (await switch(client, mode)).status_code == 200
+        if mode == "dom":
+            assert (await switch(client, mode)).status_code == 409
+            with sessions() as db:
+                transport.set_order_transport(db, mode)
+        else:
+            assert (await switch(client, mode)).status_code == 200
         for kind in ("full", "engagement_only"):
             response = await client.post("/api/tasks", json={
                 "user_id": 1, "main_comment": "Текст", "text_variants": ["Первый", "Второй", "Третий"],
@@ -204,10 +215,10 @@ async def test_http_api_switch_then_create_full_and_reply_orders(transport_api, 
                 "kind": kind, "engagement_comment_text": "поиск",
                 "settings": {"order_transport_mode": "incorrect", "replies": ["Ответ"]}})
             assert response.status_code == 200, response.text
-            assert response.json()["order_transport_mode"] == mode
+            assert response.json()["order_transport_mode"] == "http"
             with sessions() as db:
                 task = db.get(Task, response.json()["task_id"])
-                assert task.settings["order_transport_mode"] == mode
+                assert task.settings["order_transport_mode"] == "http"
                 assert task.kind == kind
     assert reserve.await_count == finalize.await_count == 4
     await engine.dispose()
@@ -222,7 +233,7 @@ def test_monitor_settings_override_template_transport(mode):
                         settings={"text_variants": ["a", "b", "c"], transport.ORDER_TRANSPORT_KEY: "stale"}),
         origin="autopilot", created_from="monitor_worker", boost_likes_enabled=False,
         boost_likes_quantity=0, order_transport_mode=mode)
-    assert result[transport.ORDER_TRANSPORT_KEY] == mode
+    assert result[transport.ORDER_TRANSPORT_KEY] == "http"
 
 
 def callback(data="admin:order_strategy:set:http"):
@@ -248,14 +259,14 @@ async def test_admin_ui_renders_only_server_confirmed_mode(monkeypatch):
     assert "Не удалось сохранить" in cb.answer.call_args.args[0]
 
 
-def test_admin_keyboard_has_two_clear_modes_and_no_placeholder_strategy():
+def test_admin_keyboard_exposes_http_quantity_orders():
     from bot.handlers.admin import _build_order_strategy_text
     text, keyboard = _build_order_strategy_text("dom")
     assert "HTTP-запросами с браузерной сессией" in text
-    assert "полных заказов" in text
-    assert "«Ответы по ключевым словам» всегда выполняются через HTTP" in text
+    assert "полные заказы" in text
+    assert "ключевые слова и мониторинг" in text
     assert [row[0].callback_data for row in keyboard.inline_keyboard[:-1]] == [
-        "admin:order_strategy:set:dom", "admin:order_strategy:set:http"]
+        "admin:order_strategy:set:http"]
     assert "Balanced" not in text and "future" not in text
 
 

@@ -237,7 +237,7 @@ _RESOLVE_USER_JS = """async ({username, timeoutMs, runtimeParams}) => {
     };
     const controller = new AbortController();
     const abortTimer = setTimeout(() => controller.abort(), timeoutMs);
-    const remainingTimeout = () => Math.max(600, deadline - Date.now());
+    const remainingTimeout = () => Math.max(1, deadline - Date.now());
 
     const withTimeout = (promise, ms) => Promise.race([
         promise,
@@ -248,10 +248,17 @@ _RESOLVE_USER_JS = """async ({username, timeoutMs, runtimeParams}) => {
     let lastError = null;
 
     // Phase 1: Native webmssdk-signed fetch to user detail API with full params
+    const apiController = new AbortController();
+    const abortApi = () => apiController.abort();
+    controller.signal.addEventListener('abort', abortApi, {once: true});
+    const apiBudget = Math.max(1, Math.min(2500, Math.floor(timeoutMs / 2)));
+    const apiTimer = setTimeout(abortApi, apiBudget);
+    const apiDeadline = Date.now() + apiBudget;
+    const apiRemaining = () => Math.max(1, apiDeadline - Date.now());
     try {
         const p = runtimeParams || {};
         const ua = String(navigator.userAgent || '');
-        const browserVersion = ua.replace(/^Mozilla\//i, '') || '5.0 (Windows NT 10.0; Win64; x64)';
+        const browserVersion = ua.replace(/^Mozilla\\//i, '') || '5.0 (Windows NT 10.0; Win64; x64)';
         const qs = new URLSearchParams({
             aid: '1988',
             app_name: 'tiktok_web',
@@ -287,9 +294,9 @@ _RESOLVE_USER_JS = """async ({username, timeoutMs, runtimeParams}) => {
 
         const resp = await withTimeout(
             fetch('/api/user/detail/?' + qs.toString(), {
-                credentials: 'include', headers: {accept: 'application/json'}, signal: controller.signal,
+                credentials: 'include', headers: {accept: 'application/json'}, signal: apiController.signal,
             }),
-            remainingTimeout()
+            apiRemaining()
         );
 
         if (!sameEndpoint(resp, '/api/user/detail/')) throw new Error('api_unexpected_response_url');
@@ -297,7 +304,7 @@ _RESOLVE_USER_JS = """async ({username, timeoutMs, runtimeParams}) => {
         // Try the public profile before creating a negative cache entry.
         if (resp.status !== 200) throw new Error('api_http_' + resp.status);
 
-        const body = await resp.text();
+        const body = await withTimeout(resp.text(), apiRemaining());
         if (body) {
             try {
                 const data = JSON.parse(body);
@@ -316,6 +323,10 @@ _RESOLVE_USER_JS = """async ({username, timeoutMs, runtimeParams}) => {
         }
     } catch (e) {
         lastError = e && e.message ? e.message : 'api_fetch_failed';
+    } finally {
+        clearTimeout(apiTimer);
+        apiController.abort();
+        controller.signal.removeEventListener('abort', abortApi);
     }
 
     // Phase 2: SSR extraction fallback from profile HTML
@@ -334,7 +345,7 @@ _RESOLVE_USER_JS = """async ({username, timeoutMs, runtimeParams}) => {
             }
             if (resp.status !== 200) throw new Error('ssr_http_' + resp.status);
 
-            const html = await resp.text();
+            const html = await withTimeout(resp.text(), remainingTimeout());
             if (html) {
                 const m = html.match(/<script[^>]+id="__UNIVERSAL_DATA_FOR_REHYDRATION__"[^>]*>([\\s\\S]*?)<\\/script>/);
                 if (m) {

@@ -83,10 +83,12 @@ def apply_dedicated_proxy(account: Account) -> Account:
     """Apply the active proxy to an ORM object without dirtying Account.proxy."""
     route = get_current_dedicated_proxy()
     if route is not None:
+        from services.proxy_normalizer import resolve_account_sticky_proxy
+        resolved = resolve_account_sticky_proxy(route.proxy, account, default_country=route.country_code)
         if hasattr(account, "_sa_instance_state"):
-            set_committed_value(account, "proxy", route.proxy)
+            set_committed_value(account, "proxy", resolved)
         else:
-            account.proxy = route.proxy
+            account.proxy = resolved
         account.proxy_country_code = route.country_code
         return account
     if not get_settings().USE_PROXY:

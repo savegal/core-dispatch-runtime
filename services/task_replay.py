@@ -78,7 +78,19 @@ def retryable_video_urls(task) -> list[str]:
             continue
         row = results.get(url)
         if not isinstance(row, Mapping):
-            if explicit or status in {"error", "partial"}:
+            if explicit or status in {"error", "partial"} or (status == "stopped" and settings.get("publication_plan")):
+                selected.append(url)
+            continue
+        if settings.get("publication_plan") and isinstance(row.get("quantity_slots"), list):
+            slots = [slot for slot in row["quantity_slots"] if isinstance(slot, Mapping)]
+            plan = settings["publication_plan"]
+            safe_slots = any(slot.get("state") in {"pending", "not_sent", "absent"} for slot in slots)
+            missing_replies = any(
+                sum(child.get("kind") == "reply" and child.get("parent_action_id") == parent.get("id")
+                    for child in slots) < plan.get("replies_per_main", 0)
+                for parent in slots if parent.get("kind") == "main" and parent.get("state") == "visible")
+            untouched = not slots and not has_submission_evidence(row)
+            if safe_slots or missing_replies or untouched:
                 selected.append(url)
             continue
         row_status = str(row.get("status") or "").lower()
@@ -161,6 +173,15 @@ def reply_resume_plan(task, url):
 def seed_reply_resume(source, settings, urls=None):
     """Build server-side from the owned source order, never trust client receipts."""
     source_settings = source.get("settings", {}) if isinstance(source, Mapping) else source.settings or {}
+    settings.pop("_quantity_resume", None)
+    if source_settings.get("publication_plan"):
+        from copy import deepcopy
+        settings["_quantity_resume"] = {url: deepcopy((source_settings.get("url_results") or {}).get(url, {}).get("quantity_slots", []))
+            for url in (urls or [])}
+        settings["_quantity_resume_likes"] = {url: deepcopy((source_settings.get("url_results") or {}).get(url, {}).get("reply_likes") or {})
+            for url in (urls or [])}
+        settings.pop("_reply_resume", None)
+        return settings
     plans = {url: plan for url in (urls or source_settings.get("url_results") or {})
              if (plan := reply_resume_plan(source, url))}
     settings.pop("_reply_resume", None)

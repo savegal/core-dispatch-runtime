@@ -1,5 +1,5 @@
 from fastapi import APIRouter, Depends, HTTPException, Header, Request, Request as FastAPIRequest
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select, func, and_, or_
 from db.database import get_db, get_sync_db_context
@@ -25,6 +25,11 @@ import logging
 
 router = APIRouter(prefix="/api/accounts", tags=["accounts"], dependencies=[Depends(verify_admin_header)])
 logger = logging.getLogger(__name__)
+
+
+async def _run_browser_validation(function, *args, timeout):
+    """Keep Windows browser loops in a worker without blocking FastAPI."""
+    return await asyncio.wait_for(asyncio.to_thread(function, *args), timeout=timeout)
 
 # ИСПРАВЛЕНО: Импортируем limiter из отдельного модуля
 
@@ -54,6 +59,17 @@ class BulkImportResponse(BaseModel):
     duplicates_by_cookies: int = 0  # Дубликаты по cookies (одинаковые cookies, разные label)
     assigned_proxies: int = 0
     without_proxies: int = 0
+    results: list[dict] = []
+
+
+def _import_cookie_identity(validation):
+    import hashlib
+    from services.cookie_validator import parse_cookies_to_dict
+    normalized = validation.normalized_cookies
+    values = parse_cookies_to_dict(normalized)
+    session = values.get("sessionid") or values.get("sessionid_ss") or values.get("sid_tt")
+    value = "session:" + session if session else "cookies:" + normalized
+    return hashlib.sha256(value.encode()).hexdigest()
 
 
 class AssignProxiesRequest(BaseModel):
@@ -100,6 +116,7 @@ class AccountPoolDiagnosticsResponse(BaseModel):
     main_sql_candidates: int
     main_sql_candidates_after_proxy: int
     notes: list[str] = []
+    route_policy: dict = Field(default_factory=dict)
 
 
 class ReplaceProxyRequest(BaseModel):
@@ -122,6 +139,10 @@ async def bulk_import(
     db: AsyncSession = Depends(get_db),
     _: None = Depends(verify_admin_header)
 ):
+    return await import_account_records(request, db)
+
+
+async def import_account_records(request: BulkImportRequest, db: AsyncSession, *, commit=True, strict=False, cookie_index=None):
     """
     Импортирует или обновляет аккаунты с автоназначением прокси.
     
@@ -135,44 +156,41 @@ async def bulk_import(
     duplicates_by_cookies = 0  # Счетчик дубликатов по cookies
     assigned_proxies = 0  # Счетчик автоназначенных прокси
     without_proxies = 0  # Счетчик аккаунтов без прокси
+    record_results = []
     
-    # ИСПРАВЛЕНО: Получаем список всех прокси для round-robin назначения (status удален)
-    result = await db.execute(
-        select(Proxy).order_by(Proxy.id)
-    )
-    active_proxies = result.scalars().all()
-    proxy_country_by_proxy = {
-        proxy_obj.proxy: proxy_obj.country_code
-        for proxy_obj in active_proxies
-        if proxy_obj.proxy and proxy_obj.country_code
-    }
-    proxy_round_robin_index = 0
-    
+    from services.proxy_assignment_service import bind_account_proxy, _lock_assignment_pool
+    imported_ids = []
+    await db.run_sync(_lock_assignment_pool)
+
     # Кеш для быстрой проверки дубликатов по cookies (оптимизация)
     # Ключ: normalized_cookies, Значение: account.label
     from services.cookie_validator import validate_cookies
-    cookies_cache: dict[str, str] = {}
-    
-    # Предзагружаем normalized_cookies всех аккаунтов с cookies (для быстрой проверки)
-    try:
-        all_accounts_result = await db.execute(
-            select(Account).filter(Account.cookies.isnot(None))
-        )
-        all_accounts = all_accounts_result.scalars().all()
-        for account in all_accounts:
-            if account.cookies:
-                try:
-                    account_validation = validate_cookies(account.cookies)
-                    if account_validation.is_valid and account_validation.normalized_cookies:
-                        cookies_cache[account_validation.normalized_cookies] = account.label
-                except Exception:
-                    # Игнорируем ошибки валидации при предзагрузке
-                    pass
-    except Exception as cache_err:
-        logger.warning(f"Error preloading cookies cache: {cache_err}, will check duplicates on-the-fly")
+    from services.account_import_index import account_snapshot
+    cookie_index = cookie_index if cookie_index is not None else {}
+    snapshot = await account_snapshot(db)
+    if snapshot is None or cookie_index.get("snapshot") != snapshot:
+        rows = (await db.execute(select(Account.label, Account.cookies).where(Account.cookies.isnot(None)))).all()
+        def build_index():
+            index = {}
+            for label, raw in rows:
+                validation = validate_cookies(raw)
+                if validation.is_valid and validation.normalized_cookies:
+                    index[_import_cookie_identity(validation)] = label
+            return index
+        cookie_index["entries"] = await asyncio.to_thread(build_index)
+        cookie_index["snapshot"] = snapshot
+    cookies_cache = cookie_index["entries"]
 
     for acc_data in request.accounts:
+        savepoint = await db.begin_nested()
+        cookie_identity = None
         try:
+            if strict:
+                if not acc_data.label.strip() or len(acc_data.label) > 200:
+                    raise ValueError("invalid_account_label")
+                if ((acc_data.cookies and not validate_cookies(acc_data.cookies).is_valid)
+                        or not (acc_data.cookies or acc_data.cookie_file)):
+                    raise ValueError("invalid_cookie_format")
             # ИСПРАВЛЕНО: Проверяем сначала по cookies (приоритет), потом по label
             # Если аккаунт найден по cookies - это тот же аккаунт (обновляем)
             # Если найден только по label - проверяем куки: если разные - создаём новый
@@ -183,15 +201,21 @@ async def bulk_import(
                 try:
                     validation_result = validate_cookies(acc_data.cookies)
                     if validation_result.is_valid and validation_result.normalized_cookies:
+                        cookie_identity = _import_cookie_identity(validation_result)
                         # Используем кеш для быстрой проверки дубликатов по cookies
-                        if validation_result.normalized_cookies in cookies_cache:
-                            existing_label = cookies_cache[validation_result.normalized_cookies]
+                        if cookie_identity in cookies_cache:
+                            existing_label = cookies_cache[cookie_identity]
                             # Нашли дубликат по cookies - получаем полный аккаунт из БД
                             result = await db.execute(
                                 select(Account).filter(Account.label == existing_label)
                             )
                             existing = result.scalar_one_or_none()
+                            if existing and _import_cookie_identity(validate_cookies(existing.cookies or "")) != cookie_identity:
+                                cookies_cache.pop(cookie_identity, None)
+                                existing = None
                             if existing:
+                                if existing.label != acc_data.label:
+                                    duplicates_by_cookies += 1
                                 # Если найден по cookies - это обновление (даже если label другой)
                                 logger.info(
                                     f"Found existing account by cookies: '{existing.label[:30]}' "
@@ -219,9 +243,8 @@ async def bulk_import(
                                 existing_validation.normalized_cookies != new_validation.normalized_cookies):
                                 # Куки разные - создаём новый аккаунт с уникальным label
                                 # Генерируем уникальный label добавлением timestamp
-                                from datetime import datetime, timezone
-                                timestamp = int(datetime.now(timezone.utc).timestamp())
-                                acc_data.label = f"{acc_data.label}_{timestamp}"
+                                from uuid import uuid4
+                                acc_data.label = f"{acc_data.label[:180]}_{uuid4().hex[:12]}"
                                 logger.info(
                                     f"Different cookies for label '{acc_data.label[:30]}', "
                                     f"creating new account with label '{acc_data.label[:30]}'"
@@ -238,20 +261,7 @@ async def bulk_import(
                         # Нет куков у одного из аккаунтов - обновляем по label
                         existing = existing_by_label
 
-            # Определяем proxy (из данных или автоназначение)
             proxy = acc_data.proxy
-            was_assigned = False
-            if not proxy and active_proxies:
-                # Автоназначение по round-robin
-                proxy_obj = active_proxies[proxy_round_robin_index % len(active_proxies)]
-                proxy = proxy_obj.proxy
-                proxy_round_robin_index += 1
-                was_assigned = True
-                assigned_proxies += 1
-            
-            if not proxy:
-                without_proxies += 1
-
             if existing:
                 # Обновляем существующий
                 if acc_data.cookie_file:
@@ -263,44 +273,32 @@ async def bulk_import(
                     detected_country = detect_account_country(existing)
                     if detected_country:
                         existing.country_code = detected_country
-                    elif proxy and not existing.country_code:
-                        # Импорт должен быть быстрым: не делаем сетевую geo-проверку прокси
-                        # для каждого аккаунта. Берём уже сохранённую страну прокси, если она есть.
-                        proxy_country = proxy_country_by_proxy.get(proxy)
-                        if proxy_country:
-                            existing.country_code = proxy_country
                 # Обновляем user_agent если передан, иначе оставляем существующий или ставим дефолтный
                 if acc_data.user_agent:
                     existing.user_agent = acc_data.user_agent
                 elif not existing.user_agent:
                     # Если у существующего аккаунта нет user_agent, устанавливаем дефолтный
-                    existing.user_agent = (
-                        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-                        "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
-                    )
-                if proxy:
-                    existing.proxy = proxy
+                    from executor.browser_identity import desktop_user_agent
+                    existing.user_agent = desktop_user_agent()
                 if existing.status != "active":
                     existing.status = "active"
                 existing.error_count_recent = 0
                 existing.last_error = None
-                updated += 1
+                account = existing
             else:
                 # Создаём новый
                 # Устанавливаем дефолтный user_agent если не передан
                 user_agent = acc_data.user_agent
                 if not user_agent:
-                    user_agent = (
-                        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-                        "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
-                    )
+                    from executor.browser_identity import desktop_user_agent
+                    user_agent = desktop_user_agent()
                 
                 account = Account(
                     label=acc_data.label,
                     cookie_file=acc_data.cookie_file,
                     cookies=acc_data.cookies,
                     user_agent=user_agent,
-                    proxy=proxy,
+                    proxy=None,
                     status="active",
                     error_count_recent=0
                 )
@@ -310,22 +308,42 @@ async def bulk_import(
                 detected_country = detect_account_country(account)
                 if detected_country:
                     account.country_code = detected_country
-                elif proxy:
-                    # Импорт не должен ждать внешние geo-сервисы. Если страна прокси уже
-                    # известна в БД, используем её; иначе гео можно определить отдельной кнопкой.
-                    proxy_country = proxy_country_by_proxy.get(proxy)
-                    if proxy_country:
-                        account.country_code = proxy_country
-                
                 db.add(account)
+            await db.flush()
+            if proxy:
+                await db.run_sync(lambda sync_db: bind_account_proxy(sync_db, account, proxy))
+            await savepoint.commit()
+            if cookie_identity:
+                cookies_cache[cookie_identity] = account.label
+            imported_ids.append(account.id)
+            record_results.append({"index": len(record_results), "label": account.label[:80],
+                                   "account_id": account.id, "status": "updated" if existing else "added"})
+            if existing:
+                updated += 1
+            else:
                 added += 1
 
         except Exception as e:
+            await savepoint.rollback()
             logger.error(f"Error importing account label={acc_data.label[:30]}: {str(e)[:200]}")
             skipped += 1
+            record_results.append({"index": len(record_results), "label": acc_data.label[:80],
+                                   "status": "skipped", "error": str(e) if str(e) in {
+                                       "invalid_account_label", "invalid_cookie_format"} else type(e).__name__})
 
     try:
-        await db.commit()
+        if imported_ids:
+            assignment = await db.run_sync(lambda sync_db: assign_proxies_to_accounts(
+                sync_db, only_accounts_without_proxy=True, account_ids=imported_ids, commit=False,
+            ))
+            assigned_proxies = assignment["assigned"]
+            without_proxies = assignment["total_accounts_without_proxy"] - assigned_proxies
+        await db.flush()
+        cookie_index["snapshot"] = await account_snapshot(db)
+        if commit:
+            await db.commit()
+        else:
+            await db.flush()
     except Exception as e:
         await db.rollback()
         logger.error(f"Error committing bulk import: {e}", exc_info=True)
@@ -342,8 +360,30 @@ async def bulk_import(
         skipped=skipped,
         duplicates_by_cookies=duplicates_by_cookies,
         assigned_proxies=assigned_proxies,
-        without_proxies=without_proxies
+        without_proxies=without_proxies,
+        results=record_results,
     )
+
+
+@router.post("/import_jobs")
+async def start_import_job(request: BulkImportRequest, db: AsyncSession = Depends(get_db),
+                            _: None = Depends(verify_admin_header)):
+    if not 1 <= len(request.accounts) <= 5000:
+        raise HTTPException(422, "Импортируйте от 1 до 5000 аккаунтов за одно задание")
+    from services.account_import_jobs import create_import_job, import_progress
+    job = await create_import_job(db, [row.model_dump() for row in request.accounts])
+    return import_progress(job)
+
+
+@router.get("/import_jobs/{job_id}")
+async def get_import_job(job_id: str, include_results: bool = False, db: AsyncSession = Depends(get_db),
+                         _: None = Depends(verify_admin_header)):
+    from db.models import AccountImportJob
+    from services.account_import_jobs import import_progress
+    job = await db.get(AccountImportJob, job_id)
+    if job is None:
+        raise HTTPException(404, "Import job not found")
+    return import_progress(job, include_results=include_results)
 
 
 @router.get("/stats")
@@ -433,13 +473,14 @@ async def list_accounts(
     accounts = result.scalars().all()
 
     # НЕ возвращаем cookies в ответе (безопасность)
+    from services.log_sanitizer import sanitize_url
     return [
         {
             "id": acc.id,
             "label": acc.label,
             "status": acc.status,
             "country_code": acc.country_code,  # Добавляем гео-информацию
-            "proxy": acc.proxy[:30] + "..." if acc.proxy and len(acc.proxy) > 30 else acc.proxy,  # Показываем прокси (маскированный)
+            "proxy": sanitize_url(acc.proxy, max_length=120) if acc.proxy else None,
             "today_main_comments": acc.today_main_comments,
             "today_replies": acc.today_replies,
             "last_used_at": acc.last_used_at.isoformat() if acc.last_used_at else None,
@@ -536,7 +577,7 @@ async def account_pool_diagnostics_endpoint(
 
             notes: list[str] = []
             if test_mode:
-                notes.append("Тестовый режим включён: proxy_type_filter должен быть none, residential можно шарить при назначении.")
+                notes.append("Тестовый флаг не отменяет правило отдельного маршрута для каждого резидентского аккаунта.")
             if app_settings.USE_PROXY and without_proxy > 0:
                 notes.append(f"Есть аккаунты без proxy: {without_proxy}. При USE_PROXY=True они не попадают в работу.")
             if proxy_type_filter:
@@ -544,6 +585,12 @@ async def account_pool_diagnostics_endpoint(
             if main_sql_candidates_after_proxy == 0 and main_sql_candidates > 0:
                 notes.append("Аккаунты отрезаются proxy-фильтрами, а не статусом аккаунта.")
 
+            from services.backend_readiness import route_policy_summary
+            route_policy = route_policy_summary(sync_db)
+            if route_policy["excess_fixed_assignments"]:
+                notes.append(f"Фиксированный резидентский адрес назначен нескольким аккаунтам: "
+                             f"лишних назначений {route_policy['excess_fixed_assignments']}. "
+                             "Нужны отдельные адреса или sticky-сессии; сетевой статус прокси сам по себе не доказывает готовность пула.")
             return AccountPoolDiagnosticsResponse(
                 test_mode=test_mode,
                 proxy_type_filter=proxy_type_filter,
@@ -562,6 +609,7 @@ async def account_pool_diagnostics_endpoint(
                 main_sql_candidates=main_sql_candidates,
                 main_sql_candidates_after_proxy=main_sql_candidates_after_proxy,
                 notes=notes,
+                route_policy=route_policy,
             )
     except Exception as e:
         logger.error(f"Error building account pool diagnostics: {e}", exc_info=True)
@@ -613,11 +661,8 @@ async def set_account_proxy_test_mode_endpoint(
                 assignment_result = assign_proxies_to_accounts(
                     sync_db,
                     only_accounts_without_proxy=True,
-                    reuse_existing=True,
                     use_geo_matching=False,
-                    allow_reuse_within_batch=True,
                     force_proxy_type_filter="residential",
-                    test_shared_residential=True,
                 )
             else:
                 prev_filter = get_setting(sync_db, "account_proxy_test_mode_prev_proxy_type_filter", None)
@@ -639,98 +684,54 @@ async def set_account_proxy_test_mode_endpoint(
 
 @router.post("/replace_proxy", response_model=ReplaceProxyResponse)
 async def replace_proxy_endpoint(
-    request: ReplaceProxyRequest,
-    db: AsyncSession = Depends(get_db),
-    _: None = Depends(verify_admin_header)
+    request: ReplaceProxyRequest, db: AsyncSession = Depends(get_db),
+    _: None = Depends(verify_admin_header),
 ):
-    """
-    Заменяет прокси у аккаунта или группы аккаунтов с проблемными прокси.
-    
-    ИСПРАВЛЕНО: Переведено на async для соответствия async БД.
-    """
-    from db.models import Proxy
-    from sqlalchemy import and_, or_
-    
-    replaced = 0
-    account_ids = []
-    
-    # Определяем новый прокси
-    new_proxy_obj = None
-    if request.new_proxy_id:
-        result = await db.execute(
-            select(Proxy).filter(Proxy.id == request.new_proxy_id)
-        )
-        new_proxy_obj = result.scalar_one_or_none()
-        if not new_proxy_obj:
-            raise HTTPException(status_code=400, detail="Proxy not found")
-        if new_proxy_obj.dedicated_user_id is not None:
-            raise HTTPException(status_code=400, detail="Dedicated user proxy cannot be assigned to an account")
-    else:
-        # Автоматически выбираем лучший прокси (быстрый и свободный)
-        # Получаем использованные прокси
-        accounts_result = await db.execute(
-            select(Account.proxy).filter(
-                and_(Account.proxy.isnot(None), Account.proxy != "")
-            )
-        )
-        used_proxy_strings = {acc for acc in accounts_result.scalars().all() if acc}
-        
-        # ИСПРАВЛЕНО: Убраны фильтры по status и response_time_ms (поля удалены)
-        query = select(Proxy).filter(Proxy.dedicated_user_id.is_(None))
-        if used_proxy_strings:
-            query = query.filter(~Proxy.proxy.in_(used_proxy_strings))
-        query = query.order_by(Proxy.id)
-        
-        result = await db.execute(query)
-        new_proxy_obj = result.scalar_one_or_none()
-        
-        if not new_proxy_obj:
-            raise HTTPException(status_code=400, detail="No free proxies available")
-    
-    # Определяем аккаунты для замены
-    if request.account_id:
-        # Заменяем у конкретного аккаунта
-        result = await db.execute(
-            select(Account).filter(Account.id == request.account_id)
-        )
-        account = result.scalar_one_or_none()
-        if not account:
+    """Explicitly change bindings using exclusive residential ownership."""
+    from services.proxy_assignment_service import bind_account_proxy, _lock_assignment_pool, _resolved_proxy
+    from services.proxy_normalizer import ProxyRouteError
+
+    def replace(sync_db):
+        proxies = _lock_assignment_pool(sync_db)
+        available = [proxy for proxy in proxies if proxy.dedicated_user_id is None
+                     and proxy.status in {"active", "slow", "unknown"}]
+        if request.new_proxy_id:
+            available = [proxy for proxy in available if proxy.id == request.new_proxy_id]
+            if not available:
+                raise HTTPException(status_code=400, detail="Proxy is unavailable or dedicated to a user")
+        else:
+            available.sort(key=lambda proxy: (proxy.is_mobile == "Y", proxy.id))
+        query = sync_db.query(Account).filter(Account.status != "dead")
+        if request.account_id:
+            query = query.filter(Account.id == request.account_id)
+        accounts = query.order_by(Account.id).with_for_update().all()
+        if request.account_id and not accounts:
             raise HTTPException(status_code=404, detail="Account not found")
-        
-        old_proxy = account.proxy
-        account.proxy = new_proxy_obj.proxy
-        replaced = 1
-        account_ids = [account.id]
-        logger.info(f"Replaced proxy for account {account.id} ({account.label}): {old_proxy[:30] if old_proxy else None} -> {new_proxy_obj.proxy[:30]}")
-    else:
-        # Заменяем у всех аккаунтов с проблемными прокси
-        query = select(Account).filter(Account.status != "dead")
-        
-        # ИСПРАВЛЕНО: Убрана фильтрация по статусу прокси (поле status удалено)
-        # Теперь все прокси считаются активными, фильтрация не нужна
-        # Если нужно заменить прокси у всех аккаунтов - просто выбираем всех не dead
-        
-        result = await db.execute(query)
-        accounts_to_update = result.scalars().all()
-        
-        for account in accounts_to_update:
-            old_proxy = account.proxy
-            account.proxy = new_proxy_obj.proxy
-            replaced += 1
-            account_ids.append(account.id)
-            logger.info(f"Replaced proxy for account {account.id} ({account.label}): {old_proxy[:30] if old_proxy else None} -> {new_proxy_obj.proxy[:30]}")
-    
+        changed = []
+        for account in accounts:
+            for proxy in available:
+                if not request.new_proxy_id and account.proxy == _resolved_proxy(proxy.proxy, account, country=proxy.country_code):
+                    continue
+                try:
+                    bind_account_proxy(sync_db, account, proxy.proxy, proxy=proxy)
+                except ProxyRouteError:
+                    if request.new_proxy_id:
+                        raise
+                    continue
+                changed.append(account.id)
+                break
+        return changed
+
     try:
+        changed = await db.run_sync(replace)
         await db.commit()
-    except Exception as e:
+        return ReplaceProxyResponse(replaced=len(changed), account_ids=changed)
+    except ProxyRouteError as exc:
         await db.rollback()
-        logger.error(f"Error committing proxy replacement: {e}", exc_info=True)
-        raise HTTPException(status_code=500, detail=f"Database error: {str(e)[:200]}")
-    
-    return ReplaceProxyResponse(
-        replaced=replaced,
-        account_ids=account_ids
-    )
+        raise HTTPException(status_code=409, detail=str(exc)) from None
+    except Exception:
+        await db.rollback()
+        raise
 
 
 @router.delete("/dead")
@@ -1016,12 +1017,8 @@ async def validate_accounts(
                             logger.debug(f"Could not check proxy type for account {account.id}: {e}")
                             pass
                     
-                    with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
-                        # Передаем таймаут в validate_single_sync
-                        future = executor.submit(validate_single_sync, account, timeout_seconds)
-                        # Добавляем запас времени (20%) для надежности ThreadPoolExecutor
-                        executor_timeout = int(timeout_seconds * 1.2)
-                        is_valid = future.result(timeout=executor_timeout)
+                    is_valid = await _run_browser_validation(validate_single_sync, account, timeout_seconds,
+                                                             timeout=int(timeout_seconds * 1.2))
                 else:
                     is_valid = await quick_validate_account(account)
                 validation_result = {"valid": is_valid, "username": None, "error": None if is_valid else "Browser validation failed - login required"}
@@ -1177,9 +1174,7 @@ async def validate_single_account(
         # На Windows используем отдельный поток с новым event loop
         if sys.platform == 'win32':
             import concurrent.futures
-            with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
-                future = executor.submit(validate_sync)
-                is_valid = future.result(timeout=60)  # 60 секунд таймаут
+            is_valid = await _run_browser_validation(validate_sync, timeout=60)
         else:
             is_valid = await quick_validate_account(account)
         now = datetime.now(timezone.utc)
@@ -1334,9 +1329,7 @@ async def recheck_dead_accounts(
                             return loop.run_until_complete(quick_validate_account(account))
                     
                     if sys.platform == 'win32':
-                        with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
-                            future = executor.submit(validate_sync_recheck)
-                            is_valid = future.result(timeout=60)  # 60 секунд таймаут
+                        is_valid = await _run_browser_validation(validate_sync_recheck, timeout=60)
                     else:
                         is_valid = await quick_validate_account(account)
                     now = datetime.now(timezone.utc)
@@ -1557,6 +1550,7 @@ async def get_account_details(
         if not account:
             raise HTTPException(status_code=404, detail="Account not found")
         
+        last_reply_at = getattr(account, "last_reply_at", None)
         return {
             "id": account.id,
             "label": account.label,
@@ -1571,7 +1565,7 @@ async def get_account_details(
             "today_main_comments": account.today_main_comments or 0,
             "today_replies": account.today_replies or 0,
             "last_main_comment_at": account.last_main_comment_at.isoformat() if account.last_main_comment_at else None,
-            "last_reply_at": account.last_reply_at.isoformat() if account.last_reply_at else None,
+            "last_reply_at": last_reply_at.isoformat() if last_reply_at else None,
             "last_checked_at": account.last_checked_at.isoformat() if account.last_checked_at else None,
             "created_at": account.created_at.isoformat() if account.created_at else None,
         }
@@ -1621,7 +1615,12 @@ async def update_account(
         if update_data.user_agent is not None:
             account.user_agent = update_data.user_agent
         if update_data.proxy is not None:
-            account.proxy = update_data.proxy
+            from services.proxy_assignment_service import bind_account_proxy
+            from services.proxy_normalizer import ProxyRouteError
+            try:
+                await db.run_sync(lambda sync_db: bind_account_proxy(sync_db, account, update_data.proxy))
+            except ProxyRouteError as exc:
+                raise HTTPException(status_code=409, detail=str(exc)) from None
         if update_data.status and update_data.status in ("active", "error", "dead", "limited", "reauth_needed", "banned"):
             account.status = update_data.status
         
@@ -1629,6 +1628,7 @@ async def update_account(
         logger.info(f"Updated account {account_id}")
         return {"success": True, "account_id": account_id}
     except HTTPException:
+        await db.rollback()
         raise
     except Exception as e:
         await db.rollback()

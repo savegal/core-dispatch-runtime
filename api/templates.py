@@ -93,6 +93,10 @@ def _normalize_template_reply_payload(
             payload["keywords"] = normalize_keywords(payload.get("keywords"))
         except ValueError as exc:
             raise HTTPException(status_code=422, detail=str(exc)) from exc
+    from services.quantity_plan import quantity_plan
+    plan = quantity_plan(payload)
+    if plan is not None and plan.replies_per_main and not replies:
+        raise HTTPException(status_code=422, detail="Добавьте тексты ответов или укажите 0 ответов под комментарием")
     return payload, replies
 
 
@@ -115,14 +119,14 @@ def _extract_template_variants(template: TaskTemplate) -> list[str]:
     settings_payload = template.settings or {}
     variants = _normalize_text_list(settings_payload.get("text_variants"))
     if variants:
-        while len(variants) < 3:
+        while len(variants) < 3 and not settings_payload.get("publication_plan"):
             variants.append(variants[-1])
         return variants
 
     main_comment = _meaningful_text(template.main_comment)
     if not main_comment:
         return []
-    return [main_comment] * 3
+    return [main_comment] * (1 if settings_payload.get("publication_plan") else 3)
 
 
 def _is_archived_template(template: TaskTemplate) -> bool:
@@ -141,6 +145,19 @@ class TaskTemplateCreate(BaseModel):
     reply3: str | None = None
     likes: int = 0
     settings: dict | None = None
+
+    @field_validator("settings")
+    @classmethod
+    def validate_quantity_plan(cls, value):
+        if value is not None:
+            from services.order_settings import clean_order_configuration
+            value = clean_order_configuration(value)
+            from services.publication_runtime import normalize_order_options
+            normalize_order_options(value)
+        if value is not None and "publication_plan" in value:
+            from services.quantity_plan import QuantityPlan
+            value = {**value, "publication_plan": QuantityPlan.model_validate(value["publication_plan"]).model_dump()}
+        return value
     
     # ИСПРАВЛЕНО: Валидация входных данных
     @field_validator('name')
@@ -374,6 +391,11 @@ class TaskTemplateUpdate(BaseModel):
     reply3: str | None = None
     likes: int | None = None
     settings: dict | None = None
+
+    @field_validator("settings")
+    @classmethod
+    def validate_quantity_plan(cls, value):
+        return TaskTemplateCreate.validate_quantity_plan(value)
 
     @field_validator('name')
     @classmethod

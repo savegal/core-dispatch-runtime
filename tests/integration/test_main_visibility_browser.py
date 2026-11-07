@@ -78,6 +78,7 @@ async def test_two_missing_reads_then_one_replacement_is_publicly_confirmed(loca
         assert state["reads"] == 2
         context, page = await fixture_page(local_browser, state)
         try:
+            await page.evaluate("async () => (await fetch('/__fixture_ready__')).text()", isolated_context=False)
             client = await PlaywrightHttpClient.from_page(page)
             ok, cid, error, _ = await client.publish_main_comment(VIDEO, main.text, video_url=URL)
             assert ok, error

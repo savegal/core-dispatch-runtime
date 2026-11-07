@@ -12,8 +12,15 @@ from services.task_execution_ledger import build_task_execution_ledger, LEDGER_V
 _SUMMARY_RE = re.compile(r"успешно:\s*(\d+)\s*/\s*(\d+)", re.IGNORECASE)
 
 _MESSAGES: dict[str, tuple[str, str]] = {
+    "quantity_dispatch_budget_exhausted": ("Достигнут лимит отправок", "Заказ остановил новые публикации по заданному лимиту. Сохранённые результаты доступны в отчёте."),
+    "quantity_traffic_budget_exhausted": ("Достигнут лимит трафика", "Достигнут заданный бюджет трафика. Новые публикации и перепроверки этого заказа остановлены."),
+    "quantity_traffic_accounting_unavailable": ("Не удалось сохранить учёт трафика", "Новые запросы остановлены, чтобы не превысить заданный бюджет. Уже полученные результаты сохранены."),
+    "quantity_time_budget_exhausted": ("Достигнут лимит времени", "Завершилось заданное время работы с видео. Подтверждённые публикации сохранены."),
+    "quantity_visibility_or_delivery_unconfirmed": ("Результат требует проверки", "Есть принятые или неопределённые отправки. Повтор таких публикаций заблокирован, чтобы не создать дубли."),
+    "quantity_preparation_failed": ("Не удалось подготовить аккаунты", "Публикация не началась. Проверьте состояние аккаунтов и прокси."),
     "keyword_http_only": ("Нужен HTTP-транспорт", "Ответы по ключевым словам выполняются только через HTTP. Проверьте доступность транспорта."),
     "keyword_no_matches": ("Совпадений не найдено", "В доступном списке нет комментариев с заданными ключевыми словами."),
+    "keyword_negative_scan_unconfirmed": ("Отсутствие совпадений не подтверждено", "Первый аккаунт не нашёл совпадений. Не удалось подтвердить этот результат вторым независимым аккаунтом; публикации не отправлялись."),
     "keyword_scan_incomplete": ("Список прочитан не полностью", "TikTok не отдал весь список комментариев. Обработаны найденные совпадения; полный охват не подтверждён."),
     "keyword_delivery_unconfirmed": ("Отправка требует проверки", "Исход одного из ответов неизвестен. Автоматический повтор отключён, чтобы не создать дубль."),
     "reply_visibility_unconfirmed": (
@@ -135,10 +142,15 @@ def _extract_first_error_line(text: str) -> str | None:
 
 def _detect_error_code(text: str) -> str | None:
     lower = text.lower()
+    for code in _MESSAGES:
+        if code.startswith("quantity_") and code in lower:
+            return code
     if "keyword_http_only" in lower:
         return "keyword_http_only"
     if "keyword_no_matches" in lower:
         return "keyword_no_matches"
+    if "keyword_negative_scan_unconfirmed" in lower:
+        return "keyword_negative_scan_unconfirmed"
     if any(code in lower for code in ("keyword_delivery_unconfirmed", "keyword_parent_mismatch")):
         return "keyword_delivery_unconfirmed"
     if any(code in lower for code in ("keyword_scan", "keyword_pagination", "keyword_comment_list", "keyword_discovery")):
@@ -154,7 +166,7 @@ def _detect_error_code(text: str) -> str | None:
         return "insufficient_funds"
     if any(token in lower for token in ("stopped_by_user", "stopped by user", "остановлено пользователем", "остановлен пользователем")):
         return "stopped_by_user"
-    if any(token in lower for token in ("нет активных аккаунтов", "no active accounts", "no accounts available")):
+    if any(token in lower for token in ("нет активных аккаунтов", "no active accounts", "no accounts available", "no_accounts_available")):
         return "no_accounts"
     if any(token in lower for token in ("cooldown", "коулдаун", "в паузе")):
         return "cooldown"

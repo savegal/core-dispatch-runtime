@@ -169,6 +169,22 @@ async def resume_reply_likes(db, task, video_url, result, *, pool_owner_user_id=
             plan["state"] = "pending"
 
 
+def prepare_reply_like_phase(result, slots, *, target, count, used, allowed=True):
+    """Keep the existing like target and durable attempts policy for every order engine."""
+    targets = [{"cid": slot.comment_id, "parent_id": comment_id_key(slot.item.get("parent_comment_id"))}
+               for slot in slots if slot.public_confirmed and (target == "all" or str(slot.variant_index) == target)]
+    previous = result.get("reply_likes") or {}
+    previous_counts, previous_attempts = previous.get("by_comment_id") or {}, previous.get("attempts") or {}
+    counts = {item["cid"]: max(0, int(previous_counts.get(item["cid"]) or 0)) for item in targets}
+    attempts = {item["cid"]: copy.deepcopy(previous_attempts[item["cid"]])
+                for item in targets if item["cid"] in previous_attempts}
+    result["reply_likes"] = {"target": target, "requested_per_reply": count,
+                            "by_comment_id": counts, "attempts": attempts}
+    if targets and allowed:
+        result["reply_likes"].update(state="pending" if any(value < count for value in counts.values()) else "completed",
+            targets=targets, exclude_account_ids=sorted(used, key=str))
+
+
 async def verify_order_reply_visibility(db, task, video_url, result, *, pool_owner_user_id=None,
                                         stop_requested=lambda: False):
     """Post-process both full and replies-only results without repeating the main phase."""
@@ -180,6 +196,24 @@ async def verify_order_reply_visibility(db, task, video_url, result, *, pool_own
     auto_likes = coerce_bool(os.getenv("AUTO_BOOST_LIKES"), True)
     like_target, like_count = reply_like_preferences(task_settings)
     like_requested = bool(like_count and not keyword_order and auto_likes and http_first_enabled(settings))
+    if task_settings.get("publication_plan") and result.get("quantity_plan"):
+        # The quantity controller already owns exact-CID evidence and mutation
+        # budgets. Re-running the legacy verifier would erase that evidence and
+        # spend a second set of observer sessions after every video.
+        if like_requested:
+            from services.quantity_plan import traffic_budget_exhausted
+            items = ((result.get("engagement") or {}).get("replies") or {}).get("items") or []
+            slots = [ReplySlot(item, index, public_confirmed=item.get("public_confirmed") is True)
+                     for index, item in enumerate(items) if valid_comment_id(reply_id(item))]
+            mains = ((result.get("engagement") or {}).get("main") or {}).get("variants_published") or []
+            used = {item.get("account_id") for item in [*items, *mains] if item.get("account_id") is not None}
+            allowed = not stop_requested() and not traffic_budget_exhausted(db, task)
+            prepare_reply_like_phase(result, slots, target=like_target, count=like_count, used=used, allowed=allowed)
+            await run_visibility_checkpoint(db, task, save_reply_visibility_checkpoint, video_url, result)
+            if allowed:
+                await resume_reply_likes(db, task, video_url, result, pool_owner_user_id=pool_owner_user_id,
+                                         stop_requested=stop_requested)
+        return result
     if not verify_requested and not like_requested:
         return result
     started = time.monotonic()
@@ -498,7 +532,7 @@ async def verify_order_reply_visibility(db, task, video_url, result, *, pool_own
             slots, observe=observe, replace=replace, stop_requested=lambda: checkpoint_failed or stop_requested(),
             # Keyword dispatches are fenced by the target journal. A replacement
             # from this verifier has no corresponding journal entry.
-            repair_rounds=settings.REPLY_PUBLICATION_VISIBILITY_REPAIR_ROUNDS if verify_requested and not keyword_order else 0,
+            repair_rounds=settings.REPLY_PUBLICATION_VISIBILITY_REPAIR_ROUNDS if verify_requested and not keyword_order and not task_settings.get("publication_plan") else 0,
             observer_attempts=settings.REPLY_PUBLICATION_VISIBILITY_OBSERVER_ATTEMPTS,
             max_candidate_accounts=candidate_scan_limit(settings),
             initial_delay=settings.REPLY_PUBLICATION_VISIBILITY_INITIAL_DELAY_SECONDS,
@@ -584,19 +618,8 @@ async def verify_order_reply_visibility(db, task, video_url, result, *, pool_own
             except (ValueError, TypeError):
                 pass
         if like_requested:
-            targets = [
-                {"cid": slot.comment_id, "parent_id": comment_id_key(slot.item.get("parent_comment_id"))}
-                for slot in slots
-                if slot.public_confirmed and (like_target == "all" or str(slot.variant_index) == like_target)
-            ]
-            result["reply_likes"] = {
-                "target": like_target, "requested_per_reply": like_count,
-                "by_comment_id": dict.fromkeys((item["cid"] for item in targets), 0),
-            }
-            if targets and not checkpoint_failed and not stop_requested():
-                result["reply_likes"].update(
-                    state="pending", targets=targets, attempts={}, exclude_account_ids=sorted(used, key=str),
-                )
+            prepare_reply_like_phase(result, slots, target=like_target, count=like_count, used=used,
+                                     allowed=not checkpoint_failed and not stop_requested())
         await save()
         if checkpoint_failed:
             report.update(status="unconfirmed", reason="checkpoint_failed")

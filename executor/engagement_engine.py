@@ -3496,7 +3496,12 @@ async def _resolve_auto_engagement_parent(db, video_url, *, pool_owner_user_id=N
     if not http_first_enabled(settings):
         return None, "auto_parent_requires_http"
     from executor import user_schema as schema
-    from executor.http.comment_discovery import fetch_comment_page
+    from executor.http.comment_discovery import comment_read_batch, fetch_comment_page
+    from executor.http.comment_scanner import _cursor, _more, reports_unseen_comments
+
+    wanted = str(comment_author or "").strip().lstrip("@").casefold()
+    expected_media_id = extract_video_id(video_url)
+    last_error = "no_auto_parent_accounts"
     excluded = []
     browser_attempts = 0
     browser_limit = max(1, min(6, int(settings.MAX_RETRY_ACCOUNTS)))
@@ -3528,34 +3533,59 @@ async def _resolve_auto_engagement_parent(db, video_url, *, pool_owner_user_id=N
             _, ready, _ = await warmup_page_for_http(page, video_url, correlation_id=corr, account=account, db=db)
             if not ready:
                 continue
-            media_id = extract_video_id(getattr(page, "url", "")) or extract_video_id(video_url)
-            if not media_id:
-                return None, "video_id_unavailable"
-            payload = await fetch_comment_page(page, media_id, count=5)
-            if payload is None:
-                meta = getattr(page, "_comment_list_http_meta", {})
-                return None, "parent_api_unavailable:" + str(meta.get("reason") or "unknown")
-            wanted = str(comment_author or "").strip().lstrip("@").casefold()
-            candidates = []
-            for row in payload.get("comments", []):
-                if not isinstance(row, dict) or not valid_comment_id(row.get("cid")):
-                    continue
-                if str(row.get("reply_id") or "0") != "0" or row.get("is_deleted") in (True, 1, "1"):
-                    continue
-                user = row.get("user") if isinstance(row.get("user"), dict) else {}
-                author = str(user.get("unique_id") or user.get("nickname") or "").strip()
-                if wanted and author.lstrip("@").casefold() != wanted:
-                    continue
-                try:
-                    digg_count = max(0, int(row.get("digg_count") or 0))
-                except (TypeError, ValueError):
-                    digg_count = 0
-                candidates.append((digg_count, {"cid": str(row["cid"]), "text": str(row.get("text") or ""),
-                                                "author": author or None}))
-            if candidates:
-                candidates.sort(key=lambda item: item[0], reverse=True)
-                return candidates[0][1], None
-            return None, "auto_parent_not_found"
+            media_id = extract_video_id(getattr(page, "url", ""))
+            if not media_id or (expected_media_id and media_id != expected_media_id):
+                last_error = "video_id_unavailable" if not media_id else "target_document_changed"
+                continue
+            async with comment_read_batch(page):
+                cursor = 0
+                seen_cursors, seen_comments = {0}, set()
+                for _ in range(10 if wanted else 1):
+                    if stop_requested and stop_requested():
+                        return None, "stopped_by_user"
+                    if wanted:
+                        payload = await fetch_comment_page(page, media_id, cursor=cursor, count=20)
+                    else:
+                        payload = await fetch_comment_page(page, media_id, count=5)
+                    if payload is None:
+                        meta = getattr(page, "_comment_list_http_meta", {}) or {}
+                        last_error = "parent_api_unavailable:" + str(meta.get("reason") or "unknown")
+                        break
+                    candidates, page_comments = [], set()
+                    for row in payload.get("comments", []):
+                        if not isinstance(row, dict) or not valid_comment_id(row.get("cid")):
+                            continue
+                        if row.get("aweme_id") is not None and str(row["aweme_id"]) != str(media_id):
+                            continue
+                        if str(row.get("reply_id") or "0") != "0" or row.get("is_deleted") in (True, 1, "1"):
+                            continue
+                        cid = str(row["cid"]).strip()
+                        page_comments.add(cid)
+                        user = row.get("user") if isinstance(row.get("user"), dict) else {}
+                        author = str(user.get("unique_id") or user.get("nickname") or "").strip()
+                        if wanted and author.lstrip("@").casefold() != wanted:
+                            continue
+                        try:
+                            digg_count = max(0, int(row.get("digg_count") or 0))
+                        except (TypeError, ValueError):
+                            digg_count = 0
+                        candidates.append((digg_count, {"cid": cid, "text": str(row.get("text") or ""),
+                                                        "author": author or None}))
+                    if candidates:
+                        return max(candidates, key=lambda item: item[0])[1], None
+                    more = _more(payload.get("has_more"))
+                    new_comments = page_comments - seen_comments
+                    seen_comments.update(page_comments)
+                    if not wanted or (more is False and not reports_unseen_comments(payload, len(seen_comments))):
+                        return None, "auto_parent_not_found"
+                    next_cursor = _cursor(payload.get("cursor"))
+                    if more is not True or not new_comments or next_cursor is None or next_cursor in seen_cursors:
+                        last_error = "parent_api_unavailable:pagination_stalled"
+                        break
+                    seen_cursors.add(next_cursor)
+                    cursor = next_cursor
+                else:
+                    return None, "auto_parent_scan_limit"
         except asyncio.CancelledError:
             raise
         except Exception as exc:
@@ -3565,7 +3595,7 @@ async def _resolve_auto_engagement_parent(db, video_url, *, pool_owner_user_id=N
                 await schema._safe_close(context, page, reason="auto_parent_checked", correlation_id=corr)
             finally:
                 schema.release_reply_account_reservation(account.id)
-    return None, "no_auto_parent_accounts"
+    return None, last_error
 
 
 async def execute_engagement_only_replies_via_full_flow(

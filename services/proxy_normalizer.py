@@ -181,6 +181,7 @@ class ProxyRoute:
     password: str | None = field(default=None, repr=False)
     country_code: str | None = None
     proxy_id: int | None = None
+    is_mobile: bool = False
 
     @classmethod
     def parse(cls, raw: str, *, default_scheme: str | None = None, **metadata) -> "ProxyRoute":
@@ -253,6 +254,7 @@ def account_proxy_route(account, *, required: bool | None = None) -> ProxyRoute 
     route = ProxyRoute.parse(raw)
     country = dedicated.country_code if dedicated else getattr(account, "proxy_country_code", None)
     proxy_id = dedicated.proxy_id if dedicated else None
+    is_mobile = dedicated.is_mobile if dedicated else bool(getattr(account, "proxy_is_mobile", False))
     if account is not None and dedicated is None:
         from sqlalchemy.orm import object_session
         from db.models import Account
@@ -261,12 +263,15 @@ def account_proxy_route(account, *, required: bool | None = None) -> ProxyRoute 
             proxy = find_account_proxy_record(session, account)
             if proxy is not None:
                 country, proxy_id = proxy.country_code, proxy.id
+                is_mobile = str(proxy.is_mobile or "").strip().upper() == "Y"
+                if is_mobile and not str(proxy.rotation_url or "").strip():
+                    raise ProxyRouteError("mobile_rotation_url_missing")
     if not country and is_sticky_residential_template(raw_original):
         country = _resolve_account_geo_code(account, default_country=default_cc)
     country = str(country or "").strip().upper() or None
     if account is not None:
         account.proxy_country_code = country
-    return replace(route, country_code=country, proxy_id=proxy_id)
+    return replace(route, country_code=country, proxy_id=proxy_id, is_mobile=is_mobile)
 
 
 def find_account_proxy_record(db, account):
@@ -284,14 +289,20 @@ def find_account_proxy_record(db, account):
     direct = db.query(Proxy).filter(Proxy.proxy == current).first()
     if direct is not None:
         return direct
+    normalized_current = normalize_proxy_string(current)
+    if normalized_current is None:
+        return None
+    host = ProxyRoute.parse(normalized_current).host
     candidates = db.query(Proxy).filter(or_(
+        func.lower(Proxy.proxy).contains(host.lower()),
         Proxy.proxy.contains("{"),
         func.lower(Proxy.proxy).contains("session-auto"),
         func.lower(Proxy.proxy).contains("sessid-auto"),
         func.lower(Proxy.proxy).contains("sid-auto"),
     )).all()
     for proxy in candidates:
-        if (resolve_account_sticky_proxy(proxy.proxy, account, default_country=proxy.country_code) == current
+        expanded = resolve_account_sticky_proxy(proxy.proxy, account, default_country=proxy.country_code)
+        if (normalize_proxy_string(expanded) == normalized_current
                 or account_sticky_proxy_matches_template(proxy.proxy, account, current)):
             return proxy
     return None
@@ -382,3 +393,9 @@ def detect_proxy_scheme_sync(proxy: str, timeout: float | None = None) -> Option
                 sock.close()
             except Exception:
                 pass
+
+
+def find_proxy_record_by_route(db, raw):
+    """Resolve a fixed endpoint across historical URL serialization formats."""
+    from types import SimpleNamespace
+    return find_account_proxy_record(db, SimpleNamespace(id=None, proxy=raw, country_code=None))

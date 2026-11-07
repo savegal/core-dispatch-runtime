@@ -59,7 +59,7 @@ def test_setup_logging_accepts_diagnostic_rotation_settings(tmp_path):
 @pytest.mark.asyncio
 async def test_rotate_proxy_ip_logs_redacted_rotation_url(monkeypatch, caplog):
     raw_url = "https://proxy-seller.com/api/proxy/reboot?token=secret-token-123&keep=ok"
-    proxy = SimpleNamespace(id=7, rotation_url=raw_url, proxy="http://proxy.example:8080")
+    proxy = SimpleNamespace(id=7, is_mobile="Y", rotation_url=raw_url, proxy="http://proxy.example:8080")
 
     class FakeResponse:
         def raise_for_status(self):

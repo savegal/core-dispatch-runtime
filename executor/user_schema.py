@@ -128,6 +128,7 @@ from services.account_service import (
     release_reply_account_reservation,
 )
 from services.proxy_health_service import clear_proxy_bad, mark_proxy_bad
+from services.proxy_normalizer import find_proxy_record_by_route
 from services.mobile_proxy_service import (
     ProxyRotationError,
     acquire_proxy_lock,
@@ -386,7 +387,7 @@ def _proxy_is_rotatable_mobile_for_main(db: Session, proxy_value: Optional[str])
     proxy_value = str(proxy_value or "").strip()
     if not proxy_value:
         return False
-    proxy_obj = db.query(Proxy).filter(Proxy.proxy == proxy_value).first()
+    proxy_obj = find_proxy_record_by_route(db, proxy_value)
     return bool(
         proxy_obj is not None
         and getattr(proxy_obj, "is_mobile", None) == "Y"
@@ -1257,6 +1258,8 @@ async def _publish_main_http_first_if_eligible(
     text: str,
     *,
     correlation_id: str,
+    variant_index: Optional[int] = None,
+    tiktok_username: Optional[str] = None,
 ) -> Optional[PublishResult]:
     if session is None or session.scope != MAIN_SCOPE or session.disabled_reason:
         return None
@@ -1285,19 +1288,29 @@ async def _publish_main_http_first_if_eligible(
             correlation_id,
             str(exc)[:120],
         )
-        return PublishResult(
-            status="timeout" if "timeout" in str(exc).lower() else "failed",
-            error_reason=(
-                "no_network_response_after_publish_request"
-                if "timeout" in str(exc).lower()
-                else f"http_main_exception:{str(exc)[:140]}"
-            ),
-            network_request_attempted=True,
-            elapsed_seconds=time.monotonic() - started,
-            dom_strategy=_USER_SCHEMA_HTTP_METHOD,
-            network_response_json={"request_meta": _http_session_request_meta(session)},
-            post_was_enabled_at_click=True,
-        )
+        success, comment_id = False, None
+        error_msg = f"submitted_unconfirmed:http_main_exception:{type(exc).__name__}"
+        error_type = "submitted_unconfirmed"
+
+    confirmed = bool(success and valid_comment_id(comment_id))
+    unconfirmed = (
+        _http_error_type_value(error_type) == "submitted_unconfirmed"
+        and _http_session_request_attempted(session, error_msg=error_msg)
+    )
+    if variant_index is not None and (confirmed or unconfirmed):
+        meta = _http_session_request_meta(session)
+        await record_publication("main", {
+            "text": (meta.get("published_text") or text) if confirmed else text,
+            "variant_index": variant_index,
+            "comment_id": str(comment_id) if confirmed else None,
+            "account_id": session.account_id,
+            "tiktok_username": tiktok_username or meta.get("comment_author"),
+            "author_uid": meta.get("comment_author_uid"),
+            "network_confirmed": confirmed,
+            "submitted_unconfirmed": not confirmed,
+            "publication_attempted": True,
+            "method": _USER_SCHEMA_HTTP_METHOD,
+        })
 
     if success and comment_id:
         try:
@@ -2353,6 +2366,7 @@ class PublishedMain:
     physical_parent_key: Optional[str] = None
     public_confirmed: bool = False
     author_uid: Optional[str] = None
+    submitted_unconfirmed: bool = False
 
 
 @dataclass
@@ -2684,7 +2698,11 @@ class UserSchemaResult:
             public_main_complete if self.main_visibility.get("enabled")
             else bool(self.main_found_by_observer or self.http_main_complete)
         )
-        main_unconfirmed = bool(main_success and not main_confirmation)
+        main_unconfirmed = (
+            any(getattr(main, "submitted_unconfirmed", False) and not main.network_confirmed
+                for main in self.published_mains)
+            or bool(main_success and not main_confirmation)
+        )
         reply_unconfirmed = bool(
             main_success
             and main_confirmation
@@ -2743,6 +2761,8 @@ class UserSchemaResult:
         else:
             status = "fail"
             core_status = "fail"
+            if not result_error and main_unconfirmed:
+                result_error = "main_delivery_unconfirmed"
 
         if submitted_unconfirmed_replies and not any(
             isinstance(item, dict) and item.get("code") == "reply_submitted_unconfirmed"
@@ -2791,17 +2811,13 @@ class UserSchemaResult:
                     "expected": expected_main_publications,
                     "submitted": submitted_main_publications,
                     "missing": max(0, expected_main_publications - submitted_main_publications),
-                    "complete": (
-                        submitted_main_publications >= expected_main_publications
-                        if expected_main_publications
-                        else bool(submitted_main_publications)
-                    ),
+                    "complete": main_complete,
                     "visibility_status": (
                         "public_confirmed"
                         if public_main_complete
                         else ("network_confirmed" if main_success and self.http_main_complete
                               and not self.main_visibility.get("enabled")
-                              else ("submitted_unconfirmed" if main_success else "not_posted"))
+                              else ("submitted_unconfirmed" if main_success or main_unconfirmed else "not_posted"))
                     ),
                     "error": main_error,
                     "variants_published": [
@@ -2817,6 +2833,7 @@ class UserSchemaResult:
                             "author_uid": getattr(p, "author_uid", None),
                             "network_confirmed": p.network_confirmed,
                             "local_confirmed": p.local_confirmed,
+                            "submitted_unconfirmed": getattr(p, "submitted_unconfirmed", False) and not p.network_confirmed,
                             "public_confirmed": publicly_confirmed(p),
                         }
                         for p in self.published_mains
@@ -3104,7 +3121,7 @@ def _register_runtime_success(db: Session, account: Optional[Account], *, scope:
     if not account:
         return
     try:
-        if scope == "main":
+        if scope in {"main", MAIN_SCOPE}:
             record_main_comment_success(db, account.id)
         else:
             record_reply_success(db, account.id)
@@ -5305,8 +5322,14 @@ async def _publish_all_variants_on_account(
                     http_session,
                     text,
                     correlation_id=sub_corr,
+                    variant_index=idx,
+                    tiktok_username=tiktok_username,
                 )
-                if result is None or result.status != "success" or not valid_comment_id(result.comment_id) or not result.network_captured:
+                confirmed = bool(result and result.status == "success"
+                                 and valid_comment_id(result.comment_id) and result.network_captured)
+                unconfirmed = bool(result and result.status == "submitted_unconfirmed"
+                                   and result.network_request_attempted)
+                if not (confirmed or unconfirmed):
                     if result is not None and (
                         getattr(result, "network_request_attempted", False)
                         or getattr(result, "network_captured", False)
@@ -5393,7 +5416,7 @@ async def _publish_all_variants_on_account(
         success_status = result.status == "success"
         success = success_status and bool(result.comment_id)
         network_confirmed = success and bool(getattr(result, "network_captured", False))
-        if network_confirmed:
+        if network_confirmed and result.dom_strategy != _USER_SCHEMA_HTTP_METHOD:
             await record_publication("main", {"text": published_text, "variant_index": idx,
                 "comment_id": str(result.comment_id), "account_id": account.id,
                 "tiktok_username": tiktok_username, "network_confirmed": True,
@@ -5615,9 +5638,10 @@ async def _publish_all_variants_on_account(
             tiktok_username=tiktok_username,
             variant_index=idx,
             author_uid=_publication_author_identity(account, http_session)["author_uid"],
+            submitted_unconfirmed=submitted_unconfirmed,
         )
         published.append(published_main)
-        if not network_confirmed:
+        if not network_confirmed and result.dom_strategy != _USER_SCHEMA_HTTP_METHOD:
             await record_publication("main", published_main)
         if on_published is not None:
             try:
@@ -5662,6 +5686,10 @@ async def _publish_all_variants_on_account(
                     account.id,
                     str(exc)[:120],
                 )
+
+        if submitted_unconfirmed and result.dom_strategy == _USER_SCHEMA_HTTP_METHOD:
+            last_failure_reason = result.error_reason or "main_delivery_unconfirmed"
+            break
 
         logged_out_after_variant = await _deny_if_visible_logged_out(
             db,
@@ -6036,13 +6064,15 @@ async def _try_main_account(
                 if publish_reason
                 else "main_published"
             )
-            await _persist_cookies_after_success(
-                db,
-                page,
-                account,
-                scope="main",
-                correlation_id=correlation_id,
-            )
+            if any(not getattr(p, "submitted_unconfirmed", False) or p.network_confirmed or p.local_confirmed
+                   for p in published):
+                await _persist_cookies_after_success(
+                    db,
+                    page,
+                    account,
+                    scope="main",
+                    correlation_id=correlation_id,
+                )
         elif publish_reason:
             close_reason = f"main_publish_failed:{publish_reason}"[:200]
         else:
@@ -13117,7 +13147,7 @@ async def execute_user_schema_parallel(
         "PARALLEL_REPLY_ROTATE_MOBILE_PROXY_AFTER_ACCOUNTS",
         3,
     )
-    proxy_diversify_by_source_host = _bool_setting(
+    proxy_diversify_by_source_host = not http_first_enabled(_settings) and _bool_setting(
         "PARALLEL_PROXY_DIVERSIFY_BY_SOURCE_HOST",
         False,
     )
@@ -13190,6 +13220,7 @@ async def execute_user_schema_parallel(
     # When set (strict 6x1 wave 2), main selection is pinned to these proxies so
     # the second wave reuses the mobile endpoints that were just IP-rotated.
     main_wave_two_required_proxies: set[str] = set()
+    main_wave_two_excluded_proxies: set[str] = set()
     used_reply_proxy_values: set[str] = set()
     used_reply_proxy_counts: Dict[str, int] = {}
     active_main_proxy_counts: Dict[str, int] = {}
@@ -13382,11 +13413,7 @@ async def execute_user_schema_parallel(
         if not proxy_value or proxy_value in rotated_set:
             return False
         try:
-            proxy_obj = (
-                attempt_db.query(Proxy)
-                .filter(Proxy.proxy == proxy_value)
-                .first()
-            )
+            proxy_obj = find_proxy_record_by_route(attempt_db, proxy_value)
         except Exception as exc:
             proxy_obj = None
             logger.debug(
@@ -13477,11 +13504,7 @@ async def execute_user_schema_parallel(
             pending_main_planned_proxy_rotations.add(proxy_value)
 
         try:
-            proxy_obj = (
-                attempt_db.query(Proxy)
-                .filter(Proxy.proxy == proxy_value)
-                .first()
-            )
+            proxy_obj = find_proxy_record_by_route(attempt_db, proxy_value)
         except Exception as exc:
             proxy_obj = None
             logger.debug(
@@ -13623,11 +13646,7 @@ async def execute_user_schema_parallel(
             if _is_stop_requested():
                 return False, "stopped_by_user"
             with get_sync_db_context() as rotation_db:
-                proxy_obj = (
-                    rotation_db.query(Proxy)
-                    .filter(Proxy.proxy == proxy_value)
-                    .first()
-                )
+                proxy_obj = find_proxy_record_by_route(rotation_db, proxy_value)
                 if proxy_obj is None:
                     return False, "parallel_6x1_rotation_proxy_not_found"
                 proxy_id = int(getattr(proxy_obj, "id", 0) or 0)
@@ -13790,11 +13809,7 @@ async def execute_user_schema_parallel(
             pending_reply_planned_proxy_rotations.add(proxy_value)
 
         try:
-            proxy_obj = (
-                attempt_db.query(Proxy)
-                .filter(Proxy.proxy == proxy_value)
-                .first()
-            )
+            proxy_obj = find_proxy_record_by_route(attempt_db, proxy_value)
         except Exception as exc:
             proxy_obj = None
             logger.debug(
@@ -13931,11 +13946,7 @@ async def execute_user_schema_parallel(
                 )
                 return
             try:
-                proxy_obj = (
-                    attempt_db.query(Proxy)
-                    .filter(Proxy.proxy == proxy_value)
-                    .first()
-                )
+                proxy_obj = find_proxy_record_by_route(attempt_db, proxy_value)
             except Exception as exc:
                 proxy_obj = None
                 logger.debug(
@@ -14029,11 +14040,7 @@ async def execute_user_schema_parallel(
                 )
                 return
             try:
-                proxy_obj = (
-                    attempt_db.query(Proxy)
-                    .filter(Proxy.proxy == proxy_value)
-                    .first()
-                )
+                proxy_obj = find_proxy_record_by_route(attempt_db, proxy_value)
             except Exception as exc:
                 proxy_obj = None
                 logger.debug(
@@ -14136,7 +14143,7 @@ async def execute_user_schema_parallel(
                 if dynamic_worker_pool_enabled
                 else used_proxy_snapshot
             )
-            exclude_proxies |= edge_denied_snapshot | pending_rotation_snapshot | local_rejected_proxies
+            exclude_proxies |= edge_denied_snapshot | pending_rotation_snapshot | local_rejected_proxies | main_wave_two_excluded_proxies
             candidate = await asyncio.to_thread(
                 _select_main_account_sync,
                 exclude_ids=tried_ids_snapshot,
@@ -14214,15 +14221,8 @@ async def execute_user_schema_parallel(
                 )
                 if candidate_id in tried_main_ids:
                     reject_reason = "already_tried"
-                elif strict_6x1_main and _settings.USE_PROXY and (
-                    not proxy_value
-                    or proxy_value not in main_rotatable_mobile_proxy_values
-                ):
-                    # 6x1 requires a mandatory IP rotation between waves, which is
-                    # only possible on a rotatable mobile proxy. Reject anything
-                    # else BEFORE opening a browser so we never publish the first
-                    # wave on a proxy that cannot rotate afterwards.
-                    reject_reason = "requires_rotatable_mobile_proxy"
+                elif strict_6x1_main and _settings.USE_PROXY and not proxy_value:
+                    reject_reason = "missing_account_proxy"
                 elif proxy_value and proxy_value in current_edge_denied:
                     reject_reason = "edge_denied_proxy"
                 elif proxy_value and proxy_value in current_pending_rotation:
@@ -14925,8 +14925,17 @@ async def execute_user_schema_parallel(
                         main_success_proxy_by_slot.get(slot_index, "")
                         for slot_index in range(1, 4)
                     ]
-                    rotation_ok, rotation_error = await _rotate_6x1_wave_proxies(
-                        wave_one_proxies,
+                    mobile_wave_proxies = [
+                        proxy for proxy in wave_one_proxies
+                        if proxy in main_rotatable_mobile_proxy_values
+                    ]
+                    main_wave_two_excluded_proxies.update(
+                        proxy for proxy in wave_one_proxies
+                        if proxy and proxy not in main_rotatable_mobile_proxy_values
+                    )
+                    rotation_ok, rotation_error = (
+                        await _rotate_6x1_wave_proxies(mobile_wave_proxies)
+                        if mobile_wave_proxies else (True, None)
                     )
                     if not rotation_ok:
                         if rotation_error == "stopped_by_user":
@@ -14951,17 +14960,15 @@ async def execute_user_schema_parallel(
                     # second three accounts reuse the freshly rotated mobile IPs
                     # instead of drifting to other (unrotated) endpoints.
                     main_wave_two_required_proxies.clear()
-                    main_wave_two_required_proxies.update(
-                        proxy for proxy in wave_one_proxies if proxy
-                    )
+                    if not main_wave_two_excluded_proxies:
+                        main_wave_two_required_proxies.update(mobile_wave_proxies)
                     strict_6x1_second_wave_started = True
                     pending_main_slots.extend(
                         (slot_index, list(main_texts_by_slot[slot_index]))
                         for slot_index in range(4, 7)
                     )
                     logger.info(
-                        "Task %s: 6x1 mandatory rotation confirmed; starting wave 2 with three "
-                        "new accounts pinned to rotated proxies=%s",
+                        "Task %s: 6x1 wave 2 starts with new account routes; rotated mobile proxies=%s",
                         task_id,
                         [_short_proxy_sig(proxy) for proxy in main_wave_two_required_proxies],
                     )
@@ -15251,6 +15258,11 @@ async def execute_user_schema_parallel(
                     result.main_account_id = published.account_id
                 if published.tiktok_username and not result.main_tiktok_username:
                     result.main_tiktok_username = published.tiktok_username
+
+    if (not result.published_mains and not result.execution_attempts
+            and all(slot.error in {"no_free_main_accounts", "main_not_attempted"} for slot in main_results)
+            and any(slot.error == "no_free_main_accounts" for slot in main_results)):
+        result.error = "no_free_main_accounts"
 
     if (
         result.error == "parallel_main_no_publications_after_two_batches"
@@ -16418,6 +16430,12 @@ async def execute_user_schema_parallel(
                 trigger.account_id,
             )
             return False
+        if not _ensure_reply_proxy_rotation_capability_locked(attempt_db, proxy_value):
+            reply_visibility_stage = "independent_residential_routes"
+            reply_visibility_rotation_attempted = False
+            reply_visibility_rotation_error = None
+            _update_reply_visibility_payload()
+            return False
         if active_reply_proxy_counts.get(proxy_value, 0) > 0:
             pending_reply_proxy_rotations.add(proxy_value)
             reply_visibility_rotation_error = "rotation_delayed_active_browser"
@@ -17373,6 +17391,7 @@ async def execute_user_schema_full(
     try:
         working_video_url = video_url
         main_texts_to_publish = _dedup_variants(text_variants)
+        main_variant_indices = _variant_index_by_text(main_texts_to_publish)
         publish_main_variants_separately = not reply_variants
 
         if publish_main_variants_separately:
@@ -17398,6 +17417,8 @@ async def execute_user_schema_full(
                         pool_owner_user_id=pool_owner_user_id,
                     )
                     if not candidate:
+                        if not result.execution_attempts:
+                            result.error = "no_free_main_accounts"
                         logger.warning(
                             "Task %s: no free main accounts before main-only variant %s/%s",
                             task_id,
@@ -17429,6 +17450,7 @@ async def execute_user_schema_full(
                         [main_text],
                         correlation_id=corr,
                         resolved_video_url_holder=resolved_video_url_holder,
+                        variant_index_by_text=main_variant_indices,
                     )
                     _record_execution_attempt(
                         result,
@@ -17513,6 +17535,8 @@ async def execute_user_schema_full(
                 pool_owner_user_id=pool_owner_user_id,
             )
             if not candidate:
+                if not result.execution_attempts:
+                    result.error = "no_free_main_accounts"
                 logger.warning("Task %s: no free main accounts after attempt %s", task_id, attempt - 1)
                 break
             tried_main.append(candidate.id)
@@ -17524,10 +17548,11 @@ async def execute_user_schema_full(
             published, dead_reason = await _try_main_account(
                 db,
                 candidate,
-                video_url,
+                working_video_url,
                 remaining_main_texts,
                 correlation_id=corr,
                 resolved_video_url_holder=resolved_video_url_holder,
+                variant_index_by_text=main_variant_indices,
             )
             expected_this_attempt = len(remaining_main_texts)
             if published or not is_pre_publish_account_failure(dead_reason, publication_attempted=bool(resolved_video_url_holder.get("publication_attempted"))):
@@ -17840,6 +17865,7 @@ async def execute_user_schema_full(
                     )
                     fallback_allowed = (
                         not task_any_account_found_main
+                        and not any(getattr(main, "submitted_unconfirmed", False) for main in result.published_mains)
                         and not task_fallback_used
                         and task_confident_empty_misses >= 1
                         and fallback_main_attempts < _MAX_REPLY_FALLBACK_MAIN_ATTEMPTS

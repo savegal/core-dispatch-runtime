@@ -408,7 +408,7 @@ async def test_get_page_for_account_blocks_service_workers_when_media_blocked(
 
 @pytest.mark.unit
 @pytest.mark.asyncio
-async def test_resource_routes_install_before_cookie_domain_warmup(monkeypatch):
+async def test_invalid_cookie_payload_fails_without_spending_domain_warmup_traffic(monkeypatch):
     from executor import tiktok_client
 
     pool = BrowserPool(max_browsers=1)
@@ -440,12 +440,13 @@ async def test_resource_routes_install_before_cookie_domain_warmup(monkeypatch):
     monkeypatch.setattr(browser_pool.settings, "HUMAN_LIKE_BEHAVIOR", False, raising=False)
 
     try:
-        await pool.get_page_for_account(
-            SimpleNamespace(id=1, label="a1", proxy="http://proxy-a:8000", user_agent=None, country_code="US")
-        )
+        with pytest.raises(Exception, match="Failed to add cookies"):
+            await pool.get_page_for_account(
+                SimpleNamespace(id=1, label="a1", proxy="http://proxy-a:8000", user_agent=None, country_code="US")
+            )
 
         events = launched_browsers[0].contexts[0].events
-        assert events.index("route") < events.index("new_page")
+        assert "route" in events and "new_page" not in events
     finally:
         await pool.close_all()
 
@@ -1018,10 +1019,10 @@ async def test_get_page_for_account_serializes_same_proxy_browser_launch(monkeyp
 
     await asyncio.gather(
         pool.get_page_for_account(
-            SimpleNamespace(id=1, label="a1", proxy="http://proxy-a:8000", user_agent=None, country_code="US")
+            SimpleNamespace(id=1, label="a1", proxy="http://proxy-a:8000", proxy_is_mobile=True, user_agent=None, country_code="US")
         ),
         pool.get_page_for_account(
-            SimpleNamespace(id=2, label="a2", proxy="http://proxy-a:8000", user_agent=None, country_code="US")
+            SimpleNamespace(id=2, label="a2", proxy="http://proxy-a:8000", proxy_is_mobile=True, user_agent=None, country_code="US")
         ),
     )
 

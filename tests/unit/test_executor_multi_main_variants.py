@@ -161,12 +161,13 @@ def test_process_task_preserves_user_stopped_status_before_finalization():
 def test_process_task_counts_submitted_unconfirmed_as_successful_url_with_warning():
     source = inspect.getsource(executor.process_task)
 
-    assert executor._URL_SUCCESS_STATUSES == {"success", "submitted_unconfirmed"}
     assert executor._URL_UNCONFIRMED_STATUSES == {"submitted_unconfirmed"}
     assert "if _url_result_counts_as_success(result_dict)" in source
     assert executor._url_result_counts_as_success(
         {"status": "submitted_unconfirmed", "publication_complete": True}
-    ) is True
+    ) is False
+    assert executor._url_result_counts_as_success({"status": "submitted_unconfirmed", "publication_complete": True,
+        "engagement": {"main": {"variants_published": [{"comment_id": "7704740811904828192", "network_confirmed": True}]}}}) is True
     assert executor._url_result_counts_as_success(
         {
             "status": "submitted_unconfirmed",

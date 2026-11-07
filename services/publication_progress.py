@@ -93,7 +93,8 @@ def merge_url_result(old, new):
     variants = merge_items((previous.get("main") or {}).get("variants_published"), main.get("variants_published"), "main")
     if variants:
         main["variants_published"] = variants
-        main.update(posted=True, network_confirmed=any(v.get("network_confirmed") for v in variants),
+        main.update(posted=any(not v.get("submitted_unconfirmed") or delivery_state(v) == "accepted" for v in variants),
+                    network_confirmed=any(v.get("network_confirmed") for v in variants),
                     publication_attempted=True, comment_id=variants[0].get("comment_id"), submitted=len(variants))
     main.setdefault("publication_attempted", bool(main.get("posted") or main.get("network_confirmed")))
     engagement["main"] = main

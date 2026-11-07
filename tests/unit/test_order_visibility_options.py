@@ -148,22 +148,21 @@ async def test_manual_message_preview_shows_existing_choices(setup_orders):
 
 
 @pytest.mark.parametrize("main,reply", [(False, False), (True, False), (False, True), (True, True)])
-async def test_new_video_card_to_order_keeps_both_choices(setup_orders, main, reply):
+async def test_new_video_quantity_order_requires_public_confirmation_despite_old_state(setup_orders, main, reply):
     api, _ = setup_orders
-    state = State()
+    state = State(verify_main_visibility=main, verify_reply_visibility=reply)
     cb = callback("vp:new_videos:template_selected:44:901:77")
     await video_parsing_new_videos.new_videos_template_selected(cb, state)
-    assert_options(preview_markup(cb))
-    await choose(cb, state, main, reply)
-    cb.data = "vp:new_videos:template_selected:44:901:77"
-    await video_parsing_new_videos.new_videos_template_selected(cb, state)
-    assert_options(preview_markup(cb), main, reply)
+    buttons = [button.callback_data for row in preview_markup(cb).inline_keyboard for button in row]
+    assert not any(value.startswith((CALLBACK_PREFIX, REPLY_CALLBACK_PREFIX)) for value in buttons)
+    assert "Главных на видео" in cb.message.edit_text.await_args.args[0]
     cb.data = "vp:new_videos:confirm_order:44:901:77"
     await video_parsing_new_videos.new_videos_confirm_order(cb, state)
     api.create_task.assert_awaited_once()
     settings = api.create_task.await_args.kwargs["settings"]
-    assert settings["verify_main_visibility"] is main
-    assert settings["verify_reply_visibility"] is reply
+    assert settings["verify_main_visibility"] is True
+    assert settings["verify_reply_visibility"] is True
+    assert settings["publication_plan"]["main_count"] == 3
     assert state.cleared
 
 

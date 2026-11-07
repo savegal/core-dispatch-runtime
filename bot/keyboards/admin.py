@@ -38,6 +38,7 @@ def get_admin_menu_keyboard() -> InlineKeyboardMarkup:
             [
                 InlineKeyboardButton(text="⚙️ Режим заказов · DOM / HTTP", callback_data="admin:order_strategy"),
             ],
+            [InlineKeyboardButton(text="Потоки и видимость", callback_data="admin:publication_runtime")],
             [
                 InlineKeyboardButton(text="◀️ Меню", callback_data="menu:main"),
             ],

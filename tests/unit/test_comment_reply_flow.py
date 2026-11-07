@@ -29,6 +29,12 @@ class _DummyRequestContext:
         return self._response
 
 
+def _page_response(response):
+    return SimpleNamespace(url="https://www.tiktok.com/@fixture/video/123",
+        context=SimpleNamespace(cookies=AsyncMock(return_value=[])),
+        evaluate=AsyncMock(return_value={"status": response.status, "headers": response.headers, "text": response._body}))
+
+
 class _TimeoutRequestContext:
     def __init__(self):
         self.calls = 0
@@ -43,7 +49,7 @@ class _TimeoutRequestContext:
 async def test_execute_request_publish_requires_comment_id():
     response = _DummyResponse(status=200, body='{"status_code":0}')
     request_context = _DummyRequestContext(response)
-    client = PlaywrightHttpClient(request_context, retry_policy=RetryPolicy(max_retries=0))
+    client = PlaywrightHttpClient(request_context, page=_page_response(response), retry_policy=RetryPolicy(max_retries=0))
 
     success, _, error_msg, error_type = await client._execute_request(
         profile=RequestProfile.publish_main_profile(),
@@ -138,7 +144,7 @@ async def test_execute_request_classifies_rate_limit_api_message():
         body='{"status_code":1001,"status_msg":"You are commenting too fast. Try again later."}',
     )
     request_context = _DummyRequestContext(response)
-    client = PlaywrightHttpClient(request_context, retry_policy=RetryPolicy(max_retries=0))
+    client = PlaywrightHttpClient(request_context, page=_page_response(response), retry_policy=RetryPolicy(max_retries=0))
 
     success, _, error_msg, error_type = await client._execute_request(
         profile=RequestProfile.publish_main_profile(),
@@ -161,7 +167,7 @@ async def test_execute_request_classifies_captcha_api_message():
         body='{"status_code":1002,"status_msg":"Please complete security verification captcha"}',
     )
     request_context = _DummyRequestContext(response)
-    client = PlaywrightHttpClient(request_context, retry_policy=RetryPolicy(max_retries=0))
+    client = PlaywrightHttpClient(request_context, page=_page_response(response), retry_policy=RetryPolicy(max_retries=0))
 
     success, _, error_msg, error_type = await client._execute_request(
         profile=RequestProfile.publish_main_profile(),
@@ -180,7 +186,12 @@ async def test_execute_request_classifies_captcha_api_message():
 @pytest.mark.asyncio
 async def test_execute_request_short_circuits_local_retries_on_proxy_timeout():
     request_context = _TimeoutRequestContext()
-    client = PlaywrightHttpClient(request_context, retry_policy=RetryPolicy(max_retries=3))
+    page = _page_response(_DummyResponse(200, ""))
+    client = PlaywrightHttpClient(request_context, page=page, retry_policy=RetryPolicy(max_retries=3))
+    async def dispatched_then_timed_out(*args, **kwargs):
+        client.last_request_meta["request_attempted"] = True
+        raise TimeoutError("Proxy connect timed out after POST dispatch")
+    page.evaluate.side_effect = dispatched_then_timed_out
 
     success, _, error_msg, error_type = await client._execute_request(
         profile=RequestProfile.publish_main_profile(),
@@ -192,7 +203,7 @@ async def test_execute_request_short_circuits_local_retries_on_proxy_timeout():
     assert success is False
     assert error_type == HttpErrorType.SUBMITTED_UNCONFIRMED
     assert error_msg is not None
-    assert request_context.calls == 1
+    assert request_context.calls == 0 and page.evaluate.await_count == 1
 
 
 @pytest.mark.unit

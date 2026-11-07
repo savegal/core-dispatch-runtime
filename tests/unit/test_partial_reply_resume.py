@@ -291,3 +291,35 @@ def test_visible_parent_selection_preserves_other_receipts():
     result = UserSchemaResult(published_mains=[a, b], main_visibility={"enabled": True})
     assert eligible_reply_mains(result) == [a]
     assert result.published_mains == [a, b]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("confirmed", [False, True])
+async def test_main_http_checkpoints_receipt_or_uncertain_dispatch_before_return(persisted, confirmed):
+    from executor import user_schema as schema
+    from executor.http.playwright_http_client import HttpErrorType
+    from services.task_execution_ledger import has_submission_evidence
+
+    db, task = persisted
+    cid = "7641761192486194498"
+    response = ((True, cid, None, None) if confirmed else
+                (False, None, "submitted_unconfirmed:empty_body", HttpErrorType.SUBMITTED_UNCONFIRMED))
+    client = SimpleNamespace(publish_main_comment=AsyncMock(return_value=response),
+                             last_request_meta={"request_attempted": True, "published_text": "expanded"})
+    session = SimpleNamespace(scope=schema.MAIN_SCOPE, disabled_reason=None, client=client,
+                              account_id=99, aweme_id="7641761192486194420", cookies={}, video_url=URL)
+
+    with publication_scope(db, task, URL):
+        outcome = await schema._publish_main_http_first_if_eligible(
+            session, "main", variant_index=3, correlation_id="fixture",
+        )
+
+    db.refresh(task)
+    result = task.settings["url_results"][URL]
+    row = next(row for row in result["engagement"]["main"]["variants_published"] if row["account_id"] == 99)
+    assert row["variant_index"] == 3
+    assert row["comment_id"] == (cid if confirmed else None)
+    assert row["submitted_unconfirmed"] is (not confirmed)
+    assert row["text"] == ("expanded" if confirmed else "main")
+    assert outcome.status == ("success" if confirmed else "submitted_unconfirmed")
+    assert has_submission_evidence(result)

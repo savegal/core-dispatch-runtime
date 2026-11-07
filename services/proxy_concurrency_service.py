@@ -46,6 +46,9 @@ if redis.call('GET', KEYS[2]) == ARGV[1] then redis.call('DEL', KEYS[2]) end
 return 1
 """
 _LEASE_RENEW = """
+for i = 3, #KEYS do
+  if redis.call('GET', KEYS[i]) ~= ARGV[5] then return 0 end
+end
 if ARGV[2] == 'rotate' then
   if redis.call('GET', KEYS[2]) ~= ARGV[1] then return 0 end
   redis.call('EXPIRE', KEYS[2], ARGV[3])
@@ -56,6 +59,9 @@ else
   redis.call('ZADD', KEYS[1], now + tonumber(ARGV[3]), ARGV[1])
   redis.call('EXPIRE', KEYS[1], tonumber(ARGV[3]) * 2)
 end
+for i = 3, #KEYS do
+  redis.call('EXPIRE', KEYS[i], ARGV[6])
+end
 return 1
 """
 
@@ -65,10 +71,10 @@ def _lease_client():
     return _get_proxy_health_client()
 
 
-def _eval_lease_at_server_time(script, keys, *args):
+def _eval_lease_at_server_time(script, keys, *args, tail=()):
     client = _lease_client()
     now, _ = client.time()
-    return client.eval(script, len(keys), *keys, *args, now)
+    return client.eval(script, len(keys), *keys, *args, now, *tail)
 
 
 @dataclass
@@ -77,6 +83,9 @@ class ProxyUsageLease:
     token: str = field(repr=False)
     mode: str = "use"
     renewal: asyncio.Task | None = field(default=None, repr=False)
+    identity_keys: tuple[str, ...] = field(default=(), repr=False)
+    identity_owner: str = field(default="", repr=False)
+    identity_ttl: int = 0
 
     async def release(self):
         renewal, self.renewal = self.renewal, None
@@ -119,7 +128,9 @@ async def acquire_proxy_usage(proxy_str: str, *, rotation: bool = False, timeout
             while True:
                 await asyncio.sleep(_LEASE_TTL / 3)
                 ok = await asyncio.to_thread(
-                    _eval_lease_at_server_time, _LEASE_RENEW, lease.keys, lease.token, lease.mode, _LEASE_TTL,
+                    _eval_lease_at_server_time, _LEASE_RENEW,
+                    (*lease.keys, *lease.identity_keys), lease.token, lease.mode, _LEASE_TTL,
+                    tail=(lease.identity_owner, lease.identity_ttl),
                 )
                 if not ok:
                     raise ProxyRouteError("proxy_lease_lost")

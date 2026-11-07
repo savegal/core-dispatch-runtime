@@ -18,6 +18,40 @@ _PREVIEW_LIMIT = 90
 _VIDEO_SUCCESS_STATUSES = {"success", "submitted_unconfirmed", "done"}
 
 
+_URL_SUCCESS_STATUSES = {"success", "submitted_unconfirmed"}
+_URL_INCOMPLETE_ERRORS = {
+    "main_publication_incomplete",
+    "reply_publication_incomplete",
+    "main_variant_partial",
+}
+
+
+def url_result_counts_as_success(result: dict | None) -> bool:
+    """Accept only a fully submitted URL, even for legacy unconfirmed rows."""
+    if not isinstance(result, dict) or result.get("status") not in _URL_SUCCESS_STATUSES:
+        return False
+    if result.get("status") == "submitted_unconfirmed" and not has_confirmed_publications(result):
+        return False
+    visibility = result.get("main_visibility") or {}
+    if visibility.get("enabled") and visibility.get("status") != "confirmed":
+        return False
+    reply_visibility = result.get("reply_publication_visibility") or {}
+    if reply_visibility.get("enabled") and reply_visibility.get("status") not in {"confirmed", "not_requested"}:
+        return False
+    error = str(result.get("error") or "")
+    if error in _URL_INCOMPLETE_ERRORS or error.startswith("main_variant_partial"):
+        return False
+    if result.get("publication_complete") is False:
+        return False
+    engagement = result.get("engagement")
+    if isinstance(engagement, dict):
+        for section_name in ("main", "replies"):
+            section = engagement.get(section_name)
+            if isinstance(section, dict) and section.get("complete") is False:
+                return False
+    return True
+
+
 def has_confirmed_publications(result: Mapping[str, Any] | None) -> bool:
     """Recognize actual mutation receipts, excluding an engagement parent ID."""
     if not isinstance(result, Mapping):
@@ -729,6 +763,8 @@ def visibility_checks_complete(result: Mapping[str, Any]) -> bool:
 
 def _result_is_success_like(result: Mapping[str, Any], status: str) -> bool:
     if status not in _VIDEO_SUCCESS_STATUSES:
+        return False
+    if status == "submitted_unconfirmed" and not has_confirmed_publications(result):
         return False
     if not visibility_checks_complete(result):
         return False

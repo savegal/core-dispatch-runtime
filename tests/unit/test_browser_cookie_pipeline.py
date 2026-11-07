@@ -69,10 +69,10 @@ def test_browser_session_expiry_minus_one_is_not_treated_as_expired():
 
 
 @pytest.mark.parametrize("scope", [MAIN_SCOPE, REPLY_SCOPE])
-def test_minimal_restored_guard_session_gets_http_first_before_warmup(scope):
+def test_minimal_restored_guard_session_gets_cautious_http_bootstrap_before_warmup(scope):
     account = account_with_minimal_cookies()
     strategy = get_http_execution_strategy(account, scope)
-    assert strategy["strategy"] == "http_first"
+    assert strategy["strategy"] == "http_cautious"
     assert "ttwid" not in parse_cookies_to_dict(account.cookies)
     assert "tt_csrf_token" not in parse_cookies_to_dict(account.cookies)
 

@@ -1,5 +1,5 @@
 from fastapi import APIRouter, Depends, HTTPException, Header, Request
-from pydantic import BaseModel
+from pydantic import BaseModel, field_validator, model_validator
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select, update, or_, func
 from db.database import get_db
@@ -24,15 +24,54 @@ limiter = Limiter(key_func=get_remote_address)
 
 
 class ProxyImportItem(BaseModel):
-    """Элемент импорта прокси (поддерживает мобильные прокси с rotation_url)."""
     proxy: str
     rotation_url: str | None = None
-    is_mobile: str = "N"  # "Y" или "N"
+    is_mobile: str = "N"
+    country_code: str | None = None
+
+    @field_validator("is_mobile")
+    @classmethod
+    def validate_type(cls, value):
+        normalized = str(value).strip().upper()
+        if normalized not in {"Y", "N"}:
+            raise ValueError("is_mobile must be Y or N")
+        return normalized
+
+    @model_validator(mode="after")
+    def validate_route(self):
+        from types import SimpleNamespace
+        from urllib.parse import urlsplit
+        from services.proxy_normalizer import (
+            ProxyRoute, resolve_account_sticky_proxy, is_sticky_residential_template, _AUTO_SESSION_MARKER_RE,
+        )
+        self.proxy = self.proxy.strip()
+        if _AUTO_SESSION_MARKER_RE.search(self.proxy):
+            raise ValueError("Use an explicit {session} placeholder for residential sessions")
+        resolved = resolve_account_sticky_proxy(self.proxy, SimpleNamespace(id=1, country_code=self.country_code))
+        try:
+            ProxyRoute.parse(resolved)
+        except RuntimeError:
+            raise ValueError("Invalid proxy address") from None
+        if self.rotation_url:
+            self.rotation_url = self.rotation_url.strip()
+            parts = urlsplit(self.rotation_url)
+            if parts.scheme not in {"http", "https"} or not parts.hostname:
+                raise ValueError("rotation_url must be an HTTP(S) URL")
+        if self.is_mobile == "Y" and is_sticky_residential_template(self.proxy):
+            raise ValueError("Mobile proxies use a fixed endpoint with rotation_url")
+        if self.is_mobile == "Y" and not self.rotation_url:
+            raise ValueError("Mobile proxies require rotation_url")
+        if self.is_mobile == "N" and self.rotation_url:
+            raise ValueError("Residential proxies use per-account sessions and cannot have rotation_url")
+        if self.country_code:
+            self.country_code = self.country_code.strip().upper()
+            if len(self.country_code) != 2 or not self.country_code.isascii() or not self.country_code.isalpha():
+                raise ValueError("country_code must contain two ASCII letters")
+        return self
 
 
 class ProxyImportRequest(BaseModel):
-    """Запрос на импорт прокси. Поддерживает как старый формат (список строк), так и новый (список объектов)."""
-    proxies: List[str | dict]  # Поддержка обратной совместимости
+    proxies: List[str | ProxyImportItem]
 
 
 class ProxyImportResponse(BaseModel):
@@ -89,88 +128,74 @@ async def import_proxies(
     
     ИСПРАВЛЕНО: Убрана проверка прокси - все прокси считаются рабочими.
     """
-    inserted = 0
-    updated = 0
-    
-    # Парсим прокси (поддержка старого и нового формата)
-    parsed_proxies = []
-    seen = set()
-    
-    for proxy_item in request.proxies:
-        # Поддержка обратной совместимости: строка или словарь
-        if isinstance(proxy_item, str):
-            # Старый формат: просто строка
-            proxy_str = proxy_item.strip()
-            if proxy_str and proxy_str not in seen:
-                parsed_proxies.append({
-                    "proxy": proxy_str,
-                    "rotation_url": None,
-                    "is_mobile": "N"
-                })
-                seen.add(proxy_str)
-        elif isinstance(proxy_item, dict):
-            # Новый формат: словарь с rotation_url
-            proxy_str = proxy_item.get("proxy", "").strip()
-            if proxy_str and proxy_str not in seen:
-                parsed_proxies.append({
-                    "proxy": proxy_str,
-                    "rotation_url": proxy_item.get("rotation_url"),
-                    "is_mobile": proxy_item.get("is_mobile", "N")
-                })
-                seen.add(proxy_str)
-    
-    # Сохраняем прокси в БД
-    for proxy_data in parsed_proxies:
-        proxy_str = proxy_data["proxy"]
-        rotation_url = proxy_data.get("rotation_url")
-        is_mobile = proxy_data.get("is_mobile", "N")
-        
-        try:
-            result = await db.execute(
-                select(Proxy).filter(Proxy.proxy == proxy_str)
-            )
-            existing = result.scalar_one_or_none()
-            
+    from services.proxy_assignment_service import invalidate_proxy_cache
+    from services.proxy_normalizer import ProxyRouteError, normalize_proxy_string, is_sticky_residential_template
+
+    parsed = {}
+    try:
+        for item in request.proxies:
+            if isinstance(item, str):
+                # Plain re-import preserves the existing mobile type and rotation URL.
+                checked = ProxyImportItem(proxy=item)
+                metadata = {}
+            else:
+                checked = item
+                metadata = checked.model_dump(exclude={"proxy"}, exclude_unset=True)
+                if "is_mobile" in checked.model_fields_set:
+                    metadata["rotation_url"] = checked.rotation_url
+            raw = checked.proxy
+            if not is_sticky_residential_template(raw) and "{" not in raw:
+                raw = normalize_proxy_string(raw)
+            parsed[raw] = {**parsed.get(raw, {}), **metadata}
+    except (ValueError, ProxyRouteError) as exc:
+        raise HTTPException(status_code=422, detail="Invalid proxy configuration") from exc
+
+    inserted = updated = 0
+    try:
+        from services.proxy_assignment_service import _lock_assignment_pool
+        sources = await db.run_sync(_lock_assignment_pool)
+        for raw, metadata in parsed.items():
+            existing = next((source for source in sources if source.proxy == raw
+                             or not is_sticky_residential_template(source.proxy)
+                             and normalize_proxy_string(source.proxy) == raw), None)
             if existing:
-                # Обновляем существующий
-                # ИСПРАВЛЕНО: Убраны поля статуса - все прокси считаются рабочими
-                # Обновляем rotation_url и is_mobile (даже если rotation_url = None - это может быть сброс мобильного прокси)
-                existing.rotation_url = rotation_url
-                existing.is_mobile = is_mobile
+                for key, value in metadata.items():
+                    setattr(existing, key, value)
                 existing.status = "active"
                 existing.fail_count = 0
                 updated += 1
             else:
-                # Создаём новый
-                proxy_obj = Proxy(
-                    proxy=proxy_str,
-                    rotation_url=rotation_url,
-                    is_mobile=is_mobile,
-                    status="active",
-                    fail_count=0
-                )
-                db.add(proxy_obj)
+                db.add(Proxy(proxy=raw, **metadata, status="active", fail_count=0))
                 inserted += 1
-            
-            await db.flush()
-            
-        except Exception as e:
-            logger.error(f"Error processing proxy {proxy_str[:30]}: {str(e)[:200]}")
-            await db.rollback()
-    
-    await db.commit()
-    
-    # ИСПРАВЛЕНО: Убрана проверка прокси - все прокси считаются рабочими
-    # Инвалидируем кэш прокси после импорта
-    from services.proxy_assignment_service import invalidate_proxy_cache
+        await db.commit()
+    except Exception:
+        await db.rollback()
+        raise
     invalidate_proxy_cache()
-    
-    logger.info(f"Proxy import: inserted={inserted}, updated={updated}, total={len(parsed_proxies)}")
-    return ProxyImportResponse(
-        total=len(parsed_proxies),
-        inserted=inserted,
-        updated=updated
-    )
+    return ProxyImportResponse(total=len(parsed), inserted=inserted, updated=updated)
+
+
+@router.post("/{proxy_id}/rotate")
+async def rotate_mobile_proxy_endpoint(proxy_id: int, db: AsyncSession = Depends(get_db)):
+    """Request and verify a mobile IP change after active route users finish."""
+    from types import SimpleNamespace
+    from services.mobile_proxy_service import ensure_proxy_ip_rotated, save_proxy_last_ip, ProxyRotationError
+    from services.proxy_normalizer import ProxyRouteError
+
+    row = (await db.execute(select(Proxy).where(Proxy.id == proxy_id))).scalar_one_or_none()
+    if row is None:
+        raise HTTPException(status_code=404, detail="Proxy not found")
+    if row.is_mobile != "Y" or not row.rotation_url:
+        raise HTTPException(status_code=409, detail="IP rotation requires a mobile proxy with rotation_url")
+    proxy = SimpleNamespace(id=row.id, proxy=row.proxy, is_mobile=row.is_mobile, rotation_url=row.rotation_url)
+    # The network operation owns a Redis rotation lease, not a database transaction.
+    await db.rollback()
+    try:
+        ip = await ensure_proxy_ip_rotated(proxy, None, force_rotation=True)
+        await save_proxy_last_ip(proxy.id, ip)
+        return {"proxy_id": proxy.id, "ip": ip, "rotated": True}
+    except (ProxyRotationError, ProxyRouteError):
+        raise HTTPException(status_code=503, detail="Mobile IP rotation could not be confirmed") from None
 
 
 @router.post("/validate", response_model=ProxyValidateResponse)
@@ -208,14 +233,29 @@ async def validate_proxies(
             checked=0, active=0, slow=0, bad=0, unknown=0, errors=0
         )
 
+    from services.proxy_normalizer import find_account_proxy_record, is_sticky_residential_template
+
+    def resolved_check_routes(sync_db):
+        routes = {}
+        for account in sync_db.query(Account).filter(Account.proxy.isnot(None), Account.proxy != ""):
+            source = find_account_proxy_record(sync_db, account)
+            if source is not None:
+                routes.setdefault(source.id, account.proxy)
+        return routes
+
+    account_routes = await db.run_sync(resolved_check_routes)
     sem = asyncio.Semaphore(concurrency)
 
     async def _check(proxy_obj: Proxy):
         async with sem:
-            return proxy_obj, await check_proxy_health_async(
-                proxy_obj.proxy,
-                timeout=timeout
-            )
+            raw = account_routes.get(proxy_obj.id, proxy_obj.proxy)
+            if is_sticky_residential_template(raw):
+                return proxy_obj, (False, "unknown", "Assign an account session before checking this gateway", None)
+            outcome = await check_proxy_health_async(raw, timeout=timeout)
+            if is_sticky_residential_template(proxy_obj.proxy) and not outcome[0]:
+                # A provider session can fail while other sessions on the gateway work.
+                outcome = (False, "unknown", outcome[2], outcome[3])
+            return proxy_obj, outcome
 
     tasks = [asyncio.create_task(_check(p)) for p in proxy_rows]
     results = await asyncio.gather(*tasks, return_exceptions=True)
@@ -247,7 +287,7 @@ async def validate_proxies(
                 bad += 1
                 proxy_obj.status = "bad"
             proxy_obj.fail_count = (proxy_obj.fail_count or 0) + 1
-            if proxy_obj.proxy:
+            if proxy_obj.proxy and not is_sticky_residential_template(proxy_obj.proxy):
                 bad_proxy_values.append(proxy_obj.proxy)
 
     await db.commit()
@@ -257,12 +297,9 @@ async def validate_proxies(
     not_enough_proxies = False
 
     if request.reassign_bad_proxies and bad_proxy_values:
-        result = await db.execute(
-            update(Account)
-            .where(Account.proxy.in_(bad_proxy_values))
-            .values(proxy=None)
-        )
-        cleared_accounts = result.rowcount or 0
+        from services.proxy_assignment_service import clear_proxy_bindings
+        bad_ids = {proxy.id for proxy in proxy_rows if proxy.proxy in bad_proxy_values}
+        cleared_accounts = await db.run_sync(lambda sync_db: clear_proxy_bindings(sync_db, bad_ids, skip_busy=True))
         await db.commit()
 
     if request.assign_after:
@@ -312,6 +349,8 @@ async def delete_proxies(
     if not ids and not proxies:
         raise HTTPException(status_code=400, detail="Provide ids or proxies to delete")
 
+    from services.proxy_assignment_service import _lock_assignment_pool, clear_proxy_bindings
+    await db.run_sync(_lock_assignment_pool)
     query = select(Proxy)
     filters = []
     if ids:
@@ -332,15 +371,12 @@ async def delete_proxies(
 
     cleared_accounts = 0
     if request.clear_accounts:
-        from db.models import Account
-        proxy_values = [p.proxy for p in targets if p.proxy]
-        if proxy_values:
-            update_result = await db.execute(
-                update(Account)
-                .where(Account.proxy.in_(proxy_values))
-                .values(proxy=None)
-            )
-            cleared_accounts = update_result.rowcount or 0
+        from services.proxy_normalizer import ProxyRouteError
+        try:
+            cleared_accounts = await db.run_sync(lambda sync_db: clear_proxy_bindings(sync_db, {p.id for p in targets}))
+        except ProxyRouteError as exc:
+            await db.rollback()
+            raise HTTPException(status_code=409, detail=str(exc)) from None
 
     for p in targets:
         await db.delete(p)
@@ -363,18 +399,19 @@ async def delete_all_proxies(
     Полностью удаляет все прокси.
     По умолчанию сбрасывает proxy у всех аккаунтов, у которых он был задан.
     """
+    from services.proxy_assignment_service import _lock_assignment_pool, clear_proxy_bindings
+    from services.proxy_normalizer import ProxyRouteError
+    await db.run_sync(_lock_assignment_pool)
     total_result = await db.execute(select(func.count(Proxy.id)))
     total = total_result.scalar() or 0
 
     cleared_accounts = 0
     if request.clear_accounts:
-        from db.models import Account
-        update_result = await db.execute(
-            update(Account)
-            .where(Account.proxy.isnot(None))
-            .values(proxy=None)
-        )
-        cleared_accounts = update_result.rowcount or 0
+        try:
+            cleared_accounts = await db.run_sync(lambda sync_db: clear_proxy_bindings(sync_db, None))
+        except ProxyRouteError as exc:
+            await db.rollback()
+            raise HTTPException(status_code=409, detail=str(exc)) from None
 
     # Удаляем все прокси
     await db.execute(Proxy.__table__.delete())

@@ -109,6 +109,7 @@ def _template_edit_keyboard(template_id: int, *, replies_only: bool = False, key
     else:
         if not replies_only:
             rows.append([InlineKeyboardButton(text="💬 Комментарии", callback_data=f"template:edit_comment:{template_id}")])
+            rows.append([InlineKeyboardButton(text="🔢 Количество публикаций", callback_data=f"template:counts:{template_id}")])
         rows.append([InlineKeyboardButton(text="↩️ Ответы", callback_data=f"template:edit_replies:{template_id}")])
         rows.append([InlineKeyboardButton(text="❤️ Лайки на ответ", callback_data=f"template:edit_likes:{template_id}")])
     rows.append([InlineKeyboardButton(text="◀️ Назад", callback_data=f"template:detail:{template_id}")])
@@ -163,6 +164,18 @@ def _build_template_detail_text(template: dict) -> str:
 
     if not replies_only:
         parts.append(block("Комментарии", _variants_lines(variants)))
+        from services.quantity_plan import quantity_plan
+        plan = quantity_plan(t_settings)
+        if plan:
+            parts.append(block("Количество публикаций", [
+                f"Главных на видео: *{plan.main_count}*",
+                f"Ответов под каждым: *{plan.replies_per_main}*",
+                f"Всего ответов на видео: *{plan.main_count * plan.replies_per_main}*",
+                "Ответы — под каждым публично подтверждённым главным.",
+                "Количество вариантов текста не меняет цель.",
+            ]))
+        else:
+            parts.append("Количество главных комментариев и ответов задаётся при запуске.")
     parts.extend([
         block("Ответы", _replies_lines(replies)),
         block(
@@ -176,7 +189,6 @@ def _build_template_detail_text(template: dict) -> str:
             ),
         ),
     ])
-    parts.append("Режим DOM / HTTP выбирает администратор. При создании заказа используется текущая настройка сервиса.")
     return screen(f"Шаблон · {name}", *parts)
 
 
@@ -203,8 +215,8 @@ def _build_template_edit_text(template: dict) -> str:
         summary_lines = [
             f"Название: *{name}*",
             f"Тип: *{'только ответы' if replies_only else 'полный'}*",
-            f"Комментариев: *{len(variants)}*" if not replies_only else "Комментариев: *не используется*",
-            f"Ответов: *{len(replies)}*",
+            f"Вариантов главного текста: *{len(variants)}*" if not replies_only else "Главные тексты: *не используются*",
+            f"Вариантов ответа: *{len(replies)}*",
             f"Лайки на ответ: *{reply_likes_str}*",
         ]
 

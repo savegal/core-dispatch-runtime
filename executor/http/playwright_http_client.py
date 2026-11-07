@@ -19,7 +19,7 @@ from executor.http.request_profile import RequestProfile
 from executor.http.page_runtime import document_generation, prepared_runtime_profile, target_page_matches
 from executor.http.execution_policy import valid_comment_id
 from services.execution_attempts import track_publication_requests
-from executor.http.signature_runtime import resolve_request_signature, split_explicit_signature_params
+from executor.http.signature_runtime import resolve_request_signature, split_explicit_signature_params, wait_for_runtime_signer_ready
 from executor.http.request_evidence import observe_request_security, resolve_security_evidence, same_http_endpoint
 from services.tiktok_urls import is_tiktok_shortlink, media_id_from_url
 from services.cookie_validator import normalize_cookie_records
@@ -781,6 +781,9 @@ async def _extract_runtime_profile(page: Page) -> Dict[str, Any]:
     return profile
 
 
+from services.publication_journal import observe_publication_request
+
+
 class PlaywrightHttpClient:
     """
     HTTP-клиент для TikTok API на основе Playwright APIRequestContext.
@@ -920,6 +923,7 @@ class PlaywrightHttpClient:
             runtime_profile = await _extract_runtime_profile(dummy_page)
         return cls(request_context, retry_policy, runtime_profile=runtime_profile, page=page)
     
+    @observe_publication_request
     async def _execute_request(
         self,
         profile: RequestProfile,
@@ -956,6 +960,13 @@ class PlaywrightHttpClient:
         if prepared_mentions is not None:
             self.last_request_meta["mentions"] = prepared_mentions
         is_publish = profile.method.upper() == "POST" and profile.endpoint.rstrip("/") == "/api/comment/publish"
+        if is_publish and self.page is None:
+            self.last_request_meta["publication_status"] = "not_sent"
+            return False, None, "publish_requires_live_page", HttpErrorType.API_ERROR
+        if is_publish and not await wait_for_runtime_signer_ready(
+                self.page, timeout_ms=1200, require_signed_dispatch=True):
+            self.last_request_meta["publication_status"] = "not_sent"
+            return False, None, "runtime_signer_not_ready", HttpErrorType.API_ERROR
         if is_publish and isinstance(dynamic_params.get("text"), str):
             self.last_request_meta["published_text"] = dynamic_params["text"]
 
@@ -1084,6 +1095,9 @@ class PlaywrightHttpClient:
                     self.last_request_meta["observed_security_params"] = security["security_params"]
                 else:
                     self.last_request_meta["request_attempted"] = True
+                    if is_publish:
+                        from services.publication_journal import note_publication_dispatch
+                        note_publication_dispatch()
                     response = await self.request_context.fetch(
                         url,
                         method=profile.method,

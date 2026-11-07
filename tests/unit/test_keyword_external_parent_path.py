@@ -96,7 +96,7 @@ async def test_sparse_deep_identical_text_targets_publish_exact_cids_without_res
     no_search.assert_not_awaited()
     for name in ("_open_comment_list_with_safe_retry", "_find_main_anchors_batch", "publish_reply_hybrid"):
         reply_env.mocks[name].assert_not_awaited()
-    assert close.await_count == 2  # One cleanup per invocation, none per parent.
+    assert close.await_count == 0  # Executor keeps ownership through verification and later URLs.
 
 
 @pytest.mark.parametrize("text", ["", "Какая цена?"])

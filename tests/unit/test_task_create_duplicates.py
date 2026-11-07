@@ -43,6 +43,58 @@ async def _create(db, kind, key=None):
     return await inspect.unwrap(tasks.create_task)(request=request, task_data=payload, db=db, auth_user_id=1)
 
 
+@pytest.mark.asyncio
+@pytest.mark.parametrize("options", [{}, {"send_workers": 2, "check_workers": 2, "live_interval": 7}])
+async def test_created_order_keeps_its_speed_when_admin_defaults_change(order_db, options, monkeypatch):
+    from config.settings import get_settings
+    from services.publication_reports import activity_snapshot
+    from services.publication_runtime import update_publication_runtime
+    monkeypatch.setattr(get_settings(), "MAX_CONCURRENT_BROWSERS", 4)
+    request = Request({"type": "http", "headers": []})
+    payload = tasks.TaskCreate(user_id=1, main_comment="main", text_variants=["main"],
+        video_urls=["https://www.tiktok.com/@demo/video/1234567890123456789"], kind="full",
+        settings={"publication_plan": {"main_count": 1}, "publication_options": options})
+    result = await inspect.unwrap(tasks.create_task)(request=request, task_data=payload, db=order_db, auth_user_id=1)
+    task = await order_db.get(Task, result["task_id"])
+    saved = task.settings["publication_options"]
+    assert saved["send_workers"] == options.get("send_workers", 3)
+    await order_db.run_sync(lambda db: update_publication_runtime(db, {"send_workers": 1, "live_interval": 20}))
+    activity = await order_db.run_sync(lambda db: activity_snapshot(db, task))
+    assert activity["execution"]["send_workers"] == saved["send_workers"]
+    assert activity["live_interval"] == options.get("live_interval", 3)
+    assert activity["execution"]["effective_senders"] + activity["execution"]["effective_readers"] <= max(
+        2, activity["execution"]["browser_slots"])
+
+
+@pytest.mark.parametrize("options", [{"send_workers": 81}, {"check_workers": 0}, {"order_workers": 8}])
+def test_order_speed_cannot_exceed_its_range_or_change_global_workers(options):
+    from pydantic import ValidationError
+    with pytest.raises(ValidationError):
+        tasks.TaskCreate(user_id=1, main_comment="main", text_variants=["main"],
+            video_urls=["https://www.tiktok.com/@demo/video/1234567890123456789"], kind="full",
+            settings={"publication_plan": {"main_count": 1}, "publication_options": options})
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("flag", ["stopped_by_user", "cancelled_by_user"])
+async def test_new_order_cannot_inherit_runtime_stop_flags(order_db, flag):
+    from executor.quantity_engine import ensure_actions, claim_action
+    from services.quantity_plan import QuantityPlan
+    request = Request({"type": "http", "headers": []})
+    payload = tasks.TaskCreate(user_id=1, main_comment="main", text_variants=["main"],
+        video_urls=["https://www.tiktok.com/@demo/video/1234567890123456789"], kind="full",
+        settings={"publication_plan": QuantityPlan(main_count=1).model_dump(), flag: True,
+                  "cancelled_at": "2026-11-07", "cancel_reason": "old order", "force_close_browsers": True})
+    result = await inspect.unwrap(tasks.create_task)(request=request, task_data=payload, db=order_db, auth_user_id=1)
+    task = await order_db.get(Task, result["task_id"])
+    assert not {flag, "cancelled_at", "cancel_reason", "force_close_browsers"}.intersection(task.settings)
+    url = task.video_urls[0]
+    await order_db.run_sync(lambda sync: ensure_actions(sync, task, url, "main", 1, ["main"]))
+    from db.models import QuantityAction
+    identity = (await order_db.execute(select(QuantityAction.id))).scalar_one()
+    assert await order_db.run_sync(lambda sync: claim_action(sync, identity))
+
+
 @pytest.mark.unit
 @pytest.mark.asyncio
 @pytest.mark.parametrize('kind', ['full', 'engagement_only'])
@@ -68,6 +120,21 @@ async def test_same_request_key_still_reuses_one_order(order_db, kind):
     assert repeat['task_id'] == first['task_id']
     assert repeat['idempotency_reuse'] is True
     assert len((await order_db.execute(select(Task))).scalars().all()) == 1
+
+
+@pytest.mark.asyncio
+async def test_idempotency_is_not_lost_after_two_hundred_newer_orders(order_db):
+    original = Task(user_id=1, status="done", main_comment="original", video_urls=[],
+        settings={"client_task_fingerprint": "one-request", "order_transport_mode": "dom"})
+    order_db.add(original)
+    await order_db.flush()
+    for index in range(205):
+        order_db.add(Task(user_id=1, status="done", main_comment=str(index), video_urls=[], settings={}))
+    await order_db.commit()
+    result = await _create(order_db, "full", key="one-request")
+    assert result["task_id"] == original.id and result["idempotency_reuse"]
+    assert result["order_transport_mode"] == "dom"
+    assert len((await order_db.execute(select(Task))).scalars().all()) == 206
 
 
 @pytest.mark.asyncio

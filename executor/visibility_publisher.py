@@ -5,20 +5,26 @@ from executor.http.signature_runtime import wait_for_runtime_signer_ready
 
 
 async def publish_visibility_http(db, account, video_url, text, *, correlation_id,
-                                  parent=None, variant_index=1, on_published=None, progress=None):
+                                  parent=None, variant_index=1, on_published=None, progress=None, stop_requested=None):
     from executor import user_schema as schema
     scope = schema.REPLY_SCOPE if parent is not None else schema.MAIN_SCOPE
+    stop_requested = stop_requested or (lambda: False)
+    progress = progress if progress is not None else {}
+    progress["publication_call_started"] = False
+    if stop_requested():
+        return None, "stopped_by_user"
     if not http_first_enabled(schema._settings):
         return None, "http_disabled"
     if parent is not None and not valid_comment_id(parent.comment_id):
         return None, "invalid_reply_target"
     context = page = None
     detach = None
-    progress = progress if progress is not None else {}
     try:
         deny = await schema._preflight_cookie_http_gate(db, account, correlation_id=correlation_id, phase="visibility_http")
         if deny:
             return None, deny
+        if db is not None and db.in_transaction():
+            db.commit()
         context, page = await schema.create_page_for_account(account)
         page._publication_attempted = False
         detach = schema.track_publication_requests(page, progress)
@@ -29,6 +35,8 @@ async def publish_visibility_http(db, account, video_url, text, *, correlation_i
         )
         if not ready:
             return None, deny or "http_auth_unconfirmed"
+        if db is not None and db.in_transaction():
+            db.commit()
         session = await schema._prepare_user_schema_http_session(
             page, account, video_url, scope=scope, correlation_id=correlation_id, db=db,
         )
@@ -39,11 +47,16 @@ async def publish_visibility_http(db, account, video_url, text, *, correlation_i
         expected_id = schema.extract_tiktok_media_id(video_url) or schema.extract_tiktok_media_id(getattr(page, "url", None))
         if not expected_id or str(session.aweme_id) != str(expected_id):
             return None, "http_session_media_mismatch"
-        if not await wait_for_runtime_signer_ready(page, timeout_ms=1200):
+        if db is not None and db.in_transaction():
+            db.commit()  # No checked-out SQL connection while the browser waits/posts.
+        if not await wait_for_runtime_signer_ready(page, timeout_ms=1200, require_signed_dispatch=True):
             return None, "runtime_signer_not_ready"
         # A POST with a lost/empty response may already exist on the platform.
         # Only the visibility controller may authorize another publication.
         session.client.retry_policy = RetryPolicy(max_retries=0)
+        if stop_requested():
+            return None, "stopped_by_user"
+        progress["publication_call_started"] = True
         if parent is None:
             published = await schema._publish_main_http_first_if_eligible(session, text, correlation_id=correlation_id)
         else:

@@ -294,3 +294,85 @@ def test_http_reply_metadata_keeps_server_id_and_does_not_claim_dom_verification
     assert failed["parent_confirmation_level"] == "unconfirmed"
     assert failed["local_visible"] is None
     assert failed["reply_id"] is None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("parallel", [False, True])
+@pytest.mark.parametrize("failure", ["empty_body", "exception"])
+async def test_http_main_uncertain_delivery_is_not_resent_by_a_replacement_account(monkeypatch, parallel, failure):
+    from db import database
+    from executor import browser_pool
+    from executor.http.playwright_http_client import HttpErrorType
+
+    @contextmanager
+    def context():
+        yield SimpleNamespace()
+
+    post = AsyncMock(return_value=(False, None, "submitted_unconfirmed:empty_body", HttpErrorType.SUBMITTED_UNCONFIRMED))
+    if failure == "exception":
+        post.side_effect = RuntimeError("response processing failed after dispatch")
+    client = SimpleNamespace(publish_main_comment=post, last_request_meta={"request_attempted": True})
+    selected = Mock(side_effect=[SimpleNamespace(id=1, proxy=None), SimpleNamespace(id=2, proxy=None), None])
+
+    async def publish(db, account, url, texts, **kwargs):
+        session = SimpleNamespace(scope=user_schema.MAIN_SCOPE, client=client, disabled_reason=None,
+                                  account_id=account.id, aweme_id="7635267329407913230", cookies={}, video_url=url)
+        monkeypatch.setattr(user_schema, "_prepare_user_schema_http_session", AsyncMock(return_value=session))
+        return await user_schema._publish_all_variants_on_account(
+            db, SimpleNamespace(url=url), account, texts, correlation_id=kwargs["correlation_id"],
+            expected_video_url=url, on_published=kwargs.get("on_published"),
+        )
+
+    monkeypatch.setattr(database, "get_sync_db_context", context)
+    monkeypatch.setattr(browser_pool, "ensure_thread_browser_pool_capacity", Mock())
+    monkeypatch.setattr(browser_pool, "close_browser_pool", AsyncMock())
+    monkeypatch.setattr(user_schema, "get_free_account_for_main_comment", selected)
+    monkeypatch.setattr(user_schema, "_try_main_account", publish)
+    monkeypatch.setattr(user_schema, "extract_tiktok_username", AsyncMock(return_value="fixture"))
+    monkeypatch.setattr(user_schema, "record_main_comment_attempt", Mock())
+    monkeypatch.setattr(user_schema, "release_main_account_reservation", Mock())
+    monkeypatch.setattr(user_schema, "extend_main_account_reservation", Mock(return_value=True))
+    monkeypatch.setattr(user_schema._settings, "USE_PROXY", False)
+    monkeypatch.setattr(user_schema._settings, "PARALLEL_COMMENTING_MAX_MAIN_ATTEMPTS", 3)
+    monkeypatch.setattr(user_schema._settings, "PARALLEL_MAIN_ACCOUNT_SLOTS", 1)
+    execute = user_schema.execute_user_schema_parallel if parallel else user_schema.execute_user_schema_full
+
+    result = await execute(None, SimpleNamespace(settings={"replies": [], "reply_count": 0}), URL,
+                           ["fixture"], 101, boost_enabled=False, boost_quantity=0)
+
+    post.assert_awaited_once()
+    assert selected.call_count == 1
+    payload = result.to_dict()
+    assert payload["status"] != "success"
+    assert payload["engagement"]["main"]["submitted_unconfirmed"]
+    assert not payload["engagement"]["main"]["complete"]
+
+
+@pytest.mark.asyncio
+async def test_sequential_full_reuses_browser_resolved_url_for_remaining_variants(monkeypatch):
+    original_url = URL.replace("@demo", "@old")
+    selection = Mock(side_effect=[SimpleNamespace(id=1, proxy=None), SimpleNamespace(id=2, proxy=None)])
+    attempts = []
+
+    async def publish(db, account, video_url, texts, **kwargs):
+        attempts.append((video_url, list(texts)))
+        kwargs["resolved_video_url_holder"]["video_url"] = URL
+        text = texts[0]
+        return [user_schema.PublishedMain(
+            text=text, comment_id=str(int(CID) + account.id), network_confirmed=True,
+            local_confirmed=False, method="http_user_schema", account_id=account.id,
+            tiktok_username="fixture", variant_index=kwargs["variant_index_by_text"][text],
+        )], "main_partial" if len(texts) > 1 else None
+
+    monkeypatch.setattr(user_schema, "get_free_account_for_main_comment", selection)
+    monkeypatch.setattr(user_schema, "_try_main_account", publish)
+    monkeypatch.setattr(user_schema, "release_main_account_reservation", Mock())
+    monkeypatch.setattr(user_schema, "_prepare_public_mains_before_replies", AsyncMock(return_value=[]))
+    monkeypatch.setattr(user_schema.asyncio, "sleep", AsyncMock())
+    result = await user_schema.execute_user_schema_full(
+        None, SimpleNamespace(settings={"replies": ["reply"], "reply_count": 1}),
+        original_url, ["first", "second"], 101, boost_enabled=False, boost_quantity=0,
+    )
+
+    assert attempts == [(original_url, ["first", "second"]), (URL, ["second"])]
+    assert [main.variant_index for main in result.published_mains] == [1, 2]

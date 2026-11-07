@@ -11,6 +11,7 @@ from config.settings import get_settings
 from bot.services.drafts import get_draft
 from bot.state.order_states import OrderStates
 from bot.services.formatting import Emoji
+from bot.services.order_presentation import main_menu_text
 from bot.services.likes_ui import get_likes_display_label
 from bot.services.template_utils import is_keywords_template, is_replies_only_template, template_keywords, template_replies
 from bot.services.telegram_utils import safe_callback_answer
@@ -184,12 +185,7 @@ async def cmd_start(message: Message, state: FSMContext):
             except Exception:
                 pass
 
-        title = (
-            "*Мониторинг видео*"
-            if parsing_only
-            else "*Приватный сервис комментариев*"
-        )
-        main_text = title + balance_text + "\n\nВыберите действие:"
+        main_text = main_menu_text(parsing_only, balance_text)
 
         await message.answer(
             main_text,
@@ -253,12 +249,7 @@ async def show_main_menu(callback: CallbackQuery):
             except Exception:
                 pass
 
-        title = (
-            "*Мониторинг видео*"
-            if parsing_only
-            else "*Приватный сервис комментариев*"
-        )
-        main_text = title + balance_text + "\n\nВыберите действие:"
+        main_text = main_menu_text(parsing_only, balance_text)
 
         await callback.message.edit_text(
             main_text,
@@ -505,12 +496,7 @@ async def check_access_handler(callback: CallbackQuery):
                 except Exception:
                     pass
 
-            title = (
-                "*Мониторинг видео*"
-                if parsing_only
-                else "*Приватный сервис комментариев*"
-            )
-            main_text = title + balance_text + "\n\nВыберите действие:"
+            main_text = main_menu_text(parsing_only, balance_text)
 
             await callback.message.edit_text(
                 main_text,
@@ -575,59 +561,13 @@ async def check_access_handler(callback: CallbackQuery):
 
 @router.callback_query(F.data == "menu:new_order")
 async def menu_new_order(callback: CallbackQuery, state: FSMContext):
-    """Начинает создание заказа через меню."""
-    try:
-        await safe_callback_answer(callback)
-        has_access, user_data = await ensure_access(callback)
-        if not has_access:
-            return
-        
-        user_id = callback.from_user.id
-        
-        # КРИТИЧНО: Проверяем наличие ссылок в draft
-        draft = get_draft(user_id)
-        
-        if not draft.links or len(draft.links) == 0:
-            # Просим отправить ссылки
-            await callback.message.edit_text(
-                "📹 *Создание заказа*\n\n"
-                "Отправьте ссылки на TikTok видео (одну или несколько)\n\n"
-                "*Формат:*\n"
-                "`https://www.tiktok.com/@user/video/123`\n\n"
-                "*Или используйте короткие ссылки:*\n"
-                "`https://vm.tiktok.com/...`",
-                reply_markup=InlineKeyboardMarkup(inline_keyboard=[
-                    [InlineKeyboardButton(text="❌ Отмена", callback_data="menu:main")]
-                ]),
-                parse_mode="Markdown"
-            )
-            # Устанавливаем состояние ожидания ссылок
-            await state.set_state(OrderStates.INPUT_LINKS)
-            return
-        
-        # Если ссылки есть - перенаправляем на quick_order flow
-        # (НО у нас нет прямого способа вызвать show_template_selection)
-        # Вместо этого показываем сообщение с подтверждением
-        # ИСПРАВЛЕНО: Предлагаем начать заново если есть ссылки
-        await callback.message.edit_text(
-            f"📹 *Создание заказа*\n\n"
-            f"✅ *Найден незавершенный заказ*\n"
-            f"Сохраненных ссылок: `{len(draft.links)}`\n\n"
-            f"Вы хотите продолжить оформление или начать заново?",
-            reply_markup=InlineKeyboardMarkup(inline_keyboard=[
-                [InlineKeyboardButton(text="✅ Продолжить", callback_data="quick:show_templates")],
-                [InlineKeyboardButton(text="🗑 Начать заново", callback_data="menu:new_order:clear")],
-                [InlineKeyboardButton(text="🏠 Меню", callback_data="menu:main")]
-            ]),
-            parse_mode="Markdown"
-        )
-        
-    except Exception as e:
-        logger.error(f"Error in menu_new_order: {e}", exc_info=True)
-        try:
-            await safe_callback_answer(callback, "Ошибка", show_alert=True)
-        except:
-            pass
+    """Open the quantity-based composer after the existing access check."""
+    await safe_callback_answer(callback)
+    has_access, _ = await ensure_access(callback)
+    if not has_access or not callback.message:
+        return
+    from bot.handlers.quantity_orders import start
+    await start(callback.message, state, edit=True, actor_id=callback.from_user.id)
 
 
 @router.callback_query(F.data == "menu:new_order:clear")

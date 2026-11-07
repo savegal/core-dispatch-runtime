@@ -48,7 +48,7 @@ def test_assign_residential_proxies_one_to_one_in_normal_mode(db_session):
 
 
 @pytest.mark.unit
-def test_rebalance_distributes_accounts_evenly_across_residential_proxies(monkeypatch, db_session):
+def test_rebalance_repairs_legacy_shared_residential_routes_without_reusing_them(monkeypatch, db_session):
     proxies = [
         Proxy(
             proxy=f"http://rebalance-residential-{idx}.example:10001",
@@ -92,8 +92,10 @@ def test_rebalance_distributes_accounts_evenly_across_residential_proxies(monkey
         proxy.proxy: sum(1 for account in accounts if account.proxy == proxy.proxy)
         for proxy in proxies
     }
-    assert result["targets_by_proxy_id"] == {proxy.id: 2 for proxy in proxies}
-    assert counts == {proxy.proxy: 2 for proxy in proxies}
+    assert counts == {proxy.proxy: 1 for proxy in proxies}
+    assert result["unassigned_accounts"] == 3
+    assert result["distinct_account_routes"] == 3
+    assert sum(account.proxy is None for account in accounts) == 3
 
 
 @pytest.mark.unit

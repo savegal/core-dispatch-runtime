@@ -28,9 +28,17 @@ from decimal import Decimal
 
 
 @pytest.fixture(autouse=True)
-def isolated_runtime_caches(monkeypatch, tmp_path):
+def isolated_runtime_caches(monkeypatch, tmp_path, request):
+    from services import account_service
+    with account_service._WEB_READINESS_CACHE_LOCK:
+        account_service._WEB_READINESS_CACHE.clear()
     from executor.http import mentions
     from executor.http import playwright_http_client as http_client
+    if request.node.path.parent.name == "unit":
+        from unittest.mock import AsyncMock
+        # Unit transport adapters model an already warmed page. Readiness
+        # policy itself is exercised explicitly and in real Chromium below.
+        monkeypatch.setattr(http_client, "wait_for_runtime_signer_ready", AsyncMock(return_value=True))
     from services.autopilot.cache import clear_cache
     clear_cache()
     with http_client._ACCOUNT_WEB_IDENTITY_LOCK:
@@ -60,12 +68,22 @@ def isolated_runtime_caches(monkeypatch, tmp_path):
 
 
 @pytest.fixture(autouse=True)
-def isolated_proxy_leases(monkeypatch):
+def isolated_proxy_leases(monkeypatch, request):
     """Run production lease Lua against an isolated Redis emulator, never a live server."""
     import fakeredis
     from services import proxy_concurrency_service
     client = fakeredis.FakeRedis(decode_responses=True)
     monkeypatch.setattr(proxy_concurrency_service, "_lease_client", lambda: client)
+    from services import residential_proxy_service
+    from ipaddress import IPv6Address
+    import hashlib
+
+    async def fixture_exit_ip(route):
+        digest = hashlib.sha256(route.url.encode()).digest()
+        return str(IPv6Address(bytes.fromhex("20014860") + digest[:12]))
+
+    if request.node.path.name != "test_residential_proxy_policy.py":
+        monkeypatch.setattr(residential_proxy_service, "_probe_exit_ip", fixture_exit_ip)
     yield client
     client.close()
 

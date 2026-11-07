@@ -7,7 +7,6 @@ from aiogram.fsm.context import FSMContext
 from aiogram.exceptions import TelegramBadRequest
 from bot.services.api_client import api_client
 from bot.services.user_utils import get_user_backend_id
-from bot.services.main_visibility_ui import visibility_keyboard
 from bot.keyboards.video_parsing import get_video_parsing_menu_keyboard
 from bot.services.formatting import Emoji, escape_markdown, markdown_inline_code
 from bot.services.template_utils import filter_full_templates
@@ -345,6 +344,8 @@ async def new_videos_template_selected(callback: CallbackQuery, state: FSMContex
         from bot.services.template_utils import template_replies
         template_reply_list = template_replies(template)
         reply_count = min(len(template_reply_list), settings.MAX_REPLIES)
+        from services.quantity_plan import ensure_quantity_plan, quantity_plan
+        planned = quantity_plan(ensure_quantity_plan(template.get("settings") or {}, template_reply_list))
         
         # Карточка заказа: каждая строка — пара «*label:* value». Лейблы — жирные
         # для быстрого скана глазом, значения — обычные/моноширные где это
@@ -355,7 +356,10 @@ async def new_videos_template_selected(callback: CallbackQuery, state: FSMContex
             f"💰 *Стоимость:* *{total_cost:.2f} грн*  _({len(videos)} × {price_per_video:.2f} грн)_\n"
             f"📑 *Шаблон:* {template_name}\n"
             f"💬 *Комментарий:* {main_comment}\n"
-            f"↩️ *Ответов:* *{reply_count}*\n\n"
+            f"💬 *Главных на видео:* *{planned.main_count}*\n"
+            f"↩️ *Ответов под каждым:* *{planned.replies_per_main}*\n"
+            f"*Вариантов ответа:* {reply_count}\n"
+            f"*Проверка видимости:* независимым аккаунтом\n\n"
             f"{_new_videos_preview(videos, limit=7)}\n\n"
             f"_После запуска будет создан один заказ на все выбранные видео._"
         )
@@ -364,13 +368,6 @@ async def new_videos_template_selected(callback: CallbackQuery, state: FSMContex
             [InlineKeyboardButton(text="🚀 Запустить", callback_data=f"vp:new_videos:confirm_order:{creator_id}:{batch_id}:{template_id}")],
             [InlineKeyboardButton(text="⬅️ Назад", callback_data=f"vp:new_videos:select_template:{creator_id}:{batch_id}")]
         ])
-        state_data = await state.get_data()
-        keyboard = visibility_keyboard(
-            keyboard,
-            bool(state_data.get("verify_main_visibility", False)),
-            bool(state_data.get("verify_reply_visibility", False)),
-        )
-        
         await callback.message.edit_text(
             message,
             reply_markup=keyboard,
@@ -488,12 +485,15 @@ async def new_videos_confirm_order(callback: CallbackQuery, state: FSMContext):
         except (TypeError, ValueError):
             requested_reply_count = len(template_reply_list)
         reply_count = min(requested_reply_count, len(template_reply_list), settings.MAX_REPLIES)
+        if template_settings.get("publication_plan"):
+            reply_count = len(template_reply_list)
         selected_replies = template_reply_list[:reply_count]
         
         # Visibility options belong to this order, independently of the template.
         state_data = await state.get_data()
         # Формируем settings для заказа
         task_settings = {
+            **template_settings,
             "reply_mode": template_settings.get("reply_mode", "A"),
             "reply_count": reply_count,
             "replies": selected_replies,
@@ -507,6 +507,8 @@ async def new_videos_confirm_order(callback: CallbackQuery, state: FSMContext):
             "template_id": template_id,
             "template_name": template.get("name") or f"Шаблон #{template_id}",
         }
+        from services.quantity_plan import ensure_quantity_plan
+        task_settings = ensure_quantity_plan(task_settings, selected_replies)
         
         # P1 FIX: Создаем ОДИН заказ на все видео (вместо N задач)
         creator_usernames = sorted({
@@ -565,10 +567,10 @@ async def new_videos_confirm_order(callback: CallbackQuery, state: FSMContext):
         # Берём варианты комментария из шаблона (не reply-тексты!)
         from bot.services.template_utils import template_text_variants
         text_variants = template_text_variants(template)
-        if len(text_variants) < 3:
+        if not text_variants:
             await callback.message.edit_text(
                 "❌ *Заказ не создан*\n\n"
-                "В шаблоне должно быть минимум *3* варианта комментария.",
+                "Добавьте хотя бы один текст главного комментария в шаблон.",
                 reply_markup=InlineKeyboardMarkup(inline_keyboard=[
                     [InlineKeyboardButton(text="⬅️ Выбрать шаблон", callback_data=f"vp:new_videos:select_template:{creator_id}:{batch_id}")],
                     [InlineKeyboardButton(text="🏠 Главное меню", callback_data="menu:main")],
@@ -591,7 +593,7 @@ async def new_videos_confirm_order(callback: CallbackQuery, state: FSMContext):
             task = await api_client.create_task(
                 user_id=user_id,
                 main_comment=main_comment,
-                text_variants=text_variants[:10],  # Ограничиваем максимум 10 вариантами
+                text_variants=text_variants[:50],
                 video_urls=video_urls,  # Все видео в одном заказе
                 reply1=template.get("reply1"),
                 reply2=template.get("reply2"),

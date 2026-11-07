@@ -1,7 +1,7 @@
 from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel, field_validator
 from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy import select
+from sqlalchemy import func, select, update
 from db.database import get_db
 from db.models import AppSettings, Task, Log, User
 from services.app_settings_service import SOFTWARE_MODE_KEY, SOFTWARE_MODE_PARSING
@@ -111,22 +111,15 @@ async def next_task(
                 )
                 continue
 
-        from services.task_state_machine import TaskStateTransitionError, validate_status_transition
-
         try:
-            validate_status_transition(task.status, "in_progress")
-            task.status = "in_progress"
-            task.attempts += 1
-            task.updated_at = datetime.now(timezone.utc)
+            claimed = await db.execute(update(Task).where(Task.id == task_id, Task.status == "pending")
+                .values(status="in_progress", attempts=func.coalesce(Task.attempts, 0) + 1,
+                        updated_at=datetime.now(timezone.utc)), execution_options={"synchronize_session": False})
+            if claimed.rowcount != 1:
+                await db.rollback()
+                continue
             await db.commit()
             await db.refresh(task)
-        except TaskStateTransitionError as e:
-            await db.rollback()
-            logger.warning(
-                f"Task {task_id}: invalid status transition in next_task "
-                f"{task.status} -> in_progress: {e}"
-            )
-            continue
         except Exception as e:
             await db.rollback()
             logger.error(f"Task {task_id}: failed to claim in next_task: {e}", exc_info=True)

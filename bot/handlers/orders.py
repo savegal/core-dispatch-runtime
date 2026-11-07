@@ -12,6 +12,7 @@ from bot.config import load_config
 from bot.services.drafts import get_draft
 from bot.services.subscription_service import check_user_access, check_user_blocked
 from bot.services.bot_ui import block, empty_screen, screen
+from bot.services.order_presentation import publication_links, excerpt, NO_LINK_PREVIEWS
 from html import escape as html_escape, unescape as html_unescape
 import logging
 import re
@@ -47,15 +48,17 @@ ORDER_FILTERS = {
     "done": "Готовые",
 }
 ORDER_TABS = {
+    "live": "◉ Ход работы",
     "overview": "Заказ",
     "map": "Публикации",
     "videos": "Видео",
     "texts": "Тексты",
+    "analytics": "Конверсия",
     "settings": "Детали",
 }
 ORDER_DETAIL_SOFT_LIMIT = 3400
 ORDER_TEXT_CHUNK_LIMIT = 1500
-ORDER_MAP_REPLY_CHUNK_SIZE = 6
+ORDER_MAP_REPLY_CHUNK_SIZE = 4
 
 
 def _normalize_account_pool_mode(mode) -> str:
@@ -237,6 +240,10 @@ def _build_recreated_order_settings(orig_settings: dict | None, *, origin: str) 
             for reply in source.get("replies", [])[: settings.MAX_REPLIES]
             if str(reply or "").strip()
         ]
+    if isinstance(source.get("publication_plan"), dict):
+        clean["publication_plan"] = dict(source["publication_plan"])
+        if isinstance(source.get("publication_options"), dict):
+            clean["publication_options"] = dict(source["publication_options"])
     for idx in range(4, settings.MAX_REPLIES + 1):
         key = f"reply{idx}"
         if source.get(key):
@@ -260,7 +267,7 @@ def _text_variants_for_recreated_order(task: dict) -> list[str]:
     task_settings = task.get("settings", {}) if isinstance(task.get("settings"), dict) else {}
     text_variants = task_settings.get("text_variants") or []
     text_variants = [str(item) for item in text_variants if str(item or "").strip()]
-    if len(text_variants) >= 3:
+    if len(text_variants) >= (1 if task_settings.get("publication_plan") else 3):
         return text_variants
     return []
 
@@ -885,6 +892,9 @@ def _build_publication_map_rows(task: dict) -> tuple[list[dict], list[dict], dic
                 "url_total": url_total,
                 "url": str(url),
                 "username": target_username,
+                "aweme_id": result.get("aweme_id"),
+                "comment_id": target_comment_id,
+                "kind": "main",
                 "text": target_text,
                 "status": "✅ найден" if parent_confirmed else "☑️ задан для поиска",
                 "target_kind": "engagement_parent",
@@ -929,6 +939,9 @@ def _build_publication_map_rows(task: dict) -> tuple[list[dict], list[dict], dic
                 "url_total": url_total,
                 "url": str(url),
                 "username": username,
+                "aweme_id": result.get("aweme_id"),
+                "comment_id": raw_variant.get("comment_id"),
+                "kind": "main",
                 "text": str(raw_variant.get("text") or main.get("text_choice") or task.get("main_comment") or "").strip(),
                 "status": _main_publication_status(raw_variant),
                 "target_kind": "published_main",
@@ -968,6 +981,9 @@ def _build_publication_map_rows(task: dict) -> tuple[list[dict], list[dict], dic
                         break
 
             reply_row = {
+                "kind": "reply", "aweme_id": result.get("aweme_id"), "video_url": str(url),
+                "comment_id": raw_item.get("reply_comment_id") or raw_item.get("reply_id"),
+                "parent_id": raw_item.get("parent_comment_id"),
                 "text": str(raw_item.get("text") or "").strip(),
                 "status": (_main_publication_status(raw_item) if "public_confirmed" in raw_item
                            else "✅ подтверждено" if raw_item.get("success") else "☑️ отправлено без публичной проверки"),
@@ -1090,7 +1106,10 @@ def _publication_map_card(row: dict, *, reply_offset: int = 0, replies: list[dic
         title = f"{_safe_int(row.get('index'))}. Комментарий для ответа · {author_label} · {row.get('status') or 'найден'}"
     else:
         title = f"{_safe_int(row.get('index'))}. {author_label} · {row.get('status') or 'отправлено'}"
-    lines = [f"<b>{_html(title)}</b>", _html_inline_code(row.get("text") or "главный комментарий")]
+    lines = [f"<b>{_html(title)}</b>", f"<code>{excerpt(row.get('text') or 'главный комментарий', 180)}</code>"]
+    links = publication_links(row)
+    if links:
+        lines.append(links)
     details: list[str] = []
     if _safe_int(row.get("url_total")) > 1:
         details.append(f"видео {_safe_int(row.get('url_index'))}/{_safe_int(row.get('url_total'))}")
@@ -1115,7 +1134,10 @@ def _publication_map_card(row: dict, *, reply_offset: int = 0, replies: list[dic
         lines.append(f"<b>{_html(header)}</b>")
         for idx, reply in enumerate(replies, start=start):
             marker = "✅" if str(reply.get("status") or "").startswith("✅") else "☑️"
-            lines.append(f"{idx}. {marker} {_html_inline_code(reply.get('text') or 'ответ')}")
+            lines.append(f"{idx}. {marker} <code>{excerpt(reply.get('text') or 'ответ', 180)}</code>")
+            links = publication_links(reply)
+            if links:
+                lines.append(links)
     else:
         lines.append("Ответы: нет")
     return "\n".join(lines)
@@ -1135,7 +1157,10 @@ def _publication_map_unassigned_card(replies: list[dict], *, reply_offset: int =
     for idx, reply in enumerate(replies, start=start):
         parent = str(reply.get("parent_preview") or "").strip()
         suffix = f" · родитель: {_short_text(parent, 60)}" if parent else ""
-        lines.append(f"{idx}. {_html_inline_code(reply.get('text') or 'ответ')}{_html(suffix)}")
+        lines.append(f"{idx}. <code>{excerpt(reply.get('text') or 'ответ', 180)}</code>{_html(suffix)}")
+        links = publication_links(reply)
+        if links:
+            lines.append(links)
     return "\n".join(lines)
 
 
@@ -1407,6 +1432,7 @@ def _build_orders_keyboard(
     has_pending_tasks: bool | None = None,
 ) -> InlineKeyboardMarkup:
     keyboard = _orders_filter_keyboard(filter_name)
+    keyboard.append([InlineKeyboardButton(text="📊 Публикации и аккаунты за 24 часа", callback_data="orders:statistics:24")])
     order_buttons: list[InlineKeyboardButton] = []
     for task in page_tasks:
         task_id = int(task.get("id"))
@@ -1585,6 +1611,13 @@ def _overview_order_plan_lines(task: dict) -> list[str]:
     from services.order_transport import order_transport_label
     transport = _settings_dict(task).get("order_transport_mode")
     lines: list[str] = [f"Режим: {_html(order_transport_label(transport))}"] if transport else []
+    plan = _settings_dict(task).get("publication_plan")
+    if plan:
+        lines += [f"Главных на видео: {plan['main_count']}",
+                  f"Ответов под каждым: {plan['replies_per_main']}",
+                  f"Вариантов главного текста: {len(variants)} · ответа: {len(replies)}",
+                  "Публичные результаты и конверсия — во вкладке «В реальном времени»."]
+        return lines
     if _order_kind(task) == "keyword_replies":
         lines += ["Тип: ответы по ключевым словам", f"Ключей: {len(_settings_dict(task).get('keywords') or [])}",
                   "Один ответ на каждый найденный комментарий", f"Вариантов ответа: {len(replies)}"]
@@ -1641,7 +1674,7 @@ def _overview_notice_lines(task: dict) -> list[str]:
 
     lines: list[str] = []
     from services.task_execution_ledger import has_submission_evidence
-    if (display_status == "partial" and any(has_submission_evidence(row)
+    if (not _settings_dict(task).get("publication_plan") and display_status == "partial" and any(has_submission_evidence(row)
             for row in (_settings_dict(task).get("url_results") or {}).values())):
         lines.append("Часть публикаций уже отправлена. Повтор этих видео целиком отключён, чтобы не создать дубли. "
                      "Для недостающих ответов создайте отдельный заказ.")
@@ -1940,7 +1973,8 @@ def _render_order_settings(task: dict) -> str:
 
     reply_visibility_label = "выкл"
     if settings_dict.get("verify_reply_visibility") is True:
-        reply_visibility_label = "вкл, без повторной отправки" if _order_kind(task) == "keyword_replies" else "вкл, с заменой"
+        reply_visibility_label = ("вкл, в пределах лимитов заказа" if settings_dict.get("publication_plan") else
+            "вкл, без повторной отправки" if _order_kind(task) == "keyword_replies" else "вкл, с заменой")
     lines.extend([
         f"Отметки: {'попробовать отметить' if settings_dict.get('mention_mode') == 'attempt' else 'обычный текст'}",
         f"Задержки: {'вкл' if settings_dict.get('delays', True) else 'выкл'}",
@@ -1983,6 +2017,12 @@ def _render_order_settings(task: dict) -> str:
 
 
 def _render_order_detail(task: dict, tab: str, content_page: int = 0) -> str:
+    if tab == "live":
+        from bot.services.live_orders import render_live
+        return render_live(task.get("_activity") or {"task_id": task.get("id"), "status": task.get("status")})
+    if tab == "analytics":
+        from bot.services.live_orders import render_text_statistics
+        return render_text_statistics(task.get("_activity") or {}, content_page)
     tab = _normalize_order_tab(tab)
     if tab == "videos":
         return _render_order_videos(task, content_page)
@@ -1997,6 +2037,8 @@ def _render_order_detail(task: dict, tab: str, content_page: int = 0) -> str:
 
 def _order_detail_page_count(task: dict, tab: str) -> int:
     tab = _normalize_order_tab(tab)
+    if tab == "analytics":
+        return max(1, (len((task.get("_activity") or {}).get("texts") or []) + 3) // 4)
     if tab == "overview":
         return len(_overview_pages(task))
     if tab == "videos":
@@ -2021,7 +2063,17 @@ def _build_order_detail_keyboard(
         InlineKeyboardButton(text=("• " if tab == key else "") + label, callback_data=_detail_callback(task_id, key, page, filter_name))
         for key, label in ORDER_TABS.items()
     ]
-    keyboard = [tab_buttons[:2], tab_buttons[2:]]
+    keyboard = [tab_buttons[:2], tab_buttons[2:5], tab_buttons[5:]]
+    if tab in {"live", "analytics"}:
+        keyboard.append([InlineKeyboardButton(text="↻ Обновить", callback_data=_detail_callback(
+            task_id, tab, page, filter_name, content_page))])
+    keyboard.append([
+        InlineKeyboardButton(text="📄 Отчёт TXT", callback_data=f"order:export:{task_id}:txt"),
+        InlineKeyboardButton(text="CSV", callback_data=f"order:export:{task_id}:csv"),
+        InlineKeyboardButton(text="🔗 Ссылки", callback_data=f"order:export:{task_id}:links"),
+    ])
+    if _order_status(task) not in {"pending", "in_progress", "running", "queued"}:
+        keyboard.append([InlineKeyboardButton(text="✓ Перепроверить видимость", callback_data=f"order:recheck:{task_id}")])
     total_content_pages = _order_detail_page_count(task, tab)
     content_page = max(0, min(int(content_page or 0), total_content_pages - 1))
     if total_content_pages > 1:
@@ -2053,8 +2105,10 @@ def _build_order_detail_keyboard(
         ])
 
     failed_urls = _failed_urls_for_retry(task)
-    if failed_urls and not is_stopped:
-        keyboard.append([InlineKeyboardButton(text=f"🔄 Повторить ошибки ({len(failed_urls)})", callback_data=f"order:retry_failed:{task_id}")])
+    quantity_order = bool(_settings_dict(task).get("publication_plan"))
+    if failed_urls and (not is_stopped or quantity_order):
+        label = "Продолжить недостающее" if quantity_order else "Повторить ошибки"
+        keyboard.append([InlineKeyboardButton(text=f"🔄 {label} ({len(failed_urls)})", callback_data=f"order:retry_failed:{task_id}")])
     if _order_is_pending(task):
         pending_row: list[InlineKeyboardButton] = []
         if _order_queue_priority(task) != "high":
@@ -2088,6 +2142,39 @@ def _build_order_detail_keyboard(
 async def list_orders(callback: CallbackQuery, state: FSMContext):
     """Показывает список заказов пользователя (первая страница)."""
     await show_orders_page(callback, state, page=0, filter_name="all")
+
+
+@router.callback_query(F.data.startswith("orders:statistics:"))
+async def publication_statistics(callback: CallbackQuery):
+    await callback.answer()
+    if not callback.message:
+        return
+    user_id = await get_user_backend_id(callback.from_user.id)
+    if not user_id:
+        return
+    hours = 168 if callback.data.endswith(":168") else 24
+    stats = await api_client.get_publication_statistics(user_id, hours)
+    summary = stats.get("summary") or {}
+    lines = [f"<b>Публикации · {'7 дней' if hours == 168 else '24 часа'}</b>",
+        f"Отправок: {summary.get('dispatched', 0)}",
+        f"Принято с CID: {summary.get('accepted', 0)}",
+        f"Подтверждены независимым аккаунтом: {summary.get('ever_visible', summary.get('visible', 0))}",
+        f"Ожидают проверки: {summary.get('pending_checks', 0)}",
+        f"Исход отправки неизвестен: {summary.get('uncertain', 0)}", "", "<b>Аккаунты с отправками</b>"]
+    for account in sorted(stats.get("accounts") or [], key=lambda item: -item.get("dispatched", 0))[:15]:
+        lines.append(f"#{account.get('account_id') or '—'} · отправок {account.get('dispatched', 0)} · видно {account.get('visible', 0)} · ошибок {account.get('failed', 0)}")
+    if stats.get("geographies"):
+        lines.extend(["", "<b>Гео аккаунтов из cookies</b>"])
+        for geo in sorted(stats["geographies"], key=lambda item: -item.get("dispatched", 0))[:10]:
+            rate = geo.get("visible_percent")
+            lines.append(f"{_html(geo['country_code'])} · отправок {geo['dispatched']} · видно {geo['visible']}"
+                         + (f" · {rate:.1f}%" if rate is not None else ""))
+        lines.append("Гео может быть неизвестно. Процент относится к отправкам этого периода.")
+    lines.append("\nАвторизация аккаунта и видимость его публикаций учитываются отдельно.")
+    await callback.message.edit_text("\n".join(lines), parse_mode="HTML", reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="24 часа", callback_data="orders:statistics:24"),
+         InlineKeyboardButton(text="7 дней", callback_data="orders:statistics:168")],
+        [InlineKeyboardButton(text="Мои заказы", callback_data="menu:orders")]]))
 
 
 @router.callback_query(F.data.startswith("orders:page:"))
@@ -2195,7 +2282,8 @@ async def show_orders_page(
             await callback.message.edit_text(
                 text,
                 reply_markup=keyboard,
-                parse_mode="HTML"
+                parse_mode="HTML",
+                link_preview_options=NO_LINK_PREVIEWS,
             )
         except TelegramBadRequest as e:
             # Сообщение не изменилось - это нормально, игнорируем
@@ -2294,6 +2382,12 @@ async def show_order_detail(callback: CallbackQuery):
             return
         
         task = await api_client.get_task(task_id, user_backend_id)
+        if tab == "overview" and _task_is_running(task):
+            tab = "live"
+        if tab == "live":
+            task["_activity"] = await api_client.get_publication_activity(task_id, user_backend_id)
+        if tab == "analytics":
+            task["_activity"] = await api_client.get_publication_activity(task_id, user_backend_id, include_texts=True)
         text = _render_order_detail(task, tab, content_page)
         keyboard = _build_order_detail_keyboard(task, tab, back_page, back_filter, content_page)
         try:
@@ -2311,14 +2405,71 @@ async def show_order_detail(callback: CallbackQuery):
                 await callback.message.edit_text(
                     _html_to_plain_text(text),
                     reply_markup=keyboard,
+                    link_preview_options=NO_LINK_PREVIEWS,
                 )
             else:
                 raise
+        if tab == "live":
+            from bot.services.live_orders import live_order_views
+            def render_activity(activity):
+                updated = {**task, "_activity": activity, "status": activity["status"], "progress": activity["progress"]}
+                return (_render_order_detail(updated, "live", 0),
+                        _build_order_detail_keyboard(updated, "live", back_page, back_filter, 0))
+            await live_order_views.watch(callback.message,
+                lambda: api_client.get_publication_activity(task_id, user_backend_id), render_activity, text)
         return
 
     except Exception as e:
         logger.error(f"Error showing order detail: {e}")
         await callback.answer("Ошибка загрузки заказа", show_alert=True)
+
+
+@router.callback_query(F.data.startswith("order:export:"))
+async def export_publication_report(callback: CallbackQuery):
+    from aiogram.types import BufferedInputFile
+    if not callback.message:
+        return
+    await callback.answer()
+    try:
+        _, _, task_id, format = callback.data.split(":")
+        user_id = await get_user_backend_id(callback.from_user.id)
+        if not user_id:
+            return
+        report = await api_client.get_publication_report(int(task_id), user_id, format)
+        body = report["content"].encode("utf-8-sig" if format == "csv" else "utf-8")
+        await callback.message.answer_document(BufferedInputFile(body, filename=report["filename"]))
+    except Exception:
+        logger.exception("Publication report export failed")
+        await callback.message.answer("Не удалось сформировать отчёт. Попробуйте ещё раз.")
+
+
+@router.callback_query(F.data.startswith("order:recheck:"))
+async def recheck_publication_status(callback: CallbackQuery):
+    if not callback.message:
+        return
+    await callback.answer()
+    try:
+        task_id = int(callback.data.rsplit(":", 1)[1])
+        user_id = await get_user_backend_id(callback.from_user.id)
+        if not user_id:
+            return
+        await api_client.recheck_publications(task_id, user_id)
+        task = await api_client.get_task(task_id, user_id)
+        task["_activity"] = await api_client.get_publication_activity(task_id, user_id)
+        text = _render_order_detail(task, "live")
+        keyboard = _build_order_detail_keyboard(task, "live", 0, "all")
+        await callback.message.edit_text(text, reply_markup=keyboard, parse_mode="HTML", link_preview_options=NO_LINK_PREVIEWS)
+        from bot.services.live_orders import live_order_views
+        def render(activity):
+            updated = {**task, "status": activity["status"], "_activity": activity}
+            return _render_order_detail(updated, "live"), _build_order_detail_keyboard(updated, "live", 0, "all")
+        await live_order_views.watch(callback.message,
+            lambda: api_client.get_publication_activity(task_id, user_id), render, text)
+    except APIRequestError as exc:
+        await callback.message.answer(str(exc)[:1000], parse_mode=None)
+    except Exception:
+        logger.exception("Publication recheck request failed")
+        await callback.message.answer("Перепроверка недоступна. Дождитесь завершения заказа или проверьте соединение.")
 
 
 @router.callback_query(F.data.startswith("order:priority:"))
@@ -2469,7 +2620,7 @@ async def retry_failed_order(callback: CallbackQuery):
         orig_settings = task.get("settings", {})
         failed_urls = _failed_urls_for_retry(task)
 
-        if _order_is_stopped(task):
+        if _order_is_stopped(task) and not orig_settings.get("publication_plan"):
             await callback.answer("Остановленный заказ нельзя повторить. Можно сделать копию.", show_alert=True)
             return
 
@@ -2478,7 +2629,7 @@ async def retry_failed_order(callback: CallbackQuery):
             return
 
         text_variants = _text_variants_for_recreated_order(task)
-        if len(text_variants) < 3:
+        if len(text_variants) < (1 if orig_settings.get("publication_plan") else 3):
             await callback.answer(
                 "В старом заказе нет 3 вариантов текста. Сначала замените тексты.",
                 show_alert=True,
@@ -2549,6 +2700,11 @@ async def copy_order(callback: CallbackQuery, state: FSMContext):
             return
         
         task = await api_client.get_task(task_id, user_backend_id)
+
+        if _order_kind(task) == "full":
+            from bot.handlers.quantity_orders import copy_full_order
+            await copy_full_order(callback.message, state, task, user_backend_id)
+            return
 
         if _order_kind(task) == "keyword_replies":
             from bot.handlers.engagement_wizard import show_engagement_preview

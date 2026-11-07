@@ -102,3 +102,18 @@ class TestBalanceService:
 
         with pytest.raises(ValueError, match="price_failure cannot exceed price_success"):
             calculate_refund_amount(1, broken_pricing)
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize("success,failure,refund", [
+    ("5.00", "0.00", "5.00"),
+    ("0.00", "0.00", "0.00"),
+])
+def test_zero_pricing_values_survive_a_reload_and_are_used_for_refunds(db_session, success, failure, refund):
+    pricing = update_pricing(db_session, price_success=Decimal(success), price_failure=Decimal(failure))
+    db_session.expire_all()
+    reloaded = get_pricing(db_session)
+    assert reloaded.id == pricing.id
+    assert reloaded.price_success == Decimal(success)
+    assert reloaded.price_failure == Decimal(failure)
+    assert calculate_refund_amount(1, reloaded) == Decimal(refund)

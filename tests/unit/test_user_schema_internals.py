@@ -1867,7 +1867,8 @@ async def test_publish_all_variants_uses_http_first_when_adapter_succeeds(monkey
     async def fake_prepare(*_args, **_kwargs):
         return http_session
 
-    async def fake_http(session, text, *, correlation_id):
+    async def fake_http(session, text, *, correlation_id, variant_index, tiktok_username):
+        assert variant_index == len(http_calls) + 1
         assert session is http_session
         http_calls.append((text, correlation_id))
         return PublishResult(
@@ -2083,7 +2084,8 @@ async def test_publish_all_variants_does_not_dom_fallback_after_attempted_http_f
     async def fake_prepare(*_args, **_kwargs):
         return http_session
 
-    async def fake_http(session, text, *, correlation_id):
+    async def fake_http(session, text, *, correlation_id, variant_index, tiktok_username):
+        assert variant_index == 1
         assert session is http_session
         assert text == "hello"
         assert correlation_id == "task_http_attempted_failure_v1"

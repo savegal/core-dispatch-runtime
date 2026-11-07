@@ -166,12 +166,16 @@ async def collect_http_targets(page, aweme_id, keywords, *, stop_requested=None)
 async def discover_keyword_targets(db, video_url, keywords, *, task_id, pool_owner_user_id=None, stop_requested=None):
     from executor import engagement_engine as engine, user_schema as schema
     from services.execution_attempts import candidate_scan_limit
+    from executor.visibility_support import account_identity_keys, identity_rejection_reason
+    from services.publication_journal import record_phase
+    await record_phase("reading")
     if not http_first_enabled(settings):
         return [], {"complete": False, "scanned": 0, "error": "keyword_http_only"}
     excluded, found = [], {}
     browser_attempts = 0
     browser_limit = max(1, min(6, int(settings.MAX_RETRY_ACCOUNTS)))
     best_scan = None
+    negative_readers = []
     expected_media_id = engine.extract_video_id(video_url)
     for _ in range(candidate_scan_limit(settings)):
         if stop_requested and stop_requested():
@@ -187,6 +191,10 @@ async def discover_keyword_targets(db, video_url, keywords, *, task_id, pool_own
         corr = f"task_{task_id}_keyword_discovery_acc{account.id}"
         try:
             if await schema._preflight_cookie_http_gate(db, account, correlation_id=corr, phase="keyword_discovery"):
+                continue
+            identity = account_identity_keys(account, schema._get_cached_http_preflight_username(account),
+                                             user_id=schema._get_cached_http_preflight_user_id(account))
+            if negative_readers and identity_rejection_reason(identity, negative_readers) == "observer_identity_not_independent":
                 continue
             browser_attempts += 1
             context, page = await engine.create_page_for_account(account)
@@ -206,7 +214,20 @@ async def discover_keyword_targets(db, video_url, keywords, *, task_id, pool_own
                 best_scan = {**scan, "scanned": max(int(scan.get("scanned") or 0),
                              int((best_scan or {}).get("scanned") or 0), len(found)),
                              "resolved_video_url": str(page.url), "aweme_id": media_id}
-                if scan.get("complete") or scan.get("error") != "keyword_comment_list_unavailable":
+                if scan.get("complete") and not found:
+                    # A restricted account may receive a plausible empty list.
+                    # Require a second independent reader before saying no match.
+                    if identity_rejection_reason(identity, negative_readers) is None:
+                        negative_readers.append(identity)
+                    best_scan["negative_confirmations"] = len(negative_readers)
+                    if len(negative_readers) < 2:
+                        best_scan.update(complete=False, error="keyword_negative_scan_unconfirmed")
+                        continue
+                if scan.get("error") in {"keyword_comment_list_unavailable", "keyword_pagination_stalled"}:
+                    engine._record_http_account_result(account.id, "soft_fail")
+                if scan.get("complete") or scan.get("error") not in {
+                    "keyword_comment_list_unavailable", "keyword_pagination_stalled",
+                }:
                     return list(found.values()), best_scan
         except asyncio.CancelledError:
             raise
@@ -335,13 +356,21 @@ def _checkpoint(db, task, url, operation, data, box):
                 "unconfirmed": counts["dispatching"] + counts["unconfirmed"], "failed": counts["failed"]}
     task_settings["keyword_scans"] = scans
     url_results = dict(task_settings.get("url_results") or {})
-    # Keep one submission marker in the existing replay guards, without
-    # rewriting every historical receipt after each individual reply.
-    evidence_row = query.filter(KeywordReplyTarget.status.in_(("success", "dispatching", "unconfirmed"))).first()
-    evidence = target_dict(evidence_row) if evidence_row else None
-    url_results[url] = {"status": "in_progress", "mode": KEYWORD_ORDER_KIND, "keyword_replies": progress,
-        "engagement": {"main": {}, "replies": {"ok": counts["success"], "expected": total,
-            "submitted_unconfirmed": progress["unconfirmed"], "items": [evidence] if evidence else []}}}
+    from services.publication_progress import merge_items
+    previous = dict(url_results.get(url) or {})
+    engagement = dict(previous.get("engagement") or {})
+    reply_info = dict(engagement.get("replies") or {})
+    per_target = replies_per_keyword_target(task_settings.get("replies_per_target"))
+    receipts = [item for target in query.order_by(KeywordReplyTarget.position).all()
+                if target.status in {"success", "dispatching", "unconfirmed", "failed"}
+                for item in _target_slots(target, per_target)]
+    items = merge_items(reply_info.get("items") or [], receipts)
+    engagement["replies"] = {**reply_info, "ok": sum(bool(item.get("success")) for item in items),
+        "expected": total * per_target,
+        "submitted_unconfirmed": sum(bool(item.get("submitted_unconfirmed")) for item in items), "items": items}
+    engagement.setdefault("main", {})
+    url_results[url] = {**previous, "status": "in_progress", "mode": KEYWORD_ORDER_KIND,
+                        "keyword_replies": progress, "engagement": engagement}
     task_settings["url_results"] = url_results
     task.settings = task_settings
     flag_modified(task, "settings")
@@ -382,17 +411,9 @@ async def execute_keyword_replies(db, task, video_url, *, task_id, pool_owner_us
     """Own one browser-pool phase across every matched parent on this video."""
     if not http_first_enabled(settings):
         raise ValueError("keyword_http_only")
-    from executor.browser_pool import close_browser_pool
-    try:
-        return await _execute_keyword_replies(db, task, video_url, task_id=task_id,
-            pool_owner_user_id=pool_owner_user_id, stop_requested=stop_requested)
-    finally:
-        # Checkpoints settle their independent commit before cancellation can
-        # reach here. Shared Chromium survives individual parent replies.
-        try:
-            await close_browser_pool()
-        except Exception:
-            logger.warning("Keyword browser pool cleanup failed task=%s", task_id, exc_info=True)
+    # The executor owns this pool through visibility checks and later URLs.
+    return await _execute_keyword_replies(db, task, video_url, task_id=task_id,
+        pool_owner_user_id=pool_owner_user_id, stop_requested=stop_requested)
 
 
 async def _execute_keyword_replies(db, task, video_url, *, task_id, pool_owner_user_id=None, stop_requested=None):

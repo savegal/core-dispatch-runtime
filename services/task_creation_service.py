@@ -132,7 +132,10 @@ def _build_monitor_task_settings(
     text_variant_offset: int = 0,
     order_transport_mode: str | None = None,
 ) -> dict[str, Any]:
-    task_settings = dict(template.settings or {})
+    from services.order_settings import clean_order_configuration
+    task_settings = clean_order_configuration(template.settings)
+    from services.quantity_plan import ensure_quantity_plan
+    task_settings = ensure_quantity_plan(task_settings, _template_reply_texts(template))
     text_variants = _build_text_variants(template)
     task_settings["text_variants"] = text_variants
     task_settings["text_variant_offset"] = text_variant_offset % len(text_variants) if text_variants else 0
@@ -145,7 +148,7 @@ def _build_monitor_task_settings(
     task_settings["likes_count"] = boost_likes_quantity if boost_likes_enabled else 0
     task_settings["boost_likes_target_mode"] = _coerce_likes_target_mode(boost_likes_target_mode)
     task_settings["order_execution_strategy"] = normalize_order_execution_strategy(order_execution_strategy)
-    task_settings[ORDER_TRANSPORT_KEY] = normalize_order_transport(order_transport_mode, default_order_transport())
+    task_settings[ORDER_TRANSPORT_KEY] = "http" if task_settings.get("publication_plan") else normalize_order_transport(order_transport_mode, default_order_transport())
     # Связь с шаблоном: используется UI orders для отображения "Шаблон: X",
     # для повторов "Сделать копию" и для аналитики monitoring.
     task_settings["template_id"] = template.id
@@ -155,7 +158,7 @@ def _build_monitor_task_settings(
 
 def _validate_monitor_text_variants(task_settings: dict[str, Any]) -> str | None:
     variants = [str(item).strip() for item in (task_settings.get("text_variants") or []) if str(item).strip()]
-    if len(variants) < 3:
+    if len(variants) < (1 if task_settings.get("publication_plan") else 3):
         return "template_requires_3_text_variants"
     return None
 

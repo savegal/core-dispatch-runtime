@@ -1,7 +1,7 @@
 from fastapi import APIRouter, Depends, HTTPException, Query, Request, Header
 from pydantic import BaseModel, TypeAdapter, field_validator, model_validator
 from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy import delete, select, update, func
+from sqlalchemy import delete, select, update, func, or_
 from db.database import get_db
 from db.models import CreatorSource, CreatorVideo, PendingEnqueue, Task, Transaction, User, AppSettings
 from db.constants import TaskStatus
@@ -183,13 +183,13 @@ class TaskCreate(BaseModel):
         return value
     # Ð”Ð»Ñ engagement_only Ð¼Ð¾Ð¶ÐµÑ‚ Ð½Ðµ Ð¿ÐµÑ€ÐµÐ´Ð°Ð²Ð°Ñ‚ÑŒÑÑ: Ñ„Ð°ÐºÑ‚Ð¸Ñ‡ÐµÑÐºÐ¸Ð¹ main_comment Ð±ÐµÑ€ÐµÐ¼ Ð¸Ð· text_variants[0].
     main_comment: str | None = None
+    settings: dict | None = None
     text_variants: list[str]
     reply1: str | None = None
     reply2: str | None = None
     reply3: str | None = None
     likes: int = 0  # Legacy поле, фактическое значение задаётся app settings
     video_urls: list[str]
-    settings: dict | None = None
     # HYBRID: Ð¢Ð¸Ð¿ Ð·Ð°ÐºÐ°Ð·Ð°
     kind: str = "full"  # "full" Ð¸Ð»Ð¸ "engagement_only"
     # HYBRID: Ð”Ð»Ñ engagement_only - Ð¿Ð°Ñ€Ð°Ð¼ÐµÑ‚Ñ€Ñ‹ Ð¿Ð¾Ð¸ÑÐºÐ° ÐºÐ¾Ð¼Ð¼ÐµÐ½Ñ‚Ð°Ñ€Ð¸Ñ
@@ -203,6 +203,13 @@ class TaskCreate(BaseModel):
     def validate_visibility_setting(cls, value):
         if value is not None:
             value = dict(value)
+            from services.publication_runtime import normalize_order_options
+            normalize_order_options(value)
+            from services.quantity_plan import PLAN_KEY, QuantityPlan
+            if PLAN_KEY in value:
+                value[PLAN_KEY] = QuantityPlan.model_validate(value[PLAN_KEY]).model_dump()
+                value["verify_main_visibility"] = True
+                value["verify_reply_visibility"] = True
             for key in ("verify_main_visibility", "verify_reply_visibility"):
                 if key in value:
                     value[key] = TypeAdapter(bool).validate_python(value[key])
@@ -240,10 +247,11 @@ class TaskCreate(BaseModel):
     
     @field_validator('text_variants')
     @classmethod
-    def validate_text_variants(cls, v: list[str]) -> list[str]:
+    def validate_text_variants(cls, v: list[str], info) -> list[str]:
         """Ð¢Ñ€ÐµÐ±ÑƒÐµÐ¼ Ð¼Ð¸Ð½Ð¸Ð¼ÑƒÐ¼ 3 Ð²Ð°Ñ€Ð¸Ð°Ð½Ñ‚Ð° Ñ‚ÐµÐºÑÑ‚Ð° Ð´Ð»Ñ Ð±Ð¾Ñ€ÑŒÐ±Ñ‹ Ñ Ñ‚ÐµÐ½ÑŒÑŽ."""
-        if not v or len(v) < 3:
-            raise ValueError('text_variants must contain at least 3 non-empty items')
+        minimum = 1 if info is not None and (info.data.get("settings") or {}).get("publication_plan") else 3
+        if not v or len(v) < minimum:
+            raise ValueError(f'text_variants must contain at least {minimum} non-empty items')
         normalized = []
         for item in v:
             item = _meaningful_text(item)
@@ -252,8 +260,10 @@ class TaskCreate(BaseModel):
             if len(item) > settings.MAX_COMMENT_LENGTH:
                 raise ValueError(f'text variant too long (max {settings.MAX_COMMENT_LENGTH})')
             normalized.append(item)
-        if len(normalized) < 3:
-            raise ValueError('Provide at least 3 non-empty text variants')
+        if len(normalized) < minimum:
+            raise ValueError(f'Provide at least {minimum} non-empty text variants')
+        if minimum == 1 and len(normalized) > 50:
+            raise ValueError('Too many text variants (max 50)')
         return normalized
     
     @field_validator('main_comment')
@@ -297,6 +307,18 @@ class TaskCreate(BaseModel):
     @model_validator(mode="after")
     def validate_kind_specific_fields(self):
         """Cross-field validation for full/engagement_only orders."""
+        if (self.settings or {}).get("publication_options") and not (self.settings or {}).get("publication_plan"):
+            raise ValueError("Параметры потоков требуют количественного плана публикаций")
+        if (self.settings or {}).get("publication_plan"):
+            if self.kind != "full":
+                raise ValueError("Количественный план доступен для главных комментариев с ответами")
+            from services.quantity_plan import quantity_plan
+            plan = quantity_plan(self.settings)
+            replies = (self.settings or {}).get("replies") or [r for r in (self.reply1, self.reply2, self.reply3) if r]
+            if not isinstance(replies, list) or any(not isinstance(r, str) or not r.strip() or len(r) > settings.MAX_REPLY_LENGTH for r in replies):
+                raise ValueError("Тексты ответов должны быть непустыми строками допустимой длины")
+            if plan.replies_per_main and not replies:
+                raise ValueError("Добавьте тексты ответов или задайте 0 ответов под комментарием")
         if self.kind == KEYWORD_ORDER_KIND:
             task_settings = dict(self.settings or {})
             self.keywords = normalize_keywords(self.keywords if self.keywords is not None else task_settings.get("keywords"))
@@ -387,8 +409,8 @@ class TaskTextsUpdate(BaseModel):
     @field_validator('text_variants')
     @classmethod
     def validate_text_variants(cls, v: list[str]) -> list[str]:
-        if not v or len(v) < 3:
-            raise ValueError('Provide at least 3 text variants')
+        if not v or len(v) > 50:
+            raise ValueError('Provide between 1 and 50 text variants')
         normalized = []
         for item in v:
             item = _meaningful_text(item)
@@ -397,8 +419,8 @@ class TaskTextsUpdate(BaseModel):
             if len(item) > settings.MAX_COMMENT_LENGTH:
                 raise ValueError(f"text too long (max {settings.MAX_COMMENT_LENGTH})")
             normalized.append(item)
-        if len(normalized) < 3:
-            raise ValueError('Provide at least 3 non-empty text variants')
+        if not normalized:
+            raise ValueError('Provide at least 1 non-empty text variant')
         return normalized
 
 class TaskResponse(BaseModel):
@@ -585,6 +607,13 @@ async def create_task(
         task_data.settings,
         [task_data.reply1, task_data.reply2, task_data.reply3],
     )
+    from services.order_settings import clean_order_configuration
+    normalized_task_settings = clean_order_configuration(normalized_task_settings)
+    if task_data.kind == "full" and (normalized_task_settings.get("publication_plan") or not normalized_task_settings.get("retry_of_task_id")):
+        from services.quantity_plan import ensure_quantity_plan
+        normalized_task_settings = ensure_quantity_plan(normalized_task_settings, normalized_replies)
+    if not http_transport_available(settings):
+        raise HTTPException(status_code=409, detail="Новые заказы требуют доступного HTTP-транспорта")
     if task_data.kind == KEYWORD_ORDER_KIND and not http_transport_available(settings):
         raise HTTPException(status_code=409, detail="Ответы по ключевым словам требуют доступного HTTP-транспорта")
     
@@ -600,8 +629,10 @@ async def create_task(
         idem_result = await db.execute(
             select(Task).filter(
                 Task.user_id == task_data.user_id,
-                Task.created_at >= idempotency_window_start
-            ).order_by(Task.created_at.desc()).limit(200)
+                Task.created_at >= idempotency_window_start,
+                or_(Task.settings["idempotency_key"].as_string() == idempotency_key,
+                    Task.settings["client_task_fingerprint"].as_string() == idempotency_key),
+            ).order_by(Task.created_at.desc(), Task.id.desc()).limit(1)
         )
         for existing_task in idem_result.scalars().all():
             existing_settings = existing_task.settings or {}
@@ -624,6 +655,7 @@ async def create_task(
     # A retry has a source order; serialize that source before checking for an
     # existing retry or reserving funds. Independent new orders remain allowed.
     normalized_task_settings.pop("_reply_resume", None)
+    normalized_task_settings.pop("_quantity_resume", None)
     retry_source = normalized_task_settings.get("retry_of_task_id")
     if retry_source is not None:
         from services.task_replay import find_existing_retry, retryable_video_urls
@@ -641,8 +673,19 @@ async def create_task(
         source_task = source_result.scalar_one_or_none()
         if source_task is None:
             raise HTTPException(status_code=404, detail="Исходный заказ не найден")
-        if source_task.status not in {"error", "partial"}:
+        source_quantity = (source_task.settings or {}).get("publication_plan")
+        if source_task.status not in ({"error", "partial", "stopped"} if source_quantity else {"error", "partial"}):
             raise HTTPException(status_code=409, detail="Повтор доступен для заказов с ошибками")
+        if source_quantity:
+            if (source_task.settings or {}).get("_refund_settlement_pending"):
+                raise HTTPException(status_code=409, detail="Дождитесь завершения остановки исходного заказа")
+            from services.quantity_state import quantity_settings_snapshot
+            from types import SimpleNamespace
+            source_task = SimpleNamespace(id=source_task.id, kind=source_task.kind, status=source_task.status,
+                video_urls=source_task.video_urls,
+                settings=await db.run_sync(lambda sync: quantity_settings_snapshot(sync, source_task)))
+            if normalized_task_settings.get("publication_plan") != source_quantity:
+                raise HTTPException(status_code=409, detail="При продолжении сохраните исходные количества и лимиты")
         existing_retry = await find_existing_retry(db, task_data.user_id, retry_source)
         if existing_retry:
             return {"task_id": existing_retry.id, "status": existing_retry.status, "duplicate": True,
@@ -655,6 +698,13 @@ async def create_task(
         seed_reply_resume(source_task, normalized_task_settings, task_data.video_urls)
 
     # Identical content is allowed in separate full and reply orders.
+    if normalized_task_settings.get("publication_plan"):
+        from services.publication_runtime import (
+            ORDER_OPTIONS_KEY, OrderPublicationOptions, load_publication_runtime, order_runtime,
+        )
+        defaults = await db.run_sync(load_publication_runtime)
+        runtime = order_runtime(normalized_task_settings, defaults)
+        normalized_task_settings[ORDER_OPTIONS_KEY] = runtime.model_dump(include=set(OrderPublicationOptions.model_fields))
     new_account_pool_mode = _normalize_account_pool_mode_from_settings(normalized_task_settings)
 
     # REFACTOR: Ð˜ÑÐ¿Ð¾Ð»ÑŒÐ·ÑƒÐµÐ¼ text_variants[0] ÐºÐ°Ðº Ð¾ÑÐ½Ð¾Ð²Ð½Ð¾Ð¹ Ñ‚ÐµÐºÑÑ‚ Ð²ÐµÐ·Ð´Ðµ
@@ -802,7 +852,7 @@ async def create_task(
     task_settings["order_execution_strategy"] = order_execution_strategy
     # The administrator selects this for all users. Payload/template values
     # cannot override it; the snapshot also makes a resumed order deterministic.
-    task_settings[ORDER_TRANSPORT_KEY] = "http" if task_data.kind == KEYWORD_ORDER_KIND else await get_order_transport_async(db)
+    task_settings[ORDER_TRANSPORT_KEY] = "http"
     
     # HYBRID: Ð”Ð»Ñ engagement_only ÑÐ¾Ñ…Ñ€Ð°Ð½ÑÐµÐ¼ Ð¿Ð°Ñ€Ð°Ð¼ÐµÑ‚Ñ€Ñ‹ Ð¿Ð¾Ð¸ÑÐºÐ° ÐºÐ¾Ð¼Ð¼ÐµÐ½Ñ‚Ð°Ñ€Ð¸Ñ
     if task_data.kind == "engagement_only":
@@ -1049,6 +1099,12 @@ async def get_task(
         task = result.scalar_one_or_none()
         if not task:
             raise HTTPException(status_code=404, detail="Task not found")
+        if (task.settings or {}).get("publication_plan"):
+            from services.quantity_state import quantity_settings_snapshot
+            snapshot = await db.run_sync(lambda sync: quantity_settings_snapshot(sync, task))
+            response = TaskResponse.from_orm(task)
+            response.settings = snapshot
+            return response
         return TaskResponse.from_orm(task)
     except HTTPException:
         raise
@@ -1151,6 +1207,11 @@ async def stop_task(
     try:
         ensure_user_scope(user_id, auth_user_id)
 
+        if db.get_bind().dialect.name == "sqlite":
+            # Serialize the stop marker with finalization and receipt checkpoints.
+            await db.execute(update(Task).where(Task.id == task_id, Task.user_id == user_id)
+                             .values(updated_at=Task.updated_at))
+
         try:
             result = await db.execute(
                 select(Task).filter(
@@ -1181,11 +1242,13 @@ async def stop_task(
                 detail="Task can be stopped only while in_progress",
             )
 
+        from services.task_settlement import REFUND_PENDING_KEY
         from services.task_state_machine import validate_status_transition
         validate_status_transition(current_status, TaskStatus.STOPPED.value)
 
         now = datetime.now(timezone.utc)
         task_settings = dict(task.settings or {}) if isinstance(task.settings, dict) else {}
+        task_settings[REFUND_PENDING_KEY] = True
         task_settings["stopped_by_user"] = True
         task_settings["stopped_at"] = now.isoformat()
         task_settings["force_close_browsers"] = True
@@ -1212,6 +1275,7 @@ async def stop_task(
             "stop_signal_sent": stop_signal_sent,
         }
     except HTTPException:
+        await db.rollback()
         raise
     except Exception as e:
         await db.rollback()
@@ -1234,11 +1298,14 @@ async def update_task_texts(
     """
     try:
         ensure_user_scope(user_id, auth_user_id)
+        if db.get_bind().dialect.name == "sqlite":
+            await db.execute(update(Task).where(Task.id == task_id, Task.user_id == user_id,
+                Task.status == "pending").values(updated_at=Task.updated_at))
         result = await db.execute(
             select(Task).filter(
                 Task.id == task_id,
                 Task.user_id == user_id
-            )
+            ).with_for_update().execution_options(populate_existing=True)
         )
         task = result.scalar_one_or_none()
         if not task:
@@ -1249,8 +1316,10 @@ async def update_task_texts(
             raise HTTPException(status_code=400, detail="Task must be pending to update texts")
 
         variants = payload.text_variants
+        if not (task.settings or {}).get("publication_plan") and len(variants) < 3:
+            raise HTTPException(422, "Для сохранённого заказа старого формата нужны 3 варианта текста")
         task.main_comment = variants[0]
-        settings_dict = task.settings or {}
+        settings_dict = dict(task.settings or {})
         settings_dict["text_variants"] = variants
         task.settings = settings_dict
         task.updated_at = datetime.now(timezone.utc)

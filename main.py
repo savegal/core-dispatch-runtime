@@ -45,6 +45,7 @@ from slowapi.util import get_remote_address
 from slowapi.errors import RateLimitExceeded
 from api import users, accounts, tasks, executor_api, templates, proxies, stats, geo_recommendations, geo_stats, geo_coverage, pricing, app_settings, video_parsing, video_batch, video_inbox, adaptive_monitoring, personal_accounts
 from api.autopilot import router as autopilot_router
+from api import publications
 from config.settings import get_settings
 from config.sentry_config import init_sentry
 from services.redis_service import close_redis_client
@@ -402,7 +403,16 @@ async def lifespan(app: FastAPI):
     except Exception as e:
         logger.error(f"Failed to start background scheduler: {e}", exc_info=True)
 
-    yield  # Тут работает приложение
+    from services.publication_recheck import recheck_loop
+    from services.account_import_jobs import import_loop
+    publication_checks = asyncio.create_task(recheck_loop())
+    account_imports = asyncio.create_task(import_loop())
+    try:
+        yield
+    finally:
+        publication_checks.cancel()
+        account_imports.cancel()
+        await asyncio.gather(publication_checks, account_imports, return_exceptions=True)
     
     # ИСПРАВЛЕНО: ПРИ ОСТАНОВКЕ - корректное завершение всех компонентов
     logger.info("🛑 SHUTTING DOWN application gracefully...")
@@ -446,6 +456,7 @@ app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
 app.include_router(users.router)
 app.include_router(accounts.router)
 app.include_router(tasks.router)
+app.include_router(publications.router)
 app.include_router(executor_api.router)
 app.include_router(templates.router)
 app.include_router(proxies.router)

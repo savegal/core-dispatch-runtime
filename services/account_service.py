@@ -15,13 +15,14 @@ import logging
 import threading
 import time
 import hashlib
+from functools import lru_cache
 from typing import Any, Iterable
 import random # NEW: For jitter
 import json  # ИСПРАВЛЕНО: Для проверки cooldown в last_error
 from pathlib import Path
 from datetime import datetime, timezone, timedelta
 from urllib.parse import urlparse
-from sqlalchemy import and_, or_, func, case, select
+from sqlalchemy import and_, or_, func, case, select, literal
 from sqlalchemy.orm import Session
 from db.models import Account, Proxy
 from config.settings import get_settings
@@ -41,6 +42,42 @@ from services.dedicated_proxy_service import (
 
 logger = logging.getLogger("executor.account_service")
 settings = get_settings()
+
+
+@lru_cache(maxsize=8)
+def _preferred_account_countries(raw):
+    return frozenset("GB" if code.strip().upper() == "UK" else code.strip().upper()
+                     for code in raw.split(",") if code.strip())
+
+
+def _account_country_priority(account):
+    preferred = _preferred_account_countries(str(getattr(settings, "PREFERRED_ACCOUNT_COUNTRIES", "") or ""))
+    country = str(getattr(account, "country_code", "") or "").strip().upper()
+    country = "GB" if country == "UK" else country
+    return 0 if not preferred or country in preferred else 1
+
+
+def _account_country_order_sql():
+    preferred = set(_preferred_account_countries(str(getattr(settings, "PREFERRED_ACCOUNT_COUNTRIES", "") or "")))
+    if not preferred:
+        return literal(0)
+    if "GB" in preferred:
+        preferred.add("UK")
+    return case((func.upper(func.trim(Account.country_code)).in_(sorted(preferred)), 0), else_=1)
+
+
+def _prefer_residential_http_routes() -> bool:
+    from services.order_transport import current_order_transport, default_order_transport, HTTP
+    return bool(settings.USE_PROXY and (current_order_transport() or default_order_transport(settings)) == HTTP)
+
+
+def _http_proxy_priority(db: Session, account: Account) -> int:
+    if not _prefer_residential_http_routes():
+        return 0
+    from services.proxy_normalizer import find_account_proxy_record
+    proxy = find_account_proxy_record(db, account)
+    return int(proxy is not None and str(proxy.is_mobile or "").strip().upper() == "Y")
+
 
 # Используем настройку из settings
 ERROR_THRESHOLD = settings.ERROR_THRESHOLD
@@ -629,7 +666,7 @@ def _proxy_source_host(proxy_value: str | None) -> str:
 
 
 def _parallel_proxy_diversify_by_source_host() -> bool:
-    return bool(getattr(settings, "PARALLEL_PROXY_DIVERSIFY_BY_SOURCE_HOST", False))
+    return not _prefer_residential_http_routes() and bool(getattr(settings, "PARALLEL_PROXY_DIVERSIFY_BY_SOURCE_HOST", False))
 
 
 def _account_cookie_key_diag(account: Account, max_keys: int = 40) -> list[str]:
@@ -637,7 +674,7 @@ def _account_cookie_key_diag(account: Account, max_keys: int = 40) -> list[str]:
     if not raw_cookies:
         return []
     try:
-        cookies_dict = parse_cookies_to_dict(raw_cookies)
+        cookies_dict = parse_cookies_to_dict(raw_cookies, restore_guard_aliases=False)
     except Exception as exc:
         logger.debug(f"[ACCOUNT_SERVICE] Failed to parse cookie keys for account {account.id}: {exc}")
         return ["<parse_error>"]
@@ -700,7 +737,7 @@ def _read_account_session_quality(
         }
 
     try:
-        cookies_dict = parse_cookies_to_dict(raw_cookies)
+        cookies_dict = parse_cookies_to_dict(raw_cookies, restore_guard_aliases=False)
     except Exception as exc:
         logger.debug(f"[ACCOUNT_SERVICE] Failed to parse cookies for account {account.id}: {exc}")
         cookies_dict = {}
@@ -1256,6 +1293,12 @@ def get_http_execution_strategy(
         strategy = "skip"
     elif state["active_cooldown"]:
         strategy = "skip"
+    elif (scope in {MAIN_SCOPE, REPLY_SCOPE} and _allow_publish_session_last_resort()
+            and session_quality.get("quality_reason") == "no_browser_auth_sid_guard_only"):
+        from services.cookie_validator import has_guard_session_auth
+        # Restorable guard material may bootstrap behind live auth/signing
+        # gates, while remaining a weak last resort in account selection.
+        strategy = "http_cautious" if has_guard_session_auth(_read_account_cookie_source(account)) else "dom_first"
     elif scope in {MAIN_SCOPE, REPLY_SCOPE} and session_quality.get("can_warmup_http"):
         # Browser-generated linkage/CSRF cookies are collected during warmup.
         strategy = "http_first"
@@ -1725,6 +1768,26 @@ def get_monitor_pool_stats(db: Session) -> dict[str, Any]:
     return summary
 
 
+from collections import OrderedDict
+_WEB_READINESS_CACHE = OrderedDict()
+_WEB_READINESS_CACHE_LOCK = threading.RLock()
+
+
+def _cached_web_readiness(cookies):
+    fingerprint = hashlib.sha256(str(cookies or "").encode()).hexdigest()
+    with _WEB_READINESS_CACHE_LOCK:
+        if fingerprint in _WEB_READINESS_CACHE:
+            _WEB_READINESS_CACHE.move_to_end(fingerprint)
+            return _WEB_READINESS_CACHE[fingerprint]
+    readiness = classify_account_web_readiness(cookies)
+    with _WEB_READINESS_CACHE_LOCK:
+        _WEB_READINESS_CACHE[fingerprint] = readiness
+        _WEB_READINESS_CACHE.move_to_end(fingerprint)
+        while len(_WEB_READINESS_CACHE) > 4096:
+            _WEB_READINESS_CACHE.popitem(last=False)
+    return readiness
+
+
 def _candidate_ids_by_web_readiness(query, order_by_clauses, limit=None):
     """Rank before batching so a hot account beyond the first batch can win.
 
@@ -1734,7 +1797,7 @@ def _candidate_ids_by_web_readiness(query, order_by_clauses, limit=None):
     rows = query.with_entities(Account.id, Account.cookies).order_by(*order_by_clauses)
     if limit is not None:
         rows = rows.limit(limit)
-    ranked = [(account_id, classify_account_web_readiness(cookies))
+    ranked = [(account_id, _cached_web_readiness(cookies))
               for account_id, cookies in rows.yield_per(256)]
     ranked.sort(key=lambda item: -item[1])
     return [account_id for account_id, _ in ranked]
@@ -1881,7 +1944,8 @@ def get_free_account_for_main_comment(
     
     # Geo-matching и фильтрация типов прокси через JOIN
     proxy_type_filter = None if dedicated_route is not None or not settings.USE_PROXY else get_proxy_type_filter(db)
-    proxy_prefer_mobile = False if dedicated_route is not None or not settings.USE_PROXY else get_proxy_prefer_mobile(db)
+    prefer_residential = dedicated_route is None and _prefer_residential_http_routes()
+    proxy_prefer_mobile = False if dedicated_route is not None or not settings.USE_PROXY or prefer_residential else get_proxy_prefer_mobile(db)
     has_proxy_join = False
     
     # Подключаем JOIN если нужна фильтрация по типу прокси
@@ -1892,7 +1956,7 @@ def get_free_account_for_main_comment(
             query = query.filter(or_(Proxy.is_mobile == "Y", Proxy.id.is_(None)))
         elif proxy_type_filter.lower() == "residential":
             query = query.filter(or_(Proxy.is_mobile != "Y", Proxy.id.is_(None)))
-    elif proxy_prefer_mobile:
+    elif proxy_prefer_mobile or prefer_residential:
         query = query.outerjoin(Proxy, Account.proxy == Proxy.proxy)
         has_proxy_join = True
     
@@ -1908,6 +1972,7 @@ def get_free_account_for_main_comment(
         (Account.status != "active").asc(),
         # Меньше ошибок - лучше
         Account.error_count_recent.asc().nulls_first(),
+        _account_country_order_sql(),
     ]
     
     # Добавляем гео-приоритизацию если включено
@@ -1929,6 +1994,9 @@ def get_free_account_for_main_comment(
         Account.last_used_at.asc().nulls_first(),
         Account.id.asc()  # Для детерминированности при одинаковых значениях
     ])
+
+    if prefer_residential and has_proxy_join:
+        order_by_clauses.insert(0, case((Proxy.is_mobile == "Y", 1), else_=0).asc())
 
     total_matching_for_scan: int | None = None
 
@@ -2070,12 +2138,14 @@ def get_free_account_for_main_comment(
             ranked_item = (
                 (
                     -classify_account_web_readiness(candidate.cookies),
+                    _http_proxy_priority(db, candidate) if prefer_residential else 0,
                     assignment_rank(candidate),
                     RUNTIME_BUCKET_ORDER.get(state["bucket"], 5),
                     0 if candidate.status == "active" else 1,
                     _lane_sort_rank(MAIN_SCOPE, spend_lane["lane"]),
                     _lifecycle_sort_rank(lifecycle["stage"]),
                     -score,
+                    _account_country_priority(candidate),
                     int(candidate.error_count_recent or 0),
                     index,
                 ),
@@ -2368,11 +2438,13 @@ def get_free_account_for_reply(
     now = datetime.now(timezone.utc)
     query = query.filter(available_assignment_filter(now))
     proxy_type_filter = None if dedicated_route is not None or not settings.USE_PROXY else get_proxy_type_filter(db)
-    proxy_prefer_mobile = False if dedicated_route is not None or not settings.USE_PROXY else get_proxy_prefer_mobile(db)
+    prefer_residential = dedicated_route is None and _prefer_residential_http_routes()
+    proxy_prefer_mobile = False if dedicated_route is not None or not settings.USE_PROXY or prefer_residential else get_proxy_prefer_mobile(db)
     order_by_clauses = [
         assignment_order_sql(),
         (Account.status != "active").asc(),
         Account.error_count_recent.asc().nulls_first(),
+        _account_country_order_sql(),
         Account.last_used_at.asc().nulls_first(),
         Account.id.asc(),
     ]
@@ -2413,6 +2485,7 @@ def get_free_account_for_reply(
             raise
 
         batch_offset += batch_size
+        has_more_candidates = batch_offset < len(ordered_candidate_ids)
         positions = {account_id: index for index, account_id in enumerate(batch_ids)}
         accounts.sort(key=lambda account: positions[account.id])
         if not accounts and batch_offset < len(ordered_candidate_ids):
@@ -2504,7 +2577,7 @@ def get_free_account_for_reply(
 
         if (
             not available_accounts
-            and len(accounts) < batch_size
+            and not has_more_candidates
             and runtime_last_resort_accounts
         ):
             logger.warning(
@@ -2516,7 +2589,7 @@ def get_free_account_for_reply(
             using_reserve_accounts = True
         elif (
             not available_accounts
-            and len(accounts) < batch_size
+            and not has_more_candidates
             and last_resort_accounts
             and _allow_publish_session_last_resort()
         ):
@@ -2527,14 +2600,14 @@ def get_free_account_for_reply(
             )
             available_accounts = last_resort_accounts
             using_reserve_accounts = True
-        elif not available_accounts and len(accounts) < batch_size and last_resort_accounts:
+        elif not available_accounts and not has_more_candidates and last_resort_accounts:
             logger.warning(
                 "[ACCOUNT_SERVICE] Skipping %s sid_guard-only reply session(s): "
                 "last-resort weak browser sessions are disabled by settings",
                 len(last_resort_accounts),
             )
 
-        if not available_accounts and len(accounts) >= batch_size:
+        if not available_accounts and has_more_candidates:
             continue
 
         if not available_accounts:
@@ -2647,12 +2720,14 @@ def get_free_account_for_reply(
                         (
                             in_reply_cooldown,
                             -classify_account_web_readiness(acc.cookies),
+                            int(_proxy_is_mobile(acc)) if prefer_residential else 0,
                             assignment_rank(acc),
                             RUNTIME_BUCKET_ORDER.get(state["bucket"], 5),
                             0 if acc.status == "active" else 1,
                             _lane_sort_rank(REPLY_SCOPE, spend_lane["lane"]),
                             _lifecycle_sort_rank(lifecycle["stage"]),
                             -score,
+                            _account_country_priority(acc),
                             int(acc.error_count_recent or 0),
                             index,
                         ),
@@ -2691,7 +2766,7 @@ def get_free_account_for_reply(
                 account_score = candidate_score
                 break
             if account is None:
-                if len(accounts) >= batch_size:
+                if has_more_candidates:
                     continue
                 return None
             account_proxy_obj = proxy_map.get(account.proxy) if account.proxy else None
@@ -2727,7 +2802,7 @@ def get_free_account_for_reply(
             )
             return account
 
-        if len(accounts) < batch_size:
+        if not has_more_candidates:
             return None
 
 
@@ -3511,6 +3586,7 @@ def get_monitor_account(
             (Account.status != "active").asc(),
             Account.error_count_recent.asc(),
             Account.last_validation_ok.desc().nulls_last(),
+            _account_country_order_sql(),
             Account.today_main_comments.asc(),
             Account.last_used_at.asc().nulls_first(),
             Account.id.asc(),
@@ -3521,6 +3597,7 @@ def get_monitor_account(
             (Account.status != "active").asc(),
             Account.error_count_recent.asc(),
             Account.last_validation_ok.desc().nulls_last(),
+            _account_country_order_sql(),
             Account.today_main_comments.asc(),
             Account.last_used_at.asc().nulls_first(),
             Account.id.asc(),
@@ -3601,6 +3678,7 @@ def get_monitor_account(
                     _lane_sort_rank(MONITOR_SCOPE, spend_lane["lane"]),
                     _lifecycle_sort_rank(lifecycle["stage"]),
                     -score,
+                    _account_country_priority(candidate),
                     int(candidate.error_count_recent or 0),
                     -last_ok_ts,
                     int(candidate.today_main_comments or 0),

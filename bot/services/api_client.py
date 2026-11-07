@@ -703,7 +703,13 @@ class APIClient:
         text_variants_input = text_variants
         if kind in {"engagement_only", "keyword_replies"} and not text_variants_input:
             text_variants_input = [normalized_main_comment] * 3
-        normalized_text_variants = self._normalize_text_variants(normalized_main_comment, text_variants_input)
+        if (settings or {}).get("publication_plan"):
+            normalized_text_variants = [text for raw in (text_variants_input or [normalized_main_comment])
+                                        if (text := self._meaningful_user_text(raw))][:50]
+            if not normalized_text_variants:
+                raise APIRequestError("Добавьте хотя бы один текст комментария.")
+        else:
+            normalized_text_variants = self._normalize_text_variants(normalized_main_comment, text_variants_input)
         normalized_settings = dict(settings or {})
 
         settings_replies = normalized_settings.get("replies")
@@ -866,6 +872,21 @@ class APIClient:
         url = "/api/tasks?" + urlencode(params) if params else "/api/tasks"
         return await self._request("GET", url)
 
+    async def get_publication_activity(self, task_id: int, user_id: int, *, include_texts=False) -> dict:
+        return await self._request("GET", f"/api/publications/tasks/{task_id}/activity?user_id={user_id}"
+                                   + ("&include_texts=true" if include_texts else ""))
+
+    async def get_publication_report(self, task_id: int, user_id: int, format: str = "txt") -> dict:
+        if format not in {"txt", "csv", "links"}:
+            raise ValueError("Unsupported publication report format")
+        return await self._request("GET", f"/api/publications/tasks/{task_id}/report?user_id={user_id}&format={format}")
+
+    async def recheck_publications(self, task_id: int, user_id: int) -> dict:
+        return await self._request("POST", f"/api/publications/tasks/{task_id}/recheck?user_id={user_id}", retry_safe=False)
+
+    async def get_publication_statistics(self, user_id: int, hours: int = 24) -> dict:
+        return await self._request("GET", f"/api/publications/statistics?user_id={user_id}&hours={hours}")
+
     async def get_task(self, task_id: int, user_id: int) -> dict:
         """ÐŸÐ¾Ð»ÑƒÑ‡Ð°ÐµÑ‚ Ð·Ð°Ð´Ð°Ñ‡Ñƒ Ð¿Ð¾ ID."""
         from urllib.parse import urlencode
@@ -916,6 +937,28 @@ class APIClient:
             json={"accounts": accounts},
             timeout=timeout
         )
+
+    async def import_accounts_job(self, accounts: list[dict], on_progress=None) -> dict:
+        job = await self._request("POST", "/api/accounts/import_jobs", json={"accounts": accounts}, retry_safe=False)
+        while job["status"] in {"pending", "running"}:
+            if on_progress is not None:
+                try:
+                    await on_progress(job)
+                except Exception:
+                    logger.debug("Import progress view unavailable", exc_info=True)
+            await asyncio.sleep(2)
+            job = await self._request("GET", f"/api/accounts/import_jobs/{job['job_id']}")
+        if job["status"] != "done":
+            raise APIRequestError(f"Импорт {job['job_id']} остановлен после {job['processed']}/{job['total']} записей. Повторный импорт файла безопасен.")
+        if on_progress is not None:
+            try:
+                await on_progress(job)
+            except Exception:
+                logger.debug("Import completion view unavailable", exc_info=True)
+        return job
+
+    async def get_account_import_job(self, job_id: str) -> dict:
+        return await self._request("GET", f"/api/accounts/import_jobs/{job_id}?include_results=true")
     
     async def get_proxy_stats(self) -> dict:
         """ÐŸÐ¾Ð»ÑƒÑ‡Ð°ÐµÑ‚ ÑÑ‚Ð°Ñ‚Ð¸ÑÑ‚Ð¸ÐºÑƒ Ð¿Ñ€Ð¾ÐºÑÐ¸."""
@@ -983,6 +1026,10 @@ class APIClient:
         }
         return await self._request("POST", "/api/proxies/validate", json=payload)
     
+
+    async def rotate_mobile_proxy(self, proxy_id: int) -> dict:
+        """Request a verified mobile IP change."""
+        return await self._request("POST", f"/api/proxies/{int(proxy_id)}/rotate", timeout=240, retry_safe=False)
 
     async def list_proxies(self, limit: int = 50, offset: int = 0) -> list:
         """Ð˜Ð¡ÐŸÐ ÐÐ’Ð›Ð•ÐÐž: ÐŸÐ¾Ð»ÑƒÑ‡Ð°ÐµÑ‚ ÑÐ¿Ð¸ÑÐ¾Ðº Ð¿Ñ€Ð¾ÐºÑÐ¸ Ñ ÑÐµÑ€Ð²ÐµÑ€Ð½Ð¾Ð¹ Ð¿Ð°Ð³Ð¸Ð½Ð°Ñ†Ð¸ÐµÐ¹. Ð£Ð±Ñ€Ð°Ð½Ð° Ñ„Ð¸Ð»ÑŒÑ‚Ñ€Ð°Ñ†Ð¸Ñ Ð¿Ð¾ ÑÑ‚Ð°Ñ‚ÑƒÑÑƒ."""
@@ -1217,7 +1264,7 @@ class APIClient:
                 normalized_main_comment = normalized_text_variants[0]
             if not normalized_main_comment:
                 raise APIRequestError("Основной комментарий шаблона не может быть пустым.")
-            if len(normalized_text_variants) < 3:
+            if len(normalized_text_variants) < (1 if normalized_settings.get("publication_plan") else 3):
                 raise APIRequestError("Для шаблона нужно минимум 3 варианта комментария.")
 
         normalized_settings["text_variants"] = normalized_text_variants
@@ -1589,6 +1636,12 @@ class APIClient:
     async def get_order_transport_settings(self) -> dict:
         """Fresh global order mode; never show a cached choice after a switch."""
         return await self._request("GET", "/api/settings/order_transport", timeout=5.0)
+
+    async def get_publication_runtime(self) -> dict:
+        return await self._request("GET", "/api/settings/publication_runtime", timeout=5.0)
+
+    async def update_publication_runtime(self, changes: dict) -> dict:
+        return await self._request("POST", "/api/settings/publication_runtime", json=changes, timeout=10.0)
 
     async def update_order_transport(self, mode: str) -> dict:
         return await self._request("POST", "/api/settings/order_transport",

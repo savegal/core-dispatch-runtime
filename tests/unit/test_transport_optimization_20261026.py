@@ -46,7 +46,7 @@ async def test_page_transport_never_builds_discarded_headers(monkeypatch):
 
 @pytest.mark.asyncio
 async def test_request_context_transport_keeps_full_headers(monkeypatch):
-    profile = RequestProfile.publish_main_profile()
+    profile = RequestProfile.comment_list_profile()  # Context-only transport remains available for reads.
     monkeypatch.setattr(profile, "build_browser_headers", Mock(side_effect=AssertionError("Context transport needs full headers")))
     context = _CaptureRequestContext(_DummyResponse(200, '{"status_code":0,"comment":{"cid":"7641761192486195000"}}'))
     client = PlaywrightHttpClient(context, retry_policy=RetryPolicy(max_retries=0))

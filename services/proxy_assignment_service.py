@@ -2,19 +2,17 @@
 Сервис для автоматического распределения прокси по аккаунтам с учётом географии.
 """
 import logging
-import time
 from collections import defaultdict
+from datetime import datetime, timezone
 from sqlalchemy.orm import Session
-from sqlalchemy import and_, or_, func
+from sqlalchemy import or_, func
 from db.models import Account, Proxy
 from typing import Any, Dict, Optional
 from config.settings import get_settings
 from services.proxy_filter_utils import apply_proxy_type_filter
 from services.proxy_health_service import get_bad_proxy_set
-from services.log_sanitizer import sanitize_url
 from services.account_service import (
     ACCOUNT_LANE_RETIRE,
-    ERROR_THRESHOLD,
     MONITOR_SCOPE,
     SESSION_BUCKET_DEAD,
     _calculate_scope_quality_score,
@@ -28,20 +26,9 @@ from services.account_service import (
 settings = get_settings()
 logger = logging.getLogger("services.proxy_assignment")
 
-# КЭШ для активных прокси (TTL 60 секунд)
-# ИСПРАВЛЕНО: Добавлена функция инвалидации кэша
-_active_proxies_cache: Dict[str, tuple[list, float]] = {}
-PROXY_CACHE_TTL = 60.0  # секунды
-
-
 def invalidate_proxy_cache():
-    """
-    ИСПРАВЛЕНО: Инвалидирует кэш активных прокси.
-    Вызывается при изменении статуса прокси или при добавлении/удалении прокси.
-    """
-    global _active_proxies_cache
-    _active_proxies_cache.clear()
-    logger.debug("Proxy cache invalidated")
+    """Compatibility hook. Assignments read current database rows under a lock."""
+    return None
 
 
 def _is_mobile_proxy(proxy_obj: Proxy) -> bool:
@@ -56,14 +43,6 @@ def _normalize_proxy_type_filter(value: Optional[str]) -> Optional[str]:
         logger.warning("Invalid proxy_type_filter=%s; ignoring", value)
         return None
     return normalized
-
-
-def _safe_positive_int(value: Any, default: int, minimum: int = 1) -> int:
-    try:
-        parsed = int(value)
-    except (TypeError, ValueError):
-        parsed = default
-    return max(minimum, parsed)
 
 
 def _get_active_proxies(
@@ -83,46 +62,6 @@ def _get_active_proxies(
     else:
         query = apply_proxy_type_filter(query, db)
     return query.order_by(Proxy.created_at.asc(), Proxy.id.asc()).all(), normalized_force_filter
-
-
-def _proxy_weight(proxy_obj: Proxy, mobile_weight: int) -> int:
-    return mobile_weight if _is_mobile_proxy(proxy_obj) else 1
-
-
-def _calculate_proxy_targets(
-    proxies: list[Proxy],
-    total_accounts: int,
-    *,
-    mobile_weight: int,
-) -> dict[str, int]:
-    if total_accounts <= 0 or not proxies:
-        return {}
-
-    weights = {proxy.proxy: _proxy_weight(proxy, mobile_weight) for proxy in proxies}
-    total_weight = max(1, sum(weights.values()))
-    exact_targets: list[tuple[Proxy, float, int, float]] = []
-    targets: dict[str, int] = {}
-
-    for proxy in proxies:
-        exact = total_accounts * weights[proxy.proxy] / total_weight
-        base = int(exact)
-        targets[proxy.proxy] = base
-        exact_targets.append((proxy, exact, base, exact - base))
-
-    remaining = total_accounts - sum(targets.values())
-    if remaining > 0:
-        # Largest-remainder allocation keeps the total exact and deterministic.
-        for proxy, _exact, _base, _fraction in sorted(
-            exact_targets,
-            key=lambda item: (-item[3], -_proxy_weight(item[0], mobile_weight), item[0].id),
-        )[:remaining]:
-            targets[proxy.proxy] += 1
-
-    return targets
-
-
-def _target_summary_by_proxy_id(proxies: list[Proxy], counts_by_proxy: dict[str, int]) -> dict[int, int]:
-    return {int(proxy.id): int(counts_by_proxy.get(proxy.proxy, 0)) for proxy in proxies}
 
 
 def _rebalance_account_fit_score(account: Account, proxy_obj: Proxy, *, use_geo_matching: bool) -> tuple[int, int]:
@@ -165,491 +104,298 @@ def _is_rebalance_eligible_account(
     return True, state["bucket"], score
 
 
-def rebalance_working_account_proxies(
-    db: Session,
-    *,
-    mobile_weight: int | None = None,
-    force_proxy_type_filter: Optional[str] = None,
-    use_geo_matching: bool | None = None,
-    dry_run: bool = False,
-) -> Dict[str, Any]:
-    """Weighted rebalance for accounts that are currently usable by the monitor.
+def _lock_assignment_pool(db: Session) -> list[Proxy]:
+    """Serialize assignments before inspecting owners, including SQLite writers."""
+    from sqlalchemy import update
 
-    Mobile proxies intentionally get a larger target share. With the default
-    weight of 5, one mobile proxy plus five residential proxies produces a
-    roughly 50/10/10/10/10/10 split across the working account pool.
-    """
-    from datetime import datetime, timezone
+    with db.no_autoflush:
+        dialect = db.get_bind().dialect.name
+        if dialect == "sqlite":
+            db.execute(update(Proxy).values(updated_at=Proxy.updated_at),
+                       execution_options={"synchronize_session": False})
+        elif dialect == "postgresql":
+            # The pool may be empty when the first proxies are imported.
+            db.query(func.pg_advisory_xact_lock(0x54454C45)).scalar()
+        db.query(Proxy).order_by(Proxy.id).with_for_update().all()
+    db.flush()
+    return db.query(Proxy).order_by(Proxy.id).with_for_update().populate_existing().all()
 
-    if use_geo_matching is None:
-        use_geo_matching = settings.PROXY_GEO_MATCHING
 
-    effective_mobile_weight = _safe_positive_int(
-        mobile_weight if mobile_weight is not None else getattr(settings, "PROXY_REBALANCE_MOBILE_WEIGHT", 5),
-        default=5,
-    )
+def _resolved_proxy(raw, account, *, country=None):
+    from services.proxy_normalizer import ProxyRoute, resolve_account_sticky_proxy
+    return ProxyRoute.parse(resolve_account_sticky_proxy(raw, account, default_country=country)).url
 
-    active_proxies, normalized_force_filter = _get_active_proxies(
-        db,
-        force_proxy_type_filter=force_proxy_type_filter,
-    )
-    if not active_proxies:
-        logger.warning("[PROXY_REBALANCE] No active proxies available")
-        return {
-            "active_proxies": 0,
-            "eligible_accounts": 0,
-            "changed": 0,
-            "dry_run": bool(dry_run),
-            "mobile_weight": effective_mobile_weight,
-            "force_proxy_type_filter": normalized_force_filter,
-        }
 
-    temporarily_bad = get_bad_proxy_set(proxy.proxy for proxy in active_proxies)
-    rebalance_excluded_bad = {
-        proxy.proxy
-        for proxy in active_proxies
-        if proxy.proxy in temporarily_bad and proxy.is_mobile != "Y"
-    }
-    mobile_bad_kept = len(temporarily_bad) - len(rebalance_excluded_bad)
-    usable_proxies = [proxy for proxy in active_proxies if proxy.proxy not in rebalance_excluded_bad]
-    fail_open_bad_proxies = False
-    if temporarily_bad and not usable_proxies:
-        usable_proxies = active_proxies
-        fail_open_bad_proxies = True
-        logger.warning(
-            "[PROXY_REBALANCE] All active proxies are temporarily marked bad; fail-open keeps them in rotation"
-        )
-    elif mobile_bad_kept:
-        logger.info(
-            "[PROXY_REBALANCE] Keeping %s temporarily-bad mobile proxies in target calculation to avoid mass reassignment",
-            mobile_bad_kept,
-        )
+def _reusable_proxy(proxy: Proxy) -> bool:
+    from services.proxy_normalizer import is_sticky_residential_template
+    if _is_mobile_proxy(proxy):
+        return bool(str(proxy.rotation_url or "").strip())
+    return is_sticky_residential_template(proxy.proxy)
 
-    now = datetime.now(timezone.utc)
-    auth_material = or_(
-        and_(Account.cookies.isnot(None), Account.cookies != ""),
-        and_(Account.cookie_file.isnot(None), Account.cookie_file != ""),
-    )
-    candidate_accounts = (
-        db.query(Account)
-        .filter(
-            Account.status.in_(["active", "error"]),
-            Account.error_count_recent < ERROR_THRESHOLD,
-            auth_material,
-        )
-        .order_by(Account.id.asc())
-        .all()
-    )
 
-    skipped: dict[str, int] = defaultdict(int)
-    eligible_items: list[dict[str, Any]] = []
-    for account in candidate_accounts:
-        eligible, reason, score = _is_rebalance_eligible_account(account, now=now)
-        if not eligible:
-            skipped[reason] += 1
+def _has_active_assignment(account: Account) -> bool:
+    expires = account.assignment_lease_until
+    if expires is None:
+        return False
+    return expires.replace(tzinfo=expires.tzinfo or timezone.utc) > datetime.now(timezone.utc)
+
+
+def bind_account_proxy(db: Session, account: Account, raw: str | None, *, proxy: Proxy | None = None) -> str | None:
+    """Explicit assignment. A fixed residential route can have only one owner."""
+    from services.proxy_normalizer import ProxyRouteError, find_account_proxy_record
+
+    _lock_assignment_pool(db)
+    db.refresh(account, attribute_names=["proxy", "assignment_lease_until"], with_for_update=True)
+    if _has_active_assignment(account):
+        raise ProxyRouteError("account_route_in_use")
+    if not raw or not raw.strip():
+        account.proxy = None
+        return None
+    if proxy is None:
+        proxy = db.query(Proxy).filter(Proxy.proxy == raw).first()
+    if proxy is None:
+        from services.proxy_normalizer import normalize_proxy_string, is_sticky_residential_template
+        resolved_candidate = _resolved_proxy(raw, account)
+        proxy = next((candidate for candidate in db.query(Proxy)
+                      if not is_sticky_residential_template(candidate.proxy)
+                      and normalize_proxy_string(candidate.proxy) == resolved_candidate), None)
+        if proxy is None:
+            proxy = Proxy(proxy=raw if is_sticky_residential_template(raw) else resolved_candidate,
+                          is_mobile="N", status="active")
+            db.add(proxy)
+            db.flush()
+    if proxy is not None and proxy.dedicated_user_id is not None:
+        raise ProxyRouteError("dedicated_proxy_cannot_be_assigned")
+    if proxy is not None and _is_mobile_proxy(proxy) and not proxy.rotation_url:
+        raise ProxyRouteError("mobile_rotation_url_missing")
+    resolved = _resolved_proxy(raw, account, country=proxy.country_code if proxy else None)
+    mobile = proxy is not None and _is_mobile_proxy(proxy)
+    if not mobile:
+        owners = db.query(Account).filter(Account.id != account.id, Account.proxy.isnot(None), Account.proxy != "")
+        for other in owners.populate_existing():
+            try:
+                other_source = find_account_proxy_record(db, other)
+                if other_source is not None and _is_mobile_proxy(other_source):
+                    continue
+                if _resolved_proxy(other.proxy, other) == resolved:
+                    raise ProxyRouteError("residential_route_already_assigned")
+            except ProxyRouteError as exc:
+                if exc.reason == "residential_route_already_assigned":
+                    raise
+    account.proxy = resolved
+    return resolved
+
+
+def _free_proxy_source_count(proxies, accounts, owners) -> int:
+    from services.proxy_normalizer import ProxyRouteError
+
+    free = 0
+    for proxy in proxies:
+        if _is_mobile_proxy(proxy) and not proxy.rotation_url:
             continue
-        eligible_items.append({"account": account, "score": int(score)})
-
-    from services.proxy_normalizer import (
-        account_sticky_proxy_matches_template,
-        resolve_account_sticky_proxy,
-    )
-    # Query ALL source rows, not just the active / currently filtered pool.
-    # An already-expanded sticky account must not be moved merely because its
-    # gateway is temporarily unhealthy, disabled, or excluded by a type filter.
-    # Only a deleted source row or a persisted 'bad' status releases the pin.
-    source_templates = db.query(Proxy).filter(or_(
-        Proxy.proxy.contains("{"),
-        func.lower(Proxy.proxy).contains("session-auto"),
-        func.lower(Proxy.proxy).contains("sessid-auto"),
-        func.lower(Proxy.proxy).contains("sid-auto"),
-    )).order_by(Proxy.id.asc()).all()
-    usable_proxy_map = {proxy.proxy: proxy for proxy in usable_proxies}
-    assigned_by_proxy: dict[str, list[dict[str, Any]]] = {proxy.proxy: [] for proxy in usable_proxies}
-    current_by_proxy: dict[str, list[dict[str, Any]]] = defaultdict(list)
-    movable_items: list[dict[str, Any]] = []
-    pinned_sticky = 0
-    pinned_outside_pool = 0
-
-    for item in eligible_items:
-        account = item["account"]
-        current_proxy = (account.proxy or "").strip()
-        source = next((
-            proxy for proxy in source_templates
-            if proxy.proxy != current_proxy
-            and account_sticky_proxy_matches_template(proxy.proxy, account, current_proxy)
-        ), None)
-        if source is not None and str(source.status or "").strip().lower() != "bad":
-            # Preserve the already-expanded URL byte-for-byte, including its
-            # original country segment, through the final assignment loop.
-            item["sticky_pinned"] = True
-            pinned_sticky += 1
-            if source.proxy in usable_proxy_map:
-                assigned_by_proxy[source.proxy].append(item)
-            else:
-                pinned_outside_pool += 1
-            continue
-
-        matching = usable_proxy_map.get(current_proxy)
-        if matching is None:
-            matching = next((proxy for proxy in usable_proxies
-                if resolve_account_sticky_proxy(proxy.proxy, account, default_country=proxy.country_code) == current_proxy), None)
-        if matching is not None:
-            current_by_proxy[matching.proxy].append(item)
-        else:
-            movable_items.append(item)
-
-    # Accounts pinned to an out-of-pool source remain unchanged and consume no
-    # quota on the currently usable pool.
-    targets = _calculate_proxy_targets(
-        usable_proxies,
-        len(eligible_items) - pinned_outside_pool,
-        mobile_weight=effective_mobile_weight,
-    )
-    for proxy in usable_proxies:
-        current_items = current_by_proxy.get(proxy.proxy, [])
-        current_items.sort(key=lambda item: (-int(item["score"]), int(item["account"].id)))
-        remaining = max(0, targets.get(proxy.proxy, 0) - len(assigned_by_proxy[proxy.proxy]))
-        assigned_by_proxy[proxy.proxy].extend(current_items[:remaining])
-        movable_items.extend(current_items[remaining:])
-
-    needed_by_proxy = {
-        proxy.proxy: max(0, targets.get(proxy.proxy, 0) - len(assigned_by_proxy[proxy.proxy]))
-        for proxy in usable_proxies
-    }
-    slot_proxies: list[Proxy] = []
-    while any(needed_by_proxy.values()):
-        for proxy in usable_proxies:
-            if needed_by_proxy.get(proxy.proxy, 0) > 0:
-                slot_proxies.append(proxy)
-                needed_by_proxy[proxy.proxy] -= 1
-
-    # Fixed sticky pins can exceed their weighted quota. In that case the
-    # remaining movable accounts still need slots rather than silently dropping.
-    extra_slots = len(movable_items) - len(slot_proxies)
-    if extra_slots > 0 and usable_proxies:
-        for idx in range(extra_slots):
-            slot_proxies.append(usable_proxies[idx % len(usable_proxies)])
-
-    movable_items.sort(key=lambda item: (-int(item["score"]), int(item["account"].id)))
-    for item in movable_items:
-        if not slot_proxies:
-            break
-        account = item["account"]
-        best_index = max(
-            range(len(slot_proxies)),
-            key=lambda idx: _rebalance_account_fit_score(
-                account,
-                slot_proxies[idx],
-                use_geo_matching=bool(use_geo_matching),
-            ),
-        )
-        selected_proxy = slot_proxies.pop(best_index)
-        assigned_by_proxy[selected_proxy.proxy].append(item)
-
-    changed = 0
-    geo_filled = 0
-    actual_counts: dict[str, int] = {}
-    for proxy in usable_proxies:
-        items = assigned_by_proxy.get(proxy.proxy, [])
-        actual_counts[proxy.proxy] = len(items)
-        for item in items:
-            if item.get("sticky_pinned"):
-                continue
-            account = item["account"]
-            resolved_proxy = resolve_account_sticky_proxy(
-                proxy.proxy, account, default_country=proxy.country_code
-            )
-            if (account.proxy or "").strip() != resolved_proxy:
-                changed += 1
-                if not dry_run:
-                    account.proxy = resolved_proxy
-                    # Proxy geography is not evidence of the account's country.
-
-    if not dry_run:
         try:
-            db.commit()
-        except Exception as e:
-            db.rollback()
-            logger.error("[PROXY_REBALANCE] Commit failed: %s", e, exc_info=True)
-            raise
+            if _reusable_proxy(proxy):
+                _resolved_proxy(proxy.proxy, accounts[0] if accounts else None, country=proxy.country_code)
+                free += 1
+                continue
+            if "{" in proxy.proxy:
+                occupied = any(account.id in owners.get(
+                    _resolved_proxy(proxy.proxy, account, country=proxy.country_code), ()
+                ) for account in accounts)
+            else:
+                occupied = bool(owners.get(_resolved_proxy(proxy.proxy, None)))
+        except ProxyRouteError:
+            continue
+        free += not occupied
+    return free
 
-    mobile_count = sum(1 for proxy in usable_proxies if _is_mobile_proxy(proxy))
-    residential_count = len(usable_proxies) - mobile_count
-    result = {
-        "active_proxies": len(usable_proxies),
-        "ignored_temporarily_bad_proxies": 0 if fail_open_bad_proxies else len(rebalance_excluded_bad),
-        "kept_temporarily_bad_mobile_proxies": 0 if fail_open_bad_proxies else mobile_bad_kept,
-        "fail_open_bad_proxies": fail_open_bad_proxies,
-        "mobile_proxies": mobile_count,
-        "residential_proxies": residential_count,
-        "eligible_accounts": len(eligible_items),
-        "candidate_accounts": len(candidate_accounts),
-        "changed": changed,
-        "unchanged": max(0, len(eligible_items) - changed),
-        "geo_filled": geo_filled,
-        "pinned_sticky_accounts": pinned_sticky,
-        "pinned_outside_active_pool": pinned_outside_pool,
-        "dry_run": bool(dry_run),
-        "mobile_weight": effective_mobile_weight,
-        "force_proxy_type_filter": normalized_force_filter,
-        "targets_by_proxy_id": _target_summary_by_proxy_id(usable_proxies, targets),
-        "actual_by_proxy_id": _target_summary_by_proxy_id(usable_proxies, actual_counts),
-        "skipped": dict(sorted(skipped.items())),
-    }
 
-    logger.info(
-        "[PROXY_REBALANCE] working=%s changed=%s proxies=%s mobile=%s residential=%s targets=%s actual=%s",
-        result["eligible_accounts"],
-        result["changed"],
-        result["active_proxies"],
-        result["mobile_proxies"],
-        result["residential_proxies"],
-        result["targets_by_proxy_id"],
-        result["actual_by_proxy_id"],
+def _assign_stable_routes(db, accounts, proxies, *, use_geo_matching, replace_existing=False, repair_existing=False):
+    from services.proxy_normalizer import ProxyRouteError
+
+    all_accounts = db.query(Account).order_by(Account.id).with_for_update().populate_existing().all()
+    owners = defaultdict(set)
+    for account in all_accounts:
+        if account.proxy:
+            try:
+                owners[_resolved_proxy(account.proxy, account)].add(account.id)
+            except ProxyRouteError:
+                pass
+    free_before = _free_proxy_source_count(proxies, all_accounts, owners)
+    changed = geo_matched = geo_fallback = skipped_busy = 0
+    for account in accounts:
+        if _has_active_assignment(account):
+            skipped_busy += 1
+            continue
+        previous = account.proxy
+        if previous and not replace_existing:
+            if not repair_existing:
+                continue
+            from services.proxy_normalizer import find_account_proxy_record
+            source = find_account_proxy_record(db, account)
+            try:
+                current_route = _resolved_proxy(previous, account)
+            except ProxyRouteError:
+                current_route = None
+            if source is not None and _is_mobile_proxy(source):
+                continue
+            if current_route and min(owners[current_route] or {account.id}) == account.id:
+                continue
+        selected = False
+        ranked = sorted(proxies, key=lambda proxy: (
+            _is_mobile_proxy(proxy),
+            -_rebalance_account_fit_score(account, proxy, use_geo_matching=use_geo_matching)[0],
+            proxy.id,
+        ))
+        for proxy in ranked:
+            if _is_mobile_proxy(proxy) and not proxy.rotation_url:
+                continue
+            if use_geo_matching and account.country_code and not settings.PROXY_GEO_FALLBACK:
+                from services.proxy_normalizer import _COUNTRY_PLACEHOLDER_RE
+                dynamic_country = bool(_COUNTRY_PLACEHOLDER_RE.search(proxy.proxy))
+                if not dynamic_country and account.country_code.upper() != (proxy.country_code or "").upper():
+                    continue
+            try:
+                resolved = _resolved_proxy(proxy.proxy, account, country=proxy.country_code)
+            except ProxyRouteError:
+                continue
+            if not _is_mobile_proxy(proxy) and owners[resolved] - {account.id}:
+                continue
+            if previous:
+                try:
+                    owners[_resolved_proxy(previous, account)].discard(account.id)
+                except ProxyRouteError:
+                    pass
+            owners[resolved].add(account.id)
+            account.proxy = resolved
+            changed += previous != resolved
+            matched = bool(account.country_code and account.country_code == proxy.country_code)
+            geo_matched += bool(use_geo_matching and matched)
+            geo_fallback += bool(use_geo_matching and account.country_code and not matched)
+            selected = True
+            break
+        if repair_existing and previous and not selected:
+            try:
+                owners[_resolved_proxy(previous, account)].discard(account.id)
+            except ProxyRouteError:
+                pass
+            account.proxy = None
+            changed += 1
+    return changed, geo_matched, geo_fallback, skipped_busy, free_before, _free_proxy_source_count(proxies, all_accounts, owners)
+
+
+def rebalance_working_account_proxies(
+    db: Session, *, mobile_weight: int | None = None, force_proxy_type_filter: Optional[str] = None,
+    use_geo_matching: bool | None = None, dry_run: bool = False,
+) -> Dict[str, Any]:
+    """Fill missing routes while preserving every existing account binding."""
+    from datetime import datetime, timezone
+    from services.proxy_normalizer import find_account_proxy_record
+
+    _lock_assignment_pool(db)
+    proxies, normalized = _get_active_proxies(db, force_proxy_type_filter=force_proxy_type_filter)
+    bad = get_bad_proxy_set(proxy.proxy for proxy in proxies)
+    usable = [proxy for proxy in proxies if proxy.proxy not in bad or _is_mobile_proxy(proxy)]
+    now = datetime.now(timezone.utc)
+    accounts, skipped = [], defaultdict(int)
+    for account in db.query(Account).filter(Account.status.in_(("active", "error"))).order_by(Account.id):
+        eligible, reason, _ = _is_rebalance_eligible_account(account, now=now)
+        if eligible:
+            accounts.append(account)
+        else:
+            skipped[reason] += 1
+
+    pinned = sum(bool(account.proxy) for account in accounts)
+    missing = [account for account in accounts if not account.proxy]
+    # A savepoint lets dry-run use the same allocation algorithm without changing bindings.
+    nested = db.begin_nested() if dry_run else None
+    changed, _, _, busy, _, _ = _assign_stable_routes(
+        db, accounts, usable,
+        use_geo_matching=settings.PROXY_GEO_MATCHING if use_geo_matching is None else use_geo_matching,
+        repair_existing=True,
     )
-    return result
-
+    counts = {proxy.id: 0 for proxy in proxies}
+    for account in accounts:
+        source = find_account_proxy_record(db, account)
+        if source and source.id in counts:
+            counts[source.id] += 1
+    distinct_routes = set()
+    for account in accounts:
+        if account.proxy:
+            try:
+                distinct_routes.add(_resolved_proxy(account.proxy, account))
+            except Exception:
+                pass
+    unassigned = sum(not account.proxy for account in accounts)
+    if nested:
+        nested.rollback()
+    else:
+        db.commit()
+    mobile_count = sum(_is_mobile_proxy(proxy) and bool(proxy.rotation_url) for proxy in usable)
+    residential_count = len(usable) - sum(_is_mobile_proxy(proxy) for proxy in usable)
+    return {
+        "eligible_accounts": len(accounts), "changed": changed, "active_proxies": len(usable),
+        "mobile_proxies": mobile_count, "residential_proxies": residential_count,
+        "targets_by_proxy_id": counts, "actual_by_proxy_id": counts,
+        "pinned_sticky_accounts": pinned, "pinned_accounts": pinned,
+        "distinct_account_routes": len(distinct_routes), "unassigned_accounts": unassigned,
+        "skipped_busy_accounts": busy, "skipped": dict(skipped), "geo_filled": 0,
+        "ignored_temporarily_bad_proxies": sum(proxy.proxy in bad and not _is_mobile_proxy(proxy) for proxy in proxies),
+        "kept_temporarily_bad_mobile_proxies": sum(proxy.proxy in bad and _is_mobile_proxy(proxy) for proxy in proxies),
+        "mobile_weight": 1, "force_proxy_type_filter": normalized, "dry_run": dry_run,
+    }
 
 
 def assign_proxies_to_accounts(
-    db: Session,
-    *,
-    only_accounts_without_proxy: bool = True,
-    reuse_existing: bool = False,
-    use_geo_matching: bool | None = None,
-    allow_reuse_within_batch: bool = False,
-    force_proxy_type_filter: Optional[str] = None,
-    test_shared_residential: bool = False,
-) -> Dict[str, int | bool | str | None]:
-    """Распределяет прокси из пула активных прокси по аккаунтам.
-
-    Обычный режим:
-    - residential proxy стараемся держать 1 proxy = 1 account;
-    - mobile proxy с rotation_url можно переиспользовать.
-
-    Тестовый режим (`test_shared_residential=True`):
-    - residential proxy можно временно назначать нескольким аккаунтам;
-    - режим нужен только для диагностики пула, не для продакшена.
-    """
-    if use_geo_matching is None:
-        use_geo_matching = settings.PROXY_GEO_MATCHING
-
-    normalized_force_filter = (force_proxy_type_filter or "").strip().lower() or None
-    if normalized_force_filter in {"none", "all", "any"}:
-        normalized_force_filter = None
-    if normalized_force_filter not in {None, "mobile", "residential"}:
-        logger.warning("Invalid force_proxy_type_filter=%s; ignoring", force_proxy_type_filter)
-        normalized_force_filter = None
-
-    if test_shared_residential:
-        reuse_existing = True
-        allow_reuse_within_batch = True
-        normalized_force_filter = normalized_force_filter or "residential"
-        logger.warning(
-            "[PROXY_ASSIGN_TEST] test_shared_residential enabled: residential proxies can be reused by multiple accounts."
-        )
-
-    cache_key = f"active_proxies:force={normalized_force_filter or 'settings'}:test={int(test_shared_residential)}"
-    current_time = time.time()
-
-    active_proxies = None
-    cached = _active_proxies_cache.get(cache_key)
-    if cached:
-        cached_proxies, cache_time = cached
-        if current_time - cache_time < PROXY_CACHE_TTL:
-            active_proxies = cached_proxies
-        else:
-            _active_proxies_cache.pop(cache_key, None)
-
-    if active_proxies is None:
-        query = db.query(Proxy).filter(
-            Proxy.status.in_(["active", "slow", "unknown"]),
-            Proxy.dedicated_user_id.is_(None),
-        )
-        if normalized_force_filter == "mobile":
-            query = query.filter(func.upper(func.trim(Proxy.is_mobile)) == "Y")
-        elif normalized_force_filter == "residential":
-            query = query.filter(or_(Proxy.is_mobile.is_(None), func.upper(func.trim(Proxy.is_mobile)) != "Y"))
-        else:
-            query = apply_proxy_type_filter(query, db)
-        active_proxies = query.order_by(Proxy.created_at.asc()).all()
-        _active_proxies_cache[cache_key] = (active_proxies, current_time)
-
-    if not active_proxies:
-        logger.warning("No active proxies available for assignment")
-        return {
-            "total_accounts_without_proxy": 0,
-            "assigned": 0,
-            "not_enough_proxies": True,
-            "free_proxies_before": 0,
-            "free_proxies_after": 0,
-            "geo_matched": 0,
-            "geo_fallback": 0,
-            "test_shared_residential": bool(test_shared_residential),
-            "allow_reuse_within_batch": bool(allow_reuse_within_batch),
-            "force_proxy_type_filter": normalized_force_filter,
-        }
-
-    used_proxy_strings = set()
-    if not reuse_existing:
-        proxy_results = db.query(Account.proxy).filter(
-            and_(Account.proxy.isnot(None), Account.proxy != "")
-        ).distinct().all()
-        used_proxy_strings = {p[0] for p in proxy_results if p[0]}
-
-    from services.proxy_normalizer import is_sticky_residential_template, resolve_account_sticky_proxy
-    from services.geo_detection_service import detect_account_country
-
-    def _is_mobile_proxy(proxy_obj: Proxy) -> bool:
-        return str(proxy_obj.is_mobile or "").strip().upper() == "Y" and bool(proxy_obj.rotation_url)
-
-    def _proxy_can_be_reused(proxy_obj: Proxy) -> bool:
-        if allow_reuse_within_batch:
-            return True
-        if test_shared_residential and str(proxy_obj.is_mobile or "").strip().upper() != "Y":
-            return True
-        if is_sticky_residential_template(proxy_obj.proxy):
-            return True
-        return _is_mobile_proxy(proxy_obj)
-
-    def _proxy_available(proxy_obj: Proxy) -> bool:
-        if _proxy_can_be_reused(proxy_obj):
-            return True
-        if reuse_existing:
-            return True
-        return proxy_obj.proxy not in used_proxy_strings
-
-    if not reuse_existing:
-        # A country-only provider template expands to an account URL, but has
-        # no per-account session. Its source Proxy row must still count as used
-        # when a prior batch already assigned that expanded address.
-        country_only_templates = [
-            proxy for proxy in active_proxies
-            if "{" in (proxy.proxy or "") and not _proxy_can_be_reused(proxy)
-        ]
-        if country_only_templates:
-            assigned_accounts = db.query(Account).filter(
-                Account.proxy.isnot(None), Account.proxy != ""
-            ).all()
-            for proxy in country_only_templates:
-                if any(
-                    resolve_account_sticky_proxy(proxy.proxy, account, default_country=proxy.country_code)
-                    == account.proxy
-                    for account in assigned_accounts
-                ):
-                    used_proxy_strings.add(proxy.proxy)
-
-    free_proxies = [p for p in active_proxies if _proxy_available(p)]
-    free_proxies_before = len(free_proxies)
-
+    db: Session, *, only_accounts_without_proxy: bool = True, reuse_existing: bool = False,
+    use_geo_matching: bool | None = None, allow_reuse_within_batch: bool = False,
+    force_proxy_type_filter: Optional[str] = None, test_shared_residential: bool = False,
+    account_ids: list[int] | None = None, commit: bool = True,
+) -> Dict[str, Any]:
+    """Assign unique residential routes first, then mobile routes with rotation."""
+    _lock_assignment_pool(db)
+    proxies, normalized = _get_active_proxies(db, force_proxy_type_filter=force_proxy_type_filter)
+    bad = get_bad_proxy_set(proxy.proxy for proxy in proxies)
+    proxies = [proxy for proxy in proxies if proxy.proxy not in bad]
     query = db.query(Account).filter(Account.status != "dead")
+    if account_ids is not None:
+        query = query.filter(Account.id.in_(account_ids))
     if only_accounts_without_proxy:
         query = query.filter(or_(Account.proxy.is_(None), Account.proxy == ""))
-    accounts_needing_proxy = query.order_by(Account.id.asc()).all()
-    total_accounts_without_proxy = len(accounts_needing_proxy)
-
-    proxies_by_country: Dict[Optional[str], list] = {}
-    proxies_without_country = []
-    if use_geo_matching:
-        for proxy in free_proxies:
-            country = proxy.country_code
-            if country:
-                proxies_by_country.setdefault(country, []).append(proxy)
-            else:
-                proxies_without_country.append(proxy)
-    else:
-        proxies_without_country = list(free_proxies)
-
-    assigned = 0
-    geo_matched = 0
-    geo_fallback = 0
-
-    for account in accounts_needing_proxy:
-        proxy = None
-        matched_by_geo = False
-        if not account.country_code:
-            detected_cc = detect_account_country(account)
-            if detected_cc:
-                account.country_code = detected_cc
-
-        if use_geo_matching and account.country_code:
-            for p in proxies_by_country.get(account.country_code, []):
-                if _proxy_available(p):
-                    proxy = p
-                    matched_by_geo = True
-                    break
-
-        if not proxy:
-            for p in proxies_without_country:
-                if _proxy_available(p):
-                    proxy = p
-                    break
-
-        if not proxy:
-            for p in free_proxies:
-                if _proxy_available(p):
-                    proxy = p
-                    break
-
-        if not proxy:
-            break
-
-        account.proxy = (
-            resolve_account_sticky_proxy(proxy.proxy, account, default_country=proxy.country_code)
-        )
-        # Assignment changes the route, not the account's trusted country.
-
-        if not _proxy_can_be_reused(proxy):
-            used_proxy_strings.add(proxy.proxy)
-        assigned += 1
-
-        if matched_by_geo:
-            geo_matched += 1
-        elif use_geo_matching and account.country_code:
-            geo_fallback += 1
-
-        logger.info(
-            "Assigned proxy %s to account %s (test_shared=%s, reusable=%s)",
-            sanitize_url(proxy.proxy, max_length=80),
-            account.id,
-            test_shared_residential,
-            _proxy_can_be_reused(proxy),
-        )
-
-    try:
-        db.commit()
-    except Exception as e:
-        db.rollback()
-        logger.error("Error committing proxy assignment: %s", e, exc_info=True)
-        raise
-
-    if allow_reuse_within_batch or test_shared_residential:
-        free_proxies_after = free_proxies_before
-    else:
-        free_proxies_after = max(0, free_proxies_before - assigned)
-    not_enough_proxies = assigned < total_accounts_without_proxy
-
-    logger.info(
-        "Proxy assignment completed: %s/%s accounts assigned, geo-matched=%s, geo-fallback=%s, free=%s->%s, test_shared=%s",
-        assigned,
-        total_accounts_without_proxy,
-        geo_matched,
-        geo_fallback,
-        free_proxies_before,
-        free_proxies_after,
-        test_shared_residential,
+    accounts = query.order_by(Account.id).all()
+    changed, matched, fallback, busy, free_before, free_after = _assign_stable_routes(
+        db, accounts, proxies, use_geo_matching=settings.PROXY_GEO_MATCHING if use_geo_matching is None else use_geo_matching,
+        replace_existing=not only_accounts_without_proxy,
+        repair_existing=not only_accounts_without_proxy,
     )
-
+    assigned = sum(bool(account.proxy) for account in accounts)
+    if commit:
+        db.commit()
+    else:
+        db.flush()
+    invalidate_proxy_cache()
     return {
-        "total_accounts_without_proxy": total_accounts_without_proxy,
-        "assigned": assigned,
-        "not_enough_proxies": not_enough_proxies,
-        "free_proxies_before": free_proxies_before,
-        "free_proxies_after": free_proxies_after,
-        "geo_matched": geo_matched,
-        "geo_fallback": geo_fallback,
-        "test_shared_residential": bool(test_shared_residential),
-        "allow_reuse_within_batch": bool(allow_reuse_within_batch),
-        "force_proxy_type_filter": normalized_force_filter,
+        "total_accounts_without_proxy": len(accounts), "assigned": changed,
+        "not_enough_proxies": assigned < len(accounts), "free_proxies_before": free_before,
+        "free_proxies_after": free_after, "geo_matched": matched,
+        "geo_fallback": fallback, "test_shared_residential": False, "allow_reuse_within_batch": False,
+        "force_proxy_type_filter": normalized, "skipped_busy_accounts": busy,
     }
+
+
+def clear_proxy_bindings(db: Session, proxy_ids: set[int] | None, *, skip_busy: bool = False) -> int:
+    from services.proxy_normalizer import ProxyRouteError, find_account_proxy_record
+    _lock_assignment_pool(db)
+    cleared = 0
+    accounts = db.query(Account).filter(Account.proxy.isnot(None), Account.proxy != "").with_for_update()
+    for account in accounts.populate_existing():
+        source = find_account_proxy_record(db, account) if proxy_ids is not None else None
+        if proxy_ids is None or source is not None and source.id in proxy_ids:
+            if _has_active_assignment(account):
+                if skip_busy:
+                    continue
+                raise ProxyRouteError("account_route_in_use")
+            account.proxy = None
+            cleared += 1
+    db.flush()
+    return cleared

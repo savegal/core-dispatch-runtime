@@ -154,7 +154,7 @@ def borrow_signature_bundle_from_cookies(cookies: Optional[Dict[str, str]]) -> S
     )
 
 
-async def wait_for_runtime_signer_ready(page: Optional[Page], timeout_ms: int = 1500) -> bool:
+async def wait_for_runtime_signer_ready(page: Optional[Page], timeout_ms: int = 1500, *, require_signed_dispatch: bool = False) -> bool:
     if page is None or not callable(getattr(page, "evaluate", None)):
         return False
     # Patchright evaluate defaults to an isolated world, which cannot see the
@@ -190,7 +190,8 @@ async def wait_for_runtime_signer_ready(page: Optional[Page], timeout_ms: int = 
                 page._http_signer_probe = None
             if document_generation(page) != generation:
                 continue
-            if isinstance(state, dict) and (state.get("sdk_present") is True or state.get("signed_dispatch_seen") is True):
+            if isinstance(state, dict) and (state.get("signed_dispatch_seen") is True
+                    or (not require_signed_dispatch and state.get("sdk_present") is True)):
                 return True
             if not wake_attempted and timeout_ms >= 200:
                 wake_attempted = True

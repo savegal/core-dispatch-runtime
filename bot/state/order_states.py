@@ -76,6 +76,7 @@ class OrderStates(StatesGroup):
     ADMIN_SUBTRACT_BALANCE = State()
     ADMIN_EDIT_PRICING = State()
     ADMIN_EDIT_BOOST_LIKES = State()
+    ADMIN_EDIT_PUBLICATION_RUNTIME = State()
     SEARCH_ACCOUNTS = State()
     ADMIN_REAUTH_ACCOUNT = State()
     ADMIN_USER_SEARCH = State()

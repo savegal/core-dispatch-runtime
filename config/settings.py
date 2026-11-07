@@ -26,6 +26,7 @@ class Settings(BaseSettings):
     MAX_ACTIONS_PER_ACCOUNT: int = 999999  # ИСПРАВЛЕНО: Убран лимит на комментирование (было 50)
     SOFT_DAILY_MAIN_ACTIONS_TARGET: int = 3  # Мягкий ориентир дневной нагрузки для скоринга ротации (main)
     SOFT_DAILY_REPLY_ACTIONS_TARGET: int = 6  # Мягкий ориентир дневной нагрузки для скоринга ротации (reply)
+    RESIDENTIAL_IP_CACHE_TTL_SECONDS: int = Field(default=600, ge=30, le=3600)
     RESIDENTIAL_DEFAULT_COUNTRY: str = "DE"  # Дефолтная страна для sticky-шаблонов резидентских прокси
     MAX_THREADS: int = 2  # КРИТИЧНО: Снижено до 2 для работы на ноутбуке
     MAX_CONCURRENT_BROWSERS: int = 4  # ОПТИМИЗИРОВАНО: 4 контекста внутри 1 процесса Chromium (BROWSER_POOL_SHARED_PROCESS=True)
@@ -34,6 +35,8 @@ class Settings(BaseSettings):
     STATIC_ASSET_CACHE_ENABLED: bool = True
     STATIC_ASSET_CACHE_MAX_MB: int = 128
     KEYWORD_REPLY_MAX_SCAN_PAGES: int = Field(default=10, ge=1, le=100)
+    # Operator's account-region preference, used only after health/session ranking.
+    PREFERRED_ACCOUNT_COUNTRIES: str = "FR,ES,GB,DE,IT,PL,NL,US"
     # NEW: Лимит задач на один прокси (1-2 для мобильных, 2-3 для серверных)
     # 1 - самый безопасный режим (стабильная ротация, макс. скорость)
     MAX_TASKS_PER_PROXY: int = 1
@@ -175,7 +178,7 @@ class Settings(BaseSettings):
     MONITOR_API_SUSPICIOUS_FALLBACK_ENABLED: bool = True
     MONITOR_API_SUSPICIOUS_MIN_VIDEOS: int = 3
     PROXY_AUTO_REBALANCE_INTERVAL_SECONDS: int = 600
-    PROXY_REBALANCE_MOBILE_WEIGHT: int = 5
+    PROXY_REBALANCE_MOBILE_WEIGHT: int = 1
     BLOGGER_CHECK_TIMEOUT_SECONDS: int = 180
     BLOGGER_FAILURE_ALERT_THRESHOLD: int = 3
     MONITOR_MOBILE_PROXY_BUSY_DEFER_MINUTES: int = 1

@@ -326,6 +326,8 @@ async def _rotate_proxy_ip(proxy: Proxy) -> Tuple[bool, Optional[str]]:
     Raises:
         ProxyRotationError: при критической ошибке ротации
     """
+    if str(getattr(proxy, "is_mobile", "") or "").strip().upper() != "Y":
+        raise ProxyRotationError(f"Proxy {proxy.id} is residential and cannot rotate")
     if not proxy.rotation_url:
         raise ProxyRotationError(f"Proxy {proxy.id} has no rotation_url")
     
@@ -412,7 +414,7 @@ async def _ensure_proxy_ip_rotated(
     current_ip_before = await get_current_ip(proxy.proxy)
 
     # Если IP не изменился с предыдущего использования - нужно ротировать
-    needs_rotation = (previous_ip is None) or (current_ip_before == previous_ip)
+    needs_rotation = force_rotation or (previous_ip is None) or (current_ip_before == previous_ip)
 
     if not needs_rotation and current_ip_before:
         logger.debug(f"Proxy {proxy.id} IP already changed ({current_ip_before}), no rotation needed")
@@ -596,7 +598,8 @@ async def prepare_mobile_proxy_for_account(
         return False, None
 
     if not proxy:
-        proxy = db.query(Proxy).filter(Proxy.proxy == account.proxy).first()
+        from services.proxy_normalizer import find_account_proxy_record
+        proxy = find_account_proxy_record(db, account)
         if not proxy:
             return False, None
 

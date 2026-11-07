@@ -17,7 +17,10 @@ async def _resume_order(callback, state, resume):
     if not isinstance(resume, str):
         await callback.answer("Откройте заказ заново", show_alert=True)
         return
-    if resume == "wizard:confirm":
+    if resume == "qo:create":
+        from bot.handlers.quantity_orders import create_order
+        handler = create_order
+    elif resume == "wizard:confirm":
         from bot.handlers.order_wizard import wizard_confirm_order
         handler = wizard_confirm_order
     elif resume == "wizard:confirm_with_template":

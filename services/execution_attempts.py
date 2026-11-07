@@ -29,6 +29,8 @@ def track_publication_requests(page, state, *, flag="publication_attempted", exp
     """Record actual POST dispatch even if the surrounding coroutine times out."""
     from urllib.parse import urlparse
     from executor.http.request_evidence import same_http_endpoint
+    from services.publication_journal import capture_dispatch_callback
+    dispatched = capture_dispatch_callback()
 
     def on_request(request):
         if str(getattr(request, "method", "")).upper() != "POST":
@@ -42,6 +44,7 @@ def track_publication_requests(page, state, *, flag="publication_attempted", exp
         if (publish or expected_url is not None) and (host == "tiktok.com" or host.endswith(".tiktok.com")):
             state[flag] = True
             if publish:
+                dispatched()
                 page._publication_attempted = True
 
     if not callable(getattr(page, "on", None)):

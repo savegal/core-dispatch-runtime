@@ -3734,7 +3734,8 @@ async def process_blogger(
                 )
 
                 if account.proxy:
-                    proxy_obj = db.query(Proxy).filter(Proxy.proxy == account.proxy).first()
+                    from services.proxy_normalizer import find_account_proxy_record
+                    proxy_obj = find_account_proxy_record(db, account)
                     if proxy_obj and proxy_obj.is_mobile == "Y" and proxy_obj.rotation_url:
                         try:
                             lock_acquired, proxy_obj = await prepare_mobile_proxy_for_account(account, db, proxy_obj)
@@ -4321,8 +4322,9 @@ def _refresh_proxy_capacity_profile(rebalance_result: dict[str, Any] | None) -> 
     residential = max(0, int(rebalance_result.get("residential_proxies", 0) or 0))
     total = max(0, int(rebalance_result.get("active_proxies", 0) or 0)) or (mobile + residential)
     # Each mobile proxy can comfortably handle 1 worker (locks serialize anyway).
-    # Each residential proxy has no per-proxy lock and can take 2 workers without contention.
-    proxy_concurrency_cap = max(1, mobile + residential * 2) if (mobile + residential) > 0 else 1
+    # Expanded account sessions are independent routes even on one gateway.
+    routes = max(0, int(rebalance_result.get("distinct_account_routes", 0) or 0))
+    proxy_concurrency_cap = max(1, routes or (mobile + residential))
     cooldown_seconds = _compute_recommended_rotation_cooldown_seconds(mobile)
     previous = dict(_proxy_capacity_profile)
     _proxy_capacity_profile = {

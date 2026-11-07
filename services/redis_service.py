@@ -148,6 +148,8 @@ def update_executor_heartbeat(status: str = "ok", **extra: Any) -> bool:
                 continue
             if isinstance(val, (str, int, float, bool)):
                 payload[key] = val
+            elif key == "active_tasks" and isinstance(val, list):
+                payload[key] = val[:32]
         redis_client.set(_EXECUTOR_HEARTBEAT_KEY, json.dumps(payload), ex=_EXECUTOR_HEARTBEAT_TTL)
         return True
     except Exception as e:
@@ -333,6 +335,17 @@ class RedisLock:
             # При ошибке Redis считаем, что блокировка не захвачена (безопасный режим)
             return False
     
+    def renew(self) -> bool:
+        if not self._acquired:
+            return False
+        script = """
+if redis.call('GET', KEYS[1]) == ARGV[1] then
+  return redis.call('EXPIRE', KEYS[1], ARGV[2])
+end
+return 0
+"""
+        return bool(get_redis_client().eval(script, 1, self.key, self._token, self.timeout))
+
     def release(self):
         """Освобождает блокировку."""
         if not self._acquired:

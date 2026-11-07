@@ -326,7 +326,7 @@ async def test_parallel_6x1_blocks_second_wave_when_rotation_fails(monkeypatch):
 
 @pytest.mark.unit
 @pytest.mark.asyncio
-async def test_parallel_6x1_skips_non_rotatable_proxy_accounts_in_wave_one(monkeypatch):
+async def test_parallel_6x1_accepts_residential_routes_with_mobile_rotation_for_mobile_routes(monkeypatch):
     """First wave must never run on a proxy that cannot rotate afterwards."""
     from db import database as db_database
     from executor import browser_pool, user_schema
@@ -373,7 +373,7 @@ async def test_parallel_6x1_skips_non_rotatable_proxy_accounts_in_wave_one(monke
     def fake_db_context():
         yield FakeDb()
 
-    # Account 101 sits on a non-rotatable residential proxy and must be skipped.
+    # Residential account 101 can publish while mobile routes rotate between waves.
     accounts = [SimpleNamespace(id=101, proxy=residential_proxy)] + [
         SimpleNamespace(id=102 + index, proxy=rotatable_proxy) for index in range(7)
     ]
@@ -453,9 +453,9 @@ async def test_parallel_6x1_skips_non_rotatable_proxy_accounts_in_wave_one(monke
     )
 
     assert result.error is None
-    assert 101 not in started_ids
+    assert 101 in started_ids
     assert len(result.published_mains) == 6
-    assert all(main.account_id != 101 for main in result.published_mains)
+    assert any(main.account_id == 101 for main in result.published_mains)
 
 
 @pytest.mark.unit

@@ -32,20 +32,17 @@ import asyncio
 import copy
 from types import SimpleNamespace
 from typing import Any, Callable
-from sqlalchemy import func
+from sqlalchemy import func, update
 from sqlalchemy.orm import Session
 from sqlalchemy.orm.attributes import flag_modified
 from db.database import get_sync_db
-from db.models import Task, Proxy, User, Transaction
-from services.balance_service import (
-    get_pricing,
-    refund_balance,
-    is_admin as balance_is_admin,
-    has_full_functionality_access,
-)
-from decimal import Decimal
+from db.models import Task, Proxy
+from services.balance_service import has_full_functionality_access
 from services.task_service import dequeue_task
-from services.task_service import get_text_stats, record_text_result, requeue_deferred_task, task_queue_priority_level
+from services.task_service import get_text_stats, requeue_deferred_task, task_queue_priority_level
+from services.task_execution_ledger import url_result_counts_as_success as _url_result_counts_as_success
+from services.task_settlement import REFUND_PENDING_KEY, lock_task_for_settlement, settle_task_refund
+from services.publication_progress import merge_url_result, publication_scope
 from services.app_settings_service import is_parsing_mode
 from services.metrics import increment_counter, record_timing
 from services.likes_config import BOOST_LIKES_DEFAULT, coerce_likes_quantity, pending_reply_likes
@@ -100,7 +97,6 @@ from config.sentry_config import init_sentry
 from datetime import datetime, timezone
 from services.redis_service import update_executor_heartbeat
 from executor.policy import ExecutionPolicy
-from decimal import Decimal
 from services.metrics import set_gauge
 
 # Настройка логирования (используем единую конфигурацию)
@@ -153,13 +149,9 @@ _GLOBAL_TASK_EXECUTION_LOCK_KEY = "executor:single_active_task"
 _local_task_execution_lock = threading.Lock()
 _executor_activity_lock = threading.Lock()
 _executor_activity_payload: dict[str, Any] = {"status": "ok"}
-_URL_SUCCESS_STATUSES = {"success", "submitted_unconfirmed"}
+_executor_running_orders: dict[int, dict] = {}
+_executor_order_slots: dict[int, Any] = {}
 _URL_UNCONFIRMED_STATUSES = {"submitted_unconfirmed"}
-_URL_INCOMPLETE_ERRORS = {
-    "main_publication_incomplete",
-    "reply_publication_incomplete",
-    "main_variant_partial",
-}
 _REPLY_VISIBILITY_EXHAUSTED_ERRORS = {
     "remaining_main_comments_not_visible_after_four_accounts",
     "remaining_main_comments_not_visible_after_ip_rotation",
@@ -178,30 +170,6 @@ def _completion_status_with_errors(successful_urls: int, url_results: dict) -> s
     return "partial" if successful_urls or any(has_confirmed_publications(row)
         or (isinstance(row, dict) and row.get("status") == "partial")
         for row in url_results.values()) else "error"
-
-
-def _url_result_counts_as_success(result: dict | None) -> bool:
-    """Accept only a fully submitted URL, even for legacy unconfirmed rows."""
-    if not isinstance(result, dict) or result.get("status") not in _URL_SUCCESS_STATUSES:
-        return False
-    visibility = result.get("main_visibility") or {}
-    if visibility.get("enabled") and visibility.get("status") != "confirmed":
-        return False
-    reply_visibility = result.get("reply_publication_visibility") or {}
-    if reply_visibility.get("enabled") and reply_visibility.get("status") not in {"confirmed", "not_requested"}:
-        return False
-    error = str(result.get("error") or "")
-    if error in _URL_INCOMPLETE_ERRORS or error.startswith("main_variant_partial"):
-        return False
-    if result.get("publication_complete") is False:
-        return False
-    engagement = result.get("engagement")
-    if isinstance(engagement, dict):
-        for section_name in ("main", "replies"):
-            section = engagement.get(section_name)
-            if isinstance(section, dict) and section.get("complete") is False:
-                return False
-    return True
 
 
 def _visibility_result_has_receipts(result) -> bool:
@@ -274,20 +242,29 @@ def _get_executor_activity_payload() -> dict[str, Any]:
         return dict(_executor_activity_payload)
 
 
-def _mark_executor_idle() -> None:
-    _set_executor_activity("ok")
-    update_executor_heartbeat("ok")
+def _publish_worker_activity(worker_id: int, task_id: int | None) -> None:
+    with _executor_activity_lock:
+        if task_id is None:
+            _executor_running_orders.pop(worker_id, None)
+        else:
+            _executor_running_orders[worker_id] = dict(active_task_id=task_id, worker_id=worker_id,
+                                                       busy_since=int(time.time()))
+        active = list(_executor_running_orders.values())
+        status = "busy" if active else "ok"
+        payload = dict(active[0]) if active else {}
+        payload["active_tasks"] = active
+        payload["active_order_count"] = len(active)
+        _executor_activity_payload.clear()
+        _executor_activity_payload.update(status=status, **payload)
+    update_executor_heartbeat(status, **payload)
+
+
+def _mark_executor_idle(worker_id: int) -> None:
+    _publish_worker_activity(worker_id, None)
 
 
 def _mark_executor_busy(task_id: int, worker_id: int) -> None:
-    busy_since = int(time.time())
-    payload = {
-        "active_task_id": int(task_id),
-        "worker_id": int(worker_id),
-        "busy_since": busy_since,
-    }
-    _set_executor_activity("busy", **payload)
-    update_executor_heartbeat("busy", **payload)
+    _publish_worker_activity(worker_id, task_id)
 
 
 def _get_full_url_lock(video_url: str) -> tuple[str, threading.Lock]:
@@ -538,6 +515,9 @@ def _acquire_global_task_execution_lock(worker_id: int):
 def _release_global_task_execution_lock(lock, worker_id: int) -> None:
     if lock is None:
         return
+    with _executor_activity_lock:
+        if _executor_order_slots.get(worker_id) is lock:
+            _executor_order_slots.pop(worker_id, None)
     try:
         lock.release()
         logger.debug("Worker %s released global task execution lock", worker_id)
@@ -547,6 +527,21 @@ def _release_global_task_execution_lock(lock, worker_id: int) -> None:
             worker_id,
             str(exc)[:120],
         )
+
+
+def _acquire_parallel_task_slot(worker_id: int, capacity: int):
+    from services.redis_service import RedisLock
+    if not _redis_available_for_task_lock():
+        return _acquire_local_task_execution_lock(worker_id)
+    for offset in range(capacity):
+        slot = (worker_id - 1 + offset) % capacity
+        key = _GLOBAL_TASK_EXECUTION_LOCK_KEY if slot == 0 else f"executor:active_order:{slot}"
+        lock = RedisLock(key, timeout=90, blocking=False)
+        if lock.acquire():
+            with _executor_activity_lock:
+                _executor_order_slots[worker_id] = lock
+            return lock
+    return None
 
 
 def _format_likes_status(likes_info: dict | None) -> str:
@@ -632,6 +627,9 @@ def _main_variants_for_url(
         variant_count=len(unique),
     )
     rotated = unique[base_index:] + unique[:base_index]
+
+    if task_settings.get("publication_plan"):
+        return rotated
 
     publish_all = task_settings.get("publish_all_text_variants", True)
     if str(publish_all).strip().lower() in {"0", "false", "no", "off"}:
@@ -1146,6 +1144,20 @@ def handle_account_error(
     return error_type
 
 
+def _claim_pending_task(db, task_id):
+    # SQLite ignores SELECT FOR UPDATE. The conditional write owns the order
+    # before any account, proxy, HTTP operation or billing work can start.
+    changed = db.execute(update(Task).where(Task.id == task_id, Task.status == "pending")
+        .values(status="in_progress", attempts=func.coalesce(Task.attempts, 0) + 1,
+                updated_at=datetime.now(timezone.utc)), execution_options={"synchronize_session": False}).rowcount
+    if changed != 1:
+        db.rollback()
+        return None
+    task = db.get(Task, task_id, populate_existing=True)
+    db.commit()
+    return task
+
+
 def process_task(task_id: int) -> None:
     """
     Обрабатывает одну задачу с retry на других аккаунтах при ошибках.
@@ -1168,6 +1180,7 @@ def process_task(task_id: int) -> None:
     task_timeout_logged = False
     task_timeout_last_close_at = 0.0
     task_stopped_by_user = False
+    url_results = {}
     loop = get_event_loop()
     task_thread_id = threading.get_ident()
     stop_watcher_stop = threading.Event()
@@ -1263,6 +1276,39 @@ def process_task(task_id: int) -> None:
             except Exception as watch_error:
                 logger.debug("Task %s: stop watcher check failed: %s", task_id, watch_error)
 
+    def can_finalize_task(task: Task | None) -> bool:
+        return task is not None and (
+            task.status == "in_progress"
+            or task.status == "stopped" and (task.settings or {}).get(REFUND_PENDING_KEY) is True
+        )
+
+    def commit_task_settlement(task: Task) -> None:
+        task.updated_at = datetime.now(timezone.utc)
+        task_settings = dict(task.settings or {})
+        final_status, final_reason = task.status, task.error_reason
+        try:
+            settle_task_refund(db, task)
+            db.commit()
+        except Exception:
+            db.rollback()
+            logger.exception("Task %s: refund settlement failed; recovery will retry", task_id)
+            current = lock_task_for_settlement(db, task_id)
+            if not can_finalize_task(current):
+                db.rollback()
+                return
+            if current.status == "stopped":
+                task_settings.update({key: value for key, value in (current.settings or {}).items()
+                                      if key in {"stopped_by_user", "stopped_at", "force_close_browsers"}})
+            elif final_status in {"stopped", "error", "partial"}:
+                current.status = final_status
+                current.error_reason = final_reason
+            else:
+                current.status = "error"
+                current.error_reason = "refund_settlement_failed"
+            current.settings = {**task_settings, REFUND_PENDING_KEY: True}
+            current.updated_at = datetime.now(timezone.utc)
+            db.commit()
+
     stop_watcher_thread = threading.Thread(
         target=watch_task_stop_signal,
         name=f"TaskStopWatcher-{task_id}",
@@ -1274,42 +1320,16 @@ def process_task(task_id: int) -> None:
     shutdown_event = _shutdown_event
     
     try:
-        # ИСПРАВЛЕНО: Используем SELECT FOR UPDATE для атомарной блокировки задачи
-        # Это предотвращает race condition, когда два воркера пытаются взять одну задачу
-        try:
-            # SQLite не поддерживает nowait=True, поэтому используем без него
-            # Для PostgreSQL можно использовать nowait=True для немедленного возврата
-            task = db.query(Task).filter(
-                Task.id == task_id,
-                Task.status == "pending"  # Фильтруем только pending задачи
-            ).with_for_update().first()
-        except Exception as lock_error:
-            # Если блокировка не поддерживается (например, старый SQLite), используем обычный запрос
-            # Это не идеально, но лучше чем падение
-            logger.warning(f"SELECT FOR UPDATE not supported, falling back to regular query: {lock_error}")
-            task = db.query(Task).filter(
-                Task.id == task_id,
-                Task.status == "pending"
-            ).first()
-        
-        if not task:
-            # Задача либо не найдена, либо уже взята другим воркером, либо не в статусе pending
-            logger.debug(f"Task {task_id} not available (not found or already taken by another worker)")
+        task = _claim_pending_task(db, task_id)
+        if task is None:
+            logger.debug("Task %s is no longer pending", task_id)
             return
 
-        # Устанавливаем статус in_progress (задача заблокирована, можем безопасно обновить)
-        # ИСПРАВЛЕНО: Валидация перехода статуса через state machine
-        from services.task_state_machine import validate_status_transition
-        try:
-            validate_status_transition(task.status, "in_progress")
-            task.status = "in_progress"
-        except Exception as e:
-            logger.warning(f"Task {task_id}: Invalid status transition {task.status} -> in_progress: {e}, continuing anyway")
-            task.status = "in_progress"  # Продолжаем для обратной совместимости
-        task.attempts += 1
-        task.updated_at = datetime.now(timezone.utc)
-        db.commit()
-        db.refresh(task)
+        if (task.settings or {}).get("publication_plan"):
+            from services.quantity_plan import quantity_plan
+            plan = quantity_plan(task.settings)
+            task_timeout_seconds = min(21600, plan.max_seconds * max(1, len(task.video_urls or [])))
+            task_deadline_at = task_start_monotonic + task_timeout_seconds
 
         # Разбираем настройки задачи
         task_settings = task.settings or {}
@@ -1340,10 +1360,7 @@ def process_task(task_id: int) -> None:
             reply_only_has_text = bool(_reply_variants_from_task(task))
         if not text_variants and not reply_only_has_text:
             logger.error(f"Task {task_id}: no text variants available")
-            task.status = "error"
-            task.error_reason = "Нет доступных текстов для публикации"
-            db.commit()
-            return
+            raise ValueError("Нет доступных текстов для публикации")
 
         logger.info(f"Processing task {task_id}: {len(task.video_urls)} URLs, delays={delays_enabled}, shuffle={shuffle_enabled}, rotate={rotate_accounts}")
 
@@ -1431,7 +1448,6 @@ def process_task(task_id: int) -> None:
             if task_timeout_requested_now():
                 return True
             if shutdown_event and shutdown_event.is_set():
-                task_stopped_by_user = True
                 return True
             try:
                 with db.no_autoflush:
@@ -1460,13 +1476,11 @@ def process_task(task_id: int) -> None:
             return False
 
         def sleep_or_stop(delay_seconds: float) -> bool:
-            nonlocal task_stopped_by_user
             sleep_until = time.monotonic() + max(0.0, float(delay_seconds or 0))
             while True:
                 if task_timeout_requested_now():
                     return True
                 if shutdown_event and shutdown_event.is_set():
-                    task_stopped_by_user = True
                     return True
                 stopped_now, _ = read_stop_marker()
                 if stopped_now:
@@ -1500,30 +1514,6 @@ def process_task(task_id: int) -> None:
                 if full_url_lock.acquire(timeout=0.5):
                     return True
 
-        def stop_due_to_shadow(text_used: str, url_index: int) -> bool:
-            stats = get_text_stats(text_used)
-            if stats.get("shadow", 0) >= settings.TEXT_SHADOW_THRESHOLD:
-                remaining = len(video_urls) - url_index
-                try:
-                    from services.balance_service import get_pricing, refund_balance
-                    pricing = get_pricing(db)
-                    refund_amount = Decimal(pricing.price_success) * Decimal(max(0, remaining))
-                    if refund_amount > 0:
-                        refund_balance(db, task.user_id, refund_amount, task_id=task.id, description="Shadow ban stop refund")
-                        task.refunded_cost = (task.refunded_cost or Decimal("0")) + refund_amount
-                except Exception as refund_err:
-                    logger.warning(f"Task {task_id}: refund on shadow stop failed: {refund_err}")
-                    db.rollback()
-                task.status = "error"
-                task.error_reason = f"Текст в тени: {stats.get('shadow', 0)} подряд. Остановлено."
-                task.updated_at = datetime.now(timezone.utc)
-                db.commit()
-                log(db, task_id, None, f"Остановлено из-за тени текста. Осталось URL: {remaining}")
-                return True
-            return False
-
-        # Обрабатываем каждую ссылку
-        from services.publication_progress import publication_scope, merge_url_result
         for idx, video_url in enumerate(video_urls):
             if task_timeout_requested_now():
                 logger.info(f"Task {task_id}: timeout detected before URL {idx+1}/{len(video_urls)}")
@@ -1546,9 +1536,15 @@ def process_task(task_id: int) -> None:
             from services.task_execution_ledger import has_submission_evidence
             keyword_resume = (getattr(task, "kind", None) == "keyword_replies"
                               and isinstance(existing_row, dict) and not _url_result_counts_as_success(existing_row))
+            quantity_resume = False
+            if task_settings.get("publication_plan") and not _url_result_counts_as_success(existing_row):
+                from db.models import QuantityAction
+                quantity_resume = db.query(QuantityAction.id).filter(QuantityAction.task_id == task_id,
+                    QuantityAction.video_url == video_url).first() is not None
             if (
                 isinstance(existing_row, dict)
                 and not keyword_resume
+                and not quantity_resume
                 and video_url not in ((task.settings or {}).get("_reply_resume") or {})
                 and (_url_result_counts_as_success(existing_row) or _visibility_result_has_receipts(existing_row)
                      or has_submission_evidence(existing_row))
@@ -1668,7 +1664,10 @@ def process_task(task_id: int) -> None:
                         ))
                     task_settings = task.settings or {}
                     result_dict = normalize_url_result_for_timeout(result_dict)
-                    db.refresh(task, attribute_names=["settings"])
+                    task = lock_task_for_settlement(db, task_id)
+                    if not can_finalize_task(task):
+                        db.rollback()
+                        return
                     result_dict = merge_url_result(((task.settings or {}).get("url_results") or {}).get(video_urls[idx]), result_dict)
                     task_settings = dict(task.settings or {})
                     url_results[video_urls[idx]] = result_dict
@@ -1786,11 +1785,7 @@ def process_task(task_id: int) -> None:
             )
             if not raw_variant_choices:
                 logger.error(f"Task {task_id}: no usable text variants available for URL {idx+1}")
-                task.status = "error"
-                task.error_reason = "Нет доступных вариантов текста для публикации"
-                task.updated_at = datetime.now(timezone.utc)
-                db.commit()
-                return
+                raise ValueError("Нет доступных вариантов текста для публикации")
 
             try:
                 logger.info(f"Processing URL {idx+1}/{len(video_urls)} for task {task_id} (HYBRID FULL)")
@@ -1844,7 +1839,7 @@ def process_task(task_id: int) -> None:
                         COMMENTING_MODE_PARALLEL_6X1 = "parallel_6x1"
 
                     from executor.main_visibility import main_visibility_enabled
-                    if user_schema_active or main_visibility_enabled(task_settings):
+                    if task_settings.get("publication_plan") or user_schema_active or main_visibility_enabled(task_settings):
                         from executor.user_schema import (
                             execute_user_schema_full,
                             execute_user_schema_parallel,
@@ -1856,8 +1851,8 @@ def process_task(task_id: int) -> None:
                         prepared_variants: list[str] = []
                         shadowed_results: list[dict] = []
                         for variant_num, raw_variant in enumerate(raw_variant_choices, start=1):
-                            text_choice = process_spintax(raw_variant)
-                            text_stats = get_text_stats(text_choice)
+                            text_choice = raw_variant if task_settings.get("publication_plan") else process_spintax(raw_variant)
+                            text_stats = {} if task_settings.get("publication_plan") else get_text_stats(text_choice)
                             if (
                                 text_stats.get("shadow", 0) >= settings.TEXT_SHADOW_THRESHOLD
                                 and text_stats.get("success", 0) == 0
@@ -1914,7 +1909,7 @@ def process_task(task_id: int) -> None:
                                     nonlocal task_stopped_by_user
                                     if getattr(task, "_publication_checkpoint_failed", False):
                                         return True
-                                    if task_timeout_requested_now():
+                                    if task_timeout_requested_now() or shutdown_event.is_set():
                                         return True
                                     try:
                                         with db.no_autoflush:
@@ -1942,7 +1937,10 @@ def process_task(task_id: int) -> None:
                                         )
                                     return False
 
-                                if commenting_mode == COMMENTING_MODE_PARALLEL_6X1:
+                                if task_settings.get("publication_plan"):
+                                    from executor.quantity_engine import execute_quantity_order
+                                    user_schema_runner = execute_quantity_order
+                                elif commenting_mode == COMMENTING_MODE_PARALLEL_6X1:
                                     user_schema_runner = execute_user_schema_parallel_6x1
                                 elif commenting_mode == COMMENTING_MODE_PARALLEL:
                                     user_schema_runner = execute_user_schema_parallel
@@ -2070,7 +2068,10 @@ def process_task(task_id: int) -> None:
                     ))
                 task_settings = task.settings or {}
                 result_dict = normalize_url_result_for_timeout(result_dict)
-                db.refresh(task, attribute_names=["settings"])
+                task = lock_task_for_settlement(db, task_id)
+                if not can_finalize_task(task):
+                    db.rollback()
+                    return
                 result_dict = merge_url_result(((task.settings or {}).get("url_results") or {}).get(video_urls[idx]), result_dict)
                 task_settings = dict(task.settings or {})
                 url_results[video_urls[idx]] = result_dict
@@ -2195,13 +2196,16 @@ def process_task(task_id: int) -> None:
                 continue
 
         # Merge durable receipts on exception/stop paths as well as normal returns.
-        db.refresh(task, attribute_names=["settings"])
+        task = lock_task_for_settlement(db, task_id)
+        if not can_finalize_task(task):
+            db.rollback()
+            return
         durable_urls = (task.settings or {}).get("url_results") or {}
         url_results = {key: merge_url_result(durable_urls.get(key), value)
                        for key, value in {**durable_urls, **url_results}.items()}
 
         # Финализация задачи
-        if task_timed_out:
+        if task_timed_out and task.status != "stopped":
             close_task_browsers("task_timeout_final")
             task_settings = task.settings if isinstance(task.settings, dict) else {}
             task_settings["url_results"] = {
@@ -2221,8 +2225,7 @@ def process_task(task_id: int) -> None:
             _mark_task_settings_dirty(task)
             task.status = "stopped"
             task.error_reason = "task_timeout"
-            task.updated_at = datetime.now(timezone.utc)
-            db.commit()
+            commit_task_settlement(task)
             log(db, task_id, None, f"Task stopped by timeout after {task_timeout_seconds}s")
             logger.warning(
                 "Task %s: finalized as stopped by timeout (%s/%s URLs processed)",
@@ -2245,9 +2248,14 @@ def process_task(task_id: int) -> None:
             return
 
         stopped_now, stopped_settings = read_stop_marker()
-        if task_stopped_by_user or stopped_now:
-            task_settings = task.settings if isinstance(task.settings, dict) else {}
-            task_settings = merge_stopped_settings(task_settings, stopped_settings)
+        stopped_by_user = task_stopped_by_user or stopped_now
+        stopped_by_shutdown = shutdown_event.is_set() and successful_urls < len(video_urls)
+        if stopped_by_user or stopped_by_shutdown:
+            task_settings = dict(task.settings or {})
+            if stopped_by_user:
+                task_settings = merge_stopped_settings(task_settings, stopped_settings)
+            else:
+                task_settings["stopped_at"] = datetime.now(timezone.utc).isoformat()
             task_settings["url_results"] = {
                 **(task_settings.get("url_results") if isinstance(task_settings.get("url_results"), dict) else {}),
                 **url_results,
@@ -2259,16 +2267,20 @@ def process_task(task_id: int) -> None:
             task.settings = task_settings
             _mark_task_settings_dirty(task)
             task.status = "stopped"
-            task.error_reason = "stopped_by_user"
-            task.updated_at = datetime.now(timezone.utc)
-            db.commit()
-            log(db, task_id, None, "Заказ остановлен пользователем")
-            logger.info(
-                f"Task {task_id}: finalized as stopped by user "
-                f"({successful_urls}/{len(video_urls)} URLs successful)"
-            )
+            if stopped_by_user:
+                task.error_reason = "stopped_by_user"
+            else:
+                task.error_reason = "worker_shutdown"
+            commit_task_settlement(task)
+            if stopped_by_user:
+                log(db, task_id, None, "Заказ остановлен пользователем")
+                logger.info("Task %s: finalized as stopped by user (%s/%s URLs successful)",
+                            task_id, successful_urls, len(video_urls))
+            else:
+                logger.info("Task %s: finalized as stopped during worker shutdown", task_id)
             return
 
+        has_errors = has_errors or successful_urls != len(video_urls)
         if has_errors:
             if _completion_status_with_errors(successful_urls, url_results) == "error":
                 task.status = "error"
@@ -2303,61 +2315,6 @@ def process_task(task_id: int) -> None:
             task_settings = _refresh_execution_ledger(task_settings)
             task.settings = task_settings
             _mark_task_settings_dirty(task)
-            
-            # ИСПРАВЛЕНО: Возврат средств за неудачные видео (централизованный расчёт)
-            user = db.query(User).filter(User.id == task.user_id).first()
-            if user and not balance_is_admin(user) and task.total_cost:
-                refund_units = len(video_urls) - successful_urls
-                if refund_units > 0:
-                    try:
-                        pricing = get_pricing(db)
-                        # ИСПРАВЛЕНО: Используем централизованную функцию расчёта возврата
-                        from services.balance_service import calculate_refund_amount
-                        # Recovery may finalize the same paid task again. Settle
-                        # only the unpaid difference, never more than its hold.
-                        db.refresh(task, attribute_names=["total_cost", "refunded_cost"], with_for_update=True)
-                        paid_cost = max(Decimal(str(task.total_cost or 0)), Decimal("0.00"))
-                        recorded_refunds = db.query(func.coalesce(func.sum(Transaction.amount), 0)).filter(
-                            Transaction.task_id == task_id, Transaction.type == "refund",
-                        ).scalar()
-                        already_refunded = max(Decimal(str(task.refunded_cost or 0)),
-                                               Decimal(str(recorded_refunds or 0)), Decimal("0.00"))
-                        task.refunded_cost = already_refunded
-                        target_refund = min(calculate_refund_amount(refund_units, pricing), paid_cost)
-                        total_refund = max(target_refund - already_refunded, Decimal("0.00"))
-                        refund_reason_parts = []
-                        if failed_urls:
-                            refund_reason_parts.append(f"{len(failed_urls)} failed")
-                        refund_reason = ", ".join(refund_reason_parts) or f"{refund_units} not completed"
-                        
-                        refunded = total_refund > 0 and refund_balance(
-                            db,
-                            task.user_id,
-                            total_refund,
-                            task_id=task_id,
-                            description=f"Refund for {refund_reason} video(s) in task #{task_id}",
-                            commit=False,
-                        )
-                        if total_refund > 0 and not refunded:
-                            raise RuntimeError("Refund settlement failed; no refund was recorded")
-                        if refunded:
-                            # Commit the balance transaction and settlement
-                            # marker together below, closing the crash window.
-                            task.refunded_cost = already_refunded + total_refund
-                            logger.info(
-                                "Task %s: Refunded %s UAH for %s video(s): %s",
-                                task_id,
-                                total_refund,
-                                refund_units,
-                                refund_reason,
-                            )
-                    except Exception as refund_error:
-                        logger.error(f"Task {task_id}: Error refunding balance: {refund_error}", exc_info=True)
-                        # A failed balance operation can roll the session back,
-                        # including the terminal task status. Let the outer
-                        # handler record an explicit error after that rollback.
-                        db.rollback()
-                        raise
             
             if unconfirmed_urls:
                 logger.warning(
@@ -2400,13 +2357,11 @@ def process_task(task_id: int) -> None:
             
             # ИСПРАВЛЕНО: Записываем метрику успешного завершения задачи
             try:
-                from services.metrics import increment_counter
                 increment_counter("tasks.completed", value=1, tags={"status": "success"})
             except Exception:
                 pass  # Не критично, если метрики не работают
         
-        task.updated_at = datetime.now(timezone.utc)
-        db.commit()
+        commit_task_settlement(task)
         
         # ИСПРАВЛЕНО: Записываем метрику времени выполнения задачи
         task_duration = time.time() - task_start_time
@@ -2419,40 +2374,32 @@ def process_task(task_id: int) -> None:
         except Exception:
             pass  # Не критично, если метрики не работают
         
-    except Exception as e:
+    except (Exception, asyncio.CancelledError) as e:
         logger.error(f"Task {task_id}: Critical error: {e}", exc_info=True)
         try:
-            # ИСПРАВЛЕНО: Улучшена проверка на None - используем with_for_update для безопасности
-            try:
-                task = db.query(Task).filter(Task.id == task_id).with_for_update().first()
-            except Exception:
-                # Если блокировка не поддерживается, используем обычный запрос
-                task = db.query(Task).filter(Task.id == task_id).first()
-            
-            if task is not None:
-                try:
-                    db.refresh(task)
-                except Exception:
-                    pass
-                if str(task.status or "").lower() == "stopped":
-                    logger.info(f"Task {task_id}: critical error ignored because task is stopped by user")
-                    return
-                task.status = "error"
-                task.error_reason = f"Критическая ошибка: {str(e)[:200]}"
-                
-                # ИСПРАВЛЕНО: Записываем метрику критической ошибки
-                try:
-                    from services.metrics import increment_counter
-                    increment_counter("tasks.completed", value=1, tags={"status": "critical_error"})
-                except Exception:
-                    pass
-                task.updated_at = datetime.now(timezone.utc)
-                db.commit()
-            else:
-                logger.warning(f"Task {task_id} not found when trying to update error status")
+            db.rollback()
+            task = lock_task_for_settlement(db, task_id)
+            if can_finalize_task(task):
+                task_settings = dict(task.settings or {})
+                durable_urls = task_settings.get("url_results") or {}
+                task_settings["url_results"] = {
+                    key: merge_url_result(durable_urls.get(key), row)
+                    for key, row in {**durable_urls, **url_results}.items()
+                }
+                task.settings = _refresh_execution_ledger(task_settings)
+                if task.status != "stopped":
+                    if task_timed_out:
+                        task.status = "stopped"
+                        task.error_reason = "task_timeout"
+                    else:
+                        task.status = "error"
+                        task.error_reason = f"Критическая ошибка: {str(e)[:200]}"
+                commit_task_settlement(task)
+                increment_counter("tasks.completed", value=1, tags={"status": "critical_error"})
         except Exception:
-            pass
-        
+            db.rollback()
+            logger.exception("Task %s: could not finalize after critical error", task_id)
+
         # ИСПРАВЛЕНО: Записываем метрику времени выполнения задачи даже при критической ошибке
         try:
             task_duration = time.time() - task_start_time
@@ -2481,7 +2428,7 @@ def process_task(task_id: int) -> None:
             logger.warning(f"Task {task_id}: Error closing DB session: {close_err}")
 
 
-def worker(worker_id: int) -> None:
+def worker(worker_id: int, capacity: int = 1) -> None:
     """
     Воркер, который берёт задачи из очереди.
     
@@ -2527,7 +2474,8 @@ def worker(worker_id: int) -> None:
                                 pass
                             db = None
                 
-                task_lock = _acquire_global_task_execution_lock(worker_id)
+                task_lock = (_acquire_parallel_task_slot(worker_id, capacity) if capacity > 1
+                             else _acquire_global_task_execution_lock(worker_id))
                 if task_lock is None:
                     _sleep_until_next_worker_poll(shutdown_event)
                     continue
@@ -2569,12 +2517,14 @@ def worker(worker_id: int) -> None:
                             task_lock = None
                             _sleep_until_next_worker_poll(shutdown_event)
                             continue
+                        if isinstance(db, Session):
+                            db.rollback()
                         logger.info(f"Worker {worker_id} got task {task_id}")
                         _mark_executor_busy(task_id, worker_id)
                         try:
                             process_task(task_id)
                         finally:
-                            _mark_executor_idle()
+                            _mark_executor_idle(worker_id)
                     else:
                         _release_global_task_execution_lock(task_lock, worker_id)
                         task_lock = None
@@ -2683,14 +2633,14 @@ def run_executor():
         except Exception as exc:
             logger.warning(f"Could not set SIGTERM handler: {exc}")
     
-    configured_threads = int(getattr(settings, "MAX_THREADS", 1) or 1)
-    num_threads = 1
-    if configured_threads != num_threads:
-        logger.info(
-            "Serial task execution enabled: overriding MAX_THREADS=%s to %s worker",
-            configured_threads,
-            num_threads,
-        )
+    from services.publication_runtime import load_publication_runtime, default_runtime
+    from db.database import get_sync_db_context
+    try:
+        with get_sync_db_context() as db:
+            num_threads = load_publication_runtime(db).order_workers
+    except Exception:
+        num_threads = default_runtime().order_workers
+        logger.warning("Could not load order worker settings", exc_info=True)
     
     # ИСПРАВЛЕНО: Убрана автоматическая валидация аккаунтов - пользователь управляет проверками вручную
     # validation_thread = threading.Thread(target=auto_validation_worker, daemon=True, name="AutoValidationThread")
@@ -2716,10 +2666,18 @@ def run_executor():
     heartbeat_stop = threading.Event()
     def _heartbeat_loop():
         while not heartbeat_stop.is_set():
+            with _executor_activity_lock:
+                slots = list(_executor_order_slots.items())
+            for worker_id, lock in slots:
+                try:
+                    if not lock.renew():
+                        logger.warning("Worker %s lost its order slot lease", worker_id)
+                except Exception:
+                    logger.warning("Could not renew order slot for worker %s", worker_id, exc_info=True)
             payload = _get_executor_activity_payload()
             status = str(payload.pop("status", "ok") or "ok")
             update_executor_heartbeat(status, **payload)
-            time.sleep(10)
+            heartbeat_stop.wait(10)
         # финальный статус
         update_executor_heartbeat("stopped")
 
@@ -2734,7 +2692,7 @@ def run_executor():
 
     threads = []
     for i in range(num_threads):
-        t = threading.Thread(target=worker, args=(i + 1,), daemon=False, name=f"Worker-{i+1}")
+        t = threading.Thread(target=worker, args=(i + 1, num_threads), daemon=False, name=f"Worker-{i+1}")
         t.start()
         threads.append(t)
     

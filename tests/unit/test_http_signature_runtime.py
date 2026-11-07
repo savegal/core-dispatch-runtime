@@ -93,13 +93,15 @@ async def test_shortlink_publish_uses_resolved_media_referer(reply, path, host):
     from urllib.parse import parse_qs, urlparse
     current_url = f"https://www.tiktok.com/@demo/{path}/7635267329407913230"
     context = _CaptureRequestContext(_DummyResponse(200, '{"status_code":0,"comment":{"cid":"7641761192486195009"}}'))
-    client = PlaywrightHttpClient(context, retry_policy=RetryPolicy(max_retries=0), runtime_profile={"current_url": current_url})
+    page = _SignaturePage({}, response=context._response)
+    page.url = current_url
+    client = PlaywrightHttpClient(context, page=page, retry_policy=RetryPolicy(max_retries=0), runtime_profile={"current_url": current_url})
     if reply:
         result = await client.reply_comment("7635267329407913230", "7641761192486195000", "hello", video_url=f"https://{host}/fixture/")
     else:
         result = await client.publish_main_comment("7635267329407913230", "hello", video_url=f"https://{host}/fixture/")
     assert result[0]
-    query = parse_qs(urlparse(context.last_url).query)
+    query = parse_qs(urlparse(page.last_request["url"]).query)
     assert query["referer"] == [current_url]
     assert "root_referer" not in query  # empty document.referrer, encoded as an empty query value
 
@@ -365,15 +367,10 @@ async def test_execute_request_publish_without_page_does_not_borrow_cookie_signa
         correlation_id="borrowed_signature_test",
     )
 
-    assert success is True
-    assert error_msg is None
-    assert error_type is None
-    assert "X-Bogus=" not in request_context.last_url
-    assert "X-Gnarly=" not in request_context.last_url
-    assert request_context.last_form == {"text": "hello", "text_extra": "[]"}
-    assert request_context.calls == 1
-    assert response_data["__request_signature"]["mode"] == "unsigned"
-    assert client.last_request_meta["transport"] == "request_context.fetch"
+    assert success is False and response_data is None
+    assert error_msg == "publish_requires_live_page" and error_type == HttpErrorType.API_ERROR
+    assert request_context.calls == 0 and not client.last_request_meta["request_attempted"]
+    assert client.last_request_meta["publication_status"] == "not_sent"
 
 
 @pytest.mark.unit
@@ -454,10 +451,11 @@ async def test_signer_wake_exception_does_not_repeat_or_report_ready():
 async def test_execute_request_accepts_lowercase_explicit_signature_params():
     response = _DummyResponse(status=200, body='{"status_code":0,"comment":{"cid":"7641761192486195006"}}')
     request_context = _CaptureRequestContext(response)
+    page = _SignaturePage({}, response=response)
     client = PlaywrightHttpClient(
         request_context,
         retry_policy=RetryPolicy(max_retries=0),
-        page=None,
+        page=page,
     )
 
     success, response_data, error_msg, error_type = await client._execute_request(
@@ -475,9 +473,9 @@ async def test_execute_request_accepts_lowercase_explicit_signature_params():
     assert success is True
     assert error_msg is None
     assert error_type is None
-    assert "X-Bogus=lower_bogus" in request_context.last_url
-    assert "X-Gnarly=lower_gnarly" in request_context.last_url
-    assert request_context.last_form == {"text": "hello", "text_extra": "[]"}
+    assert "X-Bogus=lower_bogus" in page.last_request["url"]
+    assert "X-Gnarly=lower_gnarly" in page.last_request["url"]
+    assert page.last_request["form_data"] == {"text": "hello", "text_extra": "[]"}
     assert response_data["__request_signature"]["mode"] == "explicit_provided"
 
 
@@ -486,10 +484,11 @@ async def test_execute_request_accepts_lowercase_explicit_signature_params():
 async def test_execute_request_reply_uses_form_body_for_reply_payload():
     response = _DummyResponse(status=200, body='{"status_code":0,"comment":{"cid":"7641761192486195007"}}')
     request_context = _CaptureRequestContext(response)
+    page = _SignaturePage({}, response=response)
     client = PlaywrightHttpClient(
         request_context,
         retry_policy=RetryPolicy(max_retries=0),
-        page=None,
+        page=page,
     )
 
     success, response_data, error_msg, error_type = await client._execute_request(
@@ -507,8 +506,8 @@ async def test_execute_request_reply_uses_form_body_for_reply_payload():
     assert success is True
     assert error_msg is None
     assert error_type is None
-    assert "text=reply+hello" not in request_context.last_url
-    assert request_context.last_form == {
+    assert "text=reply+hello" not in page.last_request["url"]
+    assert page.last_request["form_data"] == {
         "reply_id": "456",
         "reply_to_reply_id": "789",
         "text": "reply hello",
@@ -660,7 +659,7 @@ async def test_request_context_without_page_still_uses_cookie_ms_token():
     context = _CaptureRequestContext(_DummyResponse(200, '{"status_code":0,"comment":{"cid":"7641761192486195009"}}'))
     client = PlaywrightHttpClient(context, retry_policy=RetryPolicy(max_retries=0))
     result = await client._execute_request(
-        RequestProfile.publish_main_profile(), {"aweme_id": "123", "text": "hello"},
+        RequestProfile.comment_list_profile(), {"aweme_id": "123", "text": "hello"},
         cookies={"msToken": "direct-token", "tt_csrf_token": "csrf"},
     )
     assert result[0]

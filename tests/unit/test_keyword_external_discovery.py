@@ -19,7 +19,8 @@ SHORT = "https://vt.tiktok.com/Zfixture/"
 @pytest.fixture
 def discovery_accounts(monkeypatch):
     from executor import user_schema as schema
-    accounts = [SimpleNamespace(id=index, proxy=None) for index in range(1, 15)]
+    accounts = [SimpleNamespace(id=index, proxy=None, cookies=f"sessionid=session-{index}; uid_tt={index}")
+                for index in range(1, 15)]
     selector = Mock(side_effect=accounts + [None])
     monkeypatch.setattr(engine, "get_free_account_for_reply", selector)
     gate = AsyncMock(return_value=None)
@@ -28,6 +29,7 @@ def discovery_accounts(monkeypatch):
     monkeypatch.setattr(engine, "create_page_for_account", create)
     monkeypatch.setattr(schema, "_ensure_account_login_ready", AsyncMock(return_value=(True, None)))
     monkeypatch.setattr(engine, "warmup_page_for_http", AsyncMock(return_value=({}, True, {})))
+    monkeypatch.setattr(engine, "_record_http_account_result", Mock())
     close, release = AsyncMock(), Mock()
     monkeypatch.setattr(schema, "_safe_close", close)
     monkeypatch.setattr(schema, "release_reply_account_reservation", release)
@@ -39,10 +41,12 @@ def discovery_accounts(monkeypatch):
         reset_task_order_transport(token)
 
 
-async def test_discovery_retries_transient_account_failure_and_retains_positive_matches(discovery_accounts, monkeypatch):
+@pytest.mark.parametrize("error", ["keyword_comment_list_unavailable", "keyword_pagination_stalled"])
+async def test_discovery_retries_transient_account_failure_and_retains_positive_matches(
+        discovery_accounts, monkeypatch, error):
     collect = AsyncMock(side_effect=[
         ([{"cid": CIDS[0], "text": "цена"}], {"complete": False, "scanned": 1,
-                                              "error": "keyword_comment_list_unavailable"}),
+                                              "error": error}),
         ([{"cid": CIDS[1], "text": "цена"}], {"complete": True, "scanned": 1, "error": None}),
     ])
     monkeypatch.setattr(keyword, "collect_http_targets", collect)
@@ -55,14 +59,33 @@ async def test_discovery_retries_transient_account_failure_and_retains_positive_
 
 
 async def test_preflight_rejections_do_not_consume_real_browser_attempts(discovery_accounts, monkeypatch):
-    discovery_accounts.gate.side_effect = ["dead_session"] * 3 + [None]
+    discovery_accounts.gate.side_effect = ["dead_session"] * 3 + [None, None]
     collect = AsyncMock(return_value=([], {"complete": True, "scanned": 0, "error": None}))
     monkeypatch.setattr(keyword, "collect_http_targets", collect)
     _, scan = await keyword.discover_keyword_targets(None, URL, ["цена"], task_id=1)
     assert scan["complete"] is True
-    assert discovery_accounts.gate.await_count == 4
-    assert discovery_accounts.create.await_count == 1
-    assert discovery_accounts.release.call_count == 4
+    assert discovery_accounts.gate.await_count == 5
+    assert discovery_accounts.create.await_count == 2
+    assert discovery_accounts.release.call_count == 5
+
+
+async def test_plausible_empty_list_from_first_account_cannot_hide_second_readers_matches(discovery_accounts, monkeypatch):
+    read = AsyncMock(side_effect=[([], {"complete": True, "scanned": 0, "error": None}),
+        ([{"cid": CIDS[0], "text": "цена"}], {"complete": True, "scanned": 50, "error": None})])
+    monkeypatch.setattr(keyword, "collect_http_targets", read)
+    targets, scan = await keyword.discover_keyword_targets(None, URL, ["цена"], task_id=1)
+    assert targets[0]["cid"] == CIDS[0] and scan["complete"]
+    assert read.await_count == discovery_accounts.create.await_count == 2
+
+
+async def test_duplicate_usernames_do_not_confirm_a_negative_keyword_scan(discovery_accounts, monkeypatch):
+    from executor import user_schema as schema
+    monkeypatch.setattr(schema, "_get_cached_http_preflight_username", lambda *a: "same-user")
+    read = AsyncMock(return_value=([], {"complete": True, "scanned": 0, "error": None}))
+    monkeypatch.setattr(keyword, "collect_http_targets", read)
+    targets, scan = await keyword.discover_keyword_targets(None, URL, ["цена"], task_id=1)
+    assert not targets and not scan["complete"] and scan["error"] == "keyword_negative_scan_unconfirmed"
+    assert read.await_count == 1
 
 
 async def test_incomplete_scans_preserve_matches_when_browser_budget_is_exhausted(discovery_accounts, monkeypatch):
@@ -188,3 +211,16 @@ async def test_large_count_read_never_bypasses_explicitly_unready_signer(monkeyp
     assert "const allowDirectFetch = false;" in page.evaluate.await_args.args[0]
     assert page.evaluate.await_count == 1 and page.on.call_count == 2
     recheck.assert_awaited_once()
+
+
+async def test_auto_parent_retries_an_unavailable_account_then_paginates_for_author(discovery_accounts, monkeypatch):
+    read = AsyncMock(side_effect=[
+        None,
+        {"comments": [{"cid": CIDS[0], "user": {"unique_id": "someone_else"}}], "has_more": 1, "cursor": 20},
+        {"comments": [{"cid": CIDS[1], "user": {"unique_id": "fixture"}}], "has_more": 0},
+    ])
+    monkeypatch.setattr(discovery, "fetch_comment_page", read)
+    target, error = await engine._resolve_auto_engagement_parent(None, URL, comment_author="@Fixture")
+    assert error is None and target["cid"] == CIDS[1]
+    assert [call.kwargs["cursor"] for call in read.await_args_list] == [0, 0, 20]
+    assert discovery_accounts.close.await_count == discovery_accounts.release.call_count == 2

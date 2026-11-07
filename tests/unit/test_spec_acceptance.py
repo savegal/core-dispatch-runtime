@@ -295,7 +295,10 @@ async def test_task_api_reuses_active_retry_without_implicit_deduping_of_new_ord
     order_db.add_all([original, setting])
     await order_db.commit()
     first = await create_retry_via_api(order_db, original.id)
-    assert first["order_transport_mode"] == "dom"
+    assert first["order_transport_mode"] == "http"
+    # Reusing an existing legacy snapshot must preserve its original transport.
+    retry = await order_db.get(Task, first["task_id"])
+    retry.settings = {**retry.settings, "order_transport_mode": "dom"}
     setting.value = "http"
     await order_db.commit()
     second = await create_retry_via_api(order_db, original.id)

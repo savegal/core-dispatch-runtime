@@ -84,6 +84,7 @@ async def test_reply_replaced_in_same_branch_only_after_two_missing_reads(browse
         assert state["reads"] == 2
         context, page = await open_fixture(browser, state)
         try:
+            await page.evaluate("async () => (await fetch('/__fixture_ready__')).text()", isolated_context=False)
             client = await PlaywrightHttpClient.from_page(page)
             ok, cid, error, _, _ = await client.reply_comment(VIDEO, PARENT, slot.text, video_url=URL)
             assert ok, error
