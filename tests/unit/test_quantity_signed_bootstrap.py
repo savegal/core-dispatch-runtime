@@ -1,4 +1,5 @@
 """SDK-only warmup must not be mistaken for proven signed HTTP traffic."""
+import asyncio
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
@@ -51,3 +52,18 @@ async def test_unsigned_or_failed_get_never_authorizes_publication(monkeypatch):
     )
     assert readiness.await_count == 2
     fetch.assert_awaited_once()
+
+
+async def test_stop_cancels_pending_get_without_faking_readiness(monkeypatch):
+    page = SimpleNamespace()
+    readiness = AsyncMock(return_value=False)
+    fetch = AsyncMock(side_effect=asyncio.CancelledError())
+    monkeypatch.setattr(publisher, "wait_for_runtime_signer_ready", readiness)
+    monkeypatch.setattr(comment_discovery, "fetch_comment_page", fetch)
+
+    with pytest.raises(asyncio.CancelledError):
+        await publisher._ensure_signed_dispatch_ready(
+            page, "7635267329407913230", correlation_id="quantity-cancel"
+        )
+    fetch.assert_awaited_once()
+    assert readiness.await_count == 1
