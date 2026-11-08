@@ -12,6 +12,9 @@ from services.task_execution_ledger import build_task_execution_ledger, LEDGER_V
 _SUMMARY_RE = re.compile(r"успешно:\s*(\d+)\s*/\s*(\d+)", re.IGNORECASE)
 
 _MESSAGES: dict[str, tuple[str, str]] = {
+    "residential_ip_probe_payment_required": ("Прокси требует оплаты", "Шлюз прокси вернул HTTP 402. Проверьте баланс или активность тарифа у провайдера."),
+    "quantity_proxy_preflight_unavailable": ("Не удалось подключиться через прокси", "Новые публикации остановлены после серии ошибок подключения. Точные причины по попыткам доступны в отчёте."),
+    "quantity_comment_readiness_unavailable": ("TikTok не подтвердил готовность к публикации", "Новые публикации остановлены после серии неудачных проверок чтения комментариев. Подробности по попыткам доступны в отчёте."),
     "quantity_dispatch_budget_exhausted": ("Достигнут лимит отправок", "Заказ остановил новые публикации по заданному лимиту. Сохранённые результаты доступны в отчёте."),
     "quantity_traffic_budget_exhausted": ("Достигнут лимит трафика", "Достигнут заданный бюджет трафика. Новые публикации и перепроверки этого заказа остановлены."),
     "quantity_traffic_accounting_unavailable": ("Не удалось сохранить учёт трафика", "Новые запросы остановлены, чтобы не превысить заданный бюджет. Уже полученные результаты сохранены."),
@@ -142,6 +145,8 @@ def _extract_first_error_line(text: str) -> str | None:
 
 def _detect_error_code(text: str) -> str | None:
     lower = text.lower()
+    if "residential_ip_probe_payment_required" in lower or "proxy_payment_required" in lower:
+        return "residential_ip_probe_payment_required"
     for code in _MESSAGES:
         if code.startswith("quantity_") and code in lower:
             return code

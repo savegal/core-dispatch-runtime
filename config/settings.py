@@ -32,7 +32,7 @@ class Settings(BaseSettings):
     MAX_CONCURRENT_BROWSERS: int = 4  # ОПТИМИЗИРОВАНО: 4 контекста внутри 1 процесса Chromium (BROWSER_POOL_SHARED_PROCESS=True)
     BROWSER_POOL_CAPACITY_WAIT_SECONDS: float = 15.0
     BROWSER_POOL_SHARED_PROCESS: bool = True
-    STATIC_ASSET_CACHE_ENABLED: bool = True
+    STATIC_ASSET_CACHE_ENABLED: bool = False  # Opt in to copying JS/CSS bodies through the browser driver.
     STATIC_ASSET_CACHE_MAX_MB: int = 128
     KEYWORD_REPLY_MAX_SCAN_PAGES: int = Field(default=10, ge=1, le=100)
     # Operator's account-region preference, used only after health/session ranking.

@@ -113,6 +113,24 @@ async def test_failed_meter_close_can_be_retried_without_duplicate_writes(db_ses
     assert (row.received_bytes, row.sent_bytes, row.requests) == (10, 5, 1)
 
 
+@pytest.mark.asyncio
+async def test_hung_transfer_size_does_not_block_meter_close(db_session, sample_task, monkeypatch):
+    from services import traffic_meter as traffic
+
+    monkeypatch.setattr(traffic, "REQUEST_SIZES_TIMEOUT_SECONDS", 0.02)
+    meter = traffic.TrafficMeter(db_session.get_bind(), 42)
+    released = asyncio.Event()
+    slow = SimpleNamespace(_traffic_task_id=sample_task.id, resource_type="fetch", method="GET", sizes=released.wait)
+    meter.finished(slow)
+    meter.buffer[traffic_key(sample_task)] = [10, 5, 1]
+    try:
+        await asyncio.wait_for(meter.close(), timeout=1)
+        assert not meter.pending
+        assert db_session.query(TaskTrafficBucket).one().received_bytes == 10
+    finally:
+        released.set()
+
+
 @pytest.mark.parametrize("lifecycle", ["expired", "closed", "changed"])
 def test_quantity_result_is_an_independent_immutable_sql_snapshot(db_session, sample_task, lifecycle):
     configure_task(db_session, sample_task)
@@ -257,6 +275,65 @@ async def test_observer_stops_before_next_reader_when_traffic_runs_out(db_sessio
     assert any(item.get("reason") == "quantity_traffic_budget_exhausted" for item in observations)
     if proof == "positive_before_reply":
         assert publisher.comment_id in observations[0]["found_ids"]
+
+
+@pytest.mark.asyncio
+async def test_recheck_excludes_other_batch_authors_and_recent_readers_and_stops_after_two_empty_reads(
+    db_session, sample_task, sample_account, monkeypatch,
+):
+    from executor import user_schema as schema, engagement_engine, main_visibility
+    from services import account_service
+    from services.publication_recheck import OBSERVER_COOLDOWN_SECONDS, observe_video
+    from services.publication_journal import utcnow
+    from db.models import PublicationAttempt
+
+    configure_task(db_session, sample_task)
+    url = sample_task.video_urls[0]
+    video = schema.extract_tiktok_media_id(url)
+    db_session.add(PublicationAttempt(id="other-batch", task_id=sample_task.id, account_id=sample_account.id,
+        video_url=url, aweme_id=video, kind="main", text="fixture", text_hash="fixture", status="accepted",
+        wire_count=1, comment_id="7704740811904828193", checked_at=utcnow(), observers=[{"account_id": 42}]))
+    db_session.commit()
+    readers = [SimpleNamespace(id=i, proxy=None, cookies=f"sessionid=reader{i}; uid_tt={i}",
+                               _cached_tiktok_username=f"reader{i}") for i in (71, 72, 73)]
+    selector = Mock(side_effect=readers)
+    monkeypatch.setattr(account_service, "get_free_account_for_reply", selector)
+    monkeypatch.setattr(schema, "_preflight_cookie_http_gate", AsyncMock(return_value=None))
+    monkeypatch.setattr(schema, "create_page_for_account", AsyncMock(side_effect=lambda _: (object(), SimpleNamespace(url=url))))
+    monkeypatch.setattr(schema, "_ensure_account_login_ready", AsyncMock(return_value=(True, None)))
+    warmup = AsyncMock(side_effect=AssertionError("Observer must not fetch comments during warmup"))
+    monkeypatch.setattr(engagement_engine, "warmup_page_for_http", warmup)
+    scan = AsyncMock(return_value={"found_ids": [], "absent_ids": [], "complete": False, "reason": "empty_body"})
+    monkeypatch.setattr(main_visibility, "scan_main_comment_ids", scan)
+    monkeypatch.setattr(schema, "_safe_close", AsyncMock())
+    observer_cooldowns = {}
+    loop = asyncio.get_running_loop()
+    def release(account_id):
+        remaining = observer_cooldowns[account_id] - loop.time()
+        assert 0 < remaining <= OBSERVER_COOLDOWN_SECONDS
+    release_reservation = Mock(side_effect=release)
+    monkeypatch.setattr(schema, "release_reply_account_reservation", release_reservation)
+    projection = SimpleNamespace(account_id=None, identity_keys=[["username", "publisher"]],
+        video_url=url, aweme_id=video, comment_id="7704740811904828192", kind="main", parent_id=None)
+
+    observations = await observe_video(db_session, sample_task, [projection], observer_cooldowns=observer_cooldowns)
+    assert {sample_account.id, 42} <= set(selector.call_args_list[0].kwargs["exclude_ids"])
+    assert selector.call_count == scan.await_count == 2
+    assert [item["reason"] for item in observations] == ["empty_body", "empty_body"]
+    warmup.assert_not_awaited()
+
+    # The first batch has released its leases and has yet to persist its observations.
+    # Model a selector with a stale snapshot returning reader 71 again.
+    selector.reset_mock(side_effect=True)
+    selector.side_effect = [readers[0], readers[2]]
+    scan.reset_mock()
+    scan.return_value = {"found_ids": [projection.comment_id], "absent_ids": [], "complete": True}
+    release_reservation.reset_mock()
+    observations = await observe_video(db_session, sample_task, [projection], observer_cooldowns=observer_cooldowns)
+    assert {71, 72} <= set(selector.call_args_list[0].kwargs["exclude_ids"])
+    assert [item["observer_id"] for item in observations] == [73]
+    assert [call.args[0] for call in release_reservation.call_args_list] == [71, 73]
+    scan.assert_awaited_once()
 
 
 @pytest.mark.asyncio

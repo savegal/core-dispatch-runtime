@@ -131,18 +131,22 @@ def test_selected_fp_survives_generator_cache_reset_and_metadata_save_is_not_aut
 
 
 @pytest.mark.asyncio
-async def test_ads_fp_does_not_replace_or_block_the_web_identity():
+@pytest.mark.parametrize("closing", [False, True])
+async def test_ads_fp_does_not_replace_or_block_the_web_identity(closing):
     account = SimpleNamespace(id=96303, device_seed="c" * 64, cookies=json.dumps(export_records()))
     transport.cache_web_identity(account.id, {"verify_fp": "verify_web_fixture"}, account=account)
     ads = {"name": "s_v_web_id", "value": "verify_ads_fixture", "domain": "ads.tiktok.com", "path": "/"}
     context = SimpleNamespace(cookies=AsyncMock(return_value=[ads]), add_cookies=AsyncMock())
-    cookies, _ = await persistence.synchronize_browser_cookies(context, account)
+    cookies, _ = await persistence.synchronize_browser_cookies(context, account, closing=closing)
     assert cookies["s_v_web_id"] == "verify_web_fixture"
     assert ads in cookies.records
-    context.add_cookies.assert_awaited_once_with([{
-        "name": "s_v_web_id", "value": "verify_web_fixture", "domain": ".tiktok.com",
-        "path": "/", "secure": True, "httpOnly": False,
-    }])
+    if closing:
+        context.add_cookies.assert_not_awaited()
+    else:
+        context.add_cookies.assert_awaited_once_with([{
+            "name": "s_v_web_id", "value": "verify_web_fixture", "domain": ".tiktok.com",
+            "path": "/", "secure": True, "httpOnly": False,
+        }])
 
 
 @pytest.mark.asyncio

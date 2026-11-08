@@ -4,7 +4,6 @@ import asyncio
 from decimal import Decimal
 import math
 import logging
-import re
 from uuid import uuid4
 
 from aiogram import F, Router
@@ -16,7 +15,7 @@ from aiogram.types import InlineKeyboardButton as Button, InlineKeyboardMarkup a
 from bot.services.api_client import api_client, APIRequestError
 from bot.services.user_utils import get_user_backend_id
 from bot.services.template_utils import template_text_variants, template_replies, filter_full_templates, is_full_template
-from bot.services.validators import normalize_url, validate_video_url
+from bot.services.validators import parse_links as parse_tiktok_links
 from services.quantity_plan import QuantityPlan, quantity_plan
 from services.publication_runtime import (
     MAX_SEND_WORKERS, ORDER_OPTIONS_KEY, OrderPublicationOptions, PublicationRuntime,
@@ -51,11 +50,7 @@ CANCEL = keyboard([("🏠 Меню", "menu:main")])
 
 
 def parse_links(text):
-    links = []
-    for raw in re.findall(r"https?://[^\s<>]+", text or ""):
-        url = normalize_url(raw.rstrip(".,);]"))
-        if validate_video_url(url) and url not in links:
-            links.append(url)
+    links = parse_tiktok_links(text)
     if not links or len(links) > 100:
         raise ValueError("Пришлите от 1 до 100 ссылок на TikTok-видео.")
     return links
@@ -106,7 +101,9 @@ def speed_lines(data):
         return [f"Профиль · HTTP-отправки <b>{runtime.send_workers}</b>, проверки {runtime.check_workers}",
                 "Лимит исполнителя пока недоступен"]
     senders, readers = runtime.limits(slots)
-    return [f"Лимит параллельности · HTTP-отправки <b>{senders}</b>, проверки <b>{readers}</b>"]
+    idle_senders = runtime.idle_reader_send_limit(slots)
+    extra = f" · без проверок до <b>{idle_senders}</b>" if idle_senders > senders else ""
+    return [f"Лимит параллельности · HTTP-отправки <b>{senders}</b>, проверки <b>{readers}</b>{extra}"]
 
 
 def preview_text(data):
@@ -279,7 +276,7 @@ async def input_links(message, state):
         await choose_template(message, state, await get_user_backend_id(message.from_user.id))
 
 
-@router.message(StateFilter(None), F.text.regexp(r"https?://(?:www\.|vm\.|vt\.)?tiktok\.com/"))
+@router.message(StateFilter(None), F.text.regexp(r"(?i)\s*(?:https?://)?(?:www\.|m\.|vm\.|vt\.)?tiktok\.com/"))
 async def pasted_links(message, state):
     try:
         links = parse_links(message.text)
@@ -456,10 +453,10 @@ async def edit_speed(callback, state):
         presets = [1]
         selection_text = "Выберите одну отправку или введите своё число. Исполнитель применит свой лимит."
     else:
-        max_senders, _ = publication_capacity(slots, runtime.check_workers)
-        senders, readers = runtime.limits(slots)
+        max_senders = min(MAX_SEND_WORKERS, slots)
+        senders, readers = runtime.idle_reader_send_limit(slots), runtime.limits(slots)[1]
         presets = sorted({1, (max_senders + 1) // 2, max_senders})
-        selection_text = f"Лимит отправки при текущем числе проверок · {max_senders}. Выберите вариант или введите число."
+        selection_text = f"Лимит отправки без активных проверок · {max_senders}. Выберите вариант или введите число."
     text = ["<b>Потоки и скорость заказа</b>", "", *speed_lines(data),
             f"Интервал запуска отправок · {runtime.send_interval:g} с",
             f"Пауза перед первой проверкой · {runtime.check_delay:g} с",
@@ -483,10 +480,10 @@ async def choose_speed(callback, state):
     elif choice != "back":
         data = await state.get_data()
         runtime, slots = draft_runtime(data)
-        limit = publication_capacity(slots, runtime.check_workers)[0] if slots is not None else MAX_SEND_WORKERS
+        limit = min(MAX_SEND_WORKERS, slots) if slots is not None else MAX_SEND_WORKERS
         senders = int(choice)
         if not 1 <= senders <= limit:
-            await callback.answer(f"Допустимое число отправок при текущем числе проверок · {limit}.", show_alert=True)
+            await callback.answer(f"Допустимое число отправок · {limit}.", show_alert=True)
             return
         options = {**(data.get(ORDER_OPTIONS_KEY) or {}), "send_workers": senders}
         await state.update_data(publication_options=options, idempotency_key=uuid4().hex)
@@ -515,12 +512,13 @@ async def input_speed(message, state):
         return
     if slots is not None:
         requested_checks = options.get("check_workers", runtime.check_workers)
-        max_senders, readers = publication_capacity(slots, requested_checks)
+        _, readers = publication_capacity(slots, requested_checks)
+        max_senders = min(MAX_SEND_WORKERS, slots)
         if len(values) == 5 and requested_checks > readers:
             await message.answer(f"Лимит проверок на заказ · {readers}.")
             return
         if options["send_workers"] > max_senders:
-            await message.answer(f"Лимит отправки при таком числе проверок · {max_senders}.")
+            await message.answer(f"Лимит отправки · {max_senders}.")
             return
     await state.update_data(publication_options=options, idempotency_key=uuid4().hex)
     await show_preview(message, state)
@@ -692,7 +690,11 @@ async def replace_pending_texts(message, state):
         await message.answer(str(exc))
         return
     task_id = data["quantity_replace_task_id"]
-    await api_client.update_task_texts(task_id, texts, await get_user_backend_id(message.from_user.id))
+    try:
+        await api_client.update_task_texts(task_id, texts, await get_user_backend_id(message.from_user.id))
+    except APIRequestError as exc:
+        await message.answer(escape(str(exc)[:1000]), parse_mode="HTML")
+        return
     await state.clear()
     await message.answer("Тексты заказа обновлены.",
         reply_markup=keyboard([("Открыть заказ", f"order:detail:{task_id}:overview:0:all:0")]))

@@ -715,6 +715,7 @@ class _UserSchemaHttpSession:
     aweme_id: str
     video_url: str
     disabled_reason: Optional[str] = None
+    comment_list_deferred: bool = False
 
 
 def _user_schema_http_first_enabled(scope: str) -> bool:
@@ -1058,6 +1059,8 @@ async def _prepare_user_schema_http_session(
     scope: str,
     correlation_id: str,
     db: Optional[Session] = None,
+    require_comment_readiness: bool = False,
+    allow_verified_signer_without_list: bool = False,
 ) -> Optional[_UserSchemaHttpSession]:
     """Prepare HTTP publishing and retain the exact pre-submit refusal reason."""
     errors = getattr(page, "_user_schema_http_prepare_errors", {})
@@ -1129,12 +1132,17 @@ async def _prepare_user_schema_http_session(
 
     warmup_started = time.monotonic()
     try:
+        warmup_options = ({"max_retries": 1, "require_comment_readiness": True}
+                          if require_comment_readiness else {})
+        if allow_verified_signer_without_list:
+            warmup_options["allow_verified_signer_without_list"] = True
         cookies_dict, profile_valid, warmup_info = await warmup_http_page(
             page,
             video_url,
             correlation_id=correlation_id,
             account=account,
             db=db,
+            **warmup_options,
         )
     except Exception as exc:
         logger.info(
@@ -1156,10 +1164,9 @@ async def _prepare_user_schema_http_session(
 
     if not profile_valid or not aweme_id:
         reason = str(warmup_info.get("reason_code") or "warmup_failed")
-        record_http_account_result(
-            getattr(account, "id", None),
-            "soft_fail",
-        )
+        # A read that couldn't be verified isn't evidence of a bad account.
+        if not reason.startswith("comment_readiness_unconfirmed:"):
+            record_http_account_result(getattr(account, "id", None), "soft_fail")
         _log_user_trace(
             "http_first_warmup_unavailable",
             page=page,
@@ -1250,6 +1257,7 @@ async def _prepare_user_schema_http_session(
         cookies=cookies_dict,
         aweme_id=str(aweme_id),
         video_url=effective_video_url,
+        comment_list_deferred=warmup_info.get("comment_list_deferred") is True,
     )
 
 
@@ -3459,7 +3467,9 @@ async def _preflight_cookie_http_gate(
     if result.get("category") == "proxy_route":
         return error or "proxy_route:unavailable"
     if http_first:
-        if _allow_guard_browser_bootstrap(account, cache_key, result, correlation_id=correlation_id):
+        auth_unconfirmed = error_lower == "passport response did not confirm authentication"
+        skip_browser = phase in {"visibility_http", "publication_recheck"} and auth_unconfirmed
+        if not skip_browser and _allow_guard_browser_bootstrap(account, cache_key, result, correlation_id=correlation_id):
             if phase == "reply_selection":
                 with _HTTP_PREFLIGHT_VALID_CACHE_LOCK:
                     for key, stamp in list(_HTTP_PREFLIGHT_BROWSER_HANDOFFS.items()):
@@ -3470,8 +3480,13 @@ async def _preflight_cookie_http_gate(
                     _HTTP_PREFLIGHT_BROWSER_HANDOFFS[handoff_key] = time.monotonic()
             logger.info("[USER_SCHEMA] %s: guard session needs bounded browser verification after inconclusive Passport", correlation_id)
             return None
-        reason = f"http_preflight:inconclusive:{error or status or 'unknown'}"
-        mark_soft_error(db, account.id, reason)
+        failure = "passport_auth_unconfirmed" if auth_unconfirmed else error or status or "unknown"
+        reason = f"http_preflight:inconclusive:{failure}"
+        if skip_browser:
+            from services.account_service import mark_runtime_cooldown
+            mark_runtime_cooldown(db, account.id, reason, cooldown_minutes=30, category="auth_unconfirmed")
+        else:
+            mark_soft_error(db, account.id, reason)
         return reason
     return None
 
@@ -3632,12 +3647,17 @@ async def _visible_logged_out_reason(page: Page, *, phase: str) -> Optional[str]
     except Exception as exc:
         logger.debug("[USER_SCHEMA] login-state probe failed during %s: %s", phase, exc)
         return None
+    return _apply_browser_login_state(page, state, phase=phase, document=started)
+
+
+def _apply_browser_login_state(page: Page, state: dict, *, phase: str, document) -> Optional[str]:
+    from executor.http.page_runtime import page_document_key
     reason = _login_state_logged_out_reason(state, phase=phase)
     clear_probe = getattr(page, "_http_clear_captcha_probe", None)
     now = time.monotonic()
     if (reason is None and str(state.get("state") or "").lower() == "logged_in"
             and isinstance(clear_probe, tuple) and len(clear_probe) == 2
-            and clear_probe[0] == started == page_document_key(page)
+            and clear_probe[0] == document == page_document_key(page)
             and type(clear_probe[1]) in (int, float) and 0.0 <= now - clear_probe[1] <= 15.0):
         page._http_auth_verified_at = now
     return reason
@@ -3673,6 +3693,12 @@ async def _deny_if_visible_logged_out(
             level=logging.INFO,
         )
         return None
+    return _record_visible_logout(db, page, account, reason, correlation_id=correlation_id, phase=phase)
+
+
+def _record_visible_logout(
+    db: Session, page: Page, account: Account, reason: Optional[str], *, correlation_id: str, phase: str,
+) -> Optional[str]:
     if not reason:
         return None
     _register_dead_session(db, account, reason)
@@ -3687,6 +3713,48 @@ async def _deny_if_visible_logged_out(
         level=logging.WARNING,
     )
     return f"dead_session:{reason}"
+
+
+async def _probe_confirmed_http_auth_ui(
+    page: Page, *, phase: str, correlation_id: str, timeout_seconds: float,
+) -> Tuple[Optional[str], Optional[str]]:
+    """Check both UI vetoes in one window for a session with recent auth proof."""
+    from executor.browser_reads import await_browser_read
+    from executor.http.page_runtime import page_document_key
+
+    document = page_document_key(page)
+    deadline = time.monotonic() + timeout_seconds
+    login_read = asyncio.create_task(
+        await_browser_read(lambda: get_browser_login_state(page), timeout=timeout_seconds)
+    )
+    try:
+        captcha = await _fast_visible_captcha_reason(page, phase=phase, timeout_seconds=timeout_seconds)
+        if captcha:
+            return captcha, None
+        state = await login_read
+        reason = _apply_browser_login_state(page, state, phase=phase, document=document)
+        remaining = deadline - time.monotonic()
+        if (reason is None and state.get("state") == "unknown" and remaining > 0
+                and document == page_document_key(page)):
+            # A consent banner can obscure the auth UI. Preserve the existing
+            # cleanup and recheck for an inconclusive read within the same budget.
+            reason = await await_browser_read(
+                lambda: _visible_logged_out_reason(page, phase=phase), timeout=remaining,
+            )
+        return None, reason
+    except asyncio.TimeoutError:
+        logger.info(
+            "[USER_SCHEMA] %s: logged_out_ui_probe_timeout after %.2fs during %s",
+            correlation_id, timeout_seconds, phase,
+        )
+        return None, None
+    except Exception as exc:
+        logger.debug("[USER_SCHEMA] login-state probe failed during %s: %s", phase, exc)
+        return None, None
+    finally:
+        if not login_read.done():
+            login_read.cancel()
+        await asyncio.gather(login_read, return_exceptions=True)
 
 
 async def _wait_for_url_settled(page: Page, *, max_wait_ms: int = 4000) -> str:
@@ -4029,22 +4097,37 @@ async def _ensure_account_login_ready(
         if _on_target_media() and any(
             cookies.get(name) for name in ("sessionid", "sid_tt", "sessionid_ss")
         ):
+            from executor.http.page_runtime import page_document_key
+
             # commit can precede React's auth markers. Wait only for an
             # inconclusive state; explicit logout/captcha still stops at once.
             auth_deadline = time.monotonic() + min(6.0, max(0.2, timeout_ms / 1000))
+            phase = "http_preflight_browser_auth"
             while True:
                 remaining = max(0.2, auth_deadline - time.monotonic())
-                captcha = await _fast_visible_captcha_reason(
-                    page, phase="http_preflight_browser_auth", timeout_seconds=min(1.75, remaining),
-                )
+                if http_preflight_valid:
+                    document = page_document_key(page)
+                    captcha, logout_reason = await _probe_confirmed_http_auth_ui(
+                        page, phase=phase, correlation_id=correlation_id, timeout_seconds=min(1.75, remaining),
+                    )
+                    if not _on_target_media():
+                        return False, "redirect_not_video"
+                    if document != page_document_key(page):
+                        if time.monotonic() >= auth_deadline:
+                            return _reject_unconfirmed_http_browser_auth(db, account, correlation_id)
+                        continue
+                else:
+                    captcha = await _fast_visible_captcha_reason(page, phase=phase, timeout_seconds=min(1.75, remaining))
                 if captcha:
                     _register_captcha_session(db, account, captcha)
                     return False, captcha
-                remaining = max(0.2, auth_deadline - time.monotonic())
-                denied = await _deny_if_visible_logged_out(
-                    db, page, account, correlation_id=correlation_id,
-                    phase="http_preflight_browser_auth", timeout_seconds=min(1.75, remaining),
-                )
+                if http_preflight_valid:
+                    denied = _record_visible_logout(db, page, account, logout_reason, correlation_id=correlation_id, phase=phase)
+                else:
+                    remaining = max(0.2, auth_deadline - time.monotonic())
+                    denied = await _deny_if_visible_logged_out(
+                        db, page, account, correlation_id=correlation_id, phase=phase, timeout_seconds=min(1.75, remaining),
+                    )
                 if denied:
                     return False, denied
                 if not _on_target_media():

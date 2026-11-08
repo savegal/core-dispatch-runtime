@@ -24,13 +24,15 @@ from datetime import datetime, timezone, timedelta
 from urllib.parse import urlparse
 from sqlalchemy import and_, or_, func, case, select, literal
 from sqlalchemy.orm import Session
-from db.models import Account, Proxy
+from db.models import Account, Proxy, PublicationAttempt
 from config.settings import get_settings
 from services.proxy_filter_utils import get_proxy_type_filter
 from services.app_settings_service import get_proxy_prefer_mobile
 from services.proxy_health_service import get_bad_proxy_set, is_proxy_bad
 from services.mobile_proxy_service import get_locked_proxy_ids
-from services.cookie_validator import parse_cookies_to_dict, validate_cookies, classify_account_web_readiness
+from services.cookie_validator import (
+    classify_account_web_readiness, get_cookies_for_account, has_unverified_guard_aliases, parse_cookies_to_dict, validate_cookies,
+)
 from services.account_assignment import (
     assignment_order_sql, assignment_rank, available_assignment_filter,
     claim_assignment, release_assignment, extend_assignment,
@@ -716,6 +718,11 @@ def _account_selection_diagnostics(
     )
 
 
+def _publish_cookie_risk(cookies: dict) -> bool:
+    keys = {str(key).lower() for key, value in cookies.items() if str(value or "").strip()}
+    return bool(keys & {"_waftokenid", "x-web-secsdk-uid", "waf_logged_in"})
+
+
 def _read_account_session_quality(
     account: Account,
     scope: str,
@@ -768,6 +775,9 @@ def _read_account_session_quality(
     # sid_guard alone cannot render TikTok's comment input box in the browser.
     # Only sessionid/sid_tt allow the React app to show the comment form.
     has_browser_auth = has_sid_tt or has_sessionid
+    if scope in {MAIN_SCOPE, REPLY_SCOPE} and has_unverified_guard_aliases(
+            cookies_dict, validated=getattr(account, "last_validation_ok", None) is not None):
+        has_browser_auth = False
     has_strong_pair = (has_sid_tt and has_sessionid) or (has_sid_guard and has_ms_token)
 
     matched_set = None
@@ -904,6 +914,7 @@ def _read_account_session_quality(
         "has_browser_linkage": has_browser_linkage,
         "has_device_linkage": has_device_linkage,
         "has_csrf": has_csrf,
+        "publish_cookie_risk": _publish_cookie_risk(cookie_keys),
         "missing_http_critical": missing_http_critical,
         "missing_http_optional": missing_http_optional,
     }
@@ -1570,8 +1581,10 @@ def _calculate_scope_quality_score(
             ACCOUNT_LANE_RETIRE: -100,
         }
     score += lane_adjustments.get(spend_lane["lane"], 0)
-
-    return max(0, min(100, score))
+    score = max(0, min(100, score))
+    if scope in {MAIN_SCOPE, REPLY_SCOPE} and session_quality.get("publish_cookie_risk"):
+        score = max(0, score - 25)
+    return score
 
 
 def _has_bad_proxy(account: Account, bad_proxy_set: set[str] | None = None) -> bool:
@@ -1773,19 +1786,21 @@ _WEB_READINESS_CACHE = OrderedDict()
 _WEB_READINESS_CACHE_LOCK = threading.RLock()
 
 
-def _cached_web_readiness(cookies):
-    fingerprint = hashlib.sha256(str(cookies or "").encode()).hexdigest()
+def _cached_web_readiness(cookies, *, validated=False, include_risk=False):
+    fingerprint = (hashlib.sha256(str(cookies or "").encode()).hexdigest(), validated, int(time.time() // 60))
     with _WEB_READINESS_CACHE_LOCK:
         if fingerprint in _WEB_READINESS_CACHE:
             _WEB_READINESS_CACHE.move_to_end(fingerprint)
-            return _WEB_READINESS_CACHE[fingerprint]
-    readiness = classify_account_web_readiness(cookies)
+            profile = _WEB_READINESS_CACHE[fingerprint]
+            return profile if include_risk else profile[0]
+    readiness = classify_account_web_readiness(cookies, validated=validated, for_selection=True)
+    profile = (readiness, _publish_cookie_risk(parse_cookies_to_dict(cookies, restore_guard_aliases=False)))
     with _WEB_READINESS_CACHE_LOCK:
-        _WEB_READINESS_CACHE[fingerprint] = readiness
+        _WEB_READINESS_CACHE[fingerprint] = profile
         _WEB_READINESS_CACHE.move_to_end(fingerprint)
         while len(_WEB_READINESS_CACHE) > 4096:
             _WEB_READINESS_CACHE.popitem(last=False)
-    return readiness
+    return profile if include_risk else profile[0]
 
 
 def _candidate_ids_by_web_readiness(query, order_by_clauses, limit=None):
@@ -1794,13 +1809,24 @@ def _candidate_ids_by_web_readiness(query, order_by_clauses, limit=None):
     Stream cookie rows and retain only IDs and integer ranks. Existing SQL
     ordering remains the stable tie-breaker; locked eligibility checks follow.
     """
-    rows = query.with_entities(Account.id, Account.cookies).order_by(*order_by_clauses)
+    rows = query.with_entities(Account.id, Account.cookies, Account.cookie_file, Account.last_validation_ok).order_by(*order_by_clauses)
     if limit is not None:
         rows = rows.limit(limit)
-    ranked = [(account_id, _cached_web_readiness(cookies))
-              for account_id, cookies in rows.yield_per(256)]
-    ranked.sort(key=lambda item: -item[1])
+    ranked = [(row.id, _cached_web_readiness(get_cookies_for_account(row),
+               validated=row.last_validation_ok is not None, include_risk=True)) for row in rows.yield_per(256)]
+    ranked.sort(key=lambda item: (item[1][1], -item[1][0]))
     return [account_id for account_id, _ in ranked]
+
+
+def _without_recent_empty_publication(now):
+    observed_at = func.coalesce(PublicationAttempt.finished_at, PublicationAttempt.dispatched_at, PublicationAttempt.started_at)
+    return ~select(PublicationAttempt.id).where(
+        PublicationAttempt.account_id == Account.id,
+        PublicationAttempt.origin == "http",
+        PublicationAttempt.wire_count > 0,
+        PublicationAttempt.error_code == "submitted_unconfirmed:empty_body",
+        observed_at > now - timedelta(minutes=60),
+    ).exists()
 
 
 def get_free_account_for_main_comment(
@@ -1890,7 +1916,7 @@ def get_free_account_for_main_comment(
             )
         )
 
-    query = query.filter(available_assignment_filter(now))
+    query = query.filter(available_assignment_filter(now), _without_recent_empty_publication(now))
     reserved_ids = get_reserved_main_account_ids() | get_reserved_reply_account_ids()
     combined_exclude_ids = set(exclude_ids or [])
     combined_exclude_ids.update(reserved_ids)
@@ -1967,12 +1993,11 @@ def get_free_account_for_main_comment(
     
     # Сортировка: ORDER BY с учетом geo-matching
     order_by_clauses = [
-        assignment_order_sql(),
-        # Status/quality break ties; they cannot monopolize successive turns.
         (Account.status != "active").asc(),
         # Меньше ошибок - лучше
         Account.error_count_recent.asc().nulls_first(),
         _account_country_order_sql(),
+        assignment_order_sql(),
     ]
     
     # Добавляем гео-приоритизацию если включено
@@ -2083,11 +2108,7 @@ def get_free_account_for_main_comment(
     runtime_last_resort_candidates: list[tuple[tuple[Any, ...], Account, dict[str, Any], int]] = []
     last_resort_candidates: list[tuple[tuple[Any, ...], Account, dict[str, Any], int]] = []
     candidates: list[Account] = []
-    try:
-        desired_ranked_candidates = int(getattr(settings, "PARALLEL_COMMENTING_TARGET_BROWSERS", 3) or 3)
-    except (TypeError, ValueError):
-        desired_ranked_candidates = 3
-    desired_ranked_candidates = max(1, min(10, desired_ranked_candidates))
+    desired_ranked_candidates = 20
     selection_proxy_cache: dict[str, bool] = {}
     offset = 0
     while offset < max_candidate_scan and len(ranked_candidates) < desired_ranked_candidates:
@@ -2137,9 +2158,9 @@ def get_free_account_for_main_comment(
             score = _calculate_scope_quality_score(candidate, state, MAIN_SCOPE, now, lifecycle=lifecycle, session_quality=session_quality, spend_lane=spend_lane)
             ranked_item = (
                 (
-                    -classify_account_web_readiness(candidate.cookies),
+                    bool(session_quality.get("publish_cookie_risk")),
+                    -_cached_web_readiness(get_cookies_for_account(candidate), validated=candidate.last_validation_ok is not None),
                     _http_proxy_priority(db, candidate) if prefer_residential else 0,
-                    assignment_rank(candidate),
                     RUNTIME_BUCKET_ORDER.get(state["bucket"], 5),
                     0 if candidate.status == "active" else 1,
                     _lane_sort_rank(MAIN_SCOPE, spend_lane["lane"]),
@@ -2147,6 +2168,7 @@ def get_free_account_for_main_comment(
                     -score,
                     _account_country_priority(candidate),
                     int(candidate.error_count_recent or 0),
+                    assignment_rank(candidate),
                     index,
                 ),
                 candidate,
@@ -2436,15 +2458,15 @@ def get_free_account_for_reply(
         )
 
     now = datetime.now(timezone.utc)
-    query = query.filter(available_assignment_filter(now))
+    query = query.filter(available_assignment_filter(now), _without_recent_empty_publication(now))
     proxy_type_filter = None if dedicated_route is not None or not settings.USE_PROXY else get_proxy_type_filter(db)
     prefer_residential = dedicated_route is None and _prefer_residential_http_routes()
     proxy_prefer_mobile = False if dedicated_route is not None or not settings.USE_PROXY or prefer_residential else get_proxy_prefer_mobile(db)
     order_by_clauses = [
-        assignment_order_sql(),
         (Account.status != "active").asc(),
         Account.error_count_recent.asc().nulls_first(),
         _account_country_order_sql(),
+        assignment_order_sql(),
         Account.last_used_at.asc().nulls_first(),
         Account.id.asc(),
     ]
@@ -2707,8 +2729,10 @@ def get_free_account_for_reply(
             reply_cooldown_seconds = max(0, int(getattr(settings, "REPLY_ACCOUNT_COOLDOWN_SECONDS", 0) or 0))
             for acc, state, index in available_accounts:
                 lifecycle = _read_account_lifecycle(acc, now)
-                spend_lane = _read_account_spend_lane(acc, REPLY_SCOPE, now)
-                score = _calculate_scope_quality_score(acc, state, REPLY_SCOPE, now)
+                session_quality = _read_account_session_quality(acc, REPLY_SCOPE, now)
+                spend_lane = _read_account_spend_lane(acc, REPLY_SCOPE, now, lifecycle=lifecycle, session_quality=session_quality)
+                score = _calculate_scope_quality_score(acc, state, REPLY_SCOPE, now, lifecycle=lifecycle,
+                                                       session_quality=session_quality, spend_lane=spend_lane)
                 in_reply_cooldown = 0
                 if reply_cooldown_seconds > 0 and getattr(acc, "last_used_at", None) is not None:
                     raw_used = acc.last_used_at
@@ -2718,10 +2742,10 @@ def get_free_account_for_reply(
                 ranked_available.append(
                     (
                         (
+                            bool(session_quality.get("publish_cookie_risk")),
                             in_reply_cooldown,
-                            -classify_account_web_readiness(acc.cookies),
+                            -_cached_web_readiness(get_cookies_for_account(acc), validated=acc.last_validation_ok is not None),
                             int(_proxy_is_mobile(acc)) if prefer_residential else 0,
-                            assignment_rank(acc),
                             RUNTIME_BUCKET_ORDER.get(state["bucket"], 5),
                             0 if acc.status == "active" else 1,
                             _lane_sort_rank(REPLY_SCOPE, spend_lane["lane"]),
@@ -2729,6 +2753,7 @@ def get_free_account_for_reply(
                             -score,
                             _account_country_priority(acc),
                             int(acc.error_count_recent or 0),
+                            assignment_rank(acc),
                             index,
                         ),
                         acc,

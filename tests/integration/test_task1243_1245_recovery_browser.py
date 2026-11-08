@@ -3,6 +3,8 @@ import json
 import asyncio
 import gc
 from urllib.parse import urlparse
+from types import SimpleNamespace
+from unittest.mock import Mock
 
 import pytest
 
@@ -81,7 +83,41 @@ async def _clear():
     return None
 
 
-async def test_browser_close_after_login_probe_timeout_retrieves_late_errors(browser_page, monkeypatch):
+@pytest.mark.parametrize(("html", "blocked_by"), [
+    ('<button aria-label="Open settings menu">Settings</button>', None),
+    ('<button data-e2e="login-button">Log in</button>', "dead_session:visible_login_ui:"),
+    ('<div id="captcha-verify-image">Drag the slider</div>', "captcha_challenge:slider"),
+    ('<button data-e2e="login-button">Log in</button><div id="captcha-verify-image">Drag the slider</div>',
+     "captcha_challenge:slider"),
+])
+async def test_confirmed_http_auth_still_checks_live_browser_ui(browser_page, monkeypatch, html, blocked_by):
+    from executor import user_schema as schema
+
+    await browser_page.route("**/*", lambda route: route.fulfill(content_type="text/html", body=html))
+    await browser_page.goto(URL)
+    await browser_page.context.add_cookies([
+        {"name": "sessionid", "value": "fixture", "domain": ".tiktok.com", "path": "/"},
+    ])
+    monkeypatch.setattr(schema, "_has_recent_http_preflight_valid", lambda account: True)
+    monkeypatch.setattr(schema, "_http_first_for_correlation", lambda *args: True)
+    monkeypatch.setattr(schema, "_HTTP_PREFLIGHT_VALID_CACHE", {})
+    for name in ("register_alive_session", "_register_dead_session", "_register_captcha_session"):
+        monkeypatch.setattr(schema, name, Mock())
+
+    ok, reason = await schema._ensure_account_login_ready(
+        None, browser_page, SimpleNamespace(id=77, cookies='{"sessionid": "fixture"}', cookie_file=None),
+        URL, timeout_ms=1750, correlation_id="fixture",
+    )
+
+    assert ok == (blocked_by is None)
+    assert reason is None if blocked_by is None else reason.startswith(blocked_by)
+    assert schema.register_alive_session.call_count == int(ok)
+    assert schema._register_dead_session.call_count == int(bool(blocked_by and blocked_by.startswith("dead_session:")))
+    assert schema._register_captcha_session.call_count == int(bool(blocked_by and blocked_by.startswith("captcha_challenge:")))
+
+
+@pytest.mark.parametrize("confirmed_auth", [False, True])
+async def test_browser_close_after_login_probe_timeout_retrieves_late_errors(browser_page, monkeypatch, confirmed_auth):
     from executor import user_schema as schema
     await browser_page.route("**/*", lambda route: route.fulfill(content_type="text/html", body="<html>Local fixture</html>"))
     await browser_page.goto(URL)
@@ -91,10 +127,16 @@ async def test_browser_close_after_login_probe_timeout_retrieves_late_errors(bro
     loop.set_exception_handler(lambda _, context: errors.append(context))
     async def slow_probe(page, **_):
         return await page.evaluate("() => new Promise(() => {})", isolated_context=False)
-    monkeypatch.setattr(schema, "_visible_logged_out_reason", slow_probe)
     try:
-        for _ in range(5):
-            assert await schema._deny_if_visible_logged_out(None, browser_page, None, correlation_id="fixture", phase="fixture", timeout_seconds=0.2) is None
+        if confirmed_auth:
+            monkeypatch.setattr(schema, "get_browser_login_state", slow_probe)
+            assert await schema._probe_confirmed_http_auth_ui(
+                browser_page, correlation_id="fixture", phase="fixture", timeout_seconds=0.2,
+            ) == (None, None)
+        else:
+            monkeypatch.setattr(schema, "_visible_logged_out_reason", slow_probe)
+            for _ in range(5):
+                assert await schema._deny_if_visible_logged_out(None, browser_page, None, correlation_id="fixture", phase="fixture", timeout_seconds=0.2) is None
         await browser_page.close()
         await asyncio.sleep(0.1)
         gc.collect()

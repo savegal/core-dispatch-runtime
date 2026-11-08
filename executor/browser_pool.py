@@ -170,6 +170,7 @@ _TIKTOK_SHORTCUTS_SUPPRESS_INIT_SCRIPT = (
 )
 
 settings = get_settings()
+STATIC_ASSET_WAIT_SECONDS = 0.4
 
 
 async def _install_resource_blocking_routes(context: BrowserContext, account_id: int | None = None) -> None:
@@ -191,6 +192,17 @@ async def _install_resource_blocking_routes(context: BrowserContext, account_id:
             "default",
         )
 
+    downloads = {}
+    tasks = set()
+    context._static_asset_cache_tasks = tasks
+    cache = static_asset_cache
+    cache_enabled = settings.STATIC_ASSET_CACHE_ENABLED and cache.max_total_bytes > 0 and callable(getattr(context, "on", None))
+
+    def finish_download(request):
+        url = downloads.pop(id(request), None)
+        if url is not None:
+            cache.finish_download(url)
+
     async def route_handler(route):
         try:
             request = route.request
@@ -200,16 +212,30 @@ async def _install_resource_blocking_routes(context: BrowserContext, account_id:
                 request._traffic_local = True
                 await route.abort()
                 return
-            if (settings.STATIC_ASSET_CACHE_ENABLED
+            if (cache_enabled
                     and is_cacheable_static_asset(request.method, resource_type, request_url)):
-                cached = static_asset_cache.get(request_url)
+                cached = cache.get(request_url)
+                if cached is None:
+                    pending, owner = cache.begin_download(request_url)
+                    if owner:
+                        downloads[id(request)] = request_url
+                    else:
+                        try:
+                            await asyncio.wait_for(pending.wait(), timeout=STATIC_ASSET_WAIT_SECONDS)
+                        except TimeoutError:
+                            pass
+                        cached = cache.get(request_url)
                 if cached is not None:
                     request._traffic_local = True
                     await route.fulfill(status=cached.status, headers=cached.headers, body=cached.body)
                     return
             try:
                 await route.continue_()
+            except asyncio.CancelledError:
+                finish_download(request)
+                raise
             except Exception as continue_error:
+                finish_download(request)
                 if "target" in str(continue_error).lower() or "closed" in str(continue_error).lower():
                     logger.debug(f"Route handler: page/context closed, ignoring: {continue_error}")
                     return
@@ -221,40 +247,42 @@ async def _install_resource_blocking_routes(context: BrowserContext, account_id:
             logger.debug(f"Route handler error: {route_error}")
 
     await context.route("**/*", route_handler)
-
-    tasks = set()
-    pending_urls = set()
-    context._static_asset_cache_tasks = tasks
+    if not cache_enabled:
+        return
 
     async def populate(response):
         try:
             all_headers = getattr(response, "all_headers", None)
             headers = await await_browser_read(all_headers) if callable(all_headers) else response.headers
             body = await await_browser_read(response.body)
-            if settings.STATIC_ASSET_CACHE_ENABLED:
-                static_asset_cache.put(response.url, response.status, headers, body)
+            cache.put(response.url, response.status, headers, body)
         except Exception:
             pass  # Closing a tab must never affect other contexts' downloads.
         finally:
-            pending_urls.discard(response.url)
+            finish_download(response.request)
 
     def _on_context_response(response):
         request = response.request
-        if (settings.STATIC_ASSET_CACHE_ENABLED and response.status == 200
-                and is_cacheable_static_asset(request.method, request.resource_type, response.url)
-                and response.url not in pending_urls and not static_asset_cache.has(response.url)):
-            pending_urls.add(response.url)
+        # A waiter that went to the network may serve the page, but only the
+        # elected downloader should copy the response body through the driver.
+        if downloads.get(id(request)) == response.url and response.status == 200:
             task = asyncio.create_task(populate(response))
             tasks.add(task)
             task.add_done_callback(tasks.discard)
+        else:
+            finish_download(request)
 
     def cancel_population(*_):
         for task in list(tasks):
             task.cancel()
+        for url in downloads.values():
+            cache.finish_download(url)
+        downloads.clear()
 
-    if callable(getattr(context, "on", None)):
-        context.on("response", _on_context_response)
-        context.on("close", cancel_population)
+    context._cancel_static_asset_population = cancel_population
+    context.on("response", _on_context_response)
+    context.on("requestfailed", finish_download)
+    context.on("close", cancel_population)
 
 
 def _positive_int_setting(name: str, default: int, *, minimum: int = 1, maximum: int = 10000) -> int:
@@ -692,6 +720,11 @@ class BrowserPool:
             return True
         async with lock:
             context = self._contexts.get(account_id)
+            if context is not None and getattr(page, "context", context) is context and not any(
+                    other is not page and not other.is_closed() for other in context.pages):
+                cancel_population = getattr(context, "_cancel_static_asset_population", None)
+                if callable(cancel_population):
+                    cancel_population()
             if not page.is_closed():
                 try:
                     await page.close()
@@ -722,7 +755,7 @@ class BrowserPool:
             return
         try:
             from services.cookie_persistence_service import synchronize_browser_cookies
-            await synchronize_browser_cookies(context, account)
+            await synchronize_browser_cookies(context, account, closing=True)
         except Exception as exc:
             logger.debug(
                 "Could not flush cookies before closing context account=%s: %s",
@@ -1803,6 +1836,7 @@ class BrowserPool:
                 context._shared_browser_process = bool(settings.BROWSER_POOL_SHARED_PROCESS and proxy_source)
                 context._account_proxy_route = resolved_route
                 context._account_locale = context_options.get("locale")
+                context._account_timezone = context_options.get("timezone_id")
                 context._account_accept_language = accept_language if proxy_source else None
                 context._pool_account_id = account.id
                 context._pool_account_obj = None if getattr(account, "_anonymous_http_context", False) else account

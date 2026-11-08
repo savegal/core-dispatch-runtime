@@ -103,6 +103,7 @@ def summarize(rows):
         uncertain=sum(row["status"] == "unknown" for row in rows),
         pending_checks=sum(row["status"] == "accepted" and row["visibility"] in {"unchecked", "inconclusive"} for row in receipts),
         failed=sum(row["status"] == "failed" for row in rows), not_sent=sum(row["status"] == "not_sent" for row in rows),
+        preflight_rejected=sum(row["status"] == "not_sent" and row["wire_count"] == 0 for row in rows),
         preparing=sum(row["status"] == "preparing" for row in rows),
         historical_without_attempt_count=sum(row["wire_count"] is None for row in rows),
         accepted_percent=round(100 * len(accepted & wire) / dispatched, 2) if dispatched else None,
@@ -144,6 +145,7 @@ def _sql_summary(query):
         pending_checks=count(latest & accepted & c.visibility.in_(["unchecked", "inconclusive"])),
         failed=count(c.status == "failed"),
         not_sent=count(c.status == "not_sent"),
+        preflight_rejected=count((c.origin == "http") & (c.status == "not_sent") & (c.wire_count == 0)),
         preparing=count(c.status == "preparing"),
         historical_without_attempt_count=count(c.origin != "http"),
         wire_accepted=unique(accepted & (c.http == 1)),
@@ -191,8 +193,13 @@ def activity_snapshot(db, task, *, limit=12, include_texts=False):
         success = quantity_goal_count(db, task)
         errors = dict(query.filter(PublicationAttempt.error_code.isnot(None)).with_entities(
             PublicationAttempt.error_code, func.count(PublicationAttempt.id)).group_by(PublicationAttempt.error_code).all())
-        latest = query.order_by(func.coalesce(PublicationAttempt.checked_at, PublicationAttempt.finished_at,
-            PublicationAttempt.dispatched_at, PublicationAttempt.started_at).desc(), PublicationAttempt.id).limit(limit).all()
+        latest_query = query.order_by(func.coalesce(PublicationAttempt.checked_at, PublicationAttempt.finished_at,
+            PublicationAttempt.dispatched_at, PublicationAttempt.started_at).desc(), PublicationAttempt.id.desc())
+        http_attempts = latest_query.filter(PublicationAttempt.origin == "http")
+        latest = http_attempts.filter(PublicationAttempt.wire_count > 0).limit(limit).all()
+        if not latest and limit:
+            latest = http_attempts.filter(PublicationAttempt.wire_count == 0,
+                PublicationAttempt.status == "not_sent").limit(min(limit, 2)).all()
         return dict(task_id=task.id, status=task.status, progress=task.progress, videos_total=len(task.video_urls or []),
             live_interval=live_interval,
             execution=runtime_payload(execution),
@@ -250,7 +257,7 @@ def export_report(db, task, format="txt"):
         output = StringIO()
         fields = ["kind", "text", "account_id", "parent_id", "comment_id", "status", "visibility", "source",
                   "wire_count", "started_at", "checked_at", "visible_at", "author_visible",
-                  "independent_absences", "link", "parent_link"]
+                  "independent_absences", "link", "parent_link", "error_code"]
         writer = csv.DictWriter(output, fieldnames=fields, extrasaction="ignore")
         writer.writeheader()
         for row in rows:
@@ -281,13 +288,16 @@ def export_report(db, task, format="txt"):
                           f"Принято с CID: {text['accepted']} · ожидают проверки: {text['pending_checks']}",
                           f"Только автору: {text['author_only']} · не найдены наблюдателями: {text['not_found']}",
                           f"Из предыдущих заказов: принято {text['existing_accepted']}, подтверждено {text['existing_visible']}",
-                          f"Неопределённые отправки: {text['uncertain']} · ошибок: {text['failed']}", ""])
+                          f"Неопределённые отправки: {text['uncertain']} · ошибок: {text['failed']} · не отправлено: {text['not_sent']}", ""])
     lines.extend(["Публикации", ""])
     for row in rows:
         lines.extend([f"{row['kind']} · аккаунт {row['account_id']} · {row['status']} · {row['visibility']}",
                       row["text"], f"CID: {row['comment_id'] or 'не получен'} · родитель: {row['parent_id'] or '—'}",
                       row["link"], f"Ссылка на родителя: {row['parent_link']}" if row.get("parent_link") else "",
-                      f"Проверено: {row['checked_at'] or 'проверка не выполнена'}", ""])
+                      f"Проверено: {row['checked_at'] or 'проверка не выполнена'}"])
+        if row["error_code"]:
+            lines.append(f"Причина: {row['error_code']}")
+        lines.append("")
     return "\n".join(lines)
 
 

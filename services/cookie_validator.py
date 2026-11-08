@@ -129,6 +129,12 @@ def remember_observed_ms_token(context: Any, cookies: Dict[str, str]) -> None:
         context._http_observed_ms_token_fingerprint = fingerprint
 
 
+def ms_token_differs_from_import(context: Any, cookies: Dict[str, str]) -> bool:
+    imported = getattr(context, "_http_imported_ms_token_fingerprint", None)
+    current = _ms_token_fingerprint(cookies.get("msToken"))
+    return bool(imported is not None and current and current != imported)
+
+
 def ms_token_needs_browser_refresh(context: Any, cookies: Dict[str, str], account: Any = None) -> bool:
     """Require one live read for an unchanged imported token in this context."""
     imported = getattr(context, "_http_imported_ms_token_fingerprint", None)
@@ -146,22 +152,18 @@ def ms_token_needs_browser_refresh(context: Any, cookies: Dict[str, str], accoun
                 and getattr(context, "_http_observed_ms_token_fingerprint", "") != current)
 
 
-def account_has_fresh_antifraud_cookies(account: Any, *, max_age_minutes: float = 30.0) -> bool:
-    """Return True when the account's cookies were validated or used within max_age_minutes."""
+def account_has_fresh_antifraud_cookies(account: Any, *, max_age_minutes: float = 10.0) -> bool:
+    """Only a recent live-browser cookie refresh establishes freshness."""
     if account is None:
         return False
     now_utc = datetime.now(timezone.utc)
     max_age_seconds = max(0.0, float(max_age_minutes) * 60.0)
-    for attr in ("last_validation_ok", "last_used_at", "_cookies_warmed_at"):
-        ts = getattr(account, attr, None)
-        if not isinstance(ts, datetime):
-            continue
-        if ts.tzinfo is None:
-            ts = ts.replace(tzinfo=timezone.utc)
-        age = (now_utc - ts).total_seconds()
-        if 0.0 <= age <= max_age_seconds:
-            return True
-    return False
+    ts = getattr(account, "_cookies_warmed_at", None)
+    if not isinstance(ts, datetime):
+        return False
+    if ts.tzinfo is None:
+        ts = ts.replace(tzinfo=timezone.utc)
+    return 0.0 <= (now_utc - ts).total_seconds() <= max_age_seconds
 
 
 def normalize_cookies_for_browser(
@@ -245,9 +247,9 @@ def prepare_cookies_for_context(
     raw_cookies: Optional[str] = None,
     *,
     parse_fn: Optional[Any] = None,
-    max_age_minutes: float = 30.0,
+    max_age_minutes: float = 10.0,
 ) -> List[dict]:
-    """Prepare browser context cookies, retaining fresh ttwid/tt_csrf_token (<30m) and seeding web identity."""
+    """Prepare startup cookies, preserving CSRF only after a recent browser refresh."""
     cookies_source = raw_cookies if raw_cookies is not None else get_cookies_for_account(account)
     try:
         from executor.http.playwright_http_client import cache_web_identity, extract_web_identity_from_cookies
@@ -393,7 +395,24 @@ WARM_AUTH_READY = 1
 COLD_NEEDS_BOOTSTRAP = 0
 
 
-def classify_account_web_readiness(cookies_input: str | list | dict | None) -> int:
+def has_web_auth_marker(cookies) -> bool:
+    return (any(str(cookies.get(name) or "").strip() for name in ("uid_tt", "uid_tt_ss"))
+            or str(cookies.get("passport_fe_beating_status") or "").strip().lower() == "true")
+
+
+def has_unverified_guard_aliases(cookies, *, validated=False) -> bool:
+    """Guest linkage and aliases of one guard do not establish web authentication."""
+    if validated or has_web_auth_marker(cookies):
+        return False
+    prefix, timestamp = _sid_guard_parts(cookies.get("sid_guard", ""))
+    return bool(timestamp > 0 and re.fullmatch(r"[0-9a-fA-F]{32}", prefix)
+                and all(cookies.get(name) in {None, "", prefix}
+                        for name in ("sessionid", "sid_tt", "sessionid_ss")))
+
+
+def classify_account_web_readiness(
+    cookies_input: str | list | dict | None, *, validated: bool = False, for_selection: bool = False,
+) -> int:
     """Rank available web material, without treating a guard as live session proof."""
     if isinstance(cookies_input, NormalizedCookies) and cookies_input.records:
         cookies_input = cookies_input.records
@@ -421,11 +440,18 @@ def classify_account_web_readiness(cookies_input: str | list | dict | None) -> i
                       if str(item.get("domain") or "").lower().lstrip(".") in {"", "tiktok.com", "www.tiktok.com"}}
     has_session = any(name in explicit_names and str(cookies.get(name) or "").strip()
                       for name in ("sessionid", "sessionid_ss", "sid_tt"))
-    if (has_session and cookies.get("ttwid") and (cookies.get("tt_csrf_token") or cookies.get("ctoken"))
-            and cookies.get("msToken")):
-        return HOT_WEB_READY
     prefix, timestamp = _sid_guard_parts(cookies.get("sid_guard", ""))
     has_guard = timestamp > 0 and bool(re.fullmatch(r"[0-9a-fA-F]{32}", prefix))
+    # A browser can add guest tokens and persist aliases derived from a guard.
+    # A matching guard prefix alone carries no information about authentication.
+    if has_session and has_guard and all(cookies.get(name) == prefix for name in ("sessionid", "sid_tt", "sessionid_ss")):
+        scoped = normalize_cookie_records([item for item in records
+            if str(item.get("domain") or "").lower().lstrip(".") in {"", "tiktok.com", "www.tiktok.com"}])
+        if has_unverified_guard_aliases(scoped, validated=validated):
+            return COLD_NEEDS_BOOTSTRAP
+    if (has_session and cookies.get("ttwid") and (cookies.get("tt_csrf_token") or cookies.get("ctoken"))
+            and (for_selection or cookies.get("msToken"))):
+        return HOT_WEB_READY
     if (has_session or has_guard) and cookies.get("ttwid"):
         return WARM_AUTH_READY
     return COLD_NEEDS_BOOTSTRAP
@@ -551,6 +577,18 @@ def _inconclusive_result(error: str, *, country_code: Optional[str] = None) -> d
 def _proxy_auth_result(country_code=None):
     return {**_inconclusive_result("proxy_authentication_required:HTTP407", country_code=country_code),
             "category": "proxy_route", "request_attempted": False}
+
+
+def _proxy_tunnel_error_result(error, country_code):
+    status = getattr(error, "status", None)
+    message = str(error)
+    if ((isinstance(error, aiohttp.ClientHttpProxyError) and status == 402)
+            or re.search(r"\bCONNECT tunnel failed, response 402\b", message, re.IGNORECASE)):
+        return {**_inconclusive_result("proxy_payment_required:HTTP402", country_code=country_code),
+                "category": "proxy_route", "request_attempted": False}
+    if status == 407 or re.search(r"\b407\b", message):
+        return _proxy_auth_result(country_code)
+    return None
 
 
 def _normalize_proxy_for_aiohttp(proxy_raw):
@@ -745,8 +783,8 @@ async def _validate_account_http_tri_state(account: Account, *, strict_passport:
                     return _inconclusive_result(f"HTTP challenge/rate-limit {status_code}", country_code=country_code)
                 return _inconclusive_result("Could not verify session (no definitive auth markers)", country_code=country_code)
         except Exception as curl_exc:
-            if proxy_url and re.search(r"\b407\b", str(curl_exc)):
-                return _proxy_auth_result(country_code)
+            if proxy_url and (proxy_failure := _proxy_tunnel_error_result(curl_exc, country_code)):
+                return proxy_failure
             network_errors.append(f"curl_passport:{str(curl_exc)[:80]}")
             logger.warning("curl_cffi passport transport failed; attempting aiohttp backup: %s", type(curl_exc).__name__)
 
@@ -799,8 +837,8 @@ async def _validate_account_http_tri_state(account: Account, *, strict_passport:
                     elif resp.status in (429, 503):
                         return _inconclusive_result(f"HTTP challenge/rate-limit {resp.status}", country_code=country_code)
             except (aiohttp.ClientError, asyncio.TimeoutError) as exc:
-                if proxy_url and (getattr(exc, "status", None) == 407 or re.search(r"\b407\b", str(exc))):
-                    return _proxy_auth_result(country_code)
+                if proxy_url and (proxy_failure := _proxy_tunnel_error_result(exc, country_code)):
+                    return proxy_failure
                 network_errors.append(f"passport:{str(exc)[:80]}")
 
     except Exception as exc:

@@ -198,6 +198,9 @@ async def test_shared_socks_bridge_released_after_last_context(shared_pool, monk
     acquire, release = Mock(return_value=12000), Mock()
     monkeypatch.setattr(browser_pool, "get_local_http_proxy_for_socks5", acquire)
     monkeypatch.setattr(browser_pool, "release_local_http_proxy_for_socks5", release)
+    # This fixture shares one route to exercise the bridge's reference count.
+    # Residential route exclusivity has its own policy tests.
+    monkeypatch.setattr("services.residential_proxy_service.ensure_residential_exit_ip", AsyncMock())
     proxy = "socks5://user:pass@proxy.invalid:1080"
     try:
         first, _ = await pool.get_page_for_account(account(1, proxy))
@@ -412,6 +415,57 @@ async def test_cache_background_reads_cancel_on_close_and_ignore_body_errors(mon
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("outcome", ["cacheable", "private", "failed", "closed", "stalled"])
+async def test_concurrent_context_waits_briefly_for_a_public_asset(monkeypatch, outcome):
+    cache = StaticAssetCache()
+    monkeypatch.setattr(browser_pool, "static_asset_cache", cache)
+    monkeypatch.setattr(browser_pool.settings, "STATIC_ASSET_CACHE_ENABLED", True)
+    monkeypatch.setattr(browser_pool, "STATIC_ASSET_WAIT_SECONDS", 0.02 if outcome == "stalled" else 2)
+    first_context, second_context = Context(), Context()
+    await browser_pool._install_resource_blocking_routes(first_context)
+    await browser_pool._install_resource_blocking_routes(second_context)
+
+    def asset_route():
+        request = SimpleNamespace(method="GET", resource_type="script", url=ASSET)
+        return SimpleNamespace(request=request, continue_=AsyncMock(), fulfill=AsyncMock())
+
+    first_route, second_route = asset_route(), asset_route()
+    await first_context.route.await_args.args[1](first_route)
+    first_route.continue_.assert_awaited_once()
+    second = asyncio.create_task(second_context.route.await_args.args[1](second_route))
+    await asyncio.sleep(0)
+    assert not second.done()
+    second_route.continue_.assert_not_awaited()
+
+    if outcome in {"cacheable", "private"}:
+        headers = {"Cache-Control": "private"} if outcome == "private" else {}
+        first_context.emit("response", SimpleNamespace(request=first_route.request,
+            url=ASSET, status=200, headers=headers, body=AsyncMock(return_value=b"x" * 100)))
+    elif outcome == "failed":
+        first_context.emit("requestfailed", first_route.request)
+    elif outcome == "closed":
+        await first_context.close()
+    await asyncio.wait_for(second, timeout=1)
+
+    if outcome == "cacheable":
+        second_route.fulfill.assert_awaited_once()
+        second_route.continue_.assert_not_awaited()
+        assert second_route.request._traffic_local
+    else:
+        second_route.fulfill.assert_not_awaited()
+        second_route.continue_.assert_awaited_once()
+    if outcome == "stalled":
+        body = AsyncMock(return_value=b"x" * 100)
+        second_context.emit("response", SimpleNamespace(request=second_route.request,
+            url=ASSET, status=200, headers={}, body=body))
+        await asyncio.sleep(0)
+        body.assert_not_awaited()
+        assert not second_context._static_asset_cache_tasks
+    await first_context.close()
+    await second_context.close()
+
+
+@pytest.mark.asyncio
 async def test_disabled_cache_leaves_network_and_responses_untouched(monkeypatch):
     cache = StaticAssetCache()
     cache.put(ASSET, 200, {}, b"x" * 100)
@@ -444,6 +498,25 @@ async def test_disabled_cache_leaves_network_and_responses_untouched(monkeypatch
 ])
 def test_account_readiness_formats_and_guard_limits(raw, expected):
     assert classify_account_web_readiness(raw) == expected
+
+
+def test_guard_aliases_with_guest_tokens_require_auth_evidence_to_rank_hot():
+    from services.cookie_validator import classify_account_web_readiness
+    from services.account_service import MAIN_SCOPE, REPLY_SCOPE, _read_account_session_quality
+    import json
+
+    session = "a" * 32
+    cookies = dict(sessionid=session, sid_tt=session, sessionid_ss=session,
+                   sid_guard=f"{session}%7C1700000000%7C100", ttwid="w", tt_csrf_token="c",
+                   msToken="m", s_v_web_id="verify")
+    assert classify_account_web_readiness(cookies) == 0
+    assert classify_account_web_readiness({**cookies, "uid_tt": "uid"}) == 2
+    assert classify_account_web_readiness(cookies, validated=True) == 2
+    account = SimpleNamespace(id=57, cookies=json.dumps(cookies), cookie_file=None)
+    for scope in (MAIN_SCOPE, REPLY_SCOPE):
+        quality = _read_account_session_quality(account, scope)
+        assert quality["quality_reason"] == "no_browser_auth_sid_guard_only"
+        assert not quality["http_preferred"]
 
 
 def test_readiness_excludes_expired_sessions_and_synthesized_guard_aliases():
@@ -576,8 +649,8 @@ async def test_initial_comment_response_is_captured_during_canonical_navigation(
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("native_only", [False, True])
-async def test_native_comment_timeout_falls_back_only_with_signer(monkeypatch, native_only):
+@pytest.mark.parametrize("native_only,retry", [(False, True), (True, True), (False, False)])
+async def test_native_comment_timeout_falls_back_only_when_allowed(monkeypatch, native_only, retry):
     page = Page(Context(), URL)
     url = "https://www.tiktok.com/api/comment/list/?aweme_id=7635267329407913230&cursor=0"
 
@@ -591,8 +664,8 @@ async def test_native_comment_timeout_falls_back_only_with_signer(monkeypatch, n
     monkeypatch.setattr(comment_discovery, "_COMMENT_LIST_NATIVE_TIMEOUT_SECONDS", 0.001)
     meta = {}
     result = await comment_discovery._fetch_with_native_activation(
-        page, comment_discovery._COMMENT_LIST_FETCH_JS, url, meta, native_only=native_only)
-    if native_only:
+        page, comment_discovery._COMMENT_LIST_FETCH_JS, url, meta, native_only=native_only, retry=retry)
+    if native_only or not retry:
         assert result["unavailable_reason"] == "native_comment_response_timeout"
         assert page.evaluate.await_count == 1
     else:

@@ -16,7 +16,7 @@ from typing import Optional, Dict, Any, Tuple
 from datetime import datetime, timezone
 from patchright.async_api import APIRequestContext, Page, BrowserContext
 from executor.http.request_profile import RequestProfile
-from executor.http.page_runtime import document_generation, prepared_runtime_profile, target_page_matches
+from executor.http.page_runtime import document_generation, page_document_key, prepared_runtime_profile, target_page_matches
 from executor.http.execution_policy import valid_comment_id
 from services.execution_attempts import track_publication_requests
 from executor.http.signature_runtime import resolve_request_signature, split_explicit_signature_params, wait_for_runtime_signer_ready
@@ -690,6 +690,23 @@ async def _extract_runtime_profile(page: Page) -> Dict[str, Any]:
     except Exception:
         profile = {}
 
+    return _complete_runtime_profile(page, profile, generation, current_url)
+
+
+def runtime_profile_from_context(page):
+    """Use the actual context settings when the renderer cannot answer."""
+    context = getattr(page, "context", None)
+    device_profile = getattr(context, "_account_device_profile", None)
+    if not isinstance(device_profile, dict) or not (device_profile.get("options") or {}).get("user_agent"):
+        return None
+    profile = {key: value for key, value in {
+        "browser_language": getattr(context, "_account_locale", None),
+        "timezone": getattr(context, "_account_timezone", None),
+    }.items() if isinstance(value, str) and value}
+    return _complete_runtime_profile(page, profile, document_generation(page), page.url, context_fallback=True)
+
+
+def _complete_runtime_profile(page, profile, generation, current_url, *, context_fallback=False):
     extracted = isinstance(profile, dict) and bool(profile)
     if not isinstance(profile, dict):
         profile = {}
@@ -774,10 +791,10 @@ async def _extract_runtime_profile(page: Page) -> Dict[str, Any]:
         profile["current_url"] = current_url
     # Explicit, bounded handoff: ordinary extractions still inspect the current
     # document, including late hydration at the same URL.
-    if extracted and current_url and profile.get("current_url") == current_url and page.url == current_url:
+    if (extracted or context_fallback) and current_url and profile.get("current_url") == current_url and page.url == current_url:
         profile["_document_generation"] = generation
         profile["_captured_at"] = time.monotonic()
-        profile["_snapshot_reusable"] = ssr_identity_observed
+        profile["_snapshot_reusable"] = ssr_identity_observed or context_fallback
     return profile
 
 
@@ -963,10 +980,14 @@ class PlaywrightHttpClient:
         if is_publish and self.page is None:
             self.last_request_meta["publication_status"] = "not_sent"
             return False, None, "publish_requires_live_page", HttpErrorType.API_ERROR
-        if is_publish and not await wait_for_runtime_signer_ready(
-                self.page, timeout_ms=1200, require_signed_dispatch=True):
-            self.last_request_meta["publication_status"] = "not_sent"
-            return False, None, "runtime_signer_not_ready", HttpErrorType.API_ERROR
+        if is_publish:
+            from executor.http.comment_discovery import comment_token_handshake_ready
+            handshake = (getattr(self, "allow_comment_token_handshake", False)
+                         and comment_token_handshake_ready(self.page, dynamic_params.get("aweme_id")))
+            if not handshake and not await wait_for_runtime_signer_ready(
+                    self.page, timeout_ms=1200, require_signed_dispatch=True):
+                self.last_request_meta["publication_status"] = "not_sent"
+                return False, None, "runtime_signer_not_ready", HttpErrorType.API_ERROR
         if is_publish and isinstance(dynamic_params.get("text"), str):
             self.last_request_meta["published_text"] = dynamic_params["text"]
 
@@ -974,10 +995,16 @@ class PlaywrightHttpClient:
             self.last_request_meta["publication_status"] = "submitted_unconfirmed"
             self.last_request_meta["unconfirmed_reason"] = reason
             return False, None, f"submitted_unconfirmed:{reason}", HttpErrorType.SUBMITTED_UNCONFIRMED
+
+        def rejected(error_type, reason):
+            self.last_request_meta["publication_status"] = "rejected"
+            return False, None, reason, error_type
         effective_runtime_profile = runtime_profile_override or self.runtime_profile
         effective_retry_policy = retry_policy_override or self.retry_policy
         base_dynamic_params = dict(dynamic_params)
         request_signature_meta = {}
+        recovery_uid = getattr(self, "empty_post_recovery_uid", None) if is_publish else None
+        parent_id = str(base_dynamic_params.get("reply_id") or "0")
 
         def _attach_request_meta(payload: Optional[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
             if not isinstance(payload, dict):
@@ -1057,6 +1084,8 @@ class PlaywrightHttpClient:
                         or document_generation(self.page) != expected_generation
                     ):
                         return False, None, "target_document_changed", HttpErrorType.API_ERROR
+                    if is_publish and handshake and not comment_token_handshake_ready(self.page, expected_aweme_id):
+                        return False, None, "runtime_signer_not_ready", HttpErrorType.API_ERROR
                     # Browser-managed headers and cookies come from the live page.
                     browser_headers = {
                         key.lower(): value for key, value in headers.items()
@@ -1070,6 +1099,13 @@ class PlaywrightHttpClient:
                     try:
                         with observe_request_security(self.page, url, profile.method) as wire_evidence:
                             self.last_request_meta["transport_invoked"] = True
+                            if recovery_uid:
+                                from executor.http.comment_discovery import signed_first_comment_page
+                                recovery_document = page_document_key(self.page)
+                                previous = (signed_first_comment_page(self.page, expected_aweme_id)
+                                            if parent_id == "0" else None)
+                                dispatched_at = time.time()
+                            fetch_started = time.monotonic()
                             browser_response = await self.page.evaluate(
                                 _PAGE_FETCH_JS,
                                 {
@@ -1082,6 +1118,7 @@ class PlaywrightHttpClient:
                                 },
                                 isolated_context=False,
                             )
+                            self.last_request_meta["transport_ms"] = round((time.monotonic() - fetch_started) * 1000)
                         # A returned HTTP response also proves a dispatch for
                         # minimal page adapters without request event support.
                         self.last_request_meta["request_attempted"] = True
@@ -1145,18 +1182,40 @@ class PlaywrightHttpClient:
                     response_body = browser_response["text"] if self.page is not None else await response.text()
                     self.last_request_meta["response_body_len"] = len(response_body or "")
                     logger.info(
-                        "[HTTP_RESPONSE] correlation_id=%s transport=%s attempt=%s status=%s body_len=%s security_params=%s security_params_source=%s",
+                        "[HTTP_RESPONSE] correlation_id=%s transport=%s attempt=%s status=%s body_len=%s security_params=%s security_params_source=%s transport_ms=%s",
                         correlation_id, self.last_request_meta["transport"], attempt + 1, status_code,
                         len(response_body or ""), self.last_request_meta.get("observed_security_params"),
                         self.last_request_meta.get("security_params_source", "unavailable"),
+                        self.last_request_meta.get("transport_ms"),
                     )
                     
                     if is_publish and status_code == 200 and not (response_body or "").strip():
+                        if recovery_uid:
+                            from executor.http.comment_discovery import recover_empty_publication
+                            recovered = await recover_empty_publication(
+                                self.page, expected_aweme_id, parent_id=parent_id, author_uid=recovery_uid,
+                                text=form_data.get("text"), started_at=dispatched_at,
+                                document=recovery_document, previous=previous,
+                            )
+                            if recovered is not None:
+                                payload = {"status_code": 0, "comment": recovered}
+                                self.last_request_meta.update(receipt_source="author_list_recovery",
+                                    comment_author=_extract_comment_author(payload), comment_author_uid=recovery_uid)
+                                logger.info("[HTTP] CID recovered after empty POST | correlation_id=%s", correlation_id)
+                                return True, _attach_request_meta(payload), None, None
                         return unconfirmed("empty_body")
                     if is_publish and 300 <= status_code < 400:
                         return unconfirmed("upstream_redirect")
                     if is_publish and 500 <= status_code < 600:
                         return unconfirmed("upstream_5xx")
+                    if is_publish and status_code in {401, 403, 429}:
+                        try:
+                            error_payload = json.loads(response_body or "{}")
+                        except (TypeError, ValueError):
+                            error_payload = None
+                        if _extract_comment_id(error_payload):
+                            return unconfirmed("contradictory_receipt")
+                        return rejected(*classify_http_error(status_code))
 
                     # ИСПРАВЛЕНО: Если Content-Type не JSON - это капча/WAF/редирект
                     if "application/json" not in content_type and status_code == 200:
@@ -1278,6 +1337,10 @@ class PlaywrightHttpClient:
                         if is_publish and type(status_code_in_body) is not int:
                             return unconfirmed("invalid_api_status")
                         error_type, error_msg = _classify_api_response_error(response_data)
+                        if is_publish:
+                            if _extract_comment_id(response_data):
+                                return unconfirmed("contradictory_receipt")
+                            return rejected(error_type, error_msg)
                         logger.warning(
                             f"[HTTP] API error in response | "
                             f"correlation_id={correlation_id}, "

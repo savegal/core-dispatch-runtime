@@ -142,7 +142,6 @@ def observe_publication_request(function):
         result = None
         try:
             result = await function(self, *args, **kwargs)
-            return result
         finally:
             _operation.reset(token)
             async def finish():
@@ -151,7 +150,21 @@ def observe_publication_request(function):
                 meta = dict(getattr(self, "last_request_meta", {}) or {})
                 from executor.http.playwright_http_client import _extract_comment_id
                 cid = _extract_comment_id(result[1]) if result and result[0] else None
+                action = quantity_action.get()
                 def save(db):
+                    nonlocal cid, result
+                    if cid and action:
+                        # The task lock serializes ownership of a CID across
+                        # simultaneous sends and author-list recoveries.
+                        db.execute(update(Task).where(Task.id == task_id).values(updated_at=Task.updated_at))
+                        owner = db.query(PublicationAttempt.id).filter(
+                            PublicationAttempt.task_id == task_id, PublicationAttempt.comment_id == cid,
+                            PublicationAttempt.action_id != action[0], PublicationAttempt.status == "accepted").first()
+                        if owner is not None:
+                            from executor.http.retry_policy import HttpErrorType
+                            cid = None
+                            result = (False, None, "submitted_unconfirmed:cid_already_assigned",
+                                      HttpErrorType.SUBMITTED_UNCONFIRMED)
                     row = db.get(PublicationAttempt, operation_id)
                     if row is None:
                         return
@@ -159,9 +172,10 @@ def observe_publication_request(function):
                     row.wire_count = max(row.wire_count or 0, int(dispatched))
                     if dispatched and row.dispatched_at is None:
                         row.dispatched_at = utcnow()
+                    rejected = (dispatched and row.wire_count == 1 and result is not None
+                                and not result[0] and meta.get("publication_status") == "rejected")
                     row.status = "accepted" if cid else (
-                        "unknown" if dispatched and (result is None or "unconfirmed" in str(result[2]))
-                        else "failed" if dispatched else "not_sent")
+                        "failed" if rejected else "unknown" if dispatched else "not_sent")
                     row.comment_id, row.finished_at = cid, utcnow()
                     row.error_code = _safe_error(result[2] if result else "operation_interrupted")
                     if cid:
@@ -171,14 +185,18 @@ def observe_publication_request(function):
                         if account is not None:
                             row.identity_keys = list(account_identity_keys(account, meta.get("comment_author"),
                                 user_id=meta.get("comment_author_uid")))
+                            if meta.get("receipt_source") == "author_list_recovery":
+                                row.observers = [{"account_id": row.account_id, "role": "author", "found": True,
+                                                  "source": "empty_post_recovery"}]
                         from services.publication_runtime import load_publication_runtime
                         row.next_check_at = utcnow() + timedelta(seconds=load_publication_runtime(db).late_delays[0])
-                    action = quantity_action.get()
                     if action:
                         from db.models import QuantityAction
-                        db.execute(update(QuantityAction).where(QuantityAction.id == action[0], QuantityAction.token == action[1])
+                        db.execute(update(QuantityAction).where(QuantityAction.id == action[0],
+                            QuantityAction.token == action[1], QuantityAction.state == "dispatching")
                             .values(comment_id=cid, account_id=row.account_id,
-                                    state="accepted" if cid else "uncertain" if dispatched else "not_sent",
+                                    state="accepted" if cid else (
+                                        "rejected" if rejected else "uncertain" if dispatched else "not_sent"),
                                     updated_at=utcnow()))
                 await _persist(engine, save)
             completion = asyncio.create_task(finish())
@@ -187,6 +205,7 @@ def observe_publication_request(function):
             except Exception:
                 # Telemetry cannot convert an accepted POST into a retryable failure.
                 logger.warning("Could not finish publication telemetry", exc_info=True)
+        return result
     return wrapped
 
 

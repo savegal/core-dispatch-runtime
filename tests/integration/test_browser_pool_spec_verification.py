@@ -121,8 +121,8 @@ class LocalProxy:
                 await writer.drain()
                 self.started.set()
                 await self.release.wait()
-            else:
-                writer.write(body)
+                body = body[64:]
+            writer.write(body)
             await writer.drain()
         except (asyncio.IncompleteReadError, ConnectionError, TimeoutError, UnicodeError, ValueError):
             pass
@@ -215,6 +215,42 @@ async def test_closing_page_mid_asset_download_does_not_block_other_context(lab)
     _, page2 = await pool.get_page_for_account(account(2, fast))
     await asyncio.wait_for(check_page(page2, "fast"), timeout=5)
     assert pool._browsers["shared_proxied"].is_connected()
+
+
+async def test_concurrent_chromium_contexts_download_the_same_bundle_once(lab, monkeypatch):
+    pool, new_proxy = lab
+    first, second = await new_proxy("first", stall=True), await new_proxy("second")
+    _, page1 = await pool.get_page_for_account(account(1, first))
+    _, page2 = await pool.get_page_for_account(account(2, second))
+    waiting = asyncio.Event()
+    cache = browser_pool.static_asset_cache
+    begin_download = cache.begin_download
+
+    def track_waiter(url):
+        pending, owner = begin_download(url)
+        if url == ASSET and not owner:
+            waiting.set()
+        return pending, owner
+
+    monkeypatch.setattr(cache, "begin_download", track_waiter)
+    monkeypatch.setattr(browser_pool, "STATIC_ASSET_WAIT_SECONDS", 2)
+    first_nav = asyncio.create_task(check_page(page1, "first"))
+    second_nav = None
+    try:
+        await asyncio.wait_for(first.started.wait(), timeout=5)
+        assert not cache.has(ASSET)
+        second_nav = asyncio.create_task(check_page(page2, "second"))
+        await asyncio.wait_for(waiting.wait(), timeout=5)
+        first.release.set()
+        await asyncio.wait_for(asyncio.gather(first_nav, second_nav), timeout=5)
+        assert first.requests.count(ASSET) == 1
+        assert ASSET not in second.requests
+    finally:
+        first.release.set()
+        jobs = [task for task in (first_nav, second_nav) if task is not None]
+        for task in jobs:
+            task.cancel()
+        await asyncio.gather(*jobs, return_exceptions=True)
 
 
 def family_memory():

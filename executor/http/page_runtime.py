@@ -48,6 +48,9 @@ def document_generation(page):
             page._http_runtime_profile_probe = None
             page._cached_first_comment_page = None
             page._cached_first_comment_aweme_id = None
+            page._signed_comment_page_document = None
+            page._signed_comment_page_observed_at = None
+            page._http_confirmed_signed_get = None
 
         def dom_ready(*_):
             # Completion of the document already being observed is not a new
@@ -104,7 +107,7 @@ def prepared_runtime_profile(page, profile):
     return deepcopy(profile)
 
 
-async def read_warmup_runtime_profile(page, *, allow_extension=False, timeout_seconds=4.0, grace_seconds=4.0):
+async def read_warmup_runtime_profile(page, *, allow_extension=False, timeout_seconds=5.0, grace_seconds=4.0):
     """Allow one slow cold-start read to finish without issuing another RPC."""
     from executor.http.playwright_http_client import _extract_runtime_profile
     generation = document_generation(page)

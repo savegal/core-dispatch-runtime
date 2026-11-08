@@ -9,7 +9,7 @@ from urllib.parse import parse_qsl, parse_qs, urlencode, urlparse, urlunparse
 from patchright.async_api import Page
 
 from executor.http.request_profile import RequestProfile
-from executor.http.page_runtime import activate_page_input, document_generation
+from executor.http.page_runtime import activate_page_input, document_generation, page_document_key
 from executor.browser_reads import await_browser_read
 
 logger = logging.getLogger("executor.http.signature_runtime")
@@ -33,6 +33,10 @@ _SIGNER_READY_JS = """
         for (let i = entries.length - 1; i >= 0; i--) {
             const url = new URL(String(entries[i].name || ""), location.href);
             const isTikTok = url.hostname === "tiktok.com" || url.hostname.endsWith(".tiktok.com");
+            // A signed comment request in Resource Timing says nothing about
+            // its response. The Python reader records validated list responses.
+            const path = url.pathname.endsWith("/") ? url.pathname.slice(0, -1) : url.pathname;
+            if (["/api/comment/list", "/api/comment/list/reply", "/api/comment/publish"].includes(path)) continue;
             // X-Gnarly alone prevents a blind POST retry, but is not accepted
             // as standalone signing evidence for comment reads/readiness.
             if (isTikTok && ["X-Bogus", "a_bogus"].some(key => url.searchParams.get(key))) {
@@ -44,6 +48,14 @@ _SIGNER_READY_JS = """
     return {sdk_present, signed_dispatch_seen};
 }
 """
+
+
+def note_confirmed_signed_comment_get(page):
+    page._http_confirmed_signed_get = page_document_key(page)
+
+
+def _has_confirmed_signed_comment_get(page):
+    return getattr(page, "_http_confirmed_signed_get", None) == page_document_key(page)
 
 
 def _normalize_signature_value(value: Any) -> Optional[str]:
@@ -163,6 +175,8 @@ async def wait_for_runtime_signer_ready(page: Optional[Page], timeout_ms: int = 
     deadline = loop.time() + max(0.001, timeout_ms / 1000)
     wake_attempted = False
     while True:
+        if _has_confirmed_signed_comment_get(page):
+            return True
         remaining = deadline - loop.time()
         if remaining <= 0:
             return False
@@ -190,6 +204,8 @@ async def wait_for_runtime_signer_ready(page: Optional[Page], timeout_ms: int = 
                 page._http_signer_probe = None
             if document_generation(page) != generation:
                 continue
+            if _has_confirmed_signed_comment_get(page):
+                return True
             if isinstance(state, dict) and (state.get("signed_dispatch_seen") is True
                     or (not require_signed_dispatch and state.get("sdk_present") is True)):
                 return True

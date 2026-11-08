@@ -2,28 +2,39 @@
 from __future__ import annotations
 
 import asyncio
+from collections import Counter
 from copy import deepcopy
+from datetime import timedelta
 import hashlib
 import logging
 import time
 from types import SimpleNamespace
 from uuid import uuid4
 
-from sqlalchemy import func, update
+from sqlalchemy import and_, func, or_, update
 from sqlalchemy.orm import Session
 
 from db.models import PublicationAttempt, QuantityAction, Task
 from services.async_ownership import await_owned
 from services.quantity_plan import quantity_plan, traffic_budget_exhausted, traffic_control_reason
-from services.publication_journal import quantity_action, utcnow
+from services.quantity_state import RETRYABLE_QUANTITY_STATES
+from services.publication_journal import _safe_error, quantity_action, utcnow
 
 logger = logging.getLogger(__name__)
 INCONCLUSIVE_RECHECK_DELAYS = (2.0, 5.0, 10.0)
 TASK_CONTROL_POLL_SECONDS = 1.0
 
-# A gateway/IP-verification outage is not evidence that an account is dead.
-# Keep the per-slot candidate ceiling as a hard bound, while limiting how fast
-# a quantity order can consume new candidates during repeated route failures.
+PROXY_PREFLIGHT_FAILURE_LIMIT = 12
+COMMENT_READINESS_FAILURE_LIMIT = 20
+_PROXY_UNAVAILABLE = "quantity_proxy_preflight_unavailable"
+_PROXY_PAYMENT_REQUIRED = "proxy_payment_required"
+_COMMENT_READINESS_UNAVAILABLE = "quantity_comment_readiness_unavailable"
+_EMPTY_COMMENT_READ = "comment_readiness_unconfirmed:empty_body"
+_ORDER_AUTH_REFUSALS = (
+    "http_preflight:inconclusive:passport_auth_unconfirmed",
+    "http_auth_unconfirmed:browser_login_state",
+    "http_preflight:browser_auth_failed_this_task",
+)
 _PROXY_PREFLIGHT_ERRORS = frozenset({
     "proxy_authentication_required",
     "proxy_capacity_timeout",
@@ -34,13 +45,16 @@ _PROXY_PREFLIGHT_ERRORS = frozenset({
 })
 
 
-def _proxy_preflight_failure(reason, progress):
-    if progress.get("publication_call_started") or not isinstance(reason, str):
-        return False
-    # ProxyRouteError stringifies with a "proxy_route:" prefix; the cookie gate
-    # passes that string verbatim. Never require a bare error code here.
-    code = reason.removeprefix("proxy_route:")
-    return code in _PROXY_PREFLIGHT_ERRORS or code.startswith("residential_ip_probe_")
+def _proxy_preflight_outcome(reason, progress):
+    if progress.get("publication_call_started") is not False or not isinstance(reason, str):
+        return None
+    code = reason.removeprefix("proxy_route:").split(":", 1)[0]
+    if code in {_PROXY_PAYMENT_REQUIRED, "residential_ip_probe_payment_required"}:
+        return _PROXY_PAYMENT_REQUIRED
+    if (reason.startswith("proxy_route:") or code in _PROXY_PREFLIGHT_ERRORS
+            or code.startswith("residential_ip_probe_")):
+        return _PROXY_UNAVAILABLE
+    return None
 
 
 def _proxy_preflight_backoff_seconds(streak):
@@ -115,7 +129,7 @@ def claim_action(db, identity):
             return None
     token = uuid4().hex
     changed = db.execute(update(QuantityAction).where(QuantityAction.id == identity,
-        QuantityAction.state.in_(["pending", "not_sent", "absent"]), QuantityAction.candidate_count < 50)
+        QuantityAction.state.in_(RETRYABLE_QUANTITY_STATES), QuantityAction.candidate_count < 50)
         .values(state="dispatching", token=token, candidate_count=QuantityAction.candidate_count + 1,
                 dispatches=QuantityAction.dispatches + 1, comment_id=None, updated_at=utcnow())).rowcount
     db.commit()
@@ -183,8 +197,7 @@ def _finalize_claim(db, task_id, identity, token, receipt, reason, *, entered, c
         state = "not_sent" if proven_not_sent else "uncertain"
         values["state"] = state
     if state == "not_sent":
-        values["dispatches"] = max(0, int(action.dispatches or 0) - 1)
-    from services.publication_journal import _safe_error
+        values.update(token=None, dispatches=max(0, int(action.dispatches or 0) - 1))
     values["error_code"] = _safe_error(reason)
     # Fence the read above as well: another SQL connection may advance this
     # CID while we prepare its completion. No ORM flush can bypass this CAS.
@@ -193,6 +206,17 @@ def _finalize_claim(db, task_id, identity, token, receipt, reason, *, entered, c
         QuantityAction.state == action.state, QuantityAction.comment_id == action.comment_id,
         QuantityAction.dispatches == action.dispatches).values(**values),
         execution_options={"synchronize_session": False}).rowcount
+    if (changed and state == "not_sent" and entered and completed
+            and progress.get("publication_call_started") is False
+            and reason != "stopped_by_user" and values["error_code"]):
+        # The HTTP journal starts inside the publication call. Preserve failures
+        # before that boundary without counting them as wire dispatches.
+        db.add(PublicationAttempt(id=token, task_id=task_id, action_id=identity,
+            video_url=action.video_url, kind=action.kind, parent_id=action.parent_id,
+            account_id=action.account_id, text=action.text,
+            text_hash=hashlib.sha256(action.text.encode()).hexdigest(), status="not_sent",
+            wire_count=0, started_at=action.updated_at, finished_at=values["updated_at"],
+            error_code=values["error_code"]))
     db.commit()
     return state if changed else db.get(QuantityAction, identity, populate_existing=True).state
 
@@ -286,11 +310,24 @@ async def publish_action(engine, task_id, identity, *, stop_requested, pool_owne
         if token is None:
             return "not_claimed"
         action = db.get(QuantityAction, identity, populate_existing=True)
-        excluded = {row[0] for row in db.query(PublicationAttempt.account_id).filter(
-            PublicationAttempt.task_id == task_id, PublicationAttempt.video_url == action.video_url,
-            PublicationAttempt.kind == action.kind, PublicationAttempt.wire_count > 0,
-            (PublicationAttempt.action_id == identity) if action.kind == "main"
-                else (PublicationAttempt.parent_id == action.parent_id)).all() if row[0] is not None}
+        same_target = (PublicationAttempt.action_id == identity if action.kind == "main"
+                       else PublicationAttempt.parent_id == action.parent_id)
+        sent_to_target = and_(PublicationAttempt.video_url == action.video_url,
+                              PublicationAttempt.kind == action.kind, PublicationAttempt.wire_count > 0, same_target)
+        # These are account-level refusals. Another slot in this order would
+        # pay for the same check. Transient network and signer errors may recover.
+        refused_auth = and_(PublicationAttempt.wire_count == 0, PublicationAttempt.error_code.in_(_ORDER_AUTH_REFUSALS))
+        empty_read = and_(PublicationAttempt.video_url == action.video_url, PublicationAttempt.wire_count == 0,
+                          PublicationAttempt.error_code == _EMPTY_COMMENT_READ)
+        recent_preparation_failure = and_(PublicationAttempt.video_url == action.video_url,
+            PublicationAttempt.status == "not_sent", PublicationAttempt.wire_count == 0,
+            PublicationAttempt.finished_at > utcnow() - timedelta(seconds=90),
+            or_(PublicationAttempt.error_code == "warmup_runtime_profile_timeout",
+                PublicationAttempt.error_code.startswith("comment_readiness_unconfirmed:"),
+                PublicationAttempt.error_code.startswith("proxy_route:")))
+        excluded = {account_id for (account_id,) in db.query(PublicationAttempt.account_id).filter(
+            PublicationAttempt.task_id == task_id, PublicationAttempt.account_id.isnot(None),
+            or_(sent_to_target, refused_auth, empty_read, recent_preparation_failure)).distinct()}
         if parent_action and parent_action.account_id:
             excluded.add(parent_action.account_id)
         selector = get_free_account_for_main_comment if action.kind == "main" else get_free_account_for_reply
@@ -343,8 +380,8 @@ async def publish_action(engine, task_id, identity, *, stop_requested, pool_owne
             with browser_pool_task_scope(task_id), publication_scope(db, task, action.video_url):
                 entered = True
                 receipt, reason = await publish_visibility_http(db, account, target_url or action.video_url, action.text,
-                    parent=parent, variant_index=action.slot, progress=progress,
-                    stop_requested=stop_requested,
+                    parent=parent, variant_index=action.slot, progress=progress, require_comment_readiness=True,
+                    stop_requested=stop_requested, recover_empty_cid=True,
                     correlation_id=f"task_{task_id}_quantity_{action.kind}_{action.slot}_acc{account.id}")
                 completed = True
         finally:
@@ -359,12 +396,15 @@ async def publish_action(engine, task_id, identity, *, stop_requested, pool_owne
                 release(reserved_id)
         # Expose a non-publishing infrastructure failure to the scheduler.
         # Durable state still remains "not_sent" with its original error_code.
-        if final_state == "not_sent" and _proxy_preflight_failure(reason, progress):
-            return "proxy_preflight_unavailable"
+        if final_state == "not_sent":
+            if (progress.get("publication_call_started") is False and reason != _EMPTY_COMMENT_READ
+                    and (reason or "").startswith("comment_readiness_unconfirmed:")):
+                return _COMMENT_READINESS_UNAVAILABLE
+            return _proxy_preflight_outcome(reason, progress) or final_state
         return final_state
 
 
-async def verify_actions(engine, task_id, identities, stop_requested, *, target_url=None):
+async def verify_actions(engine, task_id, identities, stop_requested, *, target_url=None, observer_cooldowns=None):
     from services.publication_recheck import observe_video, apply_observations
     from executor.browser_pool import browser_pool_task_scope
     from services.publication_progress import publication_scope
@@ -388,7 +428,8 @@ async def verify_actions(engine, task_id, identities, stop_requested, *, target_
                 identity_keys=journal.identity_keys if journal else None, visible_at=None, check_count=0))
         db.commit()
         with browser_pool_task_scope(task_id), publication_scope(db, task, actions[0].video_url):
-            observations = await observe_video(db, task, projections)
+            options = {"observer_cooldowns": observer_cooldowns} if observer_cooldowns is not None else {}
+            observations = await observe_video(db, task, projections, **options)
         apply_observations(projections, observations)
         def persist():
             db.rollback()
@@ -408,6 +449,7 @@ async def verify_actions(engine, task_id, identities, stop_requested, *, target_
                         row.next_check_at = None
             db.commit()
         await _owned_db_call(persist)
+        return any(item.get("found_ids") or item.get("complete_ids") for item in observations)
 
 
 def build_result(db, task, url, plan, *, boost_enabled=False, boost_quantity=0, reason=None):
@@ -418,6 +460,29 @@ def build_result(db, task, url, plan, *, boost_enabled=False, boost_quantity=0, 
     plan = plan.model_copy(deep=True)
     actions = db.query(QuantityAction).filter(QuantityAction.task_id == task.id, QuantityAction.video_url == url).all()
     actions_snapshot = serialize_actions(actions)
+    slots = {action.id: action.slot for action in actions}
+    attempts = []
+    wire = Counter()
+    unknown = Counter()
+    reasons = Counter()
+    preflight_rejected = 0
+    journal = db.query(PublicationAttempt.kind, PublicationAttempt.wire_count, PublicationAttempt.status,
+        PublicationAttempt.error_code, PublicationAttempt.account_id, PublicationAttempt.action_id,
+        PublicationAttempt.comment_id).filter(PublicationAttempt.task_id == task.id,
+        PublicationAttempt.video_url == url, PublicationAttempt.origin == "http")
+    for row in journal.order_by(PublicationAttempt.started_at, PublicationAttempt.id).yield_per(256):
+        sent = int(row.wire_count or 0)
+        wire[row.kind] += sent
+        if sent and row.status == "unknown":
+            unknown[row.kind] += 1
+        preflight_rejected += int(sent == 0 and row.status == "not_sent")
+        if row.error_code:
+            reasons[row.error_code] += 1
+        attempts.append(dict(phase=row.kind, account_id=row.account_id, attempt=len(attempts) + 1,
+            variant_index=slots.get(row.action_id), success=row.status == "accepted" and bool(row.comment_id),
+            submitted=sent, reason=row.error_code, status=row.status))
+    attempts_summary = dict(total_candidate_attempts=len(attempts), wire_post_attempts=sum(wire.values()),
+                            preflight_rejected=preflight_rejected, reasons_breakdown=dict(reasons))
     task_settings = deepcopy(task.settings or {})
     previous_likes = ((task_settings.get("url_results") or {}).get(url) or {}).get("reply_likes")
     previous_likes = previous_likes or (task_settings.get("_quantity_resume_likes") or {}).get(url)
@@ -438,6 +503,16 @@ def build_result(db, task, url, plan, *, boost_enabled=False, boost_quantity=0, 
             payload["quantity_plan"] = {**plan.model_dump(), "complete": complete,
                 "visible_main": self.main_visibility["confirmed"], "visible_replies": len(visible_replies)}
             payload["quantity_slots"] = deepcopy(actions_snapshot)
+            payload["execution_attempts"] = deepcopy(attempts)
+            payload["attempts_summary"] = deepcopy(attempts_summary)
+            main = payload["engagement"]["main"]
+            main["publication_attempted"] = main["publication_attempted"] or wire["main"] > 0
+            if unknown["main"] and not main["comment_id"]:
+                main.update(submitted_unconfirmed=True, visibility_status="submitted_unconfirmed")
+            replies = payload["engagement"]["replies"]
+            replies["attempted"] = max(replies["attempted"], wire["reply"])
+            replies["submitted_unconfirmed"] = max(replies["submitted_unconfirmed"], unknown["reply"])
+            replies["attempted_uncertain"] = max(replies["attempted_uncertain"], unknown["reply"])
             if isinstance(previous_likes, dict):
                 payload["reply_likes"] = deepcopy(previous_likes)
             return payload
@@ -508,12 +583,17 @@ async def _execute_quantity_publications(db, task, video_url, text_variants, tas
     with Session(engine) as runtime_db:
         runtime = order_runtime(task.settings, load_publication_runtime(runtime_db))
     browser_slots = max(1, int(settings.MAX_CONCURRENT_BROWSERS))
-    send_limit, check_limit = runtime.limits(browser_slots)
+    _, check_limit = runtime.limits(browser_slots)
+    send_limit = runtime.idle_reader_send_limit(browser_slots)
     sends, checks = {}, {}
     checked_rounds, ready_for_check = {}, {}
+    observer_cooldowns = {}
     seeded_parents = set()
     next_send, selection_blocked, preparation_failed = 0.0, False, False
     proxy_preflight_fail_streak = 0
+    proxy_failures_include_other_errors = False
+    comment_readiness_failures = 0
+    preflight_stop_reason = None
     reason = None
     try:
         while not stop_requested() and time.monotonic() - started < plan.max_seconds:
@@ -525,13 +605,18 @@ async def _execute_quantity_publications(db, task, video_url, text_variants, tas
                 except Exception as exc:
                     outcomes.append("account_preparation_failed")
                     logger.warning("Quantity action %s failed (%s)", identity, type(exc).__name__)
-            if outcomes:
+            if outcomes and not preflight_stop_reason:
                 selection_blocked = all(value == "no_accounts_available" for value in outcomes)
                 preparation_failed = all(value == "account_preparation_failed" for value in outcomes)
-                if all(value == "proxy_preflight_unavailable" for value in outcomes):
+                if set(outcomes) <= {_PROXY_UNAVAILABLE, _PROXY_PAYMENT_REQUIRED}:
                     proxy_preflight_fail_streak += len(outcomes)
-                    pause = _proxy_preflight_backoff_seconds(proxy_preflight_fail_streak)
-                    if pause:
+                    proxy_failures_include_other_errors |= _PROXY_UNAVAILABLE in outcomes
+                    if proxy_preflight_fail_streak >= PROXY_PREFLIGHT_FAILURE_LIMIT:
+                        preflight_stop_reason = (_PROXY_UNAVAILABLE if proxy_failures_include_other_errors
+                                                 else _PROXY_PAYMENT_REQUIRED)
+                        logger.warning("Quantity task %s: stopping new publications for this video after %s proxy failures (%s)",
+                                       task_id, proxy_preflight_fail_streak, preflight_stop_reason)
+                    elif pause := _proxy_preflight_backoff_seconds(proxy_preflight_fail_streak):
                         next_send = max(next_send, time.monotonic() + pause)
                         logger.warning(
                             "Quantity task %s: %s consecutive proxy preflight failures; "
@@ -540,14 +625,28 @@ async def _execute_quantity_publications(db, task, video_url, text_variants, tas
                         )
                 else:
                     proxy_preflight_fail_streak = 0
+                    proxy_failures_include_other_errors = False
+                if any(value in {"accepted", "uncertain", "rejected"} for value in outcomes):
+                    comment_readiness_failures = 0
+                else:
+                    comment_readiness_failures += outcomes.count(_COMMENT_READINESS_UNAVAILABLE)
+                if not preflight_stop_reason and comment_readiness_failures >= COMMENT_READINESS_FAILURE_LIMIT:
+                    preflight_stop_reason = _COMMENT_READINESS_UNAVAILABLE
+                    logger.warning("Quantity task %s: stopping new publications after %s failed comment reads",
+                                   task_id, comment_readiness_failures)
             for job in [job for job in checks if job.done()]:
                 identities = checks.pop(job)
                 selection_blocked = False
+                evidence_unavailable = False
                 try:
-                    job.result()
+                    evidence_unavailable = job.result() is False
                 except Exception as exc:
                     logger.warning("Quantity visibility check failed task=%s (%s)", task_id, type(exc).__name__)
                 for identity in identities:
+                    if evidence_unavailable:
+                        # Leave inconclusive receipts for the scheduled late recheck.
+                        checked_rounds[identity] = len(INCONCLUSIVE_RECHECK_DELAYS) + 1
+                        continue
                     round_number = checked_rounds.get(identity, 0)
                     checked_rounds[identity] = round_number + 1
                     if round_number < len(INCONCLUSIVE_RECHECK_DELAYS):
@@ -579,11 +678,11 @@ async def _execute_quantity_publications(db, task, video_url, text_variants, tas
                     reason = "quantity_traffic_budget_exhausted"
                     break
                 selectable = [a for a in actions if a.id not in active_ids and a.id not in checking_ids
-                    and a.state in {"pending", "not_sent", "absent"} and a.candidate_count < 50
+                    and a.state in RETRYABLE_QUANTITY_STATES and a.candidate_count < 50
                     and (a.kind == "main" or (a.parent_action_id in parents
                         and parents[a.parent_action_id].comment_id == a.parent_id))]
-                selectable.sort(key=lambda a: (a.kind != "main", a.slot, a.id))
-                batch = [a.id for a in selectable[:min(max(0, send_limit - len(sends)), max(0, plan.max_dispatches - used))]]
+                selectable.sort(key=lambda a: (a.kind != "main", a.candidate_count, a.slot, a.id))
+                unclaimed = sum(a.id in active_ids and a.state in RETRYABLE_QUANTITY_STATES for a in actions)
                 waiting = []
                 for action in actions:
                     if (action.state == "accepted" and action.id not in active_ids and action.id not in checking_ids
@@ -592,15 +691,18 @@ async def _execute_quantity_publications(db, task, video_url, text_variants, tas
                         waiting.append(action.id)
 
             due = [identity for identity in waiting if ready_for_check[identity] <= now]
-            check_capacity = max(0, check_limit - len(checks))
-            if browser_slots == 1 and sends:
-                check_capacity = 0
+            check_capacity = max(0, min(check_limit - len(checks), browser_slots - len(sends) - len(checks)))
             for offset in range(0, min(len(due), check_capacity * runtime.check_batch_size),
                                 runtime.check_batch_size):
                 group = due[offset:offset + runtime.check_batch_size]
-                job = asyncio.create_task(verify_actions(engine, task_id, group, stop_requested, target_url=video_url))
+                job = asyncio.create_task(verify_actions(engine, task_id, group, stop_requested,
+                    target_url=video_url, observer_cooldowns=observer_cooldowns))
                 checks[job] = group
-            can_send = not selection_blocked and not preparation_failed and (browser_slots > 1 or not checks)
+            send_capacity = max(0, min(send_limit, browser_slots - len(checks)) - len(sends))
+            remaining_dispatches = max(0, plan.max_dispatches - used - unclaimed)
+            batch = [a.id for a in selectable[:min(send_capacity, remaining_dispatches)]]
+            can_send = (not preflight_stop_reason and not selection_blocked and not preparation_failed
+                        and (browser_slots > 1 or not checks))
             if can_send and next_send <= now:
                 for identity in batch[:1] if runtime.send_interval else batch:
                     # A replacement has its own verification budget.
@@ -620,7 +722,9 @@ async def _execute_quantity_publications(db, task, video_url, text_variants, tas
             elif delay is not None:
                 await asyncio.sleep(delay)
             else:
-                if selection_blocked:
+                if preflight_stop_reason:
+                    reason = preflight_stop_reason
+                elif selection_blocked:
                     reason = "no_accounts_available"
                 elif preparation_failed:
                     reason = "quantity_preparation_failed"

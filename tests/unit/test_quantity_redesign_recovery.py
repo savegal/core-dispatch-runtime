@@ -1,5 +1,6 @@
 """Cross-component recovery, ownership and metered traffic contracts."""
 import asyncio
+from datetime import timedelta
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
 import threading
@@ -72,12 +73,13 @@ def test_resume_preserves_parent_receipts_with_reversed_input_and_never_reclaims
     assert activity_snapshot(db_session, sample_task)["summary"]["dispatched"] == 0
 
 
-def test_uncertain_dispatch_consumes_mutation_budget(db_session, sample_task):
+@pytest.mark.parametrize("state", ["absent", "rejected"])
+def test_retryable_dispatch_still_consumes_mutation_budget(db_session, sample_task, state):
     configure_task(db_session, sample_task, mains=1, max_dispatches=1)
     ensure_actions(db_session, sample_task, sample_task.video_urls[0], "main", 1, ["main"])
     action = db_session.query(QuantityAction).one()
     assert claim_action(db_session, action.id)
-    action.state = "absent"
+    action.state = state
     db_session.commit()
     assert claim_action(db_session, action.id) is None
 
@@ -92,6 +94,52 @@ def test_fast_and_export_snapshots_have_same_goal_counts(db_session, sample_task
     detailed = activity_snapshot(db_session, sample_task, include_texts=True)
     assert fast["videos_success"] == detailed["videos_success"] == 1
     assert fast["summary"] == detailed["summary"]
+
+
+def test_quantity_result_and_live_card_distinguish_preflight_and_empty_post(db_session, sample_task):
+    from bot.services.live_orders import render_live
+    from executor.quantity_engine import build_result
+
+    configure_task(db_session, sample_task)
+    url = sample_task.video_urls[0]
+    ensure_actions(db_session, sample_task, url, "main", 1, ["main"])
+    for identity, status, wires, error in (
+        ("preflight", "not_sent", 0, "http_preflight:inconclusive:passport_auth_unconfirmed"),
+        ("post", "unknown", 1, "submitted_unconfirmed:empty_body"),
+    ):
+        db_session.add(PublicationAttempt(id=identity, task_id=sample_task.id, video_url=url, kind="main",
+            text="main", text_hash="hash", status=status, wire_count=wires, error_code=error, started_at=utcnow()))
+    db_session.commit()
+    result = build_result(db_session, sample_task, url, QuantityPlan.model_validate(
+        sample_task.settings["publication_plan"])).to_dict()
+    assert result["engagement"]["main"]["publication_attempted"]
+    assert result["engagement"]["main"]["submitted_unconfirmed"]
+    assert result["comment_id"] is None
+    assert result["attempts_summary"]["preflight_rejected"] == result["attempts_summary"]["wire_post_attempts"] == 1
+    assert {event["status"]: event["submitted"] for event in result["execution_attempts"]} == {"not_sent": 0, "unknown": 1}
+    view = activity_snapshot(db_session, sample_task)
+    assert view["summary"]["preflight_rejected"] == view["summary"]["dispatched"] == 1
+    assert [row["id"] for row in view["latest"]] == ["post"]
+    text = render_live(view)
+    assert "POST отправлен" in text and "Пустой ответ на POST, исход неизвестен" in text
+
+
+def test_live_card_limits_preflight_history_until_first_dispatch(db_session, sample_task, sample_account):
+    from bot.services.live_orders import render_live
+
+    configure_task(db_session, sample_task)
+    for index in range(4):
+        db_session.add(PublicationAttempt(id=f"skip-{index}", task_id=sample_task.id, kind="main",
+            video_url=sample_task.video_urls[0], text="fixture", text_hash="hash", status="not_sent", wire_count=0,
+            account_id=sample_account.id, error_code="http_preflight:inconclusive:passport_auth_unconfirmed",
+            started_at=utcnow()))
+    db_session.commit()
+    view = activity_snapshot(db_session, sample_task)
+    assert view["summary"]["preflight_rejected"] == 4 and view["summary"]["dispatched"] == 0
+    assert len(view["latest"]) == 2
+    text = render_live(view)
+    assert "пропуск до POST" in text and "Passport не подтвердил авторизацию" in text
+    assert f"акк. #{sample_account.id}" in text
 
 
 def test_late_positive_proof_reaches_map_and_live_view_without_rebilling(db_session, sample_task):
@@ -251,8 +299,9 @@ async def test_unknown_author_does_not_block_other_checks_and_positive_read_stop
 
 
 @pytest.mark.parametrize("interrupt", [False, True])
+@pytest.mark.parametrize("expired_lease", [False, True])
 def test_background_recheck_advances_only_positive_current_slots_and_owns_shutdown(
-        db_session, sample_task, monkeypatch, interrupt):
+        db_session, sample_task, monkeypatch, interrupt, expired_lease):
     import services.publication_recheck as checks
     import executor.browser_pool as pool
     import services.dedicated_proxy_service as dedicated
@@ -262,6 +311,11 @@ def test_background_recheck_advances_only_positive_current_slots_and_owns_shutdo
     row.state, row.comment_id = "accepted", "7704740811904828192"
     recorded = receipt(db_session, sample_task, account_id=None)
     request_recheck(db_session, sample_task.id)
+    if expired_lease:
+        job = db_session.get(PublicationCheckJob, sample_task.id)
+        job.status = "running"
+        job.lease_token = "previous-worker"
+        job.lease_until = utcnow() - timedelta(minutes=1)
     db_session.commit()
     stop = threading.Event()
     closed = []
@@ -336,13 +390,14 @@ async def test_copy_single_text_quantity_order_opens_new_editor_without_receipts
     message = SimpleNamespace(edit_text=AsyncMock())
     task = {"id": 42, "kind": "full", "main_comment": "one", "video_urls": ["url"], "settings": {
         "publication_plan": QuantityPlan(main_count=60, replies_per_main=2).model_dump(),
-        "text_variants": ["one"], "replies": ["answer"], "url_results": {"url": {"receipt": "private"}}}}
+        "text_variants": ["one"], "replies": ["answer", "another answer"], "reply_count": 0,
+        "url_results": {"url": {"receipt": "private"}}}}
     monkeypatch.setattr(composer.api_client, "get_pricing", AsyncMock(return_value={"price_success": 1}))
     monkeypatch.setattr(composer.api_client, "get_publication_runtime", AsyncMock(return_value={"browser_slots": 4}))
     monkeypatch.setattr(composer.api_client, "get_user", AsyncMock(return_value={"balance": 100}))
     await composer.copy_full_order(message, state, task, 1)
     data = await state.get_data()
-    assert data["texts"] == ["one"] and data["replies"] == ["answer"]
+    assert data["texts"] == ["one"] and data["replies"] == ["answer", "another answer"]
     assert data["publication_plan"]["main_count"] == 60
     assert "url_results" not in data["template_settings"]
     assert await state.get_state() == composer.QuantityStates.preview.state

@@ -1,16 +1,20 @@
 """Creation uses isolated SQLite and never enqueues live orders."""
 
 import inspect
+from decimal import Decimal
+from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
 import pytest
+from fastapi import FastAPI, HTTPException
+from httpx import ASGITransport, AsyncClient
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 from starlette.requests import Request
 
 from api import tasks
 from db.database import Base
-from db.models import Task, User
+from db.models import PendingEnqueue, Task, Transaction, User
 
 
 @pytest.fixture
@@ -57,10 +61,14 @@ async def test_created_order_keeps_its_speed_when_admin_defaults_change(order_db
     result = await inspect.unwrap(tasks.create_task)(request=request, task_data=payload, db=order_db, auth_user_id=1)
     task = await order_db.get(Task, result["task_id"])
     saved = task.settings["publication_options"]
-    assert saved["send_workers"] == options.get("send_workers", 3)
-    await order_db.run_sync(lambda db: update_publication_runtime(db, {"send_workers": 1, "live_interval": 20}))
+    assert saved["send_workers"] == options.get("send_workers", 4)
+    assert saved["check_delay"] == 5
+    await order_db.run_sync(lambda db: update_publication_runtime(db, {
+        "send_workers": 1, "check_delay": 0, "live_interval": 20,
+    }))
     activity = await order_db.run_sync(lambda db: activity_snapshot(db, task))
     assert activity["execution"]["send_workers"] == saved["send_workers"]
+    assert activity["execution"]["check_delay"] == saved["check_delay"]
     assert activity["live_interval"] == options.get("live_interval", 3)
     assert activity["execution"]["effective_senders"] + activity["execution"]["effective_readers"] <= max(
         2, activity["execution"]["browser_slots"])
@@ -159,6 +167,9 @@ async def test_partial_retry_api_transfers_owned_receipts_and_reuses_one_child(o
         settings={'retry_of_task_id': original.id, '_reply_resume': {'forged': True}})
     request = Request({'type': 'http', 'headers': []})
     create = inspect.unwrap(tasks.create_task)
+    with pytest.raises(HTTPException) as rejected:
+        await create(request=request, task_data=payload.model_copy(update={"kind": "full"}), db=order_db, auth_user_id=1)
+    assert rejected.value.status_code == 409 and "тип исходного заказа" in rejected.value.detail
     result = await create(request=request, task_data=payload, db=order_db, auth_user_id=1)
     child = await order_db.get(Task, result['task_id'])
     plan = child.settings['_reply_resume'][url]
@@ -167,3 +178,61 @@ async def test_partial_retry_api_transfers_owned_receipts_and_reuses_one_child(o
     assert 'forged' not in child.settings['_reply_resume']
     again = await create(request=request, task_data=payload, db=order_db, auth_user_id=1)
     assert again['task_id'] == child.id
+
+
+@pytest.mark.asyncio
+async def test_order_http_entrypoints_charge_distinct_media_once_and_reject_empty_replies(order_db, monkeypatch):
+    from services import task_service
+
+    user = await order_db.get(User, 1)
+    user.role = "user"
+    user.balance = Decimal("10.00")
+    await order_db.commit()
+    monkeypatch.setattr(tasks.settings, "ADMIN_IDS", [])
+    monkeypatch.setattr(tasks.settings, "DEMO_MODE", False)
+    monkeypatch.setattr(tasks.settings, "TIKTOK_NETWORK_IMPL_READY", True)
+    monkeypatch.setattr(tasks, "get_pricing_async", AsyncMock(return_value=SimpleNamespace(price_success=Decimal("2.00"))))
+    monkeypatch.setattr(tasks, "reserve_task_for_enqueue_async", task_service.reserve_task_for_enqueue_async)
+    monkeypatch.setattr(tasks, "finalize_reserved_enqueue_async", task_service.finalize_reserved_enqueue_async)
+    queued = []
+
+    def enqueue(task_id, *_args, **_kwargs):
+        queued.append(task_id)
+        return "queued"
+
+    monkeypatch.setattr(task_service, "enqueue_task_once", enqueue)
+    app = FastAPI()
+    app.include_router(tasks.router)
+    app.dependency_overrides[tasks.verify_user_header] = lambda: 1
+    app.dependency_overrides[tasks.get_db] = lambda: order_db
+    url = "https://www.tiktok.com/@demo/video/1234567890123456789"
+    base = {"user_id": 1, "main_comment": "a", "video_urls": [url, url + "?source=share"]}
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test-orders") as client:
+        reply_order = {**base, "kind": "engagement_only", "text_variants": ["a", "b", "c"]}
+        assert (await client.post("/api/tasks", json=reply_order)).status_code == 422
+        assert queued == [] and user.balance == Decimal("10.00")
+        quantity = {**base, "text_variants": ["@demo a"], "settings": {
+            "publication_plan": {"main_count": 1, "replies_per_main": 1}, "mention_mode": "attempt",
+            "replies": ["one", "two"], "reply_count": 0}}
+        created_ids = []
+        for payload in (quantity, {**reply_order, "reply1": "one"},
+                        {**base, "kind": "keyword_replies", "keywords": ["price"], "reply1": "one"}):
+            response = await client.post("/api/tasks", json=payload, headers={"X-Idempotency-Key": str(len(created_ids))})
+            assert response.status_code == 200, response.text
+            created_ids.append(response.json()["task_id"])
+        again = await client.post("/api/tasks", json=quantity, headers={"X-Idempotency-Key": "0"})
+        assert again.json()["task_id"] == created_ids[0]
+        blocked = await client.post(f"/api/tasks/{created_ids[0]}/texts", params={"user_id": 1},
+                                    json={"text_variants": ["@one @two @three @four"]})
+        assert blocked.status_code == 422
+        accepted = await client.post(f"/api/tasks/{created_ids[0]}/texts", params={"user_id": 1},
+                                     json={"text_variants": ["@demo new"]})
+        assert accepted.status_code == 200
+    assert queued == created_ids
+    assert (await order_db.execute(select(PendingEnqueue))).scalars().all() == []
+    saved = (await order_db.execute(select(Task).order_by(Task.id))).scalars().all()
+    assert [task.video_urls for task in saved] == [[url], [url], [url]]
+    assert saved[0].settings["reply_count"] == 2 and saved[0].main_comment == "@demo new"
+    assert user.balance == Decimal("4.00")
+    receipts = (await order_db.execute(select(Transaction))).scalars().all()
+    assert len(receipts) == 3 and all(receipt.amount == Decimal("-2.00") for receipt in receipts)

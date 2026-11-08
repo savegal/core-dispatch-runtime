@@ -115,6 +115,7 @@ async def test_engagement_only_dedup_uses_author_when_both_sides_have_one(async_
             video_urls=["https://www.tiktok.com/@demo/video/9999999999999999999"],
             settings={"origin": "test"},
             kind="engagement_only",
+            reply1="Reply",
             engagement_username="bob",
             engagement_comment_text="same text",
         ),

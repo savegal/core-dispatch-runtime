@@ -37,6 +37,29 @@ async def test_exact_id_not_same_text_or_cached_page(monkeypatch):
     fetch.assert_awaited_once_with(page, "video", 0, fresh=True)
 
 
+@pytest.mark.parametrize("case", ["found", "missing", "stale", "reload", "partial"])
+async def test_fresh_signed_observer_warmup_is_reused_only_as_positive_proof(monkeypatch, case):
+    import time
+    from executor.http.comment_discovery import cache_first_comment_page
+
+    video = "7699894341501832466"
+    page = SimpleNamespace(url=f"https://www.tiktok.com/@fixture/video/{video}")
+    started = time.monotonic()
+    cid = OTHER if case == "missing" else CID
+    cache_first_comment_page(page, video, {"comments": [{"cid": cid}], "has_more": 0}, signed=True)
+    if case == "stale":
+        started += 1
+    if case == "reload":
+        page._http_document_generation += 1
+    fetch = AsyncMock(return_value=None)
+    monkeypatch.setattr(visibility, "fetch_comment_page", fetch)
+    ids = (CID, OTHER) if case == "partial" else (CID,)
+    result = await visibility.scan_main_comment_ids(page, video, iter(ids), warmup_started_at=started)
+    assert result["found_ids"] == ([CID] if case in {"found", "partial"} else [])
+    assert not result["absent_ids"] and not result["complete"]
+    assert fetch.await_count == int(case != "found")
+
+
 async def test_scan_reads_next_page_and_ignores_reply_id(monkeypatch):
     fetch = AsyncMock(side_effect=[
         {"comments": [{"cid": CID, "reply_id": OTHER}], "has_more": 1, "cursor": 50},

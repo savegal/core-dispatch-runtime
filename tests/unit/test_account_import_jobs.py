@@ -1,4 +1,5 @@
 import asyncio
+from datetime import timedelta
 import json
 
 import pytest
@@ -33,7 +34,8 @@ async def test_import_records_and_checkpoint_commit_together(async_db_session, i
 
 
 @pytest.mark.asyncio
-async def test_cancelled_import_resumes_at_committed_batch(async_db_session, isolated_proxy_leases, monkeypatch):
+@pytest.mark.parametrize("expired_lease", [False, True])
+async def test_cancelled_import_resumes_at_committed_batch(async_db_session, isolated_proxy_leases, monkeypatch, expired_lease):
     import api.accounts as accounts
     monkeypatch.setattr(jobs, "get_redis_client", lambda: isolated_proxy_leases)
     factory = async_sessionmaker(async_db_session.bind, expire_on_commit=False)
@@ -50,6 +52,11 @@ async def test_cancelled_import_resumes_at_committed_batch(async_db_session, iso
         await jobs.process_import_job(factory)
     await async_db_session.refresh(job)
     assert job.status == "pending" and job.processed == 25
+    if expired_lease:
+        job.status = "running"
+        job.lease_token = "previous-worker"
+        job.lease_until = jobs.utcnow() - timedelta(minutes=1)
+        await async_db_session.commit()
     monkeypatch.setattr(accounts, "import_account_records", original)
     assert await jobs.process_import_job(factory)
     await async_db_session.refresh(job)

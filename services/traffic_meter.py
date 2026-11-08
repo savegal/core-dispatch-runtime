@@ -8,9 +8,11 @@ from weakref import WeakSet
 
 from sqlalchemy.orm import Session
 from db.models import TaskTrafficBucket
+from executor.browser_reads import await_browser_read
 from services.async_ownership import await_owned
 
 logger = logging.getLogger(__name__)
+REQUEST_SIZES_TIMEOUT_SECONDS = 1.5
 _meters = WeakSet()
 _meters_lock = threading.RLock()
 
@@ -73,7 +75,8 @@ class TrafficMeter:
             request._traffic_task_id = task_id
 
     def finished(self, request):
-        if not isinstance(getattr(request, "_traffic_task_id", None), int) or getattr(request, "_traffic_local", False):
+        if (self.closing or not isinstance(getattr(request, "_traffic_task_id", None), int)
+                or getattr(request, "_traffic_local", False)):
             return
         task = asyncio.create_task(self.measure(request))
         self.pending.add(task)
@@ -81,7 +84,7 @@ class TrafficMeter:
 
     async def measure(self, request):
         try:
-            sizes = await request.sizes()
+            sizes = await await_browser_read(request.sizes, timeout=REQUEST_SIZES_TIMEOUT_SECONDS)
             received = max(0, int(sizes.get("responseBodySize") or 0)) + max(0, int(sizes.get("responseHeadersSize") or 0))
             sent = max(0, int(sizes.get("requestBodySize") or 0)) + max(0, int(sizes.get("requestHeadersSize") or 0))
             category = "assets" if request.resource_type in {"script", "stylesheet", "image", "media", "font"} else (
@@ -93,6 +96,8 @@ class TrafficMeter:
             values[2] += 1
             if not self.closing and (self.timer is None or self.timer.done()):
                 self.timer = asyncio.create_task(self.delayed_flush())
+        except TimeoutError:
+            logger.debug("Browser transfer size measurement timed out")
         except Exception:
             logger.debug("Browser transfer size unavailable", exc_info=True)
 

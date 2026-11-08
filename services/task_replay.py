@@ -8,6 +8,7 @@ from weakref import WeakValueDictionary
 from services.task_execution_ledger import has_submission_evidence
 from copy import deepcopy
 from services.publication_progress import delivery_state, valid_id
+from services.quantity_state import RETRYABLE_QUANTITY_STATES
 
 
 _retry_locks = WeakValueDictionary()
@@ -84,7 +85,7 @@ def retryable_video_urls(task) -> list[str]:
         if settings.get("publication_plan") and isinstance(row.get("quantity_slots"), list):
             slots = [slot for slot in row["quantity_slots"] if isinstance(slot, Mapping)]
             plan = settings["publication_plan"]
-            safe_slots = any(slot.get("state") in {"pending", "not_sent", "absent"} for slot in slots)
+            safe_slots = any(slot.get("state") in RETRYABLE_QUANTITY_STATES for slot in slots)
             missing_replies = any(
                 sum(child.get("kind") == "reply" and child.get("parent_action_id") == parent.get("id")
                     for child in slots) < plan.get("replies_per_main", 0)

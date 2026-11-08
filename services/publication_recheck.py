@@ -8,17 +8,23 @@ import hashlib
 import logging
 import re
 import threading
+import time
 from uuid import uuid4
 
 from sqlalchemy import or_, select, update
 from sqlalchemy.orm import Session
 
 from db.models import Account, PublicationAttempt, PublicationCheckJob, QuantityAction, Task
+from services.async_ownership import await_owned
 from services.publication_journal import utcnow
 
 logger = logging.getLogger(__name__)
 ACTIVE = {"pending", "in_progress", "running", "queued"}
 RECHECK_DELAYS = (120, 600, 3600)
+OBSERVER_ACCOUNT_TIMEOUT_SECONDS = 35.0
+OBSERVER_ROUND_TIMEOUT_SECONDS = 65.0
+OBSERVER_COOLDOWN_SECONDS = 120
+OBSERVER_NO_PROGRESS_LIMIT = 2
 
 
 def seed_saved_receipts(db, task):
@@ -146,7 +152,7 @@ def _independent_evidence(observations):
     return found, absent
 
 
-async def observe_video(db, task, rows):
+async def observe_video(db, task, rows, *, observer_cooldowns: dict[int, float] | None = None):
     from services.publication_journal import record_phase
     from services.publication_runtime import load_publication_runtime
     from services.quantity_plan import traffic_control_reason
@@ -156,7 +162,7 @@ async def observe_video(db, task, rows):
     from executor.main_visibility import scan_main_comment_ids
     from executor.reply_visibility import scan_reply_comment_ids
     from executor.http.comment_discovery import comment_read_batch
-    from executor.engagement_engine import warmup_page_for_http
+    from executor.http.signature_runtime import wait_for_runtime_signer_ready
     from executor.visibility_support import account_identity_keys, identity_is_known, identity_rejection_reason
     from services.account_service import get_free_account_for_reply
     from config.settings import get_settings
@@ -177,64 +183,95 @@ async def observe_video(db, task, rows):
     # Saved identity keys still prove authorship after a pool record is deleted.
     if not safe_rows:
         return [{"reason": "publisher_identity_unavailable"}]
-    used, observations = set(publishers), []
     url, aweme_id = safe_rows[0].video_url, safe_rows[0].aweme_id
     if not aweme_id:
         return [{"reason": "video_id_unavailable"}]
+    used, observations = set(publishers), []
+    if isinstance(db, Session):
+        order_urls = task.video_urls or []
+        aliases = {url, *(value for value in order_urls if schema.extract_tiktok_media_id(value) == str(aweme_id))}
+        if len(order_urls) == 1:
+            aliases.add(order_urls[0])
+        same_video = or_(PublicationAttempt.aweme_id == str(aweme_id), PublicationAttempt.video_url.in_(aliases))
+        history = db.query(PublicationAttempt).filter(PublicationAttempt.task_id == task.id, same_video)
+        for account_id, identity_keys in history.filter(or_(PublicationAttempt.wire_count > 0,
+                PublicationAttempt.status == "accepted")).with_entities(PublicationAttempt.account_id, PublicationAttempt.identity_keys):
+            if account_id is not None:
+                used.add(account_id)
+            if identity_keys:
+                keys = {tuple(key) for key in identity_keys if isinstance(key, (list, tuple)) and len(key) == 2
+                        and all(isinstance(value, str) for value in key)}
+                if identity_is_known(keys) and keys not in references:
+                    references.append(keys)
+        cutoff = utcnow() - timedelta(seconds=OBSERVER_COOLDOWN_SECONDS)
+        for (readers,) in history.filter(PublicationAttempt.checked_at > cutoff).with_entities(PublicationAttempt.observers):
+            used.update(item["account_id"] for item in readers or [] if isinstance(item, dict)
+                        and item.get("role") != "author" and isinstance(item.get("account_id"), int))
     # Guard navigation with the resolved media ID even when the order used vt/vm.
     if not schema.extract_tiktok_media_id(url):
         url = f"https://www.tiktok.com/@_/video/{aweme_id}"
     wanted = {str(row.comment_id) for row in safe_rows}
+    loop = asyncio.get_running_loop()
+    round_deadline = loop.time() + OBSERVER_ROUND_TIMEOUT_SECONDS
     async def budget_reason():
+        if loop.time() >= round_deadline:
+            return "observer_round_timeout"
         checkpointed = (await flush_task_traffic(db.get_bind().engine, task.id)
                         if isinstance(db, Session) else True)
         return traffic_control_reason(db, task, checkpointed=checkpointed)
     async def read_account(observer, candidates, *, author=False):
-        context = page = result = keys = None
+        context = page = keys = None
         observer_id = observer.id
         corr = f"task_{task.id}_recheck_acc{observer_id}"
+        result = {"observer_id": observer_id, "role": "author" if author else "observer",
+                  "found_ids": [], "absent_ids": [], "complete_ids": []}
+        deadline = min(round_deadline, loop.time() + OBSERVER_ACCOUNT_TIMEOUT_SECONDS)
         try:
-            deny = await schema._preflight_cookie_http_gate(db, observer, correlation_id=corr, phase="publication_recheck")
-            if deny:
-                return None, None
-            keys = account_identity_keys(observer, schema._get_cached_http_preflight_username(observer),
-                                         user_id=schema._get_cached_http_preflight_user_id(observer))
-            if author:
-                candidates = [row for row in candidates if _author_identity_matches(row.identity_keys, keys)]
-                if not candidates:
+            async with asyncio.timeout_at(deadline):
+                deny = await schema._preflight_cookie_http_gate(db, observer, correlation_id=corr, phase="publication_recheck")
+                if deny:
+                    return {**result, "reason": deny}, None
+                keys = account_identity_keys(observer, schema._get_cached_http_preflight_username(observer),
+                                             user_id=schema._get_cached_http_preflight_user_id(observer))
+                if author:
+                    candidates = [row for row in candidates if _author_identity_matches(row.identity_keys, keys)]
+                    if not candidates:
+                        return None, None
+                elif identity_rejection_reason(keys, references):
                     return None, None
-            elif identity_rejection_reason(keys, references):
-                return None, None
-            if isinstance(db, Session) and db.in_transaction():
-                db.commit()
-            context, page = await schema.create_page_for_account(observer)
-            ready, _ = await schema._ensure_account_login_ready(db, page, observer, url,
-                timeout_ms=int(settings.PLAYWRIGHT_TIMEOUT * (2 if observer.proxy else 1)), correlation_id=corr)
-            if not ready:
-                return None, None
-            _, ready, _ = await warmup_page_for_http(page, url, correlation_id=corr, account=observer, db=db)
-            if not ready or not schema.is_on_expected_media_url(getattr(page, "url", None), url):
-                return None, None
-            result = {"observer_id": observer_id, "role": "author" if author else "observer",
-                      "found_ids": [], "absent_ids": [], "complete_ids": []}
-            groups = defaultdict(list)
-            for row in candidates:
-                groups[(row.kind, row.parent_id)].append(str(row.comment_id))
-            async with comment_read_batch(page):
-                for (kind, parent), ids in groups.items():
-                    if reason := await budget_reason():
-                        result["reason"] = reason
-                        break
-                    evidence = (await scan_main_comment_ids(page, aweme_id, ids, max_pages=runtime.main_pages)
-                        if kind == "main" else await scan_reply_comment_ids(page, aweme_id, parent, ids,
-                            max_pages=runtime.reply_pages))
-                    result["found_ids"].extend(evidence.get("found_ids") or [])
-                    result["absent_ids"].extend(evidence.get("absent_ids") or [])
-                    if evidence.get("complete"):
-                        result["complete_ids"].extend(ids)
+                if isinstance(db, Session) and db.in_transaction():
+                    db.commit()
+                warmup_started_at = time.monotonic()
+                context, page = await schema.create_page_for_account(observer)
+                ready, reason = await schema._ensure_account_login_ready(db, page, observer, url,
+                    timeout_ms=int(settings.PLAYWRIGHT_TIMEOUT * (2 if observer.proxy else 1)), correlation_id=corr)
+                if not ready:
+                    return {**result, "reason": reason or "observer_auth_unconfirmed"}, None
+                if not schema.is_on_expected_media_url(getattr(page, "url", None), url):
+                    return {**result, "reason": "observer_target_changed"}, None
+                page._warmup_signer_ready = await wait_for_runtime_signer_ready(page, timeout_ms=700)
+                groups = defaultdict(list)
+                for row in candidates:
+                    groups[(row.kind, row.parent_id)].append(str(row.comment_id))
+                async with comment_read_batch(page):
+                    for (kind, parent), ids in groups.items():
+                        if reason := await budget_reason():
+                            result["reason"] = reason
+                            break
+                        evidence = (await scan_main_comment_ids(page, aweme_id, ids, max_pages=runtime.main_pages,
+                                                               warmup_started_at=warmup_started_at, allow_page_fallback=True)
+                            if kind == "main" else await scan_reply_comment_ids(page, aweme_id, parent, ids,
+                                max_pages=runtime.reply_pages))
+                        result["found_ids"].extend(evidence.get("found_ids") or [])
+                        result["absent_ids"].extend(evidence.get("absent_ids") or [])
+                        if evidence.get("complete"):
+                            result["complete_ids"].extend(ids)
+                        if evidence.get("reason") and not (evidence.get("found_ids") or evidence.get("complete")):
+                            result.setdefault("reason", evidence["reason"])
+        except TimeoutError:
+            result["reason"] = "observer_account_timeout"
         except Exception as exc:
-            if result is not None:
-                result["reason"] = "observer_read_error:" + type(exc).__name__
+            result["reason"] = "observer_read_error:" + type(exc).__name__
             logger.warning("Publication reader failed task=%s account=%s (%s)", task.id, observer_id,
                            type(exc).__name__)
         finally:
@@ -245,6 +282,7 @@ async def observe_video(db, task, rows):
         return result, keys
 
     runtime = load_publication_runtime(db)
+    no_progress = 0
     for _ in range(runtime.observer_attempts):
         if reason := await budget_reason():
             observations.append({"reason": reason})
@@ -252,21 +290,48 @@ async def observe_video(db, task, rows):
         found_ids, absences = _independent_evidence(observations)
         if all(cid in found_ids or len(absences[cid]) >= 2 for cid in wanted):
             break
-        observer = get_free_account_for_reply(db, exclude_ids=list(used), reserve=True,
+        excluded = used
+        if observer_cooldowns is not None:
+            now = loop.time()
+            excluded = used | {account_id for account_id, until in observer_cooldowns.items() if until > now}
+        selection = asyncio.create_task(asyncio.to_thread(
+            get_free_account_for_reply, db, exclude_ids=list(excluded), reserve=True,
             pool_owner_user_id=task.user_id if (task.settings or {}).get("account_pool_mode") == "personal" else None,
-            exclude_degraded_categories={"captcha", "page_blocked"})
+            exclude_degraded_categories={"auth_unconfirmed", "captcha", "page_blocked"}))
+        try:
+            observer = await await_owned(selection)
+        except asyncio.CancelledError:
+            if not selection.cancelled() and selection.exception() is None:
+                observer = selection.result()
+                if observer is not None:
+                    schema.release_reply_account_reservation(observer.id)
+            raise
         if observer is None:
             break
         observer_id = observer.id
         used.add(observer_id)
+        if observer_cooldowns is not None:
+            # A parallel batch can finish reading while this selection is in flight.
+            if observer_cooldowns.get(observer_id, 0) > loop.time():
+                schema.release_reply_account_reservation(observer_id)
+                continue
+            observer_cooldowns[observer_id] = float("inf")
         try:
-            result, keys = await read_account(observer, safe_rows)
+            candidates = [row for row in safe_rows if str(row.comment_id) not in found_ids]
+            result, keys = await read_account(observer, candidates)
             if result is not None and (result["found_ids"] or result["complete_ids"] or result.get("reason")):
                 observations.append(result)
                 if result["found_ids"] or result["complete_ids"]:
                     references.append(keys)
+                    no_progress = 0
+                else:
+                    no_progress += 1
         finally:
+            if observer_cooldowns is not None:
+                observer_cooldowns[observer_id] = loop.time() + OBSERVER_COOLDOWN_SECONDS
             schema.release_reply_account_reservation(observer_id)
+        if no_progress >= OBSERVER_NO_PROGRESS_LIMIT:
+            break
 
     # The author read is a separate, read-only check. A POST receipt alone
     # provides no evidence that the author can see the comment in the list.
@@ -336,9 +401,11 @@ def process_due_checks(engine, stop_event=None):
             return False
         task_id = candidate.task_id
         due_only = (candidate.result or {}).get("scope") == "due"
+        # SQLite returns a naive lease timestamp. Compare it only in SQL.
         claimed = db.execute(update(PublicationCheckJob).where(PublicationCheckJob.task_id == task_id,
             or_(PublicationCheckJob.status == "pending", PublicationCheckJob.lease_until < now))
-            .values(status="running", lease_token=token, lease_until=now + timedelta(minutes=12), updated_at=now)).rowcount
+            .values(status="running", lease_token=token, lease_until=now + timedelta(minutes=12), updated_at=now),
+            execution_options={"synchronize_session": False}).rowcount
         db.commit()
         if not claimed:
             return False
@@ -449,7 +516,6 @@ def process_due_checks(engine, stop_event=None):
 
 async def recheck_loop():
     from db.database import sync_engine
-    from services.async_ownership import await_owned
     from services.publication_runtime import load_publication_runtime, default_runtime
     stop_event = threading.Event()
     runtime = default_runtime()
@@ -472,7 +538,7 @@ async def recheck_loop():
                     raise
                 for result in results:
                     if isinstance(result, Exception):
-                        logger.warning("Publication recheck worker failed (%s)", type(result).__name__)
+                        logger.warning("Publication recheck worker failed (%s)", type(result).__name__, exc_info=result)
             except asyncio.CancelledError:
                 raise
             except Exception:

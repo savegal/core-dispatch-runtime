@@ -22,6 +22,26 @@ TASK_STATUSES["queued"] = "В очереди"
 ACTIVE_STATUSES = {"pending", "in_progress", "running", "queued"}
 
 
+def _publication_error_label(row):
+    from services.user_facing_errors import humanize_error_text
+
+    reason = str(row.get("error_code") or "")
+    if not reason:
+        return ""
+    if reason.endswith("empty_body") and row.get("wire_count"):
+        return "Пустой ответ на POST, исход неизвестен"
+    if reason.startswith("dead_session:"):
+        return "Сессия истекла или недействительна"
+    if reason.startswith(("proxy_route:", "residential_ip_probe_")):
+        return "Ошибка маршрута прокси"
+    return {
+        "http_preflight:inconclusive:passport_auth_unconfirmed": "Passport не подтвердил авторизацию",
+        "http_auth_unconfirmed:browser_login_state": "Браузер не подтвердил авторизацию",
+        "comment_readiness_unconfirmed:timeout": "Таймаут чтения комментариев",
+        "comment_readiness_unconfirmed:empty_body": "Пустой ответ списка комментариев",
+    }.get(reason) or humanize_error_text(reason, short=True) or ""
+
+
 def render_live(activity):
     status = str(activity.get("status") or "pending")
     active = status in ACTIVE_STATUSES
@@ -51,8 +71,11 @@ def render_live(activity):
         if execution.get("browser_slots") == 1:
             lines.extend(["Один браузерный слот · HTTP-отправка и проверка чередуются", ""])
         elif execution:
+            idle_senders = execution.get("idle_reader_senders")
+            extra = (f" · без проверок до {number(idle_senders)} отправок"
+                     if idle_senders and idle_senders != execution.get("effective_senders") else "")
             lines.extend([f"Лимит параллельности · HTTP-отправки {number(execution.get('effective_senders'))}, "
-                          f"проверки {number(execution.get('effective_readers'))}", ""])
+                          f"проверки {number(execution.get('effective_readers'))}{extra}", ""])
     for key, title in (("main", "Главные комментарии"), ("replies", "Ответы")):
         value = activity.get(key) or {}
         visible = value.get("visible", 0)
@@ -63,7 +86,8 @@ def render_live(activity):
             f"Готовятся: {number(value.get('preparing'))} · отправляются: {number(value.get('sending'))}",
             f"Только автору: <b>{number(value.get('author_only'))}</b> · не найдены наблюдателями: {number(value.get('not_found'))}",
             f"Ждут проверки: {number(value.get('pending_checks'))} · исход неизвестен: {number(value.get('uncertain'))}",
-            f"Ошибок: {number(value.get('failed'))} · не отправлено: {number(value.get('not_sent'))}",
+            f"Ошибок: {number(value.get('failed'))} · отсев до POST: "
+            f"{number(value.get('preflight_rejected', value.get('not_sent')))}",
             f"Видно / отправок: {percent(value.get('visible_percent'))}"])
         if value.get("ever_visible", visible) != visible:
             lines.append(f"Когда-либо подтверждено: {number(value.get('ever_visible'))}")
@@ -91,7 +115,15 @@ def render_live(activity):
         label = "ответ" if row.get("kind") == "reply" else "комментарий"
         timestamp = next((utc_time(row.get(key)) for key in ("checked_at", "finished_at", "dispatched_at", "started_at") if utc_time(row.get(key))), None)
         clock = (timestamp.split(" · ")[-1] + " · ") if timestamp else ""
-        lines.append(f"<code>{clock}</code>{label} · {escape(state)}\n{excerpt(row.get('text'), 80, encoded_limit=200)}")
+        account = f" · акк. #{number(row['account_id'])}" if row.get("account_id") else ""
+        reason = _publication_error_label(row)
+        if row.get("wire_count") == 0 and row.get("status") == "not_sent":
+            state = "пропуск до POST"
+        if row.get("wire_count") and str(row.get("error_code") or "").endswith("empty_body"):
+            state = "POST отправлен"
+        detail = f"\n{excerpt(reason, 80, encoded_limit=160)}" if reason else ""
+        lines.append(f"<code>{clock}</code>{label}{account} · {escape(state)}{detail}\n"
+                     f"{excerpt(row.get('text'), 80, encoded_limit=200)}")
         links = publication_links(row)
         if links:
             lines.append(links)

@@ -49,9 +49,11 @@ async def process_import_job(session_factory):
         if job is None:
             return False
         job_id = job.id
+        # SQLite returns a naive lease timestamp. The job is refreshed below before use.
         claimed = await db.execute(update(AccountImportJob).where(AccountImportJob.id == job_id,
             or_(AccountImportJob.status == "pending", AccountImportJob.lease_until < now))
-            .values(status="running", lease_token=token, lease_until=now + timedelta(minutes=5), updated_at=now))
+            .values(status="running", lease_token=token, lease_until=now + timedelta(minutes=5), updated_at=now),
+            execution_options={"synchronize_session": False})
         await db.commit()
         if not claimed.rowcount:
             return False

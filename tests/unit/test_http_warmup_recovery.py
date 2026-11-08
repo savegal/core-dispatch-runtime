@@ -236,6 +236,66 @@ async def test_empty_priming_with_existing_ttwid_does_not_add_wait_or_duplicate_
     comments.assert_not_awaited()
 
 
+async def test_quantity_empty_token_bootstrap_is_final_for_this_candidate(monkeypatch, warmup):
+    page, comments, _ = warmup
+    page.context.cookies.return_value = cookies("sessionid", "ttwid", "tt_csrf_token")
+    page._comment_list_http_meta = {"reason": "empty_body"}
+    comments.return_value = None
+    health = Mock()
+    monkeypatch.setattr(engagement_engine, "_record_http_account_result", health)
+
+    _, valid, info = await engagement_engine.warmup_page_for_http(
+        page, URL, max_retries=1, require_comment_readiness=True, account=SimpleNamespace(id=22))
+
+    assert not valid and info["reason_code"] == "comment_readiness_unconfirmed:empty_body"
+    comments.assert_awaited_once()
+    assert comments.await_args.kwargs["bootstrap"] is True
+    health.assert_not_called()
+    page.goto.assert_not_awaited()
+
+
+@pytest.mark.parametrize("verified,late_waf", [(False, False), (True, False), (True, True)])
+async def test_quantity_main_can_defer_timed_out_list_only_with_signed_runtime(monkeypatch, warmup, verified, late_waf):
+    page, comments, _ = warmup
+
+    async def read(*args, **kwargs):
+        page._comment_list_http_meta = {"reason": "timeout"}
+        return None
+
+    async def signer(*args, require_signed_dispatch=False, **kwargs):
+        return verified if require_signed_dispatch else True
+
+    comments.side_effect = read
+    monkeypatch.setattr(engagement_engine, "wait_for_runtime_signer_ready", signer)
+    if late_waf:
+        snapshot = {record["name"]: record["value"] for record in page.context.cookies.return_value}
+        monkeypatch.setattr(engagement_engine, "synchronize_browser_cookies", AsyncMock(
+            return_value=({**snapshot, "_waftokenid": "fixture"}, False)))
+    _, valid, info = await engagement_engine.warmup_page_for_http(
+        page, URL, max_retries=1, require_comment_readiness=True, allow_verified_signer_without_list=True,
+    )
+    assert valid is (verified and not late_waf)
+    assert bool(info.get("comment_list_deferred")) is valid
+    assert not info.get("comment_api_ready")
+
+
+async def test_runtime_profile_timeout_reuses_verified_context_configuration(monkeypatch, warmup):
+    import asyncio
+    from executor.http.page_runtime import prepared_runtime_profile
+
+    page, _, _ = warmup
+    page.context._account_device_profile = {"options": {"user_agent": "fixture-UA"}, "identity": {"platform": "Win32"}}
+    page.context._account_locale = "fr-FR"
+    page.context._account_timezone = "Europe/Paris"
+    monkeypatch.setattr("executor.http.page_runtime.read_warmup_runtime_profile", AsyncMock(side_effect=asyncio.TimeoutError))
+
+    _, valid, info = await engagement_engine.warmup_page_for_http(page, URL, max_retries=1)
+    assert valid and info["runtime_profile_from_context"]
+    runtime = prepared_runtime_profile(page, info["_runtime_profile"])
+    assert runtime["user_agent"] == "fixture-UA" and runtime["platform"] == "Win32"
+    assert runtime["browser_language"] == "fr-FR" and runtime["timezone"] == "Europe/Paris"
+
+
 @pytest.mark.parametrize("phase", ["signer", "priming_get", "ttwid_poll", "cookie_sync"])
 @pytest.mark.parametrize("login", ["https://www.tiktok.com/login", "file://www.tiktok.com/@demo/video/7635267329407913230"])
 async def test_warmup_rejects_redirects_during_preparation(monkeypatch, warmup, phase, login):
@@ -475,7 +535,7 @@ async def test_http_preflight_softly_rejects_unconfirmed_passport_and_caches_use
     reason = await user_schema._preflight_cookie_http_gate(
         None, dead_acc, correlation_id="task_1218_parallel_main_v1_a1_acc2560", phase="main",
     )
-    assert reason and reason.startswith("http_preflight:inconclusive:")
+    assert reason == "http_preflight:inconclusive:passport_auth_unconfirmed"
     dead_marks.assert_not_called()
     soft_marks.assert_called_once()
 
@@ -488,7 +548,27 @@ async def test_http_preflight_softly_rejects_unconfirmed_passport_and_caches_use
     assert user_schema._get_cached_http_preflight_username(live_acc) == "fast_user_2563"
 
 
-async def test_prepare_cookies_preserves_fresh_csrf_within_30_minutes():
+@pytest.mark.parametrize("uid_marker", ["", "; uid_tt=123456"])
+@pytest.mark.parametrize("phase", ["visibility_http", "publication_recheck"])
+async def test_ambiguous_passport_skips_browser_even_with_uid_marker(monkeypatch, uid_marker, phase):
+    account = SimpleNamespace(id=996204, cookies=f"sid_guard={'a' * 32}%7C1700000000%7C100{uid_marker}",
+                              cookie_file=None, proxy=None)
+    monkeypatch.setattr(user_schema, "_http_first_for_correlation", Mock(return_value=True))
+    monkeypatch.setattr("services.cookie_validator.validate_account_http", AsyncMock(return_value={
+        "status": "inconclusive", "definitive": False, "error": "Passport response did not confirm authentication"}))
+    bootstrap, retire, cooldown = Mock(), Mock(), Mock()
+    monkeypatch.setattr(user_schema, "_allow_guard_browser_bootstrap", bootstrap)
+    monkeypatch.setattr(user_schema, "_register_dead_session", retire)
+    monkeypatch.setattr("services.account_service.mark_runtime_cooldown", cooldown)
+    reason = await user_schema._preflight_cookie_http_gate(
+        None, account, correlation_id="task_9204_quantity_main_1_acc996204", phase=phase)
+    assert reason == "http_preflight:inconclusive:passport_auth_unconfirmed"
+    cooldown.assert_called_once_with(None, account.id, reason, cooldown_minutes=30, category="auth_unconfirmed")
+    bootstrap.assert_not_called()
+    retire.assert_not_called()
+
+
+async def test_prepare_cookies_preserves_csrf_only_after_a_recent_browser_refresh():
     from datetime import datetime, timedelta
     from services.cookie_validator import prepare_cookies_for_context
 
@@ -497,11 +577,12 @@ async def test_prepare_cookies_preserves_fresh_csrf_within_30_minutes():
         {"name": "ttwid", "value": "fresh_ttwid", "domain": ".tiktok.com"},
         {"name": "tt_csrf_token", "value": "fresh_csrf", "domain": ".tiktok.com"},
     ]
-    fresh_account = SimpleNamespace(id=10, last_validation_ok=datetime.utcnow() - timedelta(minutes=10))
+    fresh_account = SimpleNamespace(id=10, _cookies_warmed_at=datetime.utcnow() - timedelta(minutes=9))
     fresh_names = {c["name"] for c in prepare_cookies_for_context(fresh_account, raw)}
     assert {"sessionid", "ttwid", "tt_csrf_token"} <= fresh_names
 
-    stale_account = SimpleNamespace(id=11, last_validation_ok=datetime.utcnow() - timedelta(minutes=45))
+    stale_account = SimpleNamespace(id=11, last_validation_ok=datetime.utcnow(), last_used_at=datetime.utcnow(),
+                                    _cookies_warmed_at=datetime.utcnow() - timedelta(minutes=11))
     stale_names = {c["name"] for c in prepare_cookies_for_context(stale_account, raw)}
     assert {"sessionid", "ttwid"} <= stale_names
     assert "tt_csrf_token" not in stale_names

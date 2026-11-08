@@ -64,6 +64,42 @@ async def test_visibility_reads_the_original_author_only_after_two_independent_a
     assert sample_account.assignment_lease_token is None
 
 
+@pytest.mark.asyncio
+async def test_cancelled_observer_selection_releases_late_reservation(monkeypatch):
+    from executor import user_schema as schema
+    from services import account_service
+
+    loop = asyncio.get_running_loop()
+    selecting = asyncio.Event()
+    allow_selection_to_finish = threading.Event()
+    observer = SimpleNamespace(id=101)
+
+    def select_observer(*args, **kwargs):
+        loop.call_soon_threadsafe(selecting.set)
+        if not allow_selection_to_finish.wait(timeout=2):
+            raise RuntimeError("Observer selection blocked the event loop")
+        return observer
+
+    monkeypatch.setattr(account_service, "get_free_account_for_reply", select_observer)
+    release = Mock()
+    monkeypatch.setattr(schema, "release_reply_account_reservation", release)
+    preflight = AsyncMock()
+    monkeypatch.setattr(schema, "_preflight_cookie_http_gate", preflight)
+    row = SimpleNamespace(account_id=None, identity_keys=[["username", "publisher"]],
+        video_url="https://www.tiktok.com/@test/video/123", aweme_id="123",
+        comment_id="7704740811904828192", kind="main", parent_id=None)
+    observation = asyncio.create_task(observe_video(SimpleNamespace(), SimpleNamespace(id=1, settings={}), [row]))
+    try:
+        await asyncio.wait_for(selecting.wait(), timeout=2)
+        observation.cancel()
+    finally:
+        allow_selection_to_finish.set()
+    with pytest.raises(asyncio.CancelledError):
+        await observation
+    release.assert_called_once_with(observer.id)
+    preflight.assert_not_awaited()
+
+
 def test_partial_and_duplicate_reads_do_not_prove_author_only():
     cid = "7704740811904828192"
     row = SimpleNamespace(account_id=1, comment_id=cid, visibility="unchecked", visible_at=None, check_count=0)
@@ -224,10 +260,13 @@ def test_same_order_has_one_atomic_claim_even_across_sqlite_connections(db_sessi
 @pytest.mark.parametrize("order_override", [False, True])
 async def test_a_fast_publication_is_checked_while_other_senders_are_busy(db_session, sample_task, monkeypatch, order_override):
     from executor import engagement_engine
+    from config.settings import get_settings
+    monkeypatch.setattr(get_settings(), "MAX_CONCURRENT_BROWSERS", 3)
     configure_task(db_session, sample_task, mains=3)
-    update_publication_runtime(db_session, dict(send_workers=1 if order_override else 2, check_workers=1, check_batch_size=1))
+    update_publication_runtime(db_session, dict(send_workers=1 if order_override else 3, check_workers=1,
+                                                check_batch_size=1, check_delay=0))
     if order_override:
-        sample_task.settings = {**sample_task.settings, "publication_options": {"send_workers": 2}}
+        sample_task.settings = {**sample_task.settings, "publication_options": {"send_workers": 3}}
         db_session.commit()
     monkeypatch.setattr(engagement_engine, "resolve_order_video_url", AsyncMock(
         return_value=(sample_task.video_urls[0], "7704740811904828100")))
@@ -241,10 +280,12 @@ async def test_a_fast_publication_is_checked_while_other_senders_are_busy(db_ses
         active += 1
         peak = max(active, peak)
         try:
-            if slot == 2:
-                await first_verified.wait()
+            if slot == 1:
+                await third_started.wait()
             if slot == 3:
                 third_started.set()
+            if slot in (2, 3):
+                await first_verified.wait()
             with Session(engine) as db:
                 action = db.get(QuantityAction, identity)
                 action.state, action.comment_id, action.dispatches = "accepted", str(7704740811904828100 + slot), 1
@@ -271,7 +312,7 @@ async def test_a_fast_publication_is_checked_while_other_senders_are_busy(db_ses
     monkeypatch.setattr(quantity, "verify_actions", verify)
     result = await asyncio.wait_for(quantity.execute_quantity_order(db_session, sample_task,
         sample_task.video_urls[0], ["main"], sample_task.id), 2)
-    assert result.to_dict()["publication_complete"] and checked_while_sending and peak == 2
+    assert result.to_dict()["publication_complete"] and checked_while_sending and peak == 3
 
 
 def test_background_workers_claim_distinct_jobs_and_show_each_committed_batch(db_session, sample_task, monkeypatch):
@@ -350,9 +391,10 @@ async def test_admin_runtime_api_persists_changes_and_rejects_invalid_ranges(db_
         monkeypatch.setattr(settings, "MAX_CONCURRENT_BROWSERS", 4)
         response = await client.post(route, headers=headers, json={"live_interval": 4})
         assert response.status_code == 200
-        assert response.json()["send_workers"] == 3
+        assert response.json()["send_workers"] == response.json()["idle_reader_senders"] == 4
+        assert response.json()["check_delay"] == 5.0
         monkeypatch.setattr(settings, "MAX_CONCURRENT_BROWSERS", 8)
-        assert (await client.get(route, headers=headers)).json()["send_workers"] == 7
+        assert (await client.get(route, headers=headers)).json()["send_workers"] == 8
         monkeypatch.setattr(settings, "MAX_CONCURRENT_BROWSERS", 1)
         single_slot = (await client.get(route, headers=headers)).json()
         assert single_slot["send_workers"] == single_slot["effective_readers"] == 1

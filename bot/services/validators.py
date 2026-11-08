@@ -1,5 +1,5 @@
 import re
-from services.tiktok_urls import is_tiktok_shortlink, media_id_from_url
+from services.tiktok_urls import order_video_key
 
 
 def normalize_url(url: str) -> str:
@@ -13,7 +13,7 @@ def normalize_url(url: str) -> str:
         url = 'https://' + url
     
     # Убираем лишние символы в конце
-    url = url.rstrip('.,!?;:)')
+    url = url.rstrip('.,!?;:)]')
     
     return url
 
@@ -35,48 +35,22 @@ def parse_links(text: str, return_invalid_info: bool = False) -> list[str] | tup
     
     # Паттерн для поиска URL (более гибкий)
     # Находит http(s)://, www., или просто доменные имена
-    url_patterns = [
-        r'https?://[^\s<>"\'()]+',  # С протоколом
-        r'(?:(?<=\s)|^)(?:www\.)?(?:tiktok\.com|vm\.tiktok\.com|vt\.tiktok\.com|m\.tiktok\.com)/[^\s<>"\'()]+',  # Без протокола, но с доменом TikTok
-    ]
-    
-    urls = []
-    for pattern in url_patterns:
-        found = re.findall(pattern, text, re.IGNORECASE)
-        urls.extend(found)
-    
-    # Нормализуем и фильтруем
+    urls = re.findall(
+        r'https?://[^\s<>"\'()]+|(?<!\S)(?:[a-z0-9-]+\.)*tiktok\.com/[^\s<>"\'()]+',
+        text, re.IGNORECASE,
+    )
     unique_urls = []
+    invalid_urls = []
     seen = set()
-
-    for url in urls:
-        try:
-            # Нормализуем URL
-            url = normalize_url(url)
-            
-            # Проверяем дубликаты
-            if url in seen:
-                continue
-            
-            # Парсим URL для валидации
-            if media_id_from_url(url) or is_tiktok_shortlink(url):
-                unique_urls.append(url)
-                seen.add(url)
-        except Exception:
-            # Пропускаем некорректные URL
-            continue
-    
-    if return_invalid_info:
-        # Собираем невалидные URL для информации
-        all_found_urls = []
-        for pattern in url_patterns:
-            found = re.findall(pattern, text, re.IGNORECASE)
-            all_found_urls.extend(found)
-        
-        invalid_urls = [url for url in all_found_urls if normalize_url(url) not in seen]
-        return unique_urls, invalid_urls
-
-    return unique_urls
+    for raw in urls:
+        url = normalize_url(raw)
+        key = order_video_key(url)
+        if key is None:
+            invalid_urls.append(raw)
+        elif key not in seen:
+            unique_urls.append(url)
+            seen.add(key)
+    return (unique_urls, invalid_urls) if return_invalid_info else unique_urls
 
 
 def validate_video_url(url: str) -> bool:
@@ -87,4 +61,4 @@ def validate_video_url(url: str) -> bool:
     ИСПРАВЛЕНО: Добавлена проверка паттернов для различных форматов TikTok URL.
     """
     normalized = normalize_url(url) if isinstance(url, str) else ""
-    return bool(media_id_from_url(normalized) or is_tiktok_shortlink(normalized))
+    return order_video_key(normalized) is not None

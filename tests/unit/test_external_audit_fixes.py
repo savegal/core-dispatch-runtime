@@ -64,6 +64,18 @@ def test_readiness_cache_uses_changed_cookie_content_not_account_identity(monkey
     assert classify.call_count == 2
 
 
+def test_expired_ms_token_only_affects_live_readiness():
+    from services.account_service import _cached_web_readiness
+    from services.cookie_validator import HOT_WEB_READY, WARM_AUTH_READY, classify_account_web_readiness
+
+    records = [{"name": name, "value": name, "domain": ".tiktok.com"}
+               for name in ("sessionid", "ttwid", "tt_csrf_token")]
+    records.append({"name": "msToken", "value": "old", "domain": ".tiktok.com", "expires": 1})
+    raw = json.dumps(records)
+    assert classify_account_web_readiness(raw) == WARM_AUTH_READY
+    assert _cached_web_readiness(raw) == HOT_WEB_READY
+
+
 def test_unknown_submission_is_not_completion_but_still_blocks_blind_retry():
     from services.task_execution_ledger import url_result_counts_as_success, has_submission_evidence
     result = dict(status="submitted_unconfirmed", publication_complete=True)

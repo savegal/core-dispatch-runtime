@@ -4,16 +4,17 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import time
 from executor.browser_reads import await_browser_read
 from contextlib import asynccontextmanager
 from contextvars import ContextVar
-from urllib.parse import urlparse
+from urllib.parse import parse_qs, urlparse
 
 from services.comment_search import contains_search_phrase
-from services.cookie_validator import normalize_cookie_records
+from services.cookie_validator import ms_token_differs_from_import, normalize_cookie_records
 from executor.http.request_profile import RequestProfile
 from executor.http.playwright_http_client import _extract_runtime_profile
-from executor.http.page_runtime import activate_page_input, prepared_runtime_profile
+from executor.http.page_runtime import activate_page_input, page_document_key, prepared_runtime_profile, target_page_matches
 from executor.http.request_evidence import (
     has_request_signature, observe_request_security, resolve_security_evidence, same_http_endpoint,
 )
@@ -21,6 +22,65 @@ from executor.http.request_evidence import (
 
 logger = logging.getLogger(__name__)
 _READ_BATCH = ContextVar("comment_read_batch", default=None)
+COMMENT_BOOTSTRAP_TIMEOUT_SECONDS = 12.0
+_BOOTSTRAP_FETCH_TIMEOUT_MS = 10000
+
+
+def decode_comment_list_payload(text):
+    try:
+        data = json.loads(text)
+    except (ValueError, TypeError):
+        return None, "invalid_json", None
+    if not isinstance(data, dict):
+        return None, "invalid_payload", None
+    status = data.get("status_code")
+    if type(status) is not int:
+        return None, "missing_api_status", None
+    if status != 0:
+        return None, "api_status", status
+    payload = data.get("data") if isinstance(data.get("data"), dict) else data
+    if "status_code" in payload and (type(payload["status_code"]) is not int or payload["status_code"] != 0):
+        return None, "api_status", None
+    explicit_empty = (type(payload.get("total")) is int and payload["total"] == 0
+                      and type(payload.get("has_more")) in (bool, int, str)
+                      and payload.get("has_more") in (False, 0, "0"))
+    if "comments" in payload and payload["comments"] is None and explicit_empty:
+        payload["comments"] = []
+    if not isinstance(payload.get("comments"), list):
+        return None, "missing_comments", None
+    return payload, "ok", None
+
+
+def cache_first_comment_page(page, aweme_id, payload, *, signed):
+    page._cached_first_comment_page = payload
+    page._cached_first_comment_aweme_id = str(aweme_id)
+    page._signed_comment_page_document = page_document_key(page) if signed else None
+    page._signed_comment_page_observed_at = time.monotonic() if signed else None
+    if signed and target_page_matches(page, aweme_id):
+        from executor.http.signature_runtime import note_confirmed_signed_comment_get
+        note_confirmed_signed_comment_get(page)
+
+
+def signed_first_comment_page(page, aweme_id, *, not_before=None):
+    payload = getattr(page, "_cached_first_comment_page", None)
+    observed_at = getattr(page, "_signed_comment_page_observed_at", None)
+    if not_before is not None and (not isinstance(observed_at, (int, float)) or observed_at < not_before):
+        return None
+    if (getattr(page, "_cached_first_comment_aweme_id", None) == str(aweme_id)
+            and isinstance(payload, dict) and isinstance(payload.get("comments"), list)
+            and getattr(page, "_signed_comment_page_document", None) == page_document_key(page)):
+        return payload
+    return None
+
+
+def comment_token_handshake_ready(page, aweme_id):
+    """Write warmup evidence only. It does not confirm comment-list access."""
+    meta = getattr(page, "_comment_list_http_meta", None) or {}
+    reason = meta.get("reason")
+    return (reason in {"empty_body", "timeout"}
+            and not meta.get("unsigned_dispatch_observed")
+            and target_page_matches(page, aweme_id)
+            and meta.get("signed_token_refresh") == page_document_key(page))
 
 
 @asynccontextmanager
@@ -56,15 +116,25 @@ async url => {
     let initializationRequest = false;
     const allowActivation = true;
     const allowDirectFetch = true;
+    const controlWaitMs = 0;
     try {
         const key = location.pathname;
         const request = new URL(url, location.href);
         initializationRequest = request.searchParams.get('cursor') === '0';
-        const button = document.querySelector('[data-e2e="comment-icon"], [data-e2e="comments"]');
-        if (allowActivation && request.pathname === '/api/comment/list/' &&
-            request.searchParams.get('cursor') === '0' && window.__teletanCommentActivation !== key && button) {
-            if (button.getAttribute('aria-expanded') !== 'true') {button.click(); activated = true;}
-            window.__teletanCommentActivation = key;
+        if (allowActivation && request.pathname === '/api/comment/list/' && initializationRequest &&
+            window.__teletanCommentActivation !== key) {
+            const selector = '[data-e2e="comment-icon"], [data-e2e="comments"]';
+            let button = document.querySelector(selector);
+            const deadline = performance.now() + controlWaitMs;
+            if (!button && controlWaitMs) window.scrollBy(0, 120);
+            while (!button && performance.now() < deadline) {
+                await new Promise(resolve => setTimeout(resolve, 100));
+                button = document.querySelector(selector);
+            }
+            if (button && location.pathname === key) {
+                if (button.getAttribute('aria-expanded') !== 'true') {button.click(); activated = true;}
+                window.__teletanCommentActivation = key;
+            }
         }
     } catch (error) {}
     if (initializationRequest && (allowDirectFetch || activated)) {
@@ -74,11 +144,20 @@ async url => {
     if (activated) return {activation_only: true};
     if (!allowDirectFetch) return {activation_only: false};
     const controller = new AbortController();
-    const timer = setTimeout(() => controller.abort(), 5000);
+    const fetchTimeoutMs = 5000;
+    const timer = setTimeout(() => controller.abort(), fetchTimeoutMs);
+    let response;
     try {
-        const response = await window.fetch(url, {credentials: "include", redirect: "error", signal: controller.signal});
+        response = await window.fetch(url, {credentials: "include", redirect: "error", signal: controller.signal});
         return {status: response.status, text: await response.text(), url: response.url,
                 headers: Object.fromEntries(response.headers.entries())};
+    } catch (error) {
+        if (controller.signal.aborted) {
+            if (!response) return {unavailable_reason: "timeout"};
+            return {unavailable_reason: "timeout", status: response.status, text: "", url: response.url,
+                    headers: Object.fromEntries(response.headers.entries())};
+        }
+        throw error;
     } finally { clearTimeout(timer); }
 }
 """
@@ -89,10 +168,9 @@ _COMMENT_LIST_RETRY_DELAY_SECONDS = 2.0
 _COMMENT_LIST_NATIVE_TIMEOUT_SECONDS = 5.0
 
 
-async def _fetch_with_native_activation(page, script, url, meta, *, native_only=False):
+async def _fetch_with_native_activation(page, script, url, meta, *, native_only=False, retry=True, bootstrap=False):
     """Reuse an activation GET for discovery; fresh reads still fetch independently."""
     expected = urlparse(url)
-    from urllib.parse import parse_qs
     query = parse_qs(expected.query)
     if query.get("cursor") == ["0"]:
         await activate_page_input(page)
@@ -118,7 +196,10 @@ async def _fetch_with_native_activation(page, script, url, meta, *, native_only=
             if not ready:
                 return {"status": None, "text": "", "unavailable_reason": "signer_not_ready"}
         fetch_script = script.replace('const allowActivation = true;', 'const allowActivation = false;')
-        return await await_browser_read(lambda: page.evaluate(fetch_script, url, isolated_context=False), timeout=6.0)
+        if bootstrap:
+            fetch_script = fetch_script.replace('const fetchTimeoutMs = 5000;', f'const fetchTimeoutMs = {_BOOTSTRAP_FETCH_TIMEOUT_MS};')
+        timeout = _BOOTSTRAP_FETCH_TIMEOUT_MS / 1000 + 1 if bootstrap else 6.0
+        return await await_browser_read(lambda: page.evaluate(fetch_script, url, isolated_context=False), timeout=timeout)
 
     if not first_page or not callable(getattr(page, "on", None)) or not callable(getattr(page, "remove_listener", None)):
         return await direct_fetch()
@@ -157,25 +238,31 @@ async def _fetch_with_native_activation(page, script, url, meta, *, native_only=
     page.on("request", on_request)
     page.on("response", on_response)
     try:
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + _COMMENT_LIST_NATIVE_TIMEOUT_SECONDS
         activate_script = script.replace('const allowDirectFetch = true;', 'const allowDirectFetch = false;')
+        if native_only or bootstrap:
+            activate_script = activate_script.replace('const controlWaitMs = 0;',
+                'const controlWaitMs = 2500;' if native_only else 'const controlWaitMs = 1000;')
         response = await await_browser_read(lambda: page.evaluate(activate_script, url, isolated_context=False), timeout=6.0)
-        if isinstance(response, dict) and response.get("activation_only"):
-            deadline = asyncio.get_running_loop().time() + _COMMENT_LIST_NATIVE_TIMEOUT_SECONDS
+        activated = isinstance(response, dict) and response.get("activation_only")
+        if activated or dispatched or native_only:
             try:
                 if not dispatched:
-                    await asyncio.wait_for(dispatch_event.wait(), timeout=_COMMENT_LIST_NATIVE_TIMEOUT_SECONDS)
-                remaining = max(0.001, deadline - asyncio.get_running_loop().time())
-                response = await asyncio.wait_for(asyncio.shield(result), timeout=remaining)
-                if 'cache: "no-store"' not in script:
+                    await asyncio.wait_for(dispatch_event.wait(), timeout=max(0.0, deadline - loop.time()))
+                response = await asyncio.wait_for(asyncio.shield(result), timeout=max(0.0, deadline - loop.time()))
+                if bootstrap or 'cache: "no-store"' not in script:
                     meta["activation_response_reused"] = True
                     return response
             except asyncio.TimeoutError:
                 if dispatched:
-                    if native_only:
+                    if native_only or not retry:
                         return {"status": None, "text": "", "unavailable_reason": "native_comment_response_timeout"}
                     meta["native_comment_response_timeout"] = True
                 else:
                     meta["activation_dispatch_timeout"] = True
+                    if not retry:
+                        return {"status": None, "text": "", "unavailable_reason": "native_comment_request_unavailable"}
         elif isinstance(response, dict) and "status" in response:
             return response
         return await direct_fetch()
@@ -194,8 +281,9 @@ async def _fetch_with_native_activation(page, script, url, meta, *, native_only=
 
 
 async def fetch_comment_page(page, aweme_id: str, cursor=0, count: int = 20, *, fresh: bool = False,
-                             runtime_profile=None):
-    return await _fetch_comment_list(page, aweme_id, cursor, count, fresh=fresh, runtime_profile=runtime_profile)
+                             runtime_profile=None, retry: bool = True, bootstrap: bool = False):
+    return await _fetch_comment_list(page, aweme_id, cursor, count, fresh=fresh,
+                                     runtime_profile=runtime_profile, retry=retry, bootstrap=bootstrap)
 
 
 async def activate_comment_list_via_page(page, aweme_id: str, *, count=20, runtime_profile=None):
@@ -204,13 +292,14 @@ async def activate_comment_list_via_page(page, aweme_id: str, *, count=20, runti
                                    runtime_profile=runtime_profile, native_only=True)
 
 
-async def fetch_reply_page(page, aweme_id: str, parent_comment_id: str, cursor=0, count: int = 20):
+async def fetch_reply_page(page, aweme_id: str, parent_comment_id: str, cursor=0, count: int = 20, *, retry=True):
     """Read a fresh reply branch using the page's initialized signer."""
-    return await _fetch_comment_list(page, aweme_id, cursor, count, fresh=True, parent_comment_id=parent_comment_id)
+    return await _fetch_comment_list(page, aweme_id, cursor, count, fresh=True,
+                                     parent_comment_id=parent_comment_id, retry=retry)
 
 
 async def _fetch_comment_list(page, aweme_id, cursor, count, *, fresh, parent_comment_id=None, runtime_profile=None,
-                              native_only=False):
+                              native_only=False, retry=True, bootstrap=False):
     meta = {"reason": "not_started", "http_status": None, "body_len": 0, "attempts": 0, "retry_count": 0}
     page._comment_list_http_meta = meta
     if parent_comment_id is not None:
@@ -225,12 +314,16 @@ async def _fetch_comment_list(page, aweme_id, cursor, count, *, fresh, parent_co
         return None
 
     try:
+        document = page_document_key(page)
         runtime, cookies = await _read_request_metadata(page, runtime_profile)
         profile = RequestProfile.reply_list_profile() if parent_comment_id is not None else RequestProfile.comment_list_profile()
         query = ({"item_id": aweme_id, "comment_id": parent_comment_id} if parent_comment_id is not None
                  else {"aweme_id": aweme_id})
         warmup_signer_ready = getattr(page, "_warmup_signer_ready", True)
-        effective_max_retries = _COMMENT_LIST_MAX_RETRIES if warmup_signer_ready is not False else 0
+        effective_max_retries = 0
+        if retry:
+            effective_max_retries = 1 if bootstrap else (
+                _COMMENT_LIST_MAX_RETRIES if warmup_signer_ready is not False else 0)
         for attempt in range(effective_max_retries + 1):
             meta["attempts"] = attempt + 1
             meta["retry_count"] = attempt
@@ -244,13 +337,16 @@ async def _fetch_comment_list(page, aweme_id, cursor, count, *, fresh, parent_co
             )
             url = profile.build_url_from_params(params)
             script = _COMMENT_LIST_RETRY_FETCH_JS if attempt else _COMMENT_LIST_FETCH_JS
-            if fresh:
+            if fresh or bootstrap:
                 script = script.replace('credentials: "include",', 'credentials: "include", cache: "no-store",')
+            if fresh:
                 script = script.replace('const allowActivation = true;', 'const allowActivation = false;')
             with observe_request_security(page, url) as evidence:
-                response = await _fetch_with_native_activation(page, script, url, meta, native_only=native_only)
-            if response.get("unavailable_reason"):
-                return unavailable(response["unavailable_reason"])
+                response = await _fetch_with_native_activation(
+                    page, script, url, meta, native_only=native_only, retry=retry, bootstrap=bootstrap)
+            read_error = response.get("unavailable_reason")
+            if read_error and not (bootstrap and read_error == "timeout" and response.get("status") == 200):
+                return unavailable(read_error)
             meta["http_status"] = response.get("status")
             meta["body_len"] = len(response.get("text") or "")
             security = resolve_security_evidence(evidence, response.get("url"))
@@ -264,8 +360,11 @@ async def _fetch_comment_list(page, aweme_id, cursor, count, *, fresh, parent_co
                 return unavailable("unexpected_response_url")
             headers = {str(key).lower(): value for key, value in (response.get("headers") or {}).items()}
             token = headers.get("x-ms-token")
+            rotated = False
             if meta["http_status"] == 200 and isinstance(token, str) and token.strip():
                 try:
+                    if page_document_key(page) != document:
+                        return unavailable("target_document_changed")
                     records = await page.context.cookies()
                     updates = [{**record, "value": token.strip()} for record in records
                                if record.get("name") == "msToken" and str(record.get("domain") or "").lstrip(".") in {"tiktok.com", "www.tiktok.com"}]
@@ -273,11 +372,28 @@ async def _fetch_comment_list(page, aweme_id, cursor, count, *, fresh, parent_co
                         updates = [{"name": "msToken", "value": token.strip(), "domain": ".tiktok.com", "path": "/", "secure": True}]
                     await page.context.add_cookies(updates)
                     meta["ms_token_refreshed"] = True
+                    rotated = token.strip() != cookies.get("msToken")
+                    from services.cookie_validator import remember_observed_ms_token
+                    remember_observed_ms_token(page.context, {"msToken": token.strip()})
                 except Exception:
                     meta["ms_token_refreshed"] = False
-            if attempt < effective_max_retries and meta["http_status"] == 200 and (
-                not meta["body_len"] or not has_request_signature(meta["security_params"])
-            ):
+            if (bootstrap and meta["http_status"] == 200 and not meta["body_len"]
+                    and meta["security_params_source"] == "request_event"
+                    and has_request_signature(meta["security_params"])):
+                token_used = parse_qs(urlparse(response["url"]).query).get("msToken")
+                live_before = (ms_token_differs_from_import(page.context, cookies)
+                               and token_used == [cookies.get("msToken")])
+                if not rotated and not live_before:
+                    live_after = normalize_cookie_records(await page.context.cookies())
+                    rotated = (ms_token_differs_from_import(page.context, live_after)
+                               and live_after.get("msToken") != cookies.get("msToken"))
+                if (rotated or live_before) and page_document_key(page) == document and target_page_matches(page, aweme_id):
+                    meta["signed_token_refresh"] = document
+            if read_error:
+                return unavailable(read_error)
+            can_retry = rotated if bootstrap else True
+            if (attempt < effective_max_retries and can_retry and meta["http_status"] == 200
+                    and (not meta["body_len"] or not has_request_signature(meta["security_params"]))):
                 reason = "empty_body" if not meta["body_len"] else "unsigned_response"
                 meta["initial_retry_reason"] = reason
                 logger.info(
@@ -286,6 +402,8 @@ async def _fetch_comment_list(page, aweme_id, cursor, count, *, fresh, parent_co
                     _COMMENT_LIST_RETRY_DELAY_SECONDS, meta["security_params"],
                 )
                 await asyncio.sleep(_COMMENT_LIST_RETRY_DELAY_SECONDS)
+                if page_document_key(page) != document:
+                    return unavailable("target_document_changed")
                 continue
             break
         if response.get("status") != 200:
@@ -294,33 +412,76 @@ async def _fetch_comment_list(page, aweme_id, cursor, count, *, fresh, parent_co
             return unavailable("empty_body")
         if not has_request_signature(meta["security_params"]):
             return unavailable("unsigned_response")
-        try:
-            data = json.loads(response["text"])
-        except (ValueError, TypeError):
-            return unavailable("invalid_json")
-        if not isinstance(data, dict):
-            return unavailable("invalid_payload")
-        if type(data.get("status_code")) is not int:
-            return unavailable("missing_api_status")
-        if data["status_code"] != 0:
-            meta["api_status"] = data["status_code"]
-            return unavailable("api_status")
-        payload = data.get("data") if isinstance(data.get("data"), dict) else data
-        if "status_code" in payload and (type(payload["status_code"]) is not int or payload["status_code"] != 0):
-            return unavailable("api_status")
-        explicit_empty = (type(payload.get("total")) is int and payload["total"] == 0
-                          and type(payload.get("has_more")) in (bool, int, str)
-                          and payload.get("has_more") in (False, 0, "0"))
-        if "comments" in payload and payload["comments"] is None and explicit_empty:
-            payload["comments"] = []
-        if not isinstance(payload.get("comments"), list):
-            return unavailable("missing_comments")
+        payload, reason, api_status = decode_comment_list_payload(response["text"])
+        if payload is None:
+            meta["api_status"] = api_status
+            return unavailable(reason)
+        if page_document_key(page) != document:
+            return unavailable("target_document_changed")
+        if target_page_matches(page, aweme_id):
+            from executor.http.signature_runtime import note_confirmed_signed_comment_get
+            note_confirmed_signed_comment_get(page)
         meta["reason"] = "ok"
         return payload
     except asyncio.TimeoutError:
         return unavailable("timeout")
     except Exception as exc:
         return unavailable(f"request_exception:{type(exc).__name__}")
+
+
+def _match_recent_publication(payload, *, aweme_id, parent_id, author_uid, text, started_at, now, previous):
+    from executor.http.comment_scanner import _more, reports_unseen_comments
+    from executor.http.execution_policy import valid_comment_id
+    from executor.http.playwright_http_client import _extract_comment_user_id
+
+    prior_rows = (previous or {}).get("comments") or []
+    prior_ids = {str(row["cid"]) for row in prior_rows if isinstance(row, dict) and valid_comment_id(row.get("cid"))}
+    complete_baseline = (_more((previous or {}).get("has_more")) is False
+                         and len(prior_ids) == len(prior_rows)
+                         and not reports_unseen_comments(previous, len(prior_ids)))
+    earliest = int(started_at) + (0 if complete_baseline else 1)
+    candidates = {}
+    for row in payload["comments"]:
+        if not isinstance(row, dict) or not valid_comment_id(row.get("cid")):
+            continue
+        cid = str(row["cid"])
+        if (cid in prior_ids or row.get("text") != text
+                or _extract_comment_user_id({"comment": row}) != author_uid):
+            continue
+        if row.get("aweme_id") is not None and str(row["aweme_id"]) != str(aweme_id):
+            continue
+        if str(row.get("reply_id") or "0") != parent_id or str(row.get("reply_to_reply_id") or "0") != "0":
+            continue
+        stamp = str(row.get("create_time") or "")
+        if not stamp.isascii() or not stamp.isdigit() or len(stamp) > 10:
+            continue
+        if earliest <= int(stamp) <= int(now):
+            candidates[cid] = row
+    return next(iter(candidates.values())) if len(candidates) == 1 else None
+
+
+async def recover_empty_publication(page, aweme_id, *, parent_id, author_uid, text, started_at, document, previous=None):
+    """Try one read in the publishing session. Absence is always inconclusive."""
+    if not text or page_document_key(page) != document or not target_page_matches(page, aweme_id):
+        return None
+    try:
+        async with asyncio.timeout(4.5):
+            await asyncio.sleep(0.6)
+            if page_document_key(page) != document:
+                return None
+            if parent_id == "0":
+                payload = await fetch_comment_page(page, aweme_id, fresh=True, retry=False)
+            else:
+                payload = await fetch_reply_page(page, aweme_id, parent_id, retry=False)
+    except Exception as exc:
+        logger.debug("Empty POST recovery read unavailable (%s)", type(exc).__name__)
+        return None
+    if payload is None or page_document_key(page) != document:
+        return None
+    if (getattr(page, "_comment_list_http_meta", None) or {}).get("security_params_source") != "request_event":
+        return None
+    return _match_recent_publication(payload, aweme_id=aweme_id, parent_id=parent_id, author_uid=author_uid,
+                                     text=text, started_at=started_at, now=time.time(), previous=previous)
 
 
 def _author_key(value) -> str:

@@ -85,11 +85,15 @@ async def ensure_residential_exit_ip(account, route, *, lease=None) -> str | Non
     except ProxyRouteError:
         raise
     except httpx.ProxyError as exc:
+        if str(exc).split(" ", 1)[0] == "402":
+            raise ProxyRouteError("residential_ip_probe_payment_required") from None
         if "407" in str(exc):
             raise ProxyRouteError("proxy_authentication_required") from None
         raise ProxyRouteError("residential_ip_probe_proxy_error") from None
     except httpx.HTTPStatusError as exc:
         code = exc.response.status_code
+        if code == 402:
+            raise ProxyRouteError("residential_ip_probe_payment_required") from None
         if code == 407:
             raise ProxyRouteError("proxy_authentication_required") from None
         if code == 429:

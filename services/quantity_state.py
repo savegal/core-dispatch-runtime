@@ -3,6 +3,9 @@ from copy import deepcopy
 from db.models import QuantityAction
 
 
+RETRYABLE_QUANTITY_STATES = ("pending", "not_sent", "absent", "rejected")
+
+
 def serialize_actions(actions):
     return [{key: getattr(action, key) for key in ("id", "kind", "slot", "parent_action_id", "parent_id",
         "text", "state", "comment_id", "account_id", "error_code")} for action in actions]

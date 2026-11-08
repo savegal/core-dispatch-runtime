@@ -42,3 +42,13 @@ def is_tiktok_shortlink(url: str | None) -> bool:
         _SHARE_PATH.fullmatch(parsed.path)
         or (parsed.hostname in {"vt.tiktok.com", "vm.tiktok.com"} and _SHORT_PATH.fullmatch(parsed.path))
     )
+
+
+def order_video_key(url: str):
+    """Identify duplicate order targets without resolving short links over the network."""
+    if media_id := media_id_from_url(url):
+        return ("media", media_id)
+    if is_tiktok_shortlink(url):
+        parsed = parse_tiktok_url(url)
+        return ("short", parsed.hostname, parsed.path.rstrip("/"))
+    return None

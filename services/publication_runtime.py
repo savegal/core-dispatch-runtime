@@ -36,7 +36,7 @@ class PublicationRuntime(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     order_workers: int = Field(default=2, ge=1, le=32, strict=True)
-    send_workers: int = Field(default_factory=lambda: publication_capacity(get_settings().MAX_CONCURRENT_BROWSERS)[0],
+    send_workers: int = Field(default_factory=lambda: min(MAX_SEND_WORKERS, max(1, get_settings().MAX_CONCURRENT_BROWSERS)),
                               ge=1, le=MAX_SEND_WORKERS, strict=True)
     check_workers: int = Field(default=1, ge=1, le=MAX_CHECK_WORKERS, strict=True)
     check_batch_size: int = Field(default=8, ge=1, le=100, strict=True)
@@ -45,7 +45,7 @@ class PublicationRuntime(BaseModel):
     main_pages: int = Field(default=5, ge=1, le=100, strict=True)
     reply_pages: int = Field(default=5, ge=1, le=100, strict=True)
     send_interval: float = Field(default=0, ge=0, le=30)
-    check_delay: float = Field(default=0, ge=0, le=60)
+    check_delay: float = Field(default=5.0, ge=0, le=60)
     late_workers: int = Field(default=1, ge=1, le=8, strict=True)
     late_poll: float = Field(default=5, ge=1, le=60)
     late_delays: tuple[int, ...] = Field(default=(120, 600, 3600), min_length=1, max_length=8)
@@ -61,6 +61,9 @@ class PublicationRuntime(BaseModel):
     def limits(self, browser_slots):
         senders, readers = publication_capacity(browser_slots, self.check_workers)
         return min(self.send_workers, senders), readers
+
+    def idle_reader_send_limit(self, browser_slots):
+        return min(self.send_workers, max(1, int(browser_slots)))
 
 
 def default_runtime():
@@ -118,4 +121,4 @@ def runtime_payload(runtime):
     slots = max(1, int(get_settings().MAX_CONCURRENT_BROWSERS))
     senders, readers = runtime.limits(slots)
     return runtime.model_dump(mode="json") | dict(browser_slots=slots, effective_senders=senders,
-                                                  effective_readers=readers)
+        effective_readers=readers, idle_reader_senders=runtime.idle_reader_send_limit(slots))

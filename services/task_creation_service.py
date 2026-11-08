@@ -106,7 +106,8 @@ def _build_text_variants(template: TaskTemplate) -> list[str]:
     ]
     if not variants:
         variants = [template.main_comment.strip()]
-    return variants[:10]
+    limit = 50 if template_settings.get("publication_plan") else 10
+    return variants[:limit]
 
 
 def _template_reply_texts(template: TaskTemplate) -> list[str]:

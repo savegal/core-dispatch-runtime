@@ -40,3 +40,16 @@ def test_parse_links_filters_fake_tiktok_like_host():
     )
     links = parse_links(text)
     assert links == ["https://www.tiktok.com/@demo/video/1234567890123456789"]
+
+
+def test_quantity_editor_keeps_first_media_link_and_accepts_links_without_protocol():
+    from bot.handlers.quantity_orders import parse_links as parse_order_links
+
+    text = ("www.tiktok.com/@demo/video/1234567890123456789?from=share\n"
+            "https://m.tiktok.com/@demo/video/1234567890123456789\n"
+            "vt.tiktok.com/ZDemo/\n"
+            "https://vt.tiktok.com/ZDemo/?from=share")
+    assert parse_order_links(text) == [
+        "https://www.tiktok.com/@demo/video/1234567890123456789?from=share",
+        "https://vt.tiktok.com/ZDemo/",
+    ]

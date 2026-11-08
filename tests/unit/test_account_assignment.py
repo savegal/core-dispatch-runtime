@@ -7,7 +7,7 @@ import pytest
 from sqlalchemy import update
 from sqlalchemy.orm import Session
 
-from db.models import Account
+from db.models import Account, PublicationAttempt
 from services import account_assignment as assignments
 from services import account_service as service
 from db.migrations.add_account_assignment_migration import migrate
@@ -34,14 +34,62 @@ def isolated_scheduler(monkeypatch):
 def add_accounts(db, count):
     now = datetime.now(timezone.utc)
     accounts = [Account(label=f"fair-{i}", status="active", cookies=json.dumps(
-        # Exercise turn fairness within one readiness tier; readiness itself
-        # now takes precedence over turns and validation history.
-        {"sessionid": f"session-{i}", "ttwid": "wid", **({"sid_tt":f"sid-{i}","s_v_web_id":"fp","msToken":"token"} if i % 2 else {})}),
-        last_validation_ok=now if i % 2 else None,
+        # Rotation is the tie-breaker between accounts of equal quality.
+        {"sessionid": f"session-{i}", "ttwid": "wid"}),
         created_at=now-timedelta(days=7)) for i in range(count)]
     db.add_all(accounts)
     db.commit()
     return [a.id for a in accounts]
+
+
+@pytest.mark.parametrize("selector", [service.get_free_account_for_main_comment, service.get_free_account_for_reply])
+def test_account_quality_beats_an_older_assignment(db_session, selector):
+    older_id, newer_id = add_accounts(db_session, 2)
+    now = datetime.now(timezone.utc)
+    older, newer = db_session.get(Account, older_id), db_session.get(Account, newer_id)
+    older.last_assigned_at = now - timedelta(hours=2)
+    older.error_count_recent = 2
+    newer.last_assigned_at = now - timedelta(hours=1)
+    db_session.commit()
+
+    selected = selector(db_session)
+    assert selected.id == newer_id
+
+
+@pytest.mark.parametrize("scope,selector", [(service.MAIN_SCOPE, service.get_free_account_for_main_comment),
+    (service.REPLY_SCOPE, service.get_free_account_for_reply)])
+def test_clean_cookie_profile_wins_before_the_first_candidate_batch(db_session, scope, selector):
+    ids = add_accounts(db_session, 24)
+    rows = db_session.query(Account).order_by(Account.id).all()
+    now = datetime.now(timezone.utc)
+    for index, row in enumerate(rows):
+        profile = {"sessionid": f"session-{index}", "ttwid": "wid", "tt_csrf_token": "csrf"}
+        if row.id != ids[-1]:
+            profile.update({"x-web-secsdk-uid": "fixture", "gd_random": "present"})
+        row.cookies = json.dumps(profile)
+    rows[-1].last_assigned_at = now
+    db_session.commit()
+
+    healthy = {"bucket": "healthy"}
+    clean_score = service._calculate_scope_quality_score(rows[-1], healthy, scope, now)
+    risky_score = service._calculate_scope_quality_score(rows[0], healthy, scope, now)
+    assert clean_score - risky_score == 25
+    assert selector(db_session).id == ids[-1]
+
+
+@pytest.mark.parametrize("selector", [service.get_free_account_for_main_comment, service.get_free_account_for_reply])
+def test_only_recent_wire_empty_responses_exclude_account(db_session, sample_task, selector):
+    ids = add_accounts(db_session, 3)
+    now = datetime.now(timezone.utc)
+    for index, (account_id, elapsed, wires) in enumerate(zip(ids, [59, 61, 15], [1, 1, 0])):
+        db_session.add(PublicationAttempt(id=f"response-{index}", task_id=sample_task.id, account_id=account_id,
+            video_url=sample_task.video_urls[0], kind="main", text="fixture", text_hash="fixture",
+            status="unknown", wire_count=wires, error_code="submitted_unconfirmed:empty_body",
+            started_at=now - timedelta(hours=2), finished_at=now - timedelta(minutes=elapsed)))
+    db_session.commit()
+
+    assert selector(db_session).id == ids[1]
+    assert selector(db_session, exclude_ids=[ids[1]]).id == ids[2]
 
 
 def test_rotation_covers_pool_beyond_first_sql_batch_and_survives_restart(db_session):

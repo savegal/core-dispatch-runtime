@@ -86,7 +86,11 @@ def test_passport_tls_profile_matches_the_available_browser_generation(major, ex
 
 
 @pytest.mark.asyncio
-async def test_proxy_authentication_failure_is_not_a_dead_tiktok_session(monkeypatch):
+@pytest.mark.parametrize("message,expected", [
+    ("CONNECT failed: 407", "proxy_authentication_required:HTTP407"),
+    ("CONNECT tunnel failed, response 402", "proxy_payment_required:HTTP402"),
+])
+async def test_proxy_tunnel_failure_is_not_a_dead_tiktok_session(monkeypatch, message, expected):
     import httpx
     from services import cookie_validator as validator
     monkeypatch.setenv("VALIDATOR_TEST_CURL_CFFI", "1")
@@ -96,14 +100,33 @@ async def test_proxy_authentication_failure_is_not_a_dead_tiktok_session(monkeyp
     monkeypatch.setattr(validator, "_ORIGINAL_AIOHTTP_CLIENT_SESSION", fallback)
     curl = AsyncMock()
     curl.__aenter__.return_value = curl
-    curl.get.side_effect = httpx.ProxyError("CONNECT failed: 407 password=private-value")
+    curl.get.side_effect = httpx.ProxyError(message + " password=private-value")
     monkeypatch.setattr(validator, "_CurlAsyncSession", Mock(return_value=curl))
     account = SimpleNamespace(id=1, cookies="sessionid=valid", proxy="http://user:password@proxy.invalid:8000")
     result = await validator._validate_account_http_tri_state(account)
     assert result["status"] == "inconclusive" and result["definitive"] is False
     assert result["category"] == "proxy_route" and result["request_attempted"] is False
-    assert "407" in result["error"] and "private-value" not in result["error"]
+    assert result["error"] == expected
     fallback.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_aiohttp_proxy_payment_failure_is_not_a_dead_tiktok_session(monkeypatch):
+    from services import cookie_validator as validator
+    monkeypatch.setattr(validator.get_settings(), "USE_PROXY", True)
+    session = AsyncMock()
+    session.__aenter__.return_value = session
+    session.get = Mock(side_effect=validator.aiohttp.ClientHttpProxyError(
+        SimpleNamespace(real_url="https://proxy.invalid:8000"), (), status=402, message="Payment Required"))
+    monkeypatch.setattr(validator.aiohttp, "ClientSession", Mock(return_value=session))
+    account = SimpleNamespace(id=1, cookies="sessionid=valid", proxy="http://user:password@proxy.invalid:8000")
+
+    result = await validator._validate_account_http_tri_state(account)
+
+    assert result["status"] == "inconclusive" and result["definitive"] is False
+    assert result["category"] == "proxy_route" and result["request_attempted"] is False
+    assert result["error"] == "proxy_payment_required:HTTP402"
+    session.get.assert_called_once()
 
 
 @pytest.mark.asyncio
@@ -184,7 +207,8 @@ async def test_quantity_waits_are_bounded_even_inside_a_network_operation(db_ses
 
 
 @pytest.mark.asyncio
-async def test_reader_failure_keeps_positive_evidence_from_completed_branches(monkeypatch):
+@pytest.mark.parametrize("timeout", [False, True])
+async def test_reader_failure_keeps_positive_evidence_from_completed_branches(monkeypatch, timeout):
     from executor import user_schema as schema, engagement_engine, main_visibility, reply_visibility
     from services import account_service
     from services.publication_recheck import observe_video
@@ -202,11 +226,18 @@ async def test_reader_failure_keeps_positive_evidence_from_completed_branches(mo
     monkeypatch.setattr(engagement_engine, "warmup_page_for_http", AsyncMock(return_value=({}, True, {})))
     monkeypatch.setattr(main_visibility, "scan_main_comment_ids", AsyncMock(return_value={
         "found_ids": [main.comment_id], "absent_ids": [], "complete": True}))
-    monkeypatch.setattr(reply_visibility, "scan_reply_comment_ids", AsyncMock(side_effect=RuntimeError("read failed")))
+    async def fail_reply(*args, **kwargs):
+        if timeout:
+            await asyncio.Event().wait()
+        raise RuntimeError("read failed")
+
+    monkeypatch.setattr("services.publication_recheck.OBSERVER_ACCOUNT_TIMEOUT_SECONDS", 0.5)
+    monkeypatch.setattr(reply_visibility, "scan_reply_comment_ids", fail_reply)
     monkeypatch.setattr(schema, "_safe_close", AsyncMock())
     release = Mock()
     monkeypatch.setattr(schema, "release_reply_account_reservation", release)
     observations = await observe_video(SimpleNamespace(), SimpleNamespace(id=1, settings={}), [main, reply])
     apply_observations([main, reply], observations)
+    assert observations[0]["reason"] == ("observer_account_timeout" if timeout else "observer_read_error:RuntimeError")
     assert main.visibility == "visible" and reply.visibility == "inconclusive"
     assert release.call_count == 2

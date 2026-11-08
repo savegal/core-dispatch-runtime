@@ -67,6 +67,46 @@ async def test_cancelled_dispatch_remains_unknown_and_is_not_replayed(db_session
     assert row.status == "unknown" and row.wire_count == 1
 
 
+@pytest.mark.asyncio
+async def test_quantity_journal_assigns_one_cid_to_only_one_slot(db_session, sample_task):
+    from db.models import QuantityAction
+    from services.publication_journal import quantity_action
+
+    cid = "7704740811904828192"
+    url = sample_task.video_urls[0]
+    actions = [QuantityAction(id=f"slot-{i}", task_id=sample_task.id, video_url=url, kind="main",
+                              slot=i, text="fixture", state="dispatching", token=f"claim-{i}", dispatches=1)
+               for i in (1, 2)]
+    db_session.add_all(actions)
+    db_session.commit()
+
+    class Client:
+        page = None
+
+        @observe_publication_request
+        async def execute(self, **kwargs):
+            self.last_request_meta = {"request_attempted": True, "receipt_source": "author_list_recovery"}
+            note_publication_dispatch()
+            return True, {"comment": {"cid": cid}}, None, None
+
+    results = []
+    for action in actions:
+        token = quantity_action.set((action.id, action.token))
+        try:
+            with publication_scope(db_session, sample_task, url):
+                results.append(await Client().execute(
+                    profile=SimpleNamespace(method="POST", endpoint="/api/comment/publish/"),
+                    dynamic_params={"text": "fixture", "aweme_id": "7704037684280446216"}))
+        finally:
+            quantity_action.reset(token)
+    assert results[0][0]
+    assert results[1][2] == "submitted_unconfirmed:cid_already_assigned"
+    db_session.expire_all()
+    assert [action.state for action in actions] == ["accepted", "uncertain"]
+    assert [action.comment_id for action in actions] == [cid, None]
+    assert sum(row.wire_count for row in db_session.query(PublicationAttempt)) == 2
+
+
 def test_cid_is_not_public_visibility(db_session, sample_task):
     attempt(db_session, sample_task)
     snapshot = activity_snapshot(db_session, sample_task)

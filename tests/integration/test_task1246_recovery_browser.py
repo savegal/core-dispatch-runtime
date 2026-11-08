@@ -17,6 +17,71 @@ VIDEO = "7699894341501832466"
 URL = f"https://www.tiktok.com/@fixture/video/{VIDEO}"
 
 
+async def test_visibility_recovers_exact_cid_from_page_after_empty_get(browser_page):
+    from executor.main_visibility import scan_main_comment_ids
+
+    dom_cid, hydrated_cid, unrelated_cid, missing_cid = [str(int(VIDEO) + i) for i in range(1, 5)]
+    state = {"comments": [{"cid": hydrated_cid, "aweme_id": VIDEO, "text": "fixture"},
+                          {"cid": unrelated_cid, "aweme_id": "999", "text": "other video"}]}
+    html = (f'<script id="SIGI_STATE" type="application/json">{json.dumps(state)}</script>'
+            f'<div data-comment-id="{dom_cid}"><span data-e2e="comment-level-1">Visible</span></div>')
+    calls = []
+
+    async def serve(route):
+        if urlparse(route.request.url).path == "/api/comment/list/":
+            calls.append(route.request.method)
+            await route.fulfill(status=200, body="")
+        else:
+            await route.fulfill(content_type="text/html", body=html)
+
+    await browser_page.route("**/*", serve)
+    await browser_page.goto(URL)
+    evidence = await scan_main_comment_ids(browser_page, VIDEO,
+        [dom_cid, hydrated_cid, unrelated_cid, missing_cid], allow_page_fallback=True)
+
+    assert calls == ["GET"]
+    assert evidence["found_ids"] == sorted([dom_cid, hydrated_cid])
+    assert evidence["reason"] == "page_exact_cid" and not evidence["complete"] and not evidence["absent_ids"]
+
+
+@pytest.mark.parametrize("native_only", [False, True])
+async def test_late_comment_control_drives_the_first_signed_read(browser_page, native_only):
+    from executor.http.comment_discovery import activate_comment_list_via_page, fetch_comment_page
+
+    reads = []
+
+    async def serve(route):
+        if urlparse(route.request.url).path == "/api/comment/list/":
+            reads.append(parse_qs(urlparse(route.request.url).query))
+            await route.fulfill(json={"status_code": 0, "comments": [], "has_more": 0})
+        else:
+            await route.fulfill(content_type="text/html", body="<html><body>fixture</body></html>")
+
+    await browser_page.route("**/*", serve)
+    await browser_page.goto(URL)
+    await browser_page.evaluate("""video => {
+        const scroll = window.scrollBy.bind(window);
+        window.scrollBy = (...args) => {
+            scroll(...args);
+            setTimeout(() => {
+                const button = document.createElement('button');
+                button.dataset.e2e = 'comment-icon';
+                button.onclick = () => fetch('/api/comment/list/?aweme_id=' + video +
+                    '&cursor=0&count=20&X-Bogus=fixture&native=1');
+                document.body.appendChild(button);
+            }, 200);
+        };
+    }""", VIDEO, isolated_context=False)
+
+    if native_only:
+        result = await activate_comment_list_via_page(browser_page, VIDEO)
+    else:
+        result = await fetch_comment_page(browser_page, VIDEO, bootstrap=True)
+
+    assert result and result["comments"] == []
+    assert len(reads) == 1 and reads[0]["native"] == ["1"]
+
+
 @pytest.mark.parametrize("source", ["sigi", "universal", "body"])
 async def test_login_probe_skips_large_container_layout_and_unneeded_html_serialization(browser_page, source):
     state = '{"isLogin":true}' if source != "body" else '{"isLogin":false}'

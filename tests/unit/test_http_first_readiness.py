@@ -59,7 +59,10 @@ async def test_http_preflight_and_browser_cookies_do_not_wait_for_dom_profile(mo
     dom_probe = AsyncMock(side_effect=AssertionError("HTTP-valid session must not wait for a DOM profile/composer"))
     monkeypatch.setattr(user_schema, "_open_video_and_check", dom_probe)
     monkeypatch.setattr(user_schema, "_fast_visible_captcha_reason", AsyncMock(return_value="captcha_challenge:test" if guard == "captcha" else None))
-    monkeypatch.setattr(user_schema, "_deny_if_visible_logged_out", AsyncMock(return_value="visible_login_ui:test" if guard == "logout" else None))
+    login_state = {"state": "logged_out", "loginCount": 1} if guard == "logout" else {"state": "logged_in"}
+    monkeypatch.setattr(user_schema, "get_browser_login_state", AsyncMock(return_value=login_state))
+    dead = Mock()
+    monkeypatch.setattr(user_schema, "_register_dead_session", dead)
     monkeypatch.setattr(user_schema, "_register_captcha_session", Mock())
     monkeypatch.setattr(user_schema, "register_alive_session", Mock())
 
@@ -67,7 +70,11 @@ async def test_http_preflight_and_browser_cookies_do_not_wait_for_dom_profile(mo
         None, page, SimpleNamespace(id=7), PHOTO_URL, timeout_ms=1000, correlation_id="task_engagement_reply_1",
     )
     assert ready is (guard is None)
-    assert reason == ({None: None, "captcha": "captcha_challenge:test", "logout": "visible_login_ui:test"}[guard])
+    if guard == "logout":
+        assert reason.startswith("dead_session:visible_login_ui:http_preflight_browser_auth:")
+    else:
+        assert reason == ("captcha_challenge:test" if guard == "captcha" else None)
+    assert dead.call_count == int(guard == "logout")
     assert page.goto.await_args.kwargs["wait_until"] == "commit"
     dom_probe.assert_not_awaited()
 

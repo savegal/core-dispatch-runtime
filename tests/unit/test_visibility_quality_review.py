@@ -211,13 +211,17 @@ async def test_batch_profile_does_not_leak_to_a_later_observer_read(monkeypatch)
     assert api._extract_runtime_profile.await_count == page.context.cookies.await_count == 2
 
 
-@pytest.mark.parametrize("reason", ["runtime_signer_not_ready", "http_session_media_mismatch", "url_drift_to_other_video"])
+@pytest.mark.parametrize("reason", ["comment_readiness_unconfirmed:signer_not_ready",
+                                    "http_session_media_mismatch", "url_drift_to_other_video"])
 async def test_replacement_cannot_post_with_cold_signer_or_wrong_media(monkeypatch, reason):
     from executor import visibility_publisher as publisher, user_schema as schema
+    from executor.http import comment_discovery
     url = f"https://www.tiktok.com/@fixture/video/{VIDEO}"
     page = SimpleNamespace(url=url if reason != "url_drift_to_other_video" else "https://www.tiktok.com/@fixture/video/1111111111111111111")
+    page._comment_list_http_meta = {"reason": "signer_not_ready"}
     account = SimpleNamespace(id=1, proxy=None)
-    session = SimpleNamespace(aweme_id=VIDEO if reason != "http_session_media_mismatch" else "1111111111111111111")
+    session = SimpleNamespace(aweme_id=VIDEO if reason != "http_session_media_mismatch" else "1111111111111111111",
+                              client=SimpleNamespace())
     monkeypatch.setattr(schema, "_preflight_cookie_http_gate", AsyncMock(return_value=None))
     monkeypatch.setattr(schema, "create_page_for_account", AsyncMock(return_value=(None, page)))
     monkeypatch.setattr(schema, "track_publication_requests", Mock(return_value=Mock()))
@@ -226,7 +230,8 @@ async def test_replacement_cannot_post_with_cold_signer_or_wrong_media(monkeypat
     monkeypatch.setattr(schema, "_safe_close", AsyncMock())
     post = AsyncMock(side_effect=AssertionError("No POST is authorized"))
     monkeypatch.setattr(schema, "_publish_main_http_first_if_eligible", post)
-    monkeypatch.setattr(publisher, "wait_for_runtime_signer_ready", AsyncMock(return_value=reason != "runtime_signer_not_ready"))
+    monkeypatch.setattr(publisher, "wait_for_runtime_signer_ready", AsyncMock(return_value=False))
+    monkeypatch.setattr(comment_discovery, "fetch_comment_page", AsyncMock(return_value=None))
     receipt, refusal = await publisher.publish_visibility_http(None, account, url, "hello", correlation_id="fixture")
     assert receipt is None and refusal == reason
     post.assert_not_awaited()

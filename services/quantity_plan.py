@@ -1,4 +1,6 @@
 """Publication quantities are independent from reusable text libraries."""
+from collections.abc import Mapping
+
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 PLAN_KEY = "publication_plan"
@@ -6,14 +8,15 @@ PLAN_KEY = "publication_plan"
 
 def quantity_reply_texts(task):
     """Quantity text libraries do not inherit legacy reply_count truncation."""
-    settings = task.settings or {}
+    get = task.get if isinstance(task, Mapping) else lambda name: getattr(task, name, None)
+    settings = get("settings") or {}
     for key in ("replies", "reply_variants"):
         values = settings.get(key)
         if isinstance(values, list):
             texts = [str(value).strip() for value in values if str(value or "").strip()]
             if texts:
                 return texts[:20]
-    values = [getattr(task, f"reply{index}", None) or settings.get(f"reply{index}") for index in range(1, 21)]
+    values = [get(f"reply{index}") or settings.get(f"reply{index}") for index in range(1, 21)]
     return [str(value).strip() for value in values if str(value or "").strip()]
 
 
@@ -68,8 +71,12 @@ def ensure_quantity_plan(settings, replies):
     settings = dict(settings or {})
     if PLAN_KEY not in settings:
         main_count = 1 if settings.get("publish_all_text_variants") is False else 3
-        settings[PLAN_KEY] = QuantityPlan(main_count=main_count, replies_per_main=min(20, len(replies)),
-            max_seconds=min(21600, max(1800, main_count * (1 + len(replies)) * 100))).model_dump()
+        replies_per_main = min(20, len(replies))
+        legacy_reply_count = settings.get("reply_count")
+        if type(legacy_reply_count) is int and legacy_reply_count >= 0:
+            replies_per_main = min(replies_per_main, legacy_reply_count)
+        settings[PLAN_KEY] = QuantityPlan(main_count=main_count, replies_per_main=replies_per_main,
+            max_seconds=min(21600, max(1800, main_count * (1 + replies_per_main) * 100))).model_dump()
     settings["verify_main_visibility"] = True
     settings["verify_reply_visibility"] = True
     return settings

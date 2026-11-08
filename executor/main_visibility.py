@@ -5,9 +5,9 @@ import asyncio
 import logging
 import time
 
-from executor.http.comment_discovery import fetch_comment_page
+from executor.http.comment_discovery import activate_comment_list_via_page, fetch_comment_page, signed_first_comment_page
 from executor.http.execution_policy import valid_comment_id
-from executor.http.comment_scanner import scan_comment_ids, comment_id_key
+from executor.http.comment_scanner import scan_comment_ids, comment_id_key, read_main_ids_from_page
 
 logger = logging.getLogger(__name__)
 _PENDING_CLEANUP = set()
@@ -24,13 +24,44 @@ def main_visibility_enabled(settings) -> bool:
     return value is True or (isinstance(value, str) and value.strip().lower() in {"true", "1", "yes", "on"})
 
 
-async def scan_main_comment_ids(page, aweme_id, comment_ids, *, max_pages=20):
+async def scan_main_comment_ids(page, aweme_id, comment_ids, *, max_pages=20, warmup_started_at=None, allow_page_fallback=False):
     """Read fresh exact top-level IDs; incomplete traversals never prove absence."""
     aweme_id = str(aweme_id).strip()
-    return await scan_comment_ids(
+    comment_ids = tuple(comment_ids)
+    cached_found = set()
+    if warmup_started_at is not None:
+        cached = signed_first_comment_page(page, aweme_id, not_before=warmup_started_at)
+        if cached is not None:
+            async def read_cached(_):
+                return cached
+
+            warmup = await scan_comment_ids(page, aweme_id, comment_ids, max_pages=1, read_page=read_cached)
+            if warmup["reason"] == "all_found":
+                return warmup
+            cached_found.update(warmup["found_ids"])
+            comment_ids = [cid for cid in comment_ids if comment_id_key(cid) not in cached_found]
+    async def read_page(cursor):
+        if allow_page_fallback:
+            if cursor == 0 and getattr(page, "_warmup_signer_ready", None) is False:
+                return await activate_comment_list_via_page(page, aweme_id)
+            return await fetch_comment_page(page, aweme_id, cursor, fresh=True, retry=False)
+        return await fetch_comment_page(page, aweme_id, cursor, fresh=True)
+
+    evidence = await scan_comment_ids(
         page, aweme_id, comment_ids, max_pages=max_pages,
-        read_page=lambda cursor: fetch_comment_page(page, str(aweme_id), cursor, fresh=True),
+        read_page=read_page,
     )
+    if allow_page_fallback and evidence["reason"] in {
+        "empty_body", "timeout", "native_comment_request_unavailable", "native_comment_response_timeout", "signer_not_ready",
+    }:
+        missing = [cid for cid in comment_ids if comment_id_key(cid) not in evidence["found_ids"]]
+        from_page = await read_main_ids_from_page(page, aweme_id, missing)
+        if from_page:
+            cached_found.update(from_page)
+            evidence["reason"] = "page_exact_cid"
+    if cached_found:
+        evidence["found_ids"] = sorted(cached_found.union(evidence["found_ids"]))
+    return evidence
 
 
 class _Stopped(Exception):

@@ -19,6 +19,82 @@ COOKIES = [{"name": name, "value": value, "domain": ".tiktok.com"} for name, val
            (("sessionid", "session"), ("ttwid", "wid"), ("tt_csrf_token", "csrf"), ("msToken", "web"))]
 
 
+@pytest.fixture
+def confirmed_auth_env(monkeypatch):
+    page = SimpleNamespace(url=VIDEO_URL, context=SimpleNamespace(cookies=AsyncMock(return_value=COOKIES)))
+    account = SimpleNamespace(id=77, cookies=json.dumps(COOKIES), cookie_file=None)
+    monkeypatch.setattr(user_schema, "_has_recent_http_preflight_valid", lambda account: True)
+    monkeypatch.setattr(user_schema, "_http_first_for_correlation", lambda *args: True)
+    monkeypatch.setattr(user_schema, "_HTTP_PREFLIGHT_VALID_CACHE", {})
+    for name in ("register_alive_session", "_register_dead_session", "_register_captcha_session"):
+        monkeypatch.setattr(user_schema, name, Mock())
+    monkeypatch.setattr(user_schema, "dismiss_cookie_banners", AsyncMock())
+    return page, account
+
+
+async def test_confirmed_auth_checks_captcha_and_login_in_parallel(monkeypatch, confirmed_auth_env):
+    page, account = confirmed_auth_env
+    captcha_started = asyncio.Event()
+    login_started = asyncio.Event()
+    checks_finished = []
+
+    async def captcha_probe(*args, **kwargs):
+        captcha_started.set()
+        await login_started.wait()
+        checks_finished.append("captcha")
+        return False, None
+
+    async def login_probe(page):
+        login_started.set()
+        await captcha_started.wait()
+        checks_finished.append("login")
+        return {"state": "logged_in"}
+
+    monkeypatch.setattr(user_schema, "detect_captcha", captcha_probe)
+    monkeypatch.setattr(user_schema, "get_browser_login_state", login_probe)
+
+    assert await user_schema._ensure_account_login_ready(
+        None, page, account, VIDEO_URL, timeout_ms=1000, correlation_id="fixture",
+    ) == (True, None)
+    assert set(checks_finished) == {"captcha", "login"}
+    user_schema.dismiss_cookie_banners.assert_not_awaited()
+    user_schema.register_alive_session.assert_called_once_with(None, account)
+
+
+async def test_confirmed_auth_rechecks_unknown_login_after_consent_cleanup(monkeypatch, confirmed_auth_env):
+    page, account = confirmed_auth_env
+    monkeypatch.setattr(user_schema, "detect_captcha", AsyncMock(return_value=(False, None)))
+    monkeypatch.setattr(user_schema, "get_browser_login_state", AsyncMock(side_effect=[
+        {"state": "unknown"}, {"state": "logged_out", "loginCount": 1},
+    ]))
+
+    ok, reason = await user_schema._ensure_account_login_ready(
+        None, page, account, VIDEO_URL, timeout_ms=1000, correlation_id="fixture",
+    )
+    assert not ok and reason.startswith("dead_session:visible_login_ui:")
+    user_schema.dismiss_cookie_banners.assert_awaited_once_with(page)
+    user_schema._register_dead_session.assert_called_once()
+    user_schema.register_alive_session.assert_not_called()
+
+
+async def test_confirmed_auth_discards_logout_from_previous_document(monkeypatch, confirmed_auth_env):
+    page, account = confirmed_auth_env
+    monkeypatch.setattr(user_schema, "detect_captcha", AsyncMock(return_value=(False, None)))
+
+    async def login_probe(page):
+        if page._http_document_generation == 0:
+            page._http_document_generation += 1
+            return {"state": "logged_out", "loginCount": 1}
+        return {"state": "logged_in"}
+
+    monkeypatch.setattr(user_schema, "get_browser_login_state", AsyncMock(side_effect=login_probe))
+    assert await user_schema._ensure_account_login_ready(
+        None, page, account, VIDEO_URL, timeout_ms=1000, correlation_id="fixture",
+    ) == (True, None)
+    assert user_schema.get_browser_login_state.await_count == 2
+    user_schema._register_dead_session.assert_not_called()
+
+
 @pytest.mark.parametrize("current_url, reuse", [
     (VIDEO_URL + "?source=test", True),
     (f"https://www.tiktok.com/video/{VIDEO_ID}", True),

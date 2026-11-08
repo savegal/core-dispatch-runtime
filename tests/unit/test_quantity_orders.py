@@ -39,16 +39,16 @@ async def test_order_preview_can_set_speed_and_submit_it(monkeypatch):
     assert any(button.callback_data == "qo:speed" for row in kwargs["reply_markup"].inline_keyboard for button in row)
     await composer.edit_speed(callback, state)
     speed_buttons = message.edit_text.await_args.kwargs["reply_markup"].inline_keyboard[0]
-    assert [button.callback_data for button in speed_buttons] == ["qo:speed:1", "qo:speed:2", "qo:speed:3"]
+    assert [button.callback_data for button in speed_buttons] == ["qo:speed:1", "qo:speed:2", "qo:speed:4"]
     callback.data = "qo:speed:80"
     await composer.choose_speed(callback, state)
     assert callback.answer.await_args.kwargs["show_alert"]
-    for invalid in ("81", "4", "3 2 0 0 3", "1 4 0 0 3"):
+    for invalid in ("81", "5", "5 2 0 0 3", "1 4 0 0 3"):
         message.text = invalid
         await composer.input_speed(message, state)
         assert await state.get_state() == composer.QuantityStates.speed.state
         assert (await state.get_data())["idempotency_key"] == "original"
-    message.text = "2 2 0,5 4 7"
+    message.text = "4 2 0,5 4 7"
     await composer.input_speed(message, state)
     assert await state.get_state() == composer.QuantityStates.preview.state
     assert (await state.get_data())["idempotency_key"] != "original"
@@ -62,7 +62,7 @@ async def test_order_preview_can_set_speed_and_submit_it(monkeypatch):
     monkeypatch.setattr(composer.api_client, "get_publication_activity", AsyncMock(return_value={}))
     await composer.create_order(callback, state)
     assert creator.await_args.kwargs["settings"]["publication_options"] == {
-        "send_workers": 2, "check_workers": 2, "send_interval": .5, "check_delay": 4, "live_interval": 7,
+        "send_workers": 4, "check_workers": 2, "send_interval": .5, "check_delay": 4, "live_interval": 7,
     }
 
 
@@ -73,6 +73,13 @@ def test_quantities_are_independent_from_number_of_texts():
     assert len(task.text_variants) == 1
     assert task.settings["publication_plan"]["main_count"] == 60
     assert task.settings["publication_plan"]["max_dispatches"] == 1800
+
+
+def test_legacy_quantity_defaults_honor_disabled_replies():
+    from services.quantity_plan import ensure_quantity_plan
+
+    settings = ensure_quantity_plan({"reply_count": 0}, ["saved reply"])
+    assert settings["publication_plan"]["replies_per_main"] == 0
 
 
 @pytest.mark.parametrize("plan", [

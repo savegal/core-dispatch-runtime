@@ -93,7 +93,7 @@ def _inject_web_identity_records(
 
 
 async def synchronize_browser_cookies(
-    context: Any, account: Optional[Account] = None, db: Optional[Session] = None,
+    context: Any, account: Optional[Account] = None, db: Optional[Session] = None, *, closing: bool = False,
 ) -> tuple[Dict[str, str], bool]:
     """Restore missing browser auth aliases and save fresh page cookies + JS web identity."""
     from services.cookie_validator import (
@@ -103,11 +103,15 @@ async def synchronize_browser_cookies(
         parse_cookies_to_dict,
     )
 
-    records = await context.cookies()
+    if closing:
+        from executor.browser_reads import await_browser_read
+        records = await await_browser_read(context.cookies, timeout=1.5)
+    else:
+        records = await context.cookies()
     names = {c["name"] for c in records}
     restored = [c for c in normalize_cookies_for_browser(records, drop_stale_antifraud=False)
                 if c["name"] in {"sessionid", "sid_tt", "sessionid_ss"} and c["name"] not in names]
-    if restored:
+    if restored and not closing:
         await context.add_cookies(restored)
     previous = parse_cookies_to_dict(get_cookies_for_account(account)) if account is not None else {}
     merged_records, identity_map = _inject_web_identity_records(
@@ -116,7 +120,7 @@ async def synchronize_browser_cookies(
         context=context,
         previous=previous,
     )
-    if identity_map.get("s_v_web_id"):
+    if identity_map.get("s_v_web_id") and not closing:
         await context.add_cookies([row for row in merged_records if row.get("name") == "s_v_web_id"
                                   and row.get("value") == identity_map["s_v_web_id"]
                                   and row.get("domain") == ".tiktok.com"])

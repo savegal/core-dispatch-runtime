@@ -250,6 +250,7 @@ def test_create_monitored_tasks_batch_sync_limits_by_balance(db_session):
         mode="auto_comment",
         monitored_blogger=blogger,
     )
+    variants = ["Main text", "Second text", *[f"Text {index}" for index in range(2, 14)]]
     template = TaskTemplate(
         user=user,
         name="auto",
@@ -257,7 +258,7 @@ def test_create_monitored_tasks_batch_sync_limits_by_balance(db_session):
         reply1="r1",
         reply2="r2",
         reply3="r3",
-        settings={"text_variants": ["Main text", "Second text", "Third text"]},
+        settings={"text_variants": variants, "publication_plan": {"main_count": 3, "replies_per_main": 1}},
     )
     db_session.add_all([user, pricing, blogger, creator, template])
     db_session.flush()
@@ -296,3 +297,4 @@ def test_create_monitored_tasks_batch_sync_limits_by_balance(db_session):
     tasks = db_session.query(Task).filter(Task.id.in_(result.task_ids)).order_by(Task.id).all()
     assert [task.main_comment for task in tasks] == ["Main text", "Second text"]
     assert [task.settings.get("text_variant_offset") for task in tasks] == [0, 1]
+    assert all(task.settings["text_variants"] == variants for task in tasks)

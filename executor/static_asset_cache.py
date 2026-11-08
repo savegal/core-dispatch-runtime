@@ -1,4 +1,5 @@
 """Bounded, process-local cache of public CDN scripts and stylesheets."""
+import asyncio
 from collections import OrderedDict
 from dataclasses import dataclass
 from threading import RLock
@@ -48,6 +49,7 @@ class StaticAssetCache:
         ))
         self.max_item_bytes = max_item_bytes
         self._entries = OrderedDict()
+        self._downloads: dict[tuple[asyncio.AbstractEventLoop, str], asyncio.Event] = {}
         self._total_bytes = 0
         self._lock = RLock()
 
@@ -66,6 +68,23 @@ class StaticAssetCache:
             if entry is not None:
                 self._entries.move_to_end(url)
             return entry
+
+    def begin_download(self, url: str) -> tuple[asyncio.Event, bool]:
+        """Only contexts on the same loop wait on each other's native requests."""
+        key = asyncio.get_running_loop(), url
+        with self._lock:
+            pending = self._downloads.get(key)
+            if pending is not None:
+                return pending, False
+            pending = self._downloads[key] = asyncio.Event()
+            return pending, True
+
+    def finish_download(self, url: str) -> None:
+        key = asyncio.get_running_loop(), url
+        with self._lock:
+            pending = self._downloads.pop(key, None)
+        if pending is not None:
+            pending.set()
 
     def put(self, url, status, headers, body):
         try:

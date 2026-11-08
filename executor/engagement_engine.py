@@ -13,8 +13,8 @@ Engagement Engine - единый движок для HYBRID и ENGAGEMENT_ONLY �
 """
 import threading
 from executor.cache_lock import synchronized
+from executor.browser_reads import await_browser_read
 import logging
-import json
 import os
 from services.publication_progress import record_publication, delivery_state, explicit_publication_flags
 from services.execution_attempts import pre_publish_outcomes, track_publication_requests, candidate_scan_limit, is_pre_publish_account_failure
@@ -47,6 +47,7 @@ from executor.http.signature_runtime import wait_for_runtime_signer_ready
 from services.account_service import (
     MAIN_SCOPE,
     REPLY_SCOPE,
+    _publish_cookie_risk,
     get_free_account_for_main_comment,
     get_free_account_for_reply,
     get_http_execution_strategy,
@@ -946,9 +947,11 @@ def install_early_comment_list_interceptor(page: Any, video_url: str) -> None:
     """Attach an early /api/comment/list/?cursor=0 listener before the initial page.goto."""
     if page is None or not callable(getattr(page, "on", None)):
         return
+    page._early_comment_interceptor_target = extract_video_id(video_url)
     if getattr(page, "_early_comment_interceptor_installed", False):
         return
-    target_aweme_id = extract_video_id(video_url)
+    from executor.http.comment_discovery import cache_first_comment_page, decode_comment_list_payload
+    from executor.http.request_evidence import has_request_signature, signature_presence
 
     async def _on_early_response(response: Any) -> None:
         try:
@@ -959,7 +962,7 @@ def install_early_comment_list_interceptor(page: Any, video_url: str) -> None:
             if parsed.hostname != "www.tiktok.com" or parsed.path != "/api/comment/list/":
                 return
             query = parse_qs(parsed.query)
-            expected_id = target_aweme_id or extract_video_id(getattr(page, "url", ""))
+            expected_id = page._early_comment_interceptor_target or extract_video_id(getattr(page, "url", ""))
             if (
                 expected_id
                 and query.get("aweme_id") == [str(expected_id)]
@@ -969,19 +972,13 @@ def install_early_comment_list_interceptor(page: Any, video_url: str) -> None:
                 from executor.http.page_runtime import document_generation
                 from executor.browser_reads import await_browser_read
                 generation = document_generation(page)
-                text = await await_browser_read(response.text)
-                if text and '"comments"' in text:
-                    data = json.loads(text)
-                    payload = data.get("data", data) if isinstance(data, dict) else None
-                    if (
-                        isinstance(payload, dict)
-                        and data.get("status_code") == 0
-                        and isinstance(payload.get("comments"), list)
-                        and document_generation(page) == generation
-                        and (extract_video_id(getattr(page, "url", "")) or expected_id) == expected_id
-                    ):
-                        page._cached_first_comment_page = payload
-                        page._cached_first_comment_aweme_id = str(expected_id)
+                text = await await_browser_read(response.text, timeout=4.5)
+                payload, _, _ = decode_comment_list_payload(text)
+                if (payload is not None and document_generation(page) == generation
+                        and (extract_video_id(getattr(page, "url", "")) or expected_id) == expected_id):
+                    cache_first_comment_page(page, expected_id, payload, signed=(
+                        extract_video_id(getattr(page, "url", "")) == expected_id
+                        and has_request_signature(signature_presence(url))))
         except Exception:
             pass
 
@@ -1009,9 +1006,17 @@ async def warmup_page_for_http(
     *,
     account: Optional[Account] = None,
     db: Optional[Session] = None,
+    require_comment_readiness: bool = False,
+    allow_verified_signer_without_list: bool = False,
 ) -> Tuple[Dict[str, str], bool, Dict[str, Any]]:
     """Warm the video page and session cookies for its native fetch interceptor."""
     from executor.browser_reads import await_browser_read
+    from executor.http.comment_discovery import (
+        COMMENT_BOOTSTRAP_TIMEOUT_SECONDS, activate_comment_list_via_page, cache_first_comment_page,
+        comment_token_handshake_ready, decode_comment_list_payload,
+        fetch_comment_page, signed_first_comment_page,
+    )
+    from executor.http.request_evidence import has_request_signature, signature_presence
     cookies_dict: Dict[str, str] = {}
     warmup_started = time.monotonic()
     target_document_generation = None
@@ -1040,16 +1045,13 @@ async def warmup_page_for_http(
                 from executor.browser_reads import await_browser_read
                 generation = document_generation(page)
                 text = await await_browser_read(response.text)
-                if text and '"comments"' in text:
-                    data = json.loads(text)
-                    payload = data.get("data", data) if isinstance(data, dict) else None
-                    if (isinstance(payload, dict) and data.get("status_code") == 0
-                            and isinstance(payload.get("comments"), list)
-                            and response_listener_active
-                            and document_generation(page) == generation
-                            and extract_video_id(getattr(page, "url", "")) == expected_id):
-                        page._cached_first_comment_page = payload
-                        page._cached_first_comment_aweme_id = str(expected_id)
+                payload, _, _ = decode_comment_list_payload(text)
+                if (payload is not None and response_listener_active
+                        and document_generation(page) == generation
+                        and extract_video_id(getattr(page, "url", "")) == expected_id):
+                    signed = has_request_signature(signature_presence(url))
+                    if signed or signed_first_comment_page(page, expected_id) is None:
+                        cache_first_comment_page(page, expected_id, payload, signed=signed)
         except Exception:
             pass
 
@@ -1096,7 +1098,8 @@ async def warmup_page_for_http(
                 valid = False
                 info.update(status="navigation_changed", reason_code="target_document_changed")
             info["current_url"] = str(getattr(page, "url", ""))
-        _record_http_account_result(getattr(account, "id", None), "warmup_success" if valid else "warmup_fail")
+        if info["status"] != "comment_api_unavailable":
+            _record_http_account_result(getattr(account, "id", None), "warmup_success" if valid else "warmup_fail")
         if valid and account is not None:
             account._http_preflight_requires_browser_warmup = False
         state = getattr(page, "_http_signer_state", {})
@@ -1188,6 +1191,7 @@ async def warmup_page_for_http(
 
         retry_navigation_ready = False
         for attempt in range(max_retries):
+            warmup_info.pop("comment_list_deferred", None)
             timing = None
             warmup_info["attempts"] = attempt + 1
             current = urlparse(str(getattr(page, "url", "") or ""))
@@ -1254,7 +1258,7 @@ async def warmup_page_for_http(
                 target_started_at = min(target_observed_at, mature["started_at"])
                 target_dom_ready_at = min(target_observed_at, mature["dom_ready_at"])
             try:
-                timing = await asyncio.wait_for(page.evaluate("""() => {
+                timing = await await_browser_read(lambda: page.evaluate("""() => {
                     return {
                         current_url: location.href,
                         navigation_url: performance.getEntriesByType('navigation')[0]?.name || '',
@@ -1281,8 +1285,6 @@ async def warmup_page_for_http(
                 return await _redirect_failure()
             if aweme_id and current_url and current_url != video_url:
                 cache_resolved_video_url(video_url, current_url, aweme_id)
-
-            from executor.http.comment_discovery import fetch_comment_page, activate_comment_list_via_page
 
             # Poll ttwid and runtime signer readiness in a single parallel loop
             # (0.2s step, bounded to 6.0s total).
@@ -1406,10 +1408,19 @@ async def warmup_page_for_http(
                                          or current_signer.get("signed_dispatch_seen")))
                 warmup_info["runtime_profile_read_extended"] = extended_read
             except asyncio.TimeoutError:
-                warmup_info.update(status="timeout", reason_code="warmup_runtime_profile_timeout",
-                                   missing_critical=["runtime_profile"])
                 logger.info("[WARMUP] Runtime profile read exceeded bounded wait for %s", correlation_id or "unknown")
-                return await _finish(False, dict(warmup_info))
+                if not _refresh_target_url() or document_generation(page) != generation:
+                    return await _redirect_failure()
+                from executor.http.playwright_http_client import runtime_profile_from_context
+                runtime_profile = runtime_profile_from_context(page)
+                if runtime_profile is None:
+                    warmup_info.update(status="timeout", reason_code="warmup_runtime_profile_timeout",
+                                       missing_critical=["runtime_profile"])
+                    if attempt + 1 < max_retries:
+                        retry_navigation_ready = True
+                        continue
+                    return await _finish(False, dict(warmup_info))
+                warmup_info["runtime_profile_from_context"] = True
             warmup_info["_runtime_profile"] = runtime_profile
             timing = {**(timing if isinstance(timing, dict) else {}), **runtime_profile}
             if isinstance(timing, dict):
@@ -1448,32 +1459,75 @@ async def warmup_page_for_http(
             if cached_comments and str(cached_video or "") != str(target_video_id or ""):
                 page._cached_first_comment_page = None
                 cached_comments = None
+            if require_comment_readiness:
+                cached_comments = signed_first_comment_page(page, target_video_id)
             signer_state = getattr(page, "_http_signer_state", {})
             from services.cookie_validator import remember_observed_ms_token
             imported_ms_token_only = ms_token_needs_browser_refresh(page.context, live_cookies, account)
             warmup_info["ms_token_from_import_only"] = imported_ms_token_only
             if not cached_comments:
-                if (any(live_cookies.get(key) for key in ("sessionid", "sid_tt", "sessionid_ss"))
+                if (not require_comment_readiness
+                        and any(live_cookies.get(key) for key in ("sessionid", "sid_tt", "sessionid_ss"))
                         and all(live_cookies.get(key) for key in ("ttwid", "tt_csrf_token", "msToken"))
                         and signer_ready and not imported_ms_token_only):
                     warmup_info["comment_api_skipped"] = True
                 elif live_cookies.get("ttwid"):
                     read_comments = fetch_comment_page if signer_ready else activate_comment_list_via_page
-                    warmup_comments = await read_comments(page, target_video_id, count=20, runtime_profile=runtime_profile)
+                    options = {"count": 20, "runtime_profile": runtime_profile}
                     warmup_info["comment_api_probed"] = True
                     warmup_info["comment_api_native_only"] = not signer_ready
+                    if require_comment_readiness:
+                        if signer_ready:
+                            options["bootstrap"] = True
+                        try:
+                            async with asyncio.timeout(COMMENT_BOOTSTRAP_TIMEOUT_SECONDS if signer_ready else 6.0):
+                                warmup_comments = await read_comments(page, target_video_id, **options)
+                            read_reason = (getattr(page, "_comment_list_http_meta", None) or {}).get("reason")
+                        except TimeoutError:
+                            warmup_comments, read_reason = None, "timeout"
+                            read_meta = getattr(page, "_comment_list_http_meta", None)
+                            if isinstance(read_meta, dict) and read_meta.get("reason") == "not_started":
+                                read_meta["reason"] = "timeout"
+                        if not _refresh_target_url() or document_generation(page) != generation:
+                            return await _redirect_failure()
+                        if warmup_comments is None:
+                            warmup_comments = signed_first_comment_page(page, target_video_id)
+                            if warmup_comments is None:
+                                reason = read_reason or "no_result"
+                                warmup_info["comment_list_unconfirmed"] = reason
+                                handshake = signer_ready and comment_token_handshake_ready(page, target_video_id)
+                                if (not handshake and allow_verified_signer_without_list
+                                        and live_cookies.get("tt_csrf_token") and live_cookies.get("msToken")
+                                        and not imported_ms_token_only and reason in {
+                                    "timeout", "native_comment_request_unavailable", "native_comment_response_timeout",
+                                }):
+                                    if not _publish_cookie_risk(live_cookies) and await wait_for_runtime_signer_ready(
+                                            page, timeout_ms=700, require_signed_dispatch=True):
+                                        if not _refresh_target_url() or document_generation(page) != generation:
+                                            return await _redirect_failure()
+                                        signer_ready = page._warmup_signer_ready = True
+                                        warmup_info.update(signer_ready=True, comment_list_deferred=True)
+                                        logger.info("[WARMUP] %s: comment list deferred after %s with verified signing",
+                                                    correlation_id or "unknown", reason)
+                                if not handshake and not warmup_info.get("comment_list_deferred"):
+                                    warmup_info.update(status="comment_api_unavailable",
+                                                       reason_code=f"comment_readiness_unconfirmed:{reason}")
+                                    return await _finish(False, dict(warmup_info))
+                    else:
+                        warmup_comments = await read_comments(page, target_video_id, **options)
                     warmup_info["comment_api_ready"] = warmup_comments is not None
                     if warmup_comments is not None and target_video_id:
-                        page._cached_first_comment_page = warmup_comments
-                        page._cached_first_comment_aweme_id = str(target_video_id)
+                        read_evidence = getattr(page, "_comment_list_http_meta", {}) or {}
+                        signed_read = (signed_first_comment_page(page, target_video_id) is not None
+                                       or has_request_signature(read_evidence.get("security_params")))
+                        cache_first_comment_page(page, target_video_id, warmup_comments, signed=signed_read)
             else:
                 warmup_info["comment_api_ready"] = True
                 warmup_info["comment_api_intercepted"] = True
 
             read_meta = getattr(page, "_comment_list_http_meta", {}) or {}
-            from executor.http.request_evidence import has_request_signature
             wire = read_meta.get("security_params", {})
-            if has_request_signature(wire) and read_meta.get("security_params_source") == "request_event":
+            if signed_first_comment_page(page, target_video_id) is not None:
                 signer_ready = True
                 page._warmup_signer_ready = True
                 page._http_signer_state = {**(signer_state if isinstance(signer_state, dict) else {}),
@@ -1565,10 +1619,15 @@ async def warmup_page_for_http(
                 missing_critical.append("ttwid")
             if not cookies_dict.get("tt_csrf_token"):
                 missing_critical.append("tt_csrf_token")
-            if not cookies_dict.get("msToken") and not wire.get("msToken"):
+            if not cookies_dict.get("msToken") and (warmup_info.get("comment_list_deferred") or not wire.get("msToken")):
                 missing_critical.append("msToken")
             elif ms_token_refresh_pending:
                 missing_critical.append("msToken_refresh_unconfirmed")
+            if warmup_info.get("comment_list_deferred") and _publish_cookie_risk(cookies_dict):
+                warmup_info.pop("comment_list_deferred")
+                warmup_info.update(status="comment_api_unavailable",
+                                   reason_code=f"comment_readiness_unconfirmed:{warmup_info['comment_list_unconfirmed']}")
+                return await _finish(False, dict(warmup_info))
             if not signer_ready:
                 missing_critical.append("signer_not_ready")
             is_valid = not missing_critical
@@ -1606,8 +1665,8 @@ async def warmup_page_for_http(
                 }
             )
             logger.warning(
-                f"[WARMUP] Missing critical params after attempt {attempt + 1}/{max_retries}: {missing_critical}. "
-                f"Retrying warmup..."
+                "[WARMUP] Missing critical params after attempt %s/%s: %s",
+                attempt + 1, max_retries, missing_critical,
             )
 
             if attempt < max_retries - 1:

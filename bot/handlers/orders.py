@@ -1513,6 +1513,9 @@ def _order_eta_line(task: dict) -> str | None:
 
 def _order_replies(task: dict) -> list[str]:
     settings_dict = task.get("settings") if isinstance(task.get("settings"), dict) else {}
+    if settings_dict.get("publication_plan"):
+        from services.quantity_plan import quantity_reply_texts
+        return quantity_reply_texts(task)
     if isinstance(settings_dict.get("replies"), list):
         replies = settings_dict.get("replies", [])
     else:

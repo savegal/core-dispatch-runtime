@@ -154,7 +154,7 @@ def _normalize_task_reply_payload(
 
     replies = _normalize_reply_list(raw_replies)
     requested_reply_count = task_settings.get("reply_count")
-    if isinstance(requested_reply_count, int) and requested_reply_count >= 0:
+    if not task_settings.get("publication_plan") and isinstance(requested_reply_count, int) and requested_reply_count >= 0:
         reply_count = min(requested_reply_count, len(replies), settings.MAX_REPLIES)
     else:
         reply_count = len(replies)
@@ -226,18 +226,20 @@ class TaskCreate(BaseModel):
         if len(v) > 100:
             raise ValueError('Too many URLs (max 100)')
         # Ð’Ð°Ð»Ð¸Ð´Ð¸Ñ€ÑƒÐµÐ¼ Ð¸ Ð´ÐµÐ´ÑƒÐ¿Ð»Ð¸Ñ†Ð¸Ñ€ÑƒÐµÐ¼ URLs, Ñ‡Ñ‚Ð¾Ð±Ñ‹ Ð½Ðµ ÑÐ¾Ð·Ð´Ð°Ð²Ð°Ñ‚ÑŒ/Ð¾Ð¿Ð»Ð°Ñ‡Ð¸Ð²Ð°Ñ‚ÑŒ Ð´ÑƒÐ±Ð»Ð¸ÐºÐ°Ñ‚Ñ‹.
-        from bot.services.validators import validate_video_url, normalize_url
+        from bot.services.validators import normalize_url
+        from services.tiktok_urls import order_video_key
 
         normalized_unique: list[str] = []
-        seen: set[str] = set()
+        seen = set()
 
         for raw_url in v:
             normalized_url = normalize_url(raw_url)
-            if not validate_video_url(normalized_url):
+            key = order_video_key(normalized_url)
+            if key is None:
                 raise ValueError(f'Invalid TikTok URL: {str(raw_url)[:50]}')
-            if normalized_url in seen:
+            if key in seen:
                 continue
-            seen.add(normalized_url)
+            seen.add(key)
             normalized_unique.append(normalized_url)
 
         if not normalized_unique:
@@ -607,6 +609,8 @@ async def create_task(
         task_data.settings,
         [task_data.reply1, task_data.reply2, task_data.reply3],
     )
+    if task_data.kind == "engagement_only" and not normalized_task_settings["reply_count"]:
+        raise HTTPException(status_code=422, detail="Добавьте хотя бы один ответ для заказа «Только ответы»")
     from services.order_settings import clean_order_configuration
     normalized_task_settings = clean_order_configuration(normalized_task_settings)
     if task_data.kind == "full" and (normalized_task_settings.get("publication_plan") or not normalized_task_settings.get("retry_of_task_id")):
@@ -673,6 +677,8 @@ async def create_task(
         source_task = source_result.scalar_one_or_none()
         if source_task is None:
             raise HTTPException(status_code=404, detail="Исходный заказ не найден")
+        if task_data.kind != (source_task.kind or "full"):
+            raise HTTPException(status_code=409, detail="При повторе сохраните тип исходного заказа")
         source_quantity = (source_task.settings or {}).get("publication_plan")
         if source_task.status not in ({"error", "partial", "stopped"} if source_quantity else {"error", "partial"}):
             raise HTTPException(status_code=409, detail="Повтор доступен для заказов с ошибками")
@@ -1318,6 +1324,10 @@ async def update_task_texts(
         variants = payload.text_variants
         if not (task.settings or {}).get("publication_plan") and len(variants) < 3:
             raise HTTPException(422, "Для сохранённого заказа старого формата нужны 3 варианта текста")
+        if task.kind == "full" and (task.settings or {}).get("mention_mode") == "attempt":
+            from services.mention_policy import find_mentions, MAX_MENTIONS_PER_COMMENT
+            if any(len(find_mentions(text)) > MAX_MENTIONS_PER_COMMENT for text in variants):
+                raise HTTPException(422, "Можно до 3 отметок в одном комментарии; сократите отметки")
         task.main_comment = variants[0]
         settings_dict = dict(task.settings or {})
         settings_dict["text_variants"] = variants
