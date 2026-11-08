@@ -4,7 +4,6 @@ from __future__ import annotations
 import asyncio
 from collections import Counter
 from copy import deepcopy
-from datetime import timedelta
 import hashlib
 import logging
 import time
@@ -18,7 +17,7 @@ from db.models import PublicationAttempt, QuantityAction, Task
 from services.async_ownership import await_owned
 from services.quantity_plan import quantity_plan, traffic_budget_exhausted, traffic_control_reason
 from services.quantity_state import RETRYABLE_QUANTITY_STATES
-from services.publication_journal import _safe_error, quantity_action, utcnow
+from services.publication_journal import _safe_error, quantity_action, recent_publication_preparation_failure, utcnow
 
 logger = logging.getLogger(__name__)
 INCONCLUSIVE_RECHECK_DELAYS = (2.0, 5.0, 10.0)
@@ -320,11 +319,7 @@ async def publish_action(engine, task_id, identity, *, stop_requested, pool_owne
         empty_read = and_(PublicationAttempt.video_url == action.video_url, PublicationAttempt.wire_count == 0,
                           PublicationAttempt.error_code == _EMPTY_COMMENT_READ)
         recent_preparation_failure = and_(PublicationAttempt.video_url == action.video_url,
-            PublicationAttempt.status == "not_sent", PublicationAttempt.wire_count == 0,
-            PublicationAttempt.finished_at > utcnow() - timedelta(seconds=90),
-            or_(PublicationAttempt.error_code == "warmup_runtime_profile_timeout",
-                PublicationAttempt.error_code.startswith("comment_readiness_unconfirmed:"),
-                PublicationAttempt.error_code.startswith("proxy_route:")))
+                                          recent_publication_preparation_failure(utcnow()))
         excluded = {account_id for (account_id,) in db.query(PublicationAttempt.account_id).filter(
             PublicationAttempt.task_id == task_id, PublicationAttempt.account_id.isnot(None),
             or_(sent_to_target, refused_auth, empty_read, recent_preparation_failure)).distinct()}

@@ -105,6 +105,23 @@ async def test_cached_ip_is_reused_but_expiry_is_not_extended(monkeypatch, isola
 
 
 @pytest.mark.asyncio
+async def test_ip_probe_timeout_pauses_only_the_same_route(monkeypatch, isolated_proxy_leases):
+    probe = AsyncMock(side_effect=[httpx.ConnectTimeout("fixture"), "8.8.8.8", "8.8.4.4"])
+    monkeypatch.setattr(residential, "_probe_exit_ip", probe)
+    route = ProxyRoute.parse("http://one:fixture@gateway.example:8080")
+    other = ProxyRoute.parse("http://two:fixture@gateway.example:8080")
+    for _ in range(2):
+        with pytest.raises(ProxyRouteError, match="residential_ip_probe_timeout"):
+            await residential.ensure_residential_exit_ip(SimpleNamespace(id=1), route)
+    probe.assert_awaited_once()
+    assert await residential.ensure_residential_exit_ip(SimpleNamespace(id=2), other) == "8.8.8.8"
+    key = f"proxy:residential:probe_timeout:{hashlib.sha256(route.url.encode()).hexdigest()}"
+    assert 0 < isolated_proxy_leases.ttl(key) <= 300
+    isolated_proxy_leases.delete(key)
+    assert await residential.ensure_residential_exit_ip(SimpleNamespace(id=1), route) == "8.8.4.4"
+
+
+@pytest.mark.asyncio
 async def test_mobile_does_not_use_residential_ip_probe(monkeypatch):
     probe = AsyncMock(side_effect=AssertionError("Mobile rotation owns mobile checks"))
     monkeypatch.setattr(residential, "_probe_exit_ip", probe)

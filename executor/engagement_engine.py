@@ -1192,6 +1192,7 @@ async def warmup_page_for_http(
         retry_navigation_ready = False
         for attempt in range(max_retries):
             warmup_info.pop("comment_list_deferred", None)
+            warmup_info.pop("comment_list_unconfirmed", None)
             timing = None
             warmup_info["attempts"] = attempt + 1
             current = urlparse(str(getattr(page, "url", "") or ""))
@@ -1461,10 +1462,21 @@ async def warmup_page_for_http(
                 cached_comments = None
             if require_comment_readiness:
                 cached_comments = signed_first_comment_page(page, target_video_id)
+                if not cached_comments and not signer_ready:
+                    # The first probe can expire before the runtime profile read finishes.
+                    signer_ready = bool(await wait_for_runtime_signer_ready(page, timeout_ms=2500))
+                    if not _refresh_target_url() or document_generation(page) != generation:
+                        return await _redirect_failure()
+                    page._warmup_signer_ready = signer_ready
+                    warmup_info["signer_ready"] = signer_ready
+                    warmup_info["signer_recovered_after_reads"] = signer_ready
+                    cached_comments = signed_first_comment_page(page, target_video_id)
+                    live_cookies = normalize_cookie_records(await page.context.cookies())
             signer_state = getattr(page, "_http_signer_state", {})
-            from services.cookie_validator import remember_observed_ms_token
+            from services.cookie_validator import ms_token_differs_from_import, remember_observed_ms_token
             imported_ms_token_only = ms_token_needs_browser_refresh(page.context, live_cookies, account)
             warmup_info["ms_token_from_import_only"] = imported_ms_token_only
+            allow_token_only = allow_verified_signer_without_list and not warmup_info.get("document_rebased")
             if not cached_comments:
                 if (not require_comment_readiness
                         and any(live_cookies.get(key) for key in ("sessionid", "sid_tt", "sessionid_ss"))
@@ -1479,6 +1491,8 @@ async def warmup_page_for_http(
                     if require_comment_readiness:
                         if signer_ready:
                             options["bootstrap"] = True
+                            if allow_token_only and live_cookies.get("tt_csrf_token") and not _publish_cookie_risk(live_cookies):
+                                options["stop_on_token_refresh"] = True
                         try:
                             async with asyncio.timeout(COMMENT_BOOTSTRAP_TIMEOUT_SECONDS if signer_ready else 6.0):
                                 warmup_comments = await read_comments(page, target_video_id, **options)
@@ -1495,14 +1509,17 @@ async def warmup_page_for_http(
                             if warmup_comments is None:
                                 reason = read_reason or "no_result"
                                 warmup_info["comment_list_unconfirmed"] = reason
-                                handshake = signer_ready and comment_token_handshake_ready(page, target_video_id)
-                                if (not handshake and allow_verified_signer_without_list
-                                        and live_cookies.get("tt_csrf_token") and live_cookies.get("msToken")
-                                        and not imported_ms_token_only and reason in {
+                                handshake = (signer_ready and not warmup_info.get("document_rebased")
+                                             and comment_token_handshake_ready(page, target_video_id))
+                                if not handshake and allow_token_only and reason in {
                                     "timeout", "native_comment_request_unavailable", "native_comment_response_timeout",
-                                }):
-                                    if not _publish_cookie_risk(live_cookies) and await wait_for_runtime_signer_ready(
-                                            page, timeout_ms=700, require_signed_dispatch=True):
+                                }:
+                                    current_cookies = normalize_cookie_records(await page.context.cookies())
+                                    if (current_cookies.get("tt_csrf_token")
+                                            and ms_token_differs_from_import(page.context, current_cookies)
+                                            and not _publish_cookie_risk(current_cookies)
+                                            and await wait_for_runtime_signer_ready(page, timeout_ms=700,
+                                                                                    require_signed_dispatch=True)):
                                         if not _refresh_target_url() or document_generation(page) != generation:
                                             return await _redirect_failure()
                                         signer_ready = page._warmup_signer_ready = True
@@ -1623,8 +1640,10 @@ async def warmup_page_for_http(
                 missing_critical.append("msToken")
             elif ms_token_refresh_pending:
                 missing_critical.append("msToken_refresh_unconfirmed")
-            if warmup_info.get("comment_list_deferred") and _publish_cookie_risk(cookies_dict):
-                warmup_info.pop("comment_list_deferred")
+            if (warmup_info.get("comment_list_unconfirmed")
+                    and (warmup_info.get("comment_list_deferred") or read_meta.get("stopped_on_token_refresh"))
+                    and _publish_cookie_risk(cookies_dict)):
+                warmup_info.pop("comment_list_deferred", None)
                 warmup_info.update(status="comment_api_unavailable",
                                    reason_code=f"comment_readiness_unconfirmed:{warmup_info['comment_list_unconfirmed']}")
                 return await _finish(False, dict(warmup_info))

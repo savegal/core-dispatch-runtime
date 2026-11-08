@@ -23,7 +23,7 @@ def mock_successful_redis_claims(monkeypatch):
     from types import SimpleNamespace
     monkeypatch.setattr(
         "services.proxy_concurrency_service._lease_client",
-        lambda: SimpleNamespace(eval=Mock(return_value=1), get=Mock(return_value=None)),
+        lambda: SimpleNamespace(eval=Mock(return_value=1), get=Mock(return_value=None), set=Mock()),
     )
 
 
@@ -272,7 +272,8 @@ async def test_quantity_gives_untouched_slots_a_turn_before_retrying_preflight(d
     ("http_preflight:inconclusive:passport_auth_unconfirmed", 120, True),
     ("http_auth_unconfirmed:browser_login_state", 120, True),
     ("comment_readiness_unconfirmed:empty_body", 120, True),
-    ("proxy_route:residential_ip_probe_timeout", 120, False),
+    ("proxy_route:residential_ip_probe_timeout", 301, False),
+    ("proxy_route:residential_ip_probe_timeout", 120, True),
     ("proxy_route:residential_ip_probe_timeout", 30, True),
     ("warmup_runtime_profile_timeout", 30, True),
     ("comment_readiness_unconfirmed:timeout", 30, True),

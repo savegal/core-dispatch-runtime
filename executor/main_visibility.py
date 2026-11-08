@@ -44,7 +44,7 @@ async def scan_main_comment_ids(page, aweme_id, comment_ids, *, max_pages=20, wa
         if allow_page_fallback:
             if cursor == 0 and getattr(page, "_warmup_signer_ready", None) is False:
                 return await activate_comment_list_via_page(page, aweme_id)
-            return await fetch_comment_page(page, aweme_id, cursor, fresh=True, retry=False)
+            return await fetch_comment_page(page, aweme_id, cursor, fresh=True, retry=cursor == 0, retry_limit=1)
         return await fetch_comment_page(page, aweme_id, cursor, fresh=True)
 
     evidence = await scan_comment_ids(

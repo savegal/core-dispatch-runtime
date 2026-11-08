@@ -1257,7 +1257,8 @@ def _runtime_health_grade(state: dict[str, Any] | None) -> str:
 
 
 def _runtime_health_is_selection_last_resort(state: dict[str, Any] | None) -> bool:
-    return _runtime_health_grade(state) in _RUNTIME_HEALTH_LAST_RESORT_GRADES
+    return (bool(state and state.get("bucket") == "degraded" and state.get("category") == "auth_unconfirmed")
+            or _runtime_health_grade(state) in _RUNTIME_HEALTH_LAST_RESORT_GRADES)
 
 
 def get_http_execution_strategy(

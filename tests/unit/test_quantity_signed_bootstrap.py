@@ -53,6 +53,29 @@ async def test_bootstrap_timeout_reuses_only_signed_response_headers(monkeypatch
     assert comment_discovery.comment_token_handshake_ready(page, target) is (signed and headers_arrived)
 
 
+async def test_write_bootstrap_stops_after_verified_token_rotation(monkeypatch):
+    target = "7635267329407913230"
+    context = SimpleNamespace(cookies=AsyncMock(return_value=[]), add_cookies=AsyncMock())
+    page = SimpleNamespace(url=f"https://www.tiktok.com/@fixture/video/{target}", context=context)
+    monkeypatch.setattr(comment_discovery, "_read_request_metadata", AsyncMock(return_value=({}, {"msToken": "imported"})))
+
+    @contextmanager
+    def evidence(*args):
+        yield {"request_security_params": {"X-Bogus": True}}
+
+    async def fetch(page, script, url, meta, **kwargs):
+        return {"status": 200, "url": url, "text": "", "headers": {"x-ms-token": "fresh"}}
+
+    transport = AsyncMock(side_effect=fetch)
+    monkeypatch.setattr(comment_discovery, "observe_request_security", evidence)
+    monkeypatch.setattr(comment_discovery, "_fetch_with_native_activation", transport)
+
+    assert await comment_discovery.fetch_comment_page(page, target, bootstrap=True, stop_on_token_refresh=True) is None
+    transport.assert_awaited_once()
+    assert comment_discovery.comment_token_handshake_ready(page, target)
+    assert page._comment_list_http_meta["stopped_on_token_refresh"]
+
+
 @pytest.mark.parametrize("case,expected", [
     ("exact", True), ("old", False), ("wrong_uid", False), ("wrong_media", False),
     ("wrong_parent", False), ("wrong_text", False), ("ambiguous", False), ("same_second_without_baseline", False),

@@ -5,6 +5,7 @@ import json
 from ipaddress import ip_address
 
 import httpx
+from redis.exceptions import RedisError
 
 from config.settings import get_settings
 from services.proxy_normalizer import ProxyRouteError
@@ -62,6 +63,7 @@ async def ensure_residential_exit_ip(account, route, *, lease=None) -> str | Non
     digest = hashlib.sha256(route.url.encode()).hexdigest()
     route_key = f"proxy:residential:route:{digest}"
     cache_key = f"proxy:residential:checked:{account_id}:{digest}"
+    timeout_key = f"proxy:residential:probe_timeout:{digest}"
     owner = str(account_id)
     try:
         client = _lease_client()
@@ -69,7 +71,19 @@ async def ensure_residential_exit_ip(account, route, *, lease=None) -> str | Non
         if not claimed:
             raise ProxyRouteError("residential_route_already_assigned")
         cached = await asyncio.to_thread(client.get, cache_key)
-        observed = str(cached) if cached else await _probe_exit_ip(route)
+        if cached:
+            observed = str(cached)
+        else:
+            if await asyncio.to_thread(client.get, timeout_key):
+                raise ProxyRouteError("residential_ip_probe_timeout")
+            try:
+                observed = await _probe_exit_ip(route)
+            except (httpx.TimeoutException, TimeoutError):
+                try:
+                    await asyncio.to_thread(client.set, timeout_key, "1", ex=300)
+                except RedisError:
+                    pass  # Preserve the underlying route error.
+                raise
         observed = str(ip_address(observed))
         ip_key = f"proxy:residential:ip:{observed}"
         claimed = await asyncio.to_thread(

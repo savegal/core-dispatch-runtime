@@ -99,12 +99,12 @@ def render_live(activity):
                      (f" / {number(plan.get('traffic_limit_mb'))} МБ" if plan.get("traffic_limit_mb") else ""))
     job = activity.get("recheck") or {}
     if job:
-        label = {"pending": "в очереди", "running": "в процессе", "done": "завершена", "error": "ошибка"}
+        label = {"pending": "в очереди", "running": "в процессе", "done": "раунд завершён", "error": "ошибка"}
         lines.append(f"Перепроверка: {escape(label.get(job.get('status'), '—'))}")
         stats = job.get("result") or {}
         if stats.get("processed"):
-            lines.append(f"Обработано: {number(stats['processed'])} · публично: {number(stats.get('visible'))} "
-                         f"· только автору: {number(stats.get('author_only'))}")
+            lines.append(f"Обработано: {number(stats['processed'])} · с результатом: {number(stats.get('checked'))} "
+                         f"· публично: {number(stats.get('visible'))} · только автору: {number(stats.get('author_only'))}")
     latest = activity.get("latest") or []
     if latest:
         lines.extend(["", "<b>Последние действия</b>"])

@@ -16,7 +16,8 @@ from sqlalchemy.orm import Session
 
 from db.models import Account, PublicationAttempt, PublicationCheckJob, QuantityAction, Task
 from services.async_ownership import await_owned
-from services.publication_journal import utcnow
+from services.publication_journal import _safe_error, recent_publication_preparation_failure, utcnow
+from services.proxy_normalizer import ProxyRouteError
 
 logger = logging.getLogger(__name__)
 ACTIVE = {"pending", "in_progress", "running", "queued"}
@@ -203,7 +204,10 @@ async def observe_video(db, task, rows, *, observer_cooldowns: dict[int, float] 
                         and all(isinstance(value, str) for value in key)}
                 if identity_is_known(keys) and keys not in references:
                     references.append(keys)
-        cutoff = utcnow() - timedelta(seconds=OBSERVER_COOLDOWN_SECONDS)
+        now = utcnow()
+        used.update(account_id for (account_id,) in history.filter(PublicationAttempt.account_id.isnot(None),
+            recent_publication_preparation_failure(now)).with_entities(PublicationAttempt.account_id).distinct())
+        cutoff = now - timedelta(seconds=OBSERVER_COOLDOWN_SECONDS)
         for (readers,) in history.filter(PublicationAttempt.checked_at > cutoff).with_entities(PublicationAttempt.observers):
             used.update(item["account_id"] for item in readers or [] if isinstance(item, dict)
                         and item.get("role") != "author" and isinstance(item.get("account_id"), int))
@@ -230,7 +234,7 @@ async def observe_video(db, task, rows, *, observer_cooldowns: dict[int, float] 
             async with asyncio.timeout_at(deadline):
                 deny = await schema._preflight_cookie_http_gate(db, observer, correlation_id=corr, phase="publication_recheck")
                 if deny:
-                    return {**result, "reason": deny}, None
+                    return {**result, "reason": deny, "preflight_failed": True}, None
                 keys = account_identity_keys(observer, schema._get_cached_http_preflight_username(observer),
                                              user_id=schema._get_cached_http_preflight_user_id(observer))
                 if author:
@@ -249,7 +253,10 @@ async def observe_video(db, task, rows, *, observer_cooldowns: dict[int, float] 
                     return {**result, "reason": reason or "observer_auth_unconfirmed"}, None
                 if not schema.is_on_expected_media_url(getattr(page, "url", None), url):
                     return {**result, "reason": "observer_target_changed"}, None
-                page._warmup_signer_ready = await wait_for_runtime_signer_ready(page, timeout_ms=700)
+                page._warmup_signer_ready = await wait_for_runtime_signer_ready(page, timeout_ms=5500)
+                result["signer_ready"] = page._warmup_signer_ready
+                if not schema.is_on_expected_media_url(getattr(page, "url", None), url):
+                    return {**result, "reason": "observer_target_changed"}, None
                 groups = defaultdict(list)
                 for row in candidates:
                     groups[(row.kind, row.parent_id)].append(str(row.comment_id))
@@ -270,6 +277,9 @@ async def observe_video(db, task, rows, *, observer_cooldowns: dict[int, float] 
                             result.setdefault("reason", evidence["reason"])
         except TimeoutError:
             result["reason"] = "observer_account_timeout"
+        except ProxyRouteError as exc:
+            result["reason"] = str(exc)
+            result["preflight_failed"] = context is None
         except Exception as exc:
             result["reason"] = "observer_read_error:" + type(exc).__name__
             logger.warning("Publication reader failed task=%s account=%s (%s)", task.id, observer_id,
@@ -282,8 +292,10 @@ async def observe_video(db, task, rows, *, observer_cooldowns: dict[int, float] 
         return result, keys
 
     runtime = load_publication_runtime(db)
-    no_progress = 0
-    for _ in range(runtime.observer_attempts):
+    no_progress, read_attempts = 0, 0
+    for _ in range(runtime.observer_attempts * 3):
+        if read_attempts >= runtime.observer_attempts:
+            break
         if reason := await budget_reason():
             observations.append({"reason": reason})
             break
@@ -318,8 +330,20 @@ async def observe_video(db, task, rows, *, observer_cooldowns: dict[int, float] 
             observer_cooldowns[observer_id] = float("inf")
         try:
             candidates = [row for row in safe_rows if str(row.comment_id) not in found_ids]
+            started = loop.time()
             result, keys = await read_account(observer, candidates)
-            if result is not None and (result["found_ids"] or result["complete_ids"] or result.get("reason")):
+            if result is None:
+                continue
+            preflight_failed = result.pop("preflight_failed", False)
+            logger.info("[PUBLICATION_OBSERVER] task=%s account=%s elapsed_ms=%s preflight_failed=%s "
+                        "signer_ready=%s found=%s complete=%s reason=%s", task.id, observer_id,
+                        round((loop.time() - started) * 1000), preflight_failed, result.get("signer_ready"),
+                        len(result["found_ids"]), len(result["complete_ids"]), _safe_error(result.get("reason")))
+            if preflight_failed:
+                observations.append(result)
+                continue
+            read_attempts += 1
+            if result["found_ids"] or result["complete_ids"] or result.get("reason"):
                 observations.append(result)
                 if result["found_ids"] or result["complete_ids"]:
                     references.append(keys)

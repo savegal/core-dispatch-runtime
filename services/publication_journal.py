@@ -10,7 +10,7 @@ import logging
 import re
 from uuid import uuid4
 
-from sqlalchemy import inspect, update
+from sqlalchemy import and_, inspect, or_, update
 from sqlalchemy.orm import Session
 
 from db.models import PublicationAttempt, Task, TaskRuntime
@@ -23,6 +23,16 @@ quantity_action = ContextVar("quantity_action", default=None)
 
 def utcnow():
     return datetime.now(timezone.utc)
+
+
+def recent_publication_preparation_failure(now):
+    """Temporarily skip failed candidates on the same order and video."""
+    return and_(PublicationAttempt.status == "not_sent", PublicationAttempt.wire_count == 0,
+        PublicationAttempt.finished_at > now - timedelta(minutes=5),
+        or_(PublicationAttempt.error_code.in_(("warmup_runtime_profile_timeout",
+                                               "http_preflight:inconclusive:passport_auth_unconfirmed")),
+            PublicationAttempt.error_code.startswith("comment_readiness_unconfirmed:"),
+            PublicationAttempt.error_code.startswith("proxy_route:")))
 
 
 def publication_context():

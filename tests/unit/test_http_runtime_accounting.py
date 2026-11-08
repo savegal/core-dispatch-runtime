@@ -278,8 +278,9 @@ async def test_observer_stops_before_next_reader_when_traffic_runs_out(db_sessio
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("preflight_failures", [0, 2])
 async def test_recheck_excludes_other_batch_authors_and_recent_readers_and_stops_after_two_empty_reads(
-    db_session, sample_task, sample_account, monkeypatch,
+    db_session, sample_task, sample_account, monkeypatch, preflight_failures,
 ):
     from executor import user_schema as schema, engagement_engine, main_visibility
     from services import account_service
@@ -293,12 +294,20 @@ async def test_recheck_excludes_other_batch_authors_and_recent_readers_and_stops
     db_session.add(PublicationAttempt(id="other-batch", task_id=sample_task.id, account_id=sample_account.id,
         video_url=url, aweme_id=video, kind="main", text="fixture", text_hash="fixture", status="accepted",
         wire_count=1, comment_id="7704740811904828193", checked_at=utcnow(), observers=[{"account_id": 42}]))
+    failed = Account(label="recently failed sender")
+    db_session.add(failed)
+    db_session.flush()
+    db_session.add(PublicationAttempt(id="failed-sender", task_id=sample_task.id, account_id=failed.id,
+        video_url=url, aweme_id=video, kind="main", text="fixture", text_hash="fixture", status="not_sent",
+        wire_count=0, error_code="comment_readiness_unconfirmed:timeout", finished_at=utcnow()))
     db_session.commit()
     readers = [SimpleNamespace(id=i, proxy=None, cookies=f"sessionid=reader{i}; uid_tt={i}",
                                _cached_tiktok_username=f"reader{i}") for i in (71, 72, 73)]
-    selector = Mock(side_effect=readers)
+    refused = [SimpleNamespace(id=80 + index) for index in range(preflight_failures)]
+    selector = Mock(side_effect=[*refused, *readers])
     monkeypatch.setattr(account_service, "get_free_account_for_reply", selector)
-    monkeypatch.setattr(schema, "_preflight_cookie_http_gate", AsyncMock(return_value=None))
+    monkeypatch.setattr(schema, "_preflight_cookie_http_gate", AsyncMock(
+        side_effect=lambda db, account, **kwargs: "proxy_route:residential_ip_probe_timeout" if account in refused else None))
     monkeypatch.setattr(schema, "create_page_for_account", AsyncMock(side_effect=lambda _: (object(), SimpleNamespace(url=url))))
     monkeypatch.setattr(schema, "_ensure_account_login_ready", AsyncMock(return_value=(True, None)))
     warmup = AsyncMock(side_effect=AssertionError("Observer must not fetch comments during warmup"))
@@ -317,9 +326,10 @@ async def test_recheck_excludes_other_batch_authors_and_recent_readers_and_stops
         video_url=url, aweme_id=video, comment_id="7704740811904828192", kind="main", parent_id=None)
 
     observations = await observe_video(db_session, sample_task, [projection], observer_cooldowns=observer_cooldowns)
-    assert {sample_account.id, 42} <= set(selector.call_args_list[0].kwargs["exclude_ids"])
-    assert selector.call_count == scan.await_count == 2
-    assert [item["reason"] for item in observations] == ["empty_body", "empty_body"]
+    assert {sample_account.id, failed.id, 42} <= set(selector.call_args_list[0].kwargs["exclude_ids"])
+    assert scan.await_count == 2 and selector.call_count == 2 + preflight_failures
+    assert [item["reason"] for item in observations] == (
+        ["proxy_route:residential_ip_probe_timeout"] * preflight_failures + ["empty_body", "empty_body"])
     warmup.assert_not_awaited()
 
     # The first batch has released its leases and has yet to persist its observations.

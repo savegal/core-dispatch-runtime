@@ -641,7 +641,7 @@ async def test_quantity_crosses_real_selector_transport_journal_and_checkpoint(
             assert not reads
             read_timeout.assert_awaited_once()
         else:
-            assert len(reads) == (2 if read_ok == "rotate_empty" or post_result == "recover" else 1)
+            assert len(reads) == (2 if post_result == "recover" else 1)
         if read_ok in {"rotate_empty", "navigation_token"}:
             token_expected = "fresh-fixture-token" if read_ok == "rotate_empty" else "from-navigation"
             assert parse_qs(urlparse(posts[0]).query)["msToken"] == [token_expected]

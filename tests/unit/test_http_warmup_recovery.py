@@ -254,6 +254,50 @@ async def test_quantity_empty_token_bootstrap_is_final_for_this_candidate(monkey
     page.goto.assert_not_awaited()
 
 
+async def test_quantity_rechecks_late_signer_before_choosing_comment_transport(monkeypatch, warmup):
+    page, comments, _ = warmup
+
+    async def signer(*args, timeout_ms, **kwargs):
+        return timeout_ms == 2500
+
+    monkeypatch.setattr(engagement_engine, "wait_for_runtime_signer_ready", signer)
+    _, valid, info = await engagement_engine.warmup_page_for_http(
+        page, URL, max_retries=1, require_comment_readiness=True,
+    )
+
+    assert valid and info["signer_recovered_after_reads"]
+    comments.assert_awaited_once()
+    assert comments.await_args.kwargs["bootstrap"] is True
+
+
+async def test_same_video_reload_requires_more_than_a_token_refresh(monkeypatch, warmup):
+    from executor.http.page_runtime import page_document_key
+
+    page, comments, _ = warmup
+    reloaded = False
+
+    async def signer(*args, **kwargs):
+        nonlocal reloaded
+        if not reloaded:
+            page._http_document_generation += 1
+            reloaded = True
+        return True
+
+    async def read(*args, **kwargs):
+        page._comment_list_http_meta = {"reason": "empty_body", "signed_token_refresh": page_document_key(page)}
+        return None
+
+    monkeypatch.setattr(engagement_engine, "wait_for_runtime_signer_ready", signer)
+    comments.side_effect = read
+    _, valid, info = await engagement_engine.warmup_page_for_http(
+        page, URL, max_retries=1, require_comment_readiness=True, allow_verified_signer_without_list=True,
+    )
+
+    assert not valid and info["document_rebased"]
+    assert info["reason_code"] == "comment_readiness_unconfirmed:empty_body"
+    assert "stop_on_token_refresh" not in comments.await_args.kwargs
+
+
 @pytest.mark.parametrize("verified,late_waf", [(False, False), (True, False), (True, True)])
 async def test_quantity_main_can_defer_timed_out_list_only_with_signed_runtime(monkeypatch, warmup, verified, late_waf):
     page, comments, _ = warmup

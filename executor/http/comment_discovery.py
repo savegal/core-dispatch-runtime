@@ -281,9 +281,11 @@ async def _fetch_with_native_activation(page, script, url, meta, *, native_only=
 
 
 async def fetch_comment_page(page, aweme_id: str, cursor=0, count: int = 20, *, fresh: bool = False,
-                             runtime_profile=None, retry: bool = True, bootstrap: bool = False):
+                             runtime_profile=None, retry: bool = True, bootstrap: bool = False,
+                             retry_limit: int | None = None, stop_on_token_refresh: bool = False):
     return await _fetch_comment_list(page, aweme_id, cursor, count, fresh=fresh,
-                                     runtime_profile=runtime_profile, retry=retry, bootstrap=bootstrap)
+                                     runtime_profile=runtime_profile, retry=retry, bootstrap=bootstrap,
+                                     retry_limit=retry_limit, stop_on_token_refresh=stop_on_token_refresh)
 
 
 async def activate_comment_list_via_page(page, aweme_id: str, *, count=20, runtime_profile=None):
@@ -299,7 +301,8 @@ async def fetch_reply_page(page, aweme_id: str, parent_comment_id: str, cursor=0
 
 
 async def _fetch_comment_list(page, aweme_id, cursor, count, *, fresh, parent_comment_id=None, runtime_profile=None,
-                              native_only=False, retry=True, bootstrap=False):
+                              native_only=False, retry=True, bootstrap=False, retry_limit=None,
+                              stop_on_token_refresh=False):
     meta = {"reason": "not_started", "http_status": None, "body_len": 0, "attempts": 0, "retry_count": 0}
     page._comment_list_http_meta = meta
     if parent_comment_id is not None:
@@ -324,6 +327,8 @@ async def _fetch_comment_list(page, aweme_id, cursor, count, *, fresh, parent_co
         if retry:
             effective_max_retries = 1 if bootstrap else (
                 _COMMENT_LIST_MAX_RETRIES if warmup_signer_ready is not False else 0)
+        if retry_limit is not None:
+            effective_max_retries = min(effective_max_retries, retry_limit)
         for attempt in range(effective_max_retries + 1):
             meta["attempts"] = attempt + 1
             meta["retry_count"] = attempt
@@ -389,6 +394,9 @@ async def _fetch_comment_list(page, aweme_id, cursor, count, *, fresh, parent_co
                                and live_after.get("msToken") != cookies.get("msToken"))
                 if (rotated or live_before) and page_document_key(page) == document and target_page_matches(page, aweme_id):
                     meta["signed_token_refresh"] = document
+                    if stop_on_token_refresh:
+                        meta["stopped_on_token_refresh"] = True
+                        return unavailable("empty_body")
             if read_error:
                 return unavailable(read_error)
             can_retry = rotated if bootstrap else True
